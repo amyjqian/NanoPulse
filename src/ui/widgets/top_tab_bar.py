@@ -6,7 +6,7 @@ dark background, icon + label per tab, accent underline on the active tab.
 """
 from __future__ import annotations
 
-from PySide6.QtWidgets import QWidget, QHBoxLayout, QSizePolicy
+from PySide6.QtWidgets import QWidget, QHBoxLayout, QSizePolicy, QPushButton
 from PySide6.QtCore import Qt, Signal, QSize
 from PySide6.QtGui import QPainter, QColor, QFont, QPen
 
@@ -115,6 +115,7 @@ class TopTabBar(QWidget):
     """Horizontal top navigation bar."""
 
     nav_changed = Signal(str)
+    settings_clicked = Signal()
 
     _TABS = ["Connect", "Contracts", "FlashTrade", "Executions"]
 
@@ -137,6 +138,25 @@ class TopTabBar(QWidget):
             layout.addWidget(btn)
 
         layout.addStretch(1)
+
+        # ── Settings (gear) button ───────────────────────────────────────────
+        self._settings_btn = QPushButton("⚙")
+        self._settings_btn.setFixedSize(BAR_HEIGHT, BAR_HEIGHT)
+        self._settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._settings_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent;
+                color: {TEXT_SECONDARY};
+                border: none;
+                font-size: 16px;
+            }}
+            QPushButton:hover {{
+                color: {TEXT_PRIMARY};
+                background: {HOVER_BG};
+            }}
+        """)
+        self._settings_btn.clicked.connect(self.settings_clicked.emit)
+        layout.addWidget(self._settings_btn)
 
         # Activate first tab
         first = next(iter(self._buttons.values()))

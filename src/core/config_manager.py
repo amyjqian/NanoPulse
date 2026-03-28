@@ -258,6 +258,34 @@ def save_hidden_accounts(
     log.debug("Saved %d hidden account(s) to %s", len(accounts), p)
 
 
+# ── Preferences persistence ──────────────────────────────────────────────────
+
+
+def load_preferences(path: Path | str | None = None) -> dict[str, Any]:
+    """Load the ``preferences`` dict from config JSON.
+
+    Returns an empty dict if missing or malformed.
+    """
+    p = Path(path) if path else _default_path()
+    data = _read_json(p)
+    return dict(data.get("preferences", {}))
+
+
+def save_preferences(
+    prefs: dict[str, Any],
+    path: Path | str | None = None,
+) -> None:
+    """Persist *prefs* dict into the config JSON.
+
+    Merges with existing data so other keys are preserved.
+    """
+    p = Path(path) if path else _default_path()
+    data = _read_json(p)
+    data["preferences"] = prefs
+    _write_json(p, data)
+    log.debug("Saved preferences to %s", p)
+
+
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 
