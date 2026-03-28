@@ -589,11 +589,13 @@ class OrderEntryPanel(QWidget):
     def _emit_order(self, action: str, order_type: str) -> None:
         if not self._active_symbol:
             return
+        sec = _sec_type_for(self._active_symbol)
         payload = {
             "action": action,
             "type": order_type,
             "symbol": self._active_symbol,
             "qty": self._active_qty,
+            "sec_type": sec,
         }
         log.info("Order requested: %s", payload)
         self.order_requested.emit(payload)
