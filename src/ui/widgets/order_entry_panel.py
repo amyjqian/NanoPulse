@@ -275,15 +275,21 @@ class OrderEntryPanel(QWidget):
         action_grid.setContentsMargins(0, 0, 0, 0)
         self._btn_buy_mkt = _make_btn("Buy @MKT", CLR_BUY, 36)
         self._btn_sell_mkt = _make_btn("Sell @MKT", CLR_SELL, 36)
+        self._btn_buy_mid = _make_btn("Buy @Mid", CLR_BUY, 36)
+        self._btn_sell_mid = _make_btn("Sell @Mid", CLR_SELL, 36)
         self._btn_buy_bid = _make_btn("Buy @Bid", CLR_BUY, 36)
         self._btn_sell_ask = _make_btn("Sell @Ask", CLR_SELL, 36)
         action_grid.addWidget(self._btn_buy_mkt, 0, 0)
         action_grid.addWidget(self._btn_sell_mkt, 0, 1)
-        action_grid.addWidget(self._btn_buy_bid, 1, 0)
-        action_grid.addWidget(self._btn_sell_ask, 1, 1)
+        action_grid.addWidget(self._btn_buy_mid, 1, 0)
+        action_grid.addWidget(self._btn_sell_mid, 1, 1)
+        action_grid.addWidget(self._btn_buy_bid, 2, 0)
+        action_grid.addWidget(self._btn_sell_ask, 2, 1)
 
         self._btn_buy_mkt.clicked.connect(lambda: self._emit_order("BUY", "MKT"))
         self._btn_sell_mkt.clicked.connect(lambda: self._emit_order("SELL", "MKT"))
+        self._btn_buy_mid.clicked.connect(lambda: self._emit_order("BUY", "MID"))
+        self._btn_sell_mid.clicked.connect(lambda: self._emit_order("SELL", "MID"))
         self._btn_buy_bid.clicked.connect(lambda: self._emit_order("BUY", "BID"))
         self._btn_sell_ask.clicked.connect(lambda: self._emit_order("SELL", "ASK"))
 
@@ -573,6 +579,8 @@ class OrderEntryPanel(QWidget):
         q = self._active_qty
         self._btn_buy_mkt.setText(f"Buy {q} @MKT")
         self._btn_sell_mkt.setText(f"Sell {q} @MKT")
+        self._btn_buy_mid.setText(f"Buy {q} @Mid")
+        self._btn_sell_mid.setText(f"Sell {q} @Mid")
         self._btn_buy_bid.setText(f"Buy {q} @Bid")
         self._btn_sell_ask.setText(f"Sell {q} @Ask")
 
@@ -581,11 +589,13 @@ class OrderEntryPanel(QWidget):
     def _emit_order(self, action: str, order_type: str) -> None:
         if not self._active_symbol:
             return
+        sec = _sec_type_for(self._active_symbol)
         payload = {
             "action": action,
             "type": order_type,
             "symbol": self._active_symbol,
             "qty": self._active_qty,
+            "sec_type": sec,
         }
         log.info("Order requested: %s", payload)
         self.order_requested.emit(payload)

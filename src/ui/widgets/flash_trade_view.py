@@ -240,7 +240,7 @@ class FlashTradeView(QWidget):
                 "action": action,
                 "qty": qty,
                 "order_type": order_type,
-                "tif": "DAY",
+                "tif": "DAY"
             }
             worker.place_order(params)
 

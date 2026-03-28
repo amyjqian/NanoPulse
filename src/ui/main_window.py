@@ -21,6 +21,7 @@ from .widgets.accounts_model import AccountsTableModel
 from .widgets.connections_view import ConnectionsView
 from .widgets.contracts_view import ContractsView
 from .widgets.flash_trade_view import FlashTradeView
+from .widgets.preferences_dialog import PreferencesDialog
 from src.core.ib_worker import IBWorkerThread
 from src.core import config_manager
 
@@ -87,6 +88,7 @@ class MainWindow(QWidget):
         # ── Top tab bar ───────────────────────────────────────────────────────
         self._tab_bar = TopTabBar(self)
         self._tab_bar.nav_changed.connect(self._on_nav_changed)
+        self._tab_bar.settings_clicked.connect(self._on_settings)
         root_layout.addWidget(self._tab_bar)
 
         # ── Stacked pages ─────────────────────────────────────────────────────
@@ -136,6 +138,11 @@ class MainWindow(QWidget):
         if idx is not None:
             log.debug("Nav → %s (page %d)", name, idx)
             self._pages.setCurrentIndex(idx)
+
+    def _on_settings(self) -> None:
+        """Open the Preferences dialog."""
+        dlg = PreferencesDialog(self)
+        dlg.exec()
 
     # ── Paint ─────────────────────────────────────────────────────────────────
 
