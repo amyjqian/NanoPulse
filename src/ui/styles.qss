@@ -1,0 +1,36 @@
+/* NanoPulse Trading Platform - Global Stylesheets */
+
+/* This file is used as a fallback for additional styling.
+   Most styling is handled through the Theme manager in theme.py */
+
+QMainWindow {
+    border: none;
+    outline: none;
+}
+
+QWidget {
+    border: none;
+    outline: none;
+}
+
+QLabel {
+    border: none;
+    outline: none;
+}
+
+/* Hover effects for buttons and interactive elements */
+QWidget:hover {
+    /* Theme colors are applied dynamically */
+}
+
+/* Scrollbar styling */
+QScrollBar:vertical {
+    width: 12px;
+    border: none;
+}
+
+QScrollBar::handle:vertical {
+    min-height: 20px;
+    border-radius: 6px;
+}
+
