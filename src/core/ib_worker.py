@@ -497,6 +497,26 @@ class IBWorkerThread(QThread):
                 log.info("Worker %s: Adaptive order %s %d @ limit %.4f "
                          "priority=%s",
                          self._label, action, qty, limit_price, priority)
+            elif order_type == "PEG_PRIM":
+                # Pegged to Primary (REL) — pegs to the NBBO with an
+                # optional offset, capped by a limit price.
+                #   orderType  = "REL"
+                #   auxPrice   = offset from the primary (bid for BUY, ask
+                #                for SELL) — must be >= 0
+                #   lmtPrice   = hard price cap (ceiling BUY / floor SELL)
+                from ib_async import Order
+                limit_price = float(params.get("limit_price", 0))
+                peg_offset = float(params.get("peg_offset", 0))
+                order = Order(
+                    action=action,
+                    totalQuantity=qty,
+                    orderType="REL",
+                    lmtPrice=limit_price,
+                    auxPrice=peg_offset,
+                )
+                log.info("Worker %s: PEG_PRIM order %s %d lmt=%.4f "
+                         "auxPrice(offset)=%.4f",
+                         self._label, action, qty, limit_price, peg_offset)
             elif order_type == "LMT":
                 limit_price = float(params.get("limit_price", 0))
                 order = LimitOrder(action, qty, limit_price)
