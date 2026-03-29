@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSpinBox,
     QStackedWidget,
@@ -57,6 +58,17 @@ _DEFAULTS: dict = {
     "trading_futures": {
         "quantity": 1,
         "quantity_unit": "Contracts",
+        "limit_cap": 0,
+        "limit_cap_unit": "ticks",
+        "mid_price_behavior": "Normal",
+        "buy_bid_offset": 0,
+        "buy_bid_unit": "ticks",
+        "sell_ask_offset": 0,
+        "sell_ask_unit": "ticks",
+    },
+    "trading_stocks": {
+        "quantity": 100,
+        "quantity_unit": "Shares",
         "limit_cap": 0,
         "limit_cap_unit": "ticks",
         "mid_price_behavior": "Normal",
@@ -392,30 +404,60 @@ class _DisplayPage(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Trading (Futures) settings page
+#  Reusable asset-settings block  (Futures / Stocks / …)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class _TradingPage(QWidget):
+class _AssetSettingsGroup(QWidget):
+    """Self-contained settings block for one asset class.
+
+    Parameters
+    ----------
+    title           : str  – Section heading  (e.g. ``"Futures"``).
+    qty_label       : str  – Quantity unit    (e.g. ``"Contracts"``).
+    increment_label : str  – Integer-step unit for offset combos
+                             and ``QIntValidator`` branch (e.g. ``"ticks"``).
+    prefs_key       : str  – Key inside the global prefs dict
+                             (e.g. ``"trading_futures"``).
+    prefs           : dict – Shared preferences dict (read at init;
+                             written via ``collect()`` / ``_revert_defaults``).
+    """
+
     changed = Signal()
 
-    def __init__(self, prefs: dict, parent=None):
+    def __init__(
+        self,
+        title: str,
+        qty_label: str,
+        increment_label: str,
+        prefs_key: str,
+        prefs: dict,
+        parent=None,
+    ):
         super().__init__(parent)
+        self._title = title
+        self._qty_label = qty_label
+        self._increment_label = increment_label
+        self._prefs_key = prefs_key
         self._prefs = prefs
         self._build_ui()
+
+    # ── Build ──────────────────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 16, 24, 16)
         root.setSpacing(14)
 
-        tp = self._prefs.get("trading_futures", {})
+        tp  = self._prefs.get(self._prefs_key, {})
+        inc = self._increment_label
+        lbl_qss = f"color: {_TEXT}; border: none; font-size: 12px;"
 
         # ── Header: title + Revert to Defaults ──────────────────────────────
         hdr = QHBoxLayout()
-        title = QLabel("Futures")
-        title.setFont(_FONT_TITLE)
-        title.setStyleSheet(f"color: {_TEXT}; border: none;")
-        hdr.addWidget(title)
+        title_lbl = QLabel(self._title)
+        title_lbl.setFont(_FONT_TITLE)
+        title_lbl.setStyleSheet(f"color: {_TEXT}; border: none;")
+        hdr.addWidget(title_lbl)
         hdr.addStretch()
         revert_btn = QPushButton("Revert to Defaults")
         revert_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -442,10 +484,7 @@ class _TradingPage(QWidget):
         sep.setStyleSheet(f"color: {_BORDER};")
         sep.setFixedHeight(1)
         root.addWidget(sep)
-
         root.addSpacing(4)
-
-        lbl_qss = f"color: {_TEXT}; border: none; font-size: 12px;"
 
         # ── Quantity ─────────────────────────────────────────────────────────
         qty_row = QHBoxLayout()
@@ -454,7 +493,7 @@ class _TradingPage(QWidget):
         qty_lbl.setStyleSheet(lbl_qss)
         qty_lbl.setFixedWidth(130)
         self._qty_spin = _spin(tp.get("quantity", 1), 1, 9999)
-        self._qty_unit = _combo(["Contracts"], tp.get("quantity_unit", "Contracts"))
+        self._qty_unit = _combo([self._qty_label], tp.get("quantity_unit", self._qty_label))
         qty_row.addWidget(qty_lbl)
         qty_row.addWidget(self._qty_spin)
         qty_row.addWidget(self._qty_unit)
@@ -468,7 +507,7 @@ class _TradingPage(QWidget):
         lc_lbl.setStyleSheet(lbl_qss)
         lc_lbl.setFixedWidth(130)
         self._lc_spin = _spin(tp.get("limit_cap", 0), 0, 99999)
-        self._lc_unit = _combo(["amt", "%", "ticks"], tp.get("limit_cap_unit", "ticks"))
+        self._lc_unit = _combo(["amt", "%", inc], tp.get("limit_cap_unit", inc))
         lc_row.addWidget(lc_lbl)
         lc_row.addWidget(self._lc_spin)
         lc_row.addWidget(self._lc_unit)
@@ -477,7 +516,7 @@ class _TradingPage(QWidget):
 
         root.addSpacing(6)
 
-        # ── Mid price Behavior ───────────────────────────────────────────────
+        # ── Buy/Sell @Mid ─────────────────────────────────────────────────────
         mid_row = QHBoxLayout()
         mid_row.setSpacing(10)
         mid_lbl = QLabel("Buy/Sell @Mid")
@@ -494,128 +533,101 @@ class _TradingPage(QWidget):
 
         root.addSpacing(6)
 
-        # ── buy bid ──────────────────────────────────────────────────────────
+        # ── Buy @Bid ──────────────────────────────────────────────────────────
         bb_row = QHBoxLayout()
         bb_row.setSpacing(10)
         bb_lbl = QLabel("Buy @Bid")
         bb_lbl.setStyleSheet(lbl_qss)
         bb_lbl.setFixedWidth(130)
-        self._bb_spin = _text_input(tp.get("buy_bid_offset", "0"), "+/- amt")
-        self._bb_unit = _combo(["amt", "%", "ticks"], tp.get("buy_bid_unit", "ticks"))
+        self._bb_spin = _text_input(str(tp.get("buy_bid_offset", 0)), "+/- amt")
+        self._bb_unit = _combo(["amt", "%", inc], tp.get("buy_bid_unit", inc))
         bb_row.addWidget(bb_lbl)
         bb_row.addWidget(self._bb_spin)
         bb_row.addWidget(self._bb_unit)
         bb_row.addStretch()
         root.addLayout(bb_row)
 
-        # ── sell ask ─────────────────────────────────────────────────────────
+        # ── Sell @Ask ─────────────────────────────────────────────────────────
         sa_row = QHBoxLayout()
         sa_row.setSpacing(10)
         sa_lbl = QLabel("Sell @Ask")
         sa_lbl.setStyleSheet(lbl_qss)
         sa_lbl.setFixedWidth(130)
-        self._sa_spin = _text_input(tp.get("sell_ask_offset", "0"), "+/- amt")
-        self._sa_unit = _combo(["amt", "%", "ticks"], tp.get("sell_ask_unit", "ticks"))
+        self._sa_spin = _text_input(str(tp.get("sell_ask_offset", 0)), "+/- amt")
+        self._sa_unit = _combo(["amt", "%", inc], tp.get("sell_ask_unit", inc))
         sa_row.addWidget(sa_lbl)
         sa_row.addWidget(self._sa_spin)
         sa_row.addWidget(self._sa_unit)
         sa_row.addStretch()
         root.addLayout(sa_row)
 
-        root.addStretch()
-
-        # ── Wire all widgets → changed signal ────────────────────────────────
+        # ── Wire all widgets → changed ────────────────────────────────────────
         self._qty_spin.valueChanged.connect(self.changed)
         self._qty_unit.currentTextChanged.connect(self.changed)
         self._lc_spin.valueChanged.connect(self.changed)
         self._lc_unit.currentTextChanged.connect(self.changed)
         self._mid_toggle.value_changed.connect(self.changed)
-        # editingFinished fires on focus-leave (covers mouse-click-away saves)
         self._bb_spin.editingFinished.connect(self.changed)
         self._bb_unit.currentTextChanged.connect(self.changed)
         self._sa_spin.editingFinished.connect(self.changed)
         self._sa_unit.currentTextChanged.connect(self.changed)
-        # Enter key is handled by the event filter below — NOT returnPressed.
-        # returnPressed is intentionally NOT connected here because it lets the
-        # event propagate to QDialog, which can call reject() and reset the UI.
+        # Enter handled by eventFilter — returnPressed intentionally NOT wired
         self._bb_spin.installEventFilter(self)
         self._sa_spin.installEventFilter(self)
 
-        # ── Validator: switch input mode when unit changes ───────────────────
+        # ── Validators ────────────────────────────────────────────────────────
         self._bb_unit.currentTextChanged.connect(
             lambda unit: self._apply_unit_validator(self._bb_spin, unit)
         )
         self._sa_unit.currentTextChanged.connect(
             lambda unit: self._apply_unit_validator(self._sa_spin, unit)
         )
-        # Apply immediately based on the loaded/default unit
         self._apply_unit_validator(self._bb_spin, self._bb_unit.currentText())
         self._apply_unit_validator(self._sa_spin, self._sa_unit.currentText())
 
-    @staticmethod
-    def _apply_unit_validator(field: QLineEdit, unit: str) -> None:
-        """Swap the validator and placeholder on *field* to match *unit*.
+    # ── Event filter ──────────────────────────────────────────────────────────
 
-        - ticks → QIntValidator  (integers only, positive or negative)
-        - amt / % → QDoubleValidator (up to 2 decimal places)
+    def eventFilter(self, source, event) -> bool:
+        """Intercept Return/Enter on offset fields: save, advance focus, consume."""
+        if (event.type() == QEvent.Type.KeyPress
+                and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                and source in (self._bb_spin, self._sa_spin)):
+            self.changed.emit()
+            source.focusNextChild()
+            return True          # consumed — never reaches QDialog
+        return super().eventFilter(source, event)
 
-        If the current text is incompatible with the new unit (e.g. "1.5"
-        switching to ticks), it is rounded to the nearest integer.
-        """
+    # ── Validator helper ──────────────────────────────────────────────────────
+
+    def _apply_unit_validator(self, field: QLineEdit, unit: str) -> None:
+        """QIntValidator for increment_label, QDoubleValidator(2dp) otherwise."""
         text = field.text().strip()
-        if unit == "ticks":
+        if unit == self._increment_label:
             field.setValidator(QIntValidator(-999999, 999999))
-            field.setPlaceholderText("+/- ticks")
-            # Coerce existing value to integer if needed
+            field.setPlaceholderText(f"+/- {self._increment_label}")
             try:
                 if text and "." in text:
                     field.setText(str(int(round(float(text)))))
             except ValueError:
                 field.setText("0")
         else:
-            validator = QDoubleValidator(-999999.99, 999999.99, 2)
-            validator.setNotation(QDoubleValidator.Notation.StandardNotation)
-            field.setValidator(validator)
+            v = QDoubleValidator(-999999.99, 999999.99, 2)
+            v.setNotation(QDoubleValidator.Notation.StandardNotation)
+            field.setValidator(v)
             field.setPlaceholderText("+/- amt")
-
-    def eventFilter(self, source, event) -> bool:
-        """Intercept Return/Enter key on the offset input fields.
-
-        Why not returnPressed?
-        ----------------------
-        ``QLineEdit.returnPressed`` does NOT fully consume the key event on all
-        platforms — it can still propagate to the parent ``QDialog``, which may
-        call ``accept()`` / ``reject()``, closing the dialog and discarding the
-        unsaved text.
-
-        By intercepting at the event level and returning ``True`` we:
-          1. Emit ``changed`` to persist the value immediately.
-          2. Advance focus to the next widget (tab-order step).
-          3. *Consume* the event so it never reaches QDialog.
-        """
-        if (event.type() == QEvent.Type.KeyPress
-                and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
-                and source in (self._bb_spin, self._sa_spin)):
-            self.changed.emit()
-            source.focusNextChild()
-            return True          # consumed — QDialog never sees this key press
-        return super().eventFilter(source, event)
 
     @staticmethod
     def _parse_offset(text: str) -> float:
-        """Safely convert an offset field's text to float.
-
-        Returns 0.0 for empty or non-numeric input instead of raising
-        ValueError (which would silently abort the entire _save() call).
-        """
+        """Safe float conversion — returns 0.0 for blank / non-numeric text."""
         try:
             return float(text.strip()) if text.strip() else 0.0
         except ValueError:
             return 0.0
 
+    # ── Revert ────────────────────────────────────────────────────────────────
+
     def _revert_defaults(self) -> None:
-        """Reset all widgets to their default values."""
-        d = _DEFAULTS["trading_futures"]
+        d = _DEFAULTS.get(self._prefs_key, _DEFAULTS["trading_futures"])
         self._qty_spin.setValue(d["quantity"])
         self._qty_unit.setCurrentText(d["quantity_unit"])
         self._lc_spin.setValue(d["limit_cap"])
@@ -625,21 +637,86 @@ class _TradingPage(QWidget):
         self._bb_unit.setCurrentText(d["buy_bid_unit"])
         self._sa_spin.setText(str(d["sell_ask_offset"]))
         self._sa_unit.setCurrentText(d["sell_ask_unit"])
-        log.info("Trading preferences reverted to defaults")
-        self.changed.emit()  # persist reverted values immediately
+        log.info("%s preferences reverted to defaults", self._title)
+        self.changed.emit()
+
+    # ── Collect ───────────────────────────────────────────────────────────────
 
     def collect(self) -> dict:
         return {
-            "quantity": self._qty_spin.value(),
-            "quantity_unit": self._qty_unit.currentText(),
-            "limit_cap": self._lc_spin.value(),
-            "limit_cap_unit": self._lc_unit.currentText(),
+            "quantity":           self._qty_spin.value(),
+            "quantity_unit":      self._qty_unit.currentText(),
+            "limit_cap":          self._lc_spin.value(),
+            "limit_cap_unit":     self._lc_unit.currentText(),
             "mid_price_behavior": self._mid_toggle.value(),
-            "buy_bid_offset": self._parse_offset(self._bb_spin.text()),
-            "buy_bid_unit": self._bb_unit.currentText(),
-            "sell_ask_offset": self._parse_offset(self._sa_spin.text()),
-            "sell_ask_unit": self._sa_unit.currentText(),
+            "buy_bid_offset":     self._parse_offset(self._bb_spin.text()),
+            "buy_bid_unit":       self._bb_unit.currentText(),
+            "sell_ask_offset":    self._parse_offset(self._sa_spin.text()),
+            "sell_ask_unit":      self._sa_unit.currentText(),
         }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Trading settings page  (Futures + Stocks stacked in a scroll area)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class _TradingPage(QWidget):
+    """Thin host widget: stacks a Futures and a Stocks _AssetSettingsGroup."""
+
+    changed = Signal()
+
+    def __init__(self, prefs: dict, parent=None):
+        super().__init__(parent)
+        self._prefs = prefs
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # Scroll area keeps both blocks accessible on smaller windows
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+
+        container = QWidget()
+        container.setStyleSheet(f"background: {_BG_PANEL};")
+        lay = QVBoxLayout(container)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        # ── Futures block ─────────────────────────────────────────────────────
+        self._futures_group = _AssetSettingsGroup(
+            "Futures", "Contracts", "ticks", "trading_futures", self._prefs
+        )
+        lay.addWidget(self._futures_group)
+
+        # ── Divider ───────────────────────────────────────────────────────────
+        div = QFrame()
+        div.setFrameShape(QFrame.Shape.HLine)
+        div.setStyleSheet(f"color: {_BORDER};")
+        div.setFixedHeight(1)
+        lay.addWidget(div)
+
+        # ── Stocks block ──────────────────────────────────────────────────────
+        self._stocks_group = _AssetSettingsGroup(
+            "Stocks", "Shares", "ticks", "trading_stocks", self._prefs
+        )
+        lay.addWidget(self._stocks_group)
+        lay.addStretch()
+
+        scroll.setWidget(container)
+        outer.addWidget(scroll)
+
+        # Bubble both groups' changes up to this page's changed signal
+        self._futures_group.changed.connect(self.changed)
+        self._stocks_group.changed.connect(self.changed)
+
+    def collect(self) -> tuple[dict, dict]:
+        """Return ``(futures_dict, stocks_dict)`` for direct config storage."""
+        return self._futures_group.collect(), self._stocks_group.collect()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -798,6 +875,8 @@ class PreferencesDialog(QDialog):
 
     def _save(self) -> None:
         self._prefs["display"] = self._display_page.collect()
-        self._prefs["trading_futures"] = self._trading_page.collect()
+        futures_data, stocks_data = self._trading_page.collect()
+        self._prefs["trading_futures"] = futures_data
+        self._prefs["trading_stocks"] = stocks_data
         config_manager.save_preferences(self._prefs)
         log.info("Preferences saved")
