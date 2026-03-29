@@ -491,9 +491,10 @@ class _AssetSettingsGroup(QWidget):
         qty_row.setSpacing(10)
         qty_lbl = QLabel("Quantity")
         qty_lbl.setStyleSheet(lbl_qss)
-        qty_lbl.setFixedWidth(130)
+        qty_lbl.setFixedWidth(160)
         self._qty_spin = _spin(tp.get("quantity", 1), 1, 9999)
-        self._qty_unit = _combo([self._qty_label], tp.get("quantity_unit", self._qty_label))
+        self._qty_unit = QLabel(self._qty_label)
+        self._qty_unit.setStyleSheet(f"color: {_TEXT_DIM}; border: none; font-size: 12px;")
         qty_row.addWidget(qty_lbl)
         qty_row.addWidget(self._qty_spin)
         qty_row.addWidget(self._qty_unit)
@@ -503,9 +504,9 @@ class _AssetSettingsGroup(QWidget):
         # ── Limit cap ────────────────────────────────────────────────────────
         lc_row = QHBoxLayout()
         lc_row.setSpacing(10)
-        lc_lbl = QLabel("Limit cap")
+        lc_lbl = QLabel("Limit Cap Offset")
         lc_lbl.setStyleSheet(lbl_qss)
-        lc_lbl.setFixedWidth(130)
+        lc_lbl.setFixedWidth(160)
         self._lc_spin = _spin(tp.get("limit_cap", 0), 0, 99999)
         self._lc_unit = _combo(["amt", "%", inc], tp.get("limit_cap_unit", inc))
         lc_row.addWidget(lc_lbl)
@@ -521,7 +522,7 @@ class _AssetSettingsGroup(QWidget):
         mid_row.setSpacing(10)
         mid_lbl = QLabel("Buy/Sell @Mid")
         mid_lbl.setStyleSheet(lbl_qss)
-        mid_lbl.setFixedWidth(130)
+        mid_lbl.setFixedWidth(160)
         self._mid_toggle = _ToggleGroup(
             ["Patient", "Normal", "Urgent"],
             tp.get("mid_price_behavior", "Normal"),
@@ -536,9 +537,9 @@ class _AssetSettingsGroup(QWidget):
         # ── Buy @Bid ──────────────────────────────────────────────────────────
         bb_row = QHBoxLayout()
         bb_row.setSpacing(10)
-        bb_lbl = QLabel("Buy @Bid")
+        bb_lbl = QLabel("Buy @Bid Offset")
         bb_lbl.setStyleSheet(lbl_qss)
-        bb_lbl.setFixedWidth(130)
+        bb_lbl.setFixedWidth(160)
         self._bb_spin = _text_input(str(tp.get("buy_bid_offset", 0)), "+/- amt")
         self._bb_unit = _combo(["amt", "%", inc], tp.get("buy_bid_unit", inc))
         bb_row.addWidget(bb_lbl)
@@ -550,9 +551,9 @@ class _AssetSettingsGroup(QWidget):
         # ── Sell @Ask ─────────────────────────────────────────────────────────
         sa_row = QHBoxLayout()
         sa_row.setSpacing(10)
-        sa_lbl = QLabel("Sell @Ask")
+        sa_lbl = QLabel("Sell @Ask Offset")
         sa_lbl.setStyleSheet(lbl_qss)
-        sa_lbl.setFixedWidth(130)
+        sa_lbl.setFixedWidth(160)
         self._sa_spin = _text_input(str(tp.get("sell_ask_offset", 0)), "+/- amt")
         self._sa_unit = _combo(["amt", "%", inc], tp.get("sell_ask_unit", inc))
         sa_row.addWidget(sa_lbl)
@@ -563,7 +564,7 @@ class _AssetSettingsGroup(QWidget):
 
         # ── Wire all widgets → changed ────────────────────────────────────────
         self._qty_spin.valueChanged.connect(self.changed)
-        self._qty_unit.currentTextChanged.connect(self.changed)
+        # qty_unit is a static QLabel — no signal needed
         self._lc_spin.valueChanged.connect(self.changed)
         self._lc_unit.currentTextChanged.connect(self.changed)
         self._mid_toggle.value_changed.connect(self.changed)
@@ -629,7 +630,7 @@ class _AssetSettingsGroup(QWidget):
     def _revert_defaults(self) -> None:
         d = _DEFAULTS.get(self._prefs_key, _DEFAULTS["trading_futures"])
         self._qty_spin.setValue(d["quantity"])
-        self._qty_unit.setCurrentText(d["quantity_unit"])
+        # qty_unit is a static QLabel — no reset needed
         self._lc_spin.setValue(d["limit_cap"])
         self._lc_unit.setCurrentText(d["limit_cap_unit"])
         self._mid_toggle.set_value(d["mid_price_behavior"])
@@ -645,7 +646,7 @@ class _AssetSettingsGroup(QWidget):
     def collect(self) -> dict:
         return {
             "quantity":           self._qty_spin.value(),
-            "quantity_unit":      self._qty_unit.currentText(),
+            "quantity_unit":      self._qty_label,
             "limit_cap":          self._lc_spin.value(),
             "limit_cap_unit":     self._lc_unit.currentText(),
             "mid_price_behavior": self._mid_toggle.value(),
@@ -834,7 +835,7 @@ class PreferencesDialog(QDialog):
 
             Steps:
               1. mapToGlobal(QPoint(0,0))  → client-area top-left in screen px
-              2. frameGeometry / geometry delta → frame insets (titlebar, borders)
+              2. frameGeometry / geometry delta → frame insets (title-bar, borders)
               3. Subtract insets to reach the true frame top-left
             """
             client_tl   = widget.mapToGlobal(QPoint(0, 0))
