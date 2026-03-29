@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 
 from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QPoint, QRect
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtGui import QColor, QFont, QPainter, QPen, QIntValidator, QDoubleValidator
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -334,6 +334,8 @@ class _ThemeCard(QFrame):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class _DisplayPage(QWidget):
+    changed = Signal()
+
     def __init__(self, prefs: dict, parent=None):
         super().__init__(parent)
         self._prefs = prefs
@@ -383,6 +385,7 @@ class _DisplayPage(QWidget):
         self._dark_card.set_selected(label == "Dark")
         self._light_card.set_selected(label == "Light")
         self._prefs.setdefault("display", {})["theme"] = label
+        self.changed.emit()
 
     def collect(self) -> dict:
         return {"theme": self._prefs.get("display", {}).get("theme", "Dark")}
@@ -393,6 +396,8 @@ class _DisplayPage(QWidget):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class _TradingPage(QWidget):
+    changed = Signal()
+
     def __init__(self, prefs: dict, parent=None):
         super().__init__(parent)
         self._prefs = prefs
@@ -519,6 +524,95 @@ class _TradingPage(QWidget):
 
         root.addStretch()
 
+        # ── Wire all widgets → changed signal ────────────────────────────────
+        self._qty_spin.valueChanged.connect(self.changed)
+        self._qty_unit.currentTextChanged.connect(self.changed)
+        self._lc_spin.valueChanged.connect(self.changed)
+        self._lc_unit.currentTextChanged.connect(self.changed)
+        self._mid_toggle.value_changed.connect(self.changed)
+        # editingFinished fires on focus-leave (covers mouse-click-away saves)
+        self._bb_spin.editingFinished.connect(self.changed)
+        self._bb_unit.currentTextChanged.connect(self.changed)
+        self._sa_spin.editingFinished.connect(self.changed)
+        self._sa_unit.currentTextChanged.connect(self.changed)
+        # Enter key is handled by the event filter below — NOT returnPressed.
+        # returnPressed is intentionally NOT connected here because it lets the
+        # event propagate to QDialog, which can call reject() and reset the UI.
+        self._bb_spin.installEventFilter(self)
+        self._sa_spin.installEventFilter(self)
+
+        # ── Validator: switch input mode when unit changes ───────────────────
+        self._bb_unit.currentTextChanged.connect(
+            lambda unit: self._apply_unit_validator(self._bb_spin, unit)
+        )
+        self._sa_unit.currentTextChanged.connect(
+            lambda unit: self._apply_unit_validator(self._sa_spin, unit)
+        )
+        # Apply immediately based on the loaded/default unit
+        self._apply_unit_validator(self._bb_spin, self._bb_unit.currentText())
+        self._apply_unit_validator(self._sa_spin, self._sa_unit.currentText())
+
+    @staticmethod
+    def _apply_unit_validator(field: QLineEdit, unit: str) -> None:
+        """Swap the validator and placeholder on *field* to match *unit*.
+
+        - ticks → QIntValidator  (integers only, positive or negative)
+        - amt / % → QDoubleValidator (up to 2 decimal places)
+
+        If the current text is incompatible with the new unit (e.g. "1.5"
+        switching to ticks), it is rounded to the nearest integer.
+        """
+        text = field.text().strip()
+        if unit == "ticks":
+            field.setValidator(QIntValidator(-999999, 999999))
+            field.setPlaceholderText("+/- ticks")
+            # Coerce existing value to integer if needed
+            try:
+                if text and "." in text:
+                    field.setText(str(int(round(float(text)))))
+            except ValueError:
+                field.setText("0")
+        else:
+            validator = QDoubleValidator(-999999.99, 999999.99, 2)
+            validator.setNotation(QDoubleValidator.Notation.StandardNotation)
+            field.setValidator(validator)
+            field.setPlaceholderText("+/- amt")
+
+    def eventFilter(self, source, event) -> bool:
+        """Intercept Return/Enter key on the offset input fields.
+
+        Why not returnPressed?
+        ----------------------
+        ``QLineEdit.returnPressed`` does NOT fully consume the key event on all
+        platforms — it can still propagate to the parent ``QDialog``, which may
+        call ``accept()`` / ``reject()``, closing the dialog and discarding the
+        unsaved text.
+
+        By intercepting at the event level and returning ``True`` we:
+          1. Emit ``changed`` to persist the value immediately.
+          2. Advance focus to the next widget (tab-order step).
+          3. *Consume* the event so it never reaches QDialog.
+        """
+        if (event.type() == QEvent.Type.KeyPress
+                and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                and source in (self._bb_spin, self._sa_spin)):
+            self.changed.emit()
+            source.focusNextChild()
+            return True          # consumed — QDialog never sees this key press
+        return super().eventFilter(source, event)
+
+    @staticmethod
+    def _parse_offset(text: str) -> float:
+        """Safely convert an offset field's text to float.
+
+        Returns 0.0 for empty or non-numeric input instead of raising
+        ValueError (which would silently abort the entire _save() call).
+        """
+        try:
+            return float(text.strip()) if text.strip() else 0.0
+        except ValueError:
+            return 0.0
+
     def _revert_defaults(self) -> None:
         """Reset all widgets to their default values."""
         d = _DEFAULTS["trading_futures"]
@@ -532,6 +626,7 @@ class _TradingPage(QWidget):
         self._sa_spin.setText(str(d["sell_ask_offset"]))
         self._sa_unit.setCurrentText(d["sell_ask_unit"])
         log.info("Trading preferences reverted to defaults")
+        self.changed.emit()  # persist reverted values immediately
 
     def collect(self) -> dict:
         return {
@@ -540,9 +635,9 @@ class _TradingPage(QWidget):
             "limit_cap": self._lc_spin.value(),
             "limit_cap_unit": self._lc_unit.currentText(),
             "mid_price_behavior": self._mid_toggle.value(),
-            "buy_bid_offset": float(self._bb_spin.text()) if self._bb_spin.text() else 0,
+            "buy_bid_offset": self._parse_offset(self._bb_spin.text()),
             "buy_bid_unit": self._bb_unit.currentText(),
-            "sell_ask_offset": float(self._sa_spin.text()) if self._sa_spin.text() else 0,
+            "sell_ask_offset": self._parse_offset(self._sa_spin.text()),
             "sell_ask_unit": self._sa_unit.currentText(),
         }
 
@@ -616,61 +711,83 @@ class PreferencesDialog(QDialog):
         self._stack.addWidget(self._trading_page)
         main_lay.addWidget(self._stack, stretch=1)
 
+        # Auto-save: any change on either page persists to config immediately
+        self._display_page.changed.connect(self._save)
+        self._trading_page.changed.connect(self._save)
+
     # ── Navigation ────────────────────────────────────────────────────────────
 
     def _on_page_changed(self, idx: int) -> None:
         self._stack.setCurrentIndex(idx)
 
-    # ── Auto-close on focus loss (geometry-based with absolute screen coordinates)
-
-    def event(self, e) -> bool:
-        """Override event to handle WindowDeactivate with geometry-based auto-close.
-        
-        Uses absolute screen coordinates (via mapToGlobal) to correctly detect
-        dialog position across multiple monitors, including second monitors.
-        
-        Includes debug logging to verify coordinate calculations.
-        """
-        if e.type() == QEvent.WindowDeactivate:
-            # Verify if main window is now the active window
-            active_win = QApplication.activeWindow()
-            if active_win is self.parent():
-                # Get absolute screen coordinates for dialog
-                # mapToGlobal(QPoint(0,0)) gives top-left corner in screen coordinates
-                dialog_top_left_global = self.mapToGlobal(QPoint(0, 0))
-                dialog_rect_global = QRect(dialog_top_left_global, self.size())
-
-                # Get absolute screen coordinates for main window
-                parent_top_left_global = self.parent().mapToGlobal(QPoint(0, 0))
-                parent_rect_global = QRect(parent_top_left_global, self.parent().size())
-
-                # Debug output for coordinate verification
-                print(f"[WindowDeactivate] Dialog global coords: {dialog_rect_global} "
-                      f"(top-left={dialog_top_left_global}, size={self.size()})")
-                print(f"[WindowDeactivate] Main global coords: {parent_rect_global} "
-                      f"(top-left={parent_top_left_global}, size={self.parent().size()})")
-                print(f"[WindowDeactivate] Intersects: {dialog_rect_global.intersects(parent_rect_global)}")
-
-                # If dialog does NOT overlap with main window, close it
-                if not dialog_rect_global.intersects(parent_rect_global):
-                    print("[WindowDeactivate] ✓ Closing dialog (completely outside main window)")
-                    self.close()
-                    return True
-                else:
-                    print("[WindowDeactivate] ✓ Keeping dialog open (overlaps main window)")
-
-        return super().event(e)
+    # ── Auto-close on focus loss (geometry-based with absolute screen coordinates) ──
 
     def changeEvent(self, event) -> None:
         super().changeEvent(event)
-        if event.type() == event.Type.ActivationChange:
+        if event.type() == QEvent.Type.ActivationChange:
             if not self.isActiveWindow():
+                # Defer the check so combo-box popups have time to return focus
                 self._close_timer.start()
 
     def _check_should_close(self) -> None:
-        """Only close if this dialog is still not the active window after
-        the timer fires (gives combo popups time to return focus)."""
-        if self.isVisible() and not self.isActiveWindow():
+        """Close only if the dialog is 100% contained within the main window.
+
+        Logic
+        -----
+        * ``mapToGlobal(QPoint(0, 0))`` gives the widget's CLIENT-AREA top-left
+          in absolute screen pixels — reliable across all monitors and DPI
+          configurations.
+        * We subtract the frame delta (titlebar height, border widths) to
+          extend the rect to the full OS-chrome boundary so the title-bar of
+          the dialog is included in the check.
+        * ``QRect.contains(other)`` returns True only when *every* pixel of
+          ``other`` lies inside ``self``.  Even a 1-pixel overhang returns
+          False — so a partially-dragged or second-monitor dialog stays open.
+        """
+        if not self.isVisible() or self.isActiveWindow():
+            return
+
+        parent = self.parent()
+        if parent is None:
+            self.close()
+            return
+
+        def _abs_frame_rect(widget) -> QRect:
+            """Return widget's full frame rect in absolute screen coordinates.
+
+            Steps:
+              1. mapToGlobal(QPoint(0,0))  → client-area top-left in screen px
+              2. frameGeometry / geometry delta → frame insets (titlebar, borders)
+              3. Subtract insets to reach the true frame top-left
+            """
+            client_tl   = widget.mapToGlobal(QPoint(0, 0))
+            frame_geo   = widget.frameGeometry()   # screen-absolute on top-levels,
+            client_geo  = widget.geometry()         # but we derive it ourselves to
+                                                    # be explicit about the mapping.
+            # How far the OS frame extends beyond the client area on each side
+            frame_dx = client_geo.left() - frame_geo.left()   # left border width
+            frame_dy = client_geo.top()  - frame_geo.top()    # title-bar height
+            return QRect(
+                client_tl.x() - frame_dx,
+                client_tl.y() - frame_dy,
+                frame_geo.width(),
+                frame_geo.height(),
+            )
+
+        dialog_rect = _abs_frame_rect(self)
+        parent_rect = _abs_frame_rect(parent)
+        contained   = parent_rect.contains(dialog_rect)
+
+        print(f"[AutoClose] dialog  rect (screen px): {dialog_rect}  "
+              f"tl=({dialog_rect.left()}, {dialog_rect.top()})  "
+              f"br=({dialog_rect.right()}, {dialog_rect.bottom()})")
+        print(f"[AutoClose] parent  rect (screen px): {parent_rect}  "
+              f"tl=({parent_rect.left()}, {parent_rect.top()})  "
+              f"br=({parent_rect.right()}, {parent_rect.bottom()})")
+        print(f"[AutoClose] contained               : {contained}  → "
+              f"{'CLOSING  (dialog fully inside main window)' if contained else 'KEEPING OPEN  (hanging outside or on 2nd monitor)'}")
+
+        if contained:
             self.close()
 
     # ── Save on close ─────────────────────────────────────────────────────────
