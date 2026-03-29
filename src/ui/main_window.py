@@ -189,8 +189,8 @@ class MainWindow(QWidget):
         all_stopped = True
         for label, worker in list(self.active_threads.items()):
             log.debug("Waiting for worker %s to finish...", label)
-            if not worker.wait(10000):  # 10 second timeout per worker
-                log.warning("Worker %s did not stop gracefully after 10s", label)
+            if not worker.wait(3000):  # 3 second timeout – tasks are cancelled immediately
+                log.warning("Worker %s did not stop gracefully after 3s", label)
                 all_stopped = False
             else:
                 log.debug("Worker %s stopped successfully", label)

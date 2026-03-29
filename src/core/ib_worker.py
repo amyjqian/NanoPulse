@@ -92,6 +92,7 @@ class IBWorkerThread(QThread):
         self._running = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._ib: IB | None = None
+        self._main_task: asyncio.Task | None = None
 
         # De-dupe buffer keyed by (account, tag) → (value, currency)
         self._buffer: dict[tuple[str, str], tuple[str, str]] = {}
@@ -118,13 +119,16 @@ class IBWorkerThread(QThread):
     # ── Public control ────────────────────────────────────────────────────────
 
     def stop(self) -> None:
-        """Request a graceful shutdown.
-        
-        Sets the running flag to False, which causes the asyncio loops to exit
-        gracefully on their next iteration.
+        """Request an immediate graceful shutdown.
+
+        Sets the running flag to False and cancels the main asyncio task so
+        any sleeping coroutines (reconnect / throttler) are interrupted
+        instantly rather than waiting for their next sleep to expire.
         """
         log.debug("Worker %s: stop() requested", self._label)
         self._running = False
+        if self._loop is not None and not self._loop.is_closed() and self._main_task is not None:
+            self._loop.call_soon_threadsafe(self._main_task.cancel)
 
     def request_order_snapshot(self) -> None:
         """Thread-safe: re-emit all known open + completed orders.
@@ -248,6 +252,8 @@ class IBWorkerThread(QThread):
 
         try:
             loop.run_until_complete(self._main_loop())
+        except asyncio.CancelledError:
+            log.debug("Worker %s: main loop cancelled (shutdown)", self._label)
         except Exception:
             log.exception("Worker %s crashed", self._label)
         finally:
@@ -259,20 +265,8 @@ class IBWorkerThread(QThread):
                         log.debug("Worker %s disconnected from IB", self._label)
                     except Exception as e:
                         log.warning("Worker %s: error during IB disconnect: %s", self._label, e)
-            
-            # Cancel all remaining tasks to prevent "thread destroyed while running" errors
-            pending = asyncio.all_tasks(loop)
-            for task in pending:
-                task.cancel()
-                log.debug("Worker %s: cancelled task %s", self._label, task.get_name())
-            
-            # Give cancelled tasks a moment to finish
-            if pending:
-                try:
-                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-                except Exception:
-                    pass
-            
+
+            self._main_task = None
             self._loop = None
             loop.close()
             log.info("Worker %s: thread shutdown complete", self._label)
@@ -281,9 +275,11 @@ class IBWorkerThread(QThread):
     # ── Async core ────────────────────────────────────────────────────────────
 
     async def _main_loop(self) -> None:
+        self._main_task = asyncio.current_task()
         await asyncio.gather(
             self._reconnect_loop(),
             self._throttler_loop(),
+            return_exceptions=True,
         )
 
     async def _reconnect_loop(self) -> None:
