@@ -880,4 +880,9 @@ class PreferencesDialog(QDialog):
         self._prefs["trading_futures"] = futures_data
         self._prefs["trading_stocks"] = stocks_data
         config_manager.save_preferences(self._prefs)
+
+        # Push into the in-memory singleton so the next trade uses fresh values
+        from src.core.trading_prefs import trading_prefs
+        trading_prefs.update(futures=futures_data, stocks=stocks_data)
+
         log.info("Preferences saved")

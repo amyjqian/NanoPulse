@@ -213,6 +213,52 @@ class FlashTradeView(QWidget):
         action = payload.get("action", "BUY")
         qty = payload.get("qty", 1)
         order_type = payload.get("type", "MKT")
+        last_price = payload.get("last_price", 0.0)
+        sec_type = contract.get("sec_type", "")
+
+        # ── Compute limit price when user has offsets configured ──────────
+        limit_price = None
+        if last_price > 0:
+            from src.utils.helpers import calculate_capped_price, tick_size_for_contract
+            from src.core.trading_prefs import trading_prefs
+
+            tick = tick_size_for_contract(
+                sec_type,
+                symbol=contract.get("symbol", ""),
+                local_symbol=contract.get("local_symbol", ""),
+            )
+            prefs = trading_prefs.get(sec_type)
+
+            if order_type in ("BID", "ASK", "MID"):
+                # Buy @Bid / Sell @Ask / @Mid → use buy_bid_offset / sell_ask_offset
+                limit_price = calculate_capped_price(
+                    symbol_type=sec_type,
+                    side=action,
+                    base_price=last_price,
+                    tick_size=tick,
+                    offset_key="side",
+                )
+                log.info("FlashTrade: %s %s %s base=%.4f tick=%.4f → limit=%.4f",
+                         action, order_type, symbol, last_price, tick, limit_price)
+                order_type = "LMT"
+
+            elif order_type == "MKT":
+                # MKT → check if Limit Cap Offset is set; if so, cap the MKT
+                cap_value = float(prefs.get("limit_cap", 0))
+                if cap_value != 0:
+                    limit_price = calculate_capped_price(
+                        symbol_type=sec_type,
+                        side=action,
+                        base_price=last_price,
+                        tick_size=tick,
+                        offset_key="limit_cap",
+                    )
+                    log.info("FlashTrade: MKT capped → LMT  %s %s base=%.4f "
+                             "cap=%s %s tick=%.4f → limit=%.4f",
+                             action, symbol, last_price,
+                             cap_value, prefs.get("limit_cap_unit", "ticks"),
+                             tick, limit_price)
+                    order_type = "LMT"
 
         log.info("FlashTrade: %s %s %d %s → %d account(s): %s",
                  action, order_type, qty, symbol, len(accounts), accounts)
@@ -242,6 +288,8 @@ class FlashTradeView(QWidget):
                 "order_type": order_type,
                 "tif": "DAY"
             }
+            if limit_price is not None:
+                params["limit_price"] = limit_price
             worker.place_order(params)
 
     def _find_worker_for_account(self, account: str) -> IBWorkerThread | None:
