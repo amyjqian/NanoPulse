@@ -162,6 +162,7 @@ class OrderEntryPanel(QWidget):
         self._price_received = False   # set True when first price tick arrives
         self._price_retry_workers: list = []
         self._price_params: dict = {}
+        self._last_price: float = 0.0  # latest live price for limit-order calculation
         self._symbols: list[str] = config_manager.load_order_entry_symbols()
         self._active_symbol: str | None = self._symbols[0] if self._symbols else None
         self._active_qty: int = 1
@@ -491,10 +492,12 @@ class OrderEntryPanel(QWidget):
         if self._active_symbol:
             self._lbl_symbol.setText(self._active_symbol)
             self._lbl_price.setText("")  # clear until live tick arrives
+            self._last_price = 0.0
             self._subscribe_price(self._active_symbol)
         else:
             self._lbl_symbol.setText("")
             self._lbl_price.setText("")
+            self._last_price = 0.0
             self._cancel_price_subscription()
 
     def _remove_symbol(self, sym: str) -> None:
@@ -596,6 +599,7 @@ class OrderEntryPanel(QWidget):
             "symbol": self._active_symbol,
             "qty": self._active_qty,
             "sec_type": sec,
+            "last_price": self._last_price,
         }
         log.info("Order requested: %s", payload)
         self.order_requested.emit(payload)
@@ -844,6 +848,7 @@ class OrderEntryPanel(QWidget):
         """Receive a live price tick from the worker thread."""
         if sym.upper() == (self._active_symbol or "").upper():
             self._price_received = True
+            self._last_price = price
             if hasattr(self, "_price_timeout") and self._price_timeout.isActive():
                 self._price_timeout.stop()
             self._lbl_price.setText(f"{price:,.2f}")

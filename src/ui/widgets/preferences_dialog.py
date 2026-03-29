@@ -61,10 +61,8 @@ _DEFAULTS: dict = {
         "limit_cap": 0,
         "limit_cap_unit": "ticks",
         "mid_price_behavior": "Normal",
-        "buy_bid_offset": 0,
-        "buy_bid_unit": "ticks",
-        "sell_ask_offset": 0,
-        "sell_ask_unit": "ticks",
+        "buy_bid_behavior": "Patient",
+        "sell_ask_behavior": "Patient",
     },
     "trading_stocks": {
         "quantity": 100,
@@ -431,6 +429,7 @@ class _AssetSettingsGroup(QWidget):
         increment_label: str,
         prefs_key: str,
         prefs: dict,
+        use_urgency_toggles: bool = False,
         parent=None,
     ):
         super().__init__(parent)
@@ -439,6 +438,7 @@ class _AssetSettingsGroup(QWidget):
         self._increment_label = increment_label
         self._prefs_key = prefs_key
         self._prefs = prefs
+        self._use_urgency = use_urgency_toggles
         self._build_ui()
 
     # ── Build ──────────────────────────────────────────────────────────────────
@@ -537,28 +537,46 @@ class _AssetSettingsGroup(QWidget):
         # ── Buy @Bid ──────────────────────────────────────────────────────────
         bb_row = QHBoxLayout()
         bb_row.setSpacing(10)
-        bb_lbl = QLabel("Buy @Bid Offset")
+        bb_lbl = QLabel("Buy @Bid Offset" if not self._use_urgency else "Buy @Bid")
         bb_lbl.setStyleSheet(lbl_qss)
         bb_lbl.setFixedWidth(160)
-        self._bb_spin = _text_input(str(tp.get("buy_bid_offset", 0)), "+/- amt")
-        self._bb_unit = _combo(["amt", "%", inc], tp.get("buy_bid_unit", inc))
         bb_row.addWidget(bb_lbl)
-        bb_row.addWidget(self._bb_spin)
-        bb_row.addWidget(self._bb_unit)
+
+        if self._use_urgency:
+            self._bb_toggle = _ToggleGroup(
+                ["Patient", "Normal", "Urgent"],
+                tp.get("buy_bid_behavior", "Normal"),
+            )
+            bb_row.addWidget(self._bb_toggle)
+        else:
+            self._bb_spin = _text_input(str(tp.get("buy_bid_offset", 0)), "+/- amt")
+            self._bb_unit = _combo(["amt", "%", inc], tp.get("buy_bid_unit", inc))
+            bb_row.addWidget(self._bb_spin)
+            bb_row.addWidget(self._bb_unit)
+
         bb_row.addStretch()
         root.addLayout(bb_row)
 
         # ── Sell @Ask ─────────────────────────────────────────────────────────
         sa_row = QHBoxLayout()
         sa_row.setSpacing(10)
-        sa_lbl = QLabel("Sell @Ask Offset")
+        sa_lbl = QLabel("Sell @Ask Offset" if not self._use_urgency else "Sell @Ask")
         sa_lbl.setStyleSheet(lbl_qss)
         sa_lbl.setFixedWidth(160)
-        self._sa_spin = _text_input(str(tp.get("sell_ask_offset", 0)), "+/- amt")
-        self._sa_unit = _combo(["amt", "%", inc], tp.get("sell_ask_unit", inc))
         sa_row.addWidget(sa_lbl)
-        sa_row.addWidget(self._sa_spin)
-        sa_row.addWidget(self._sa_unit)
+
+        if self._use_urgency:
+            self._sa_toggle = _ToggleGroup(
+                ["Patient", "Normal", "Urgent"],
+                tp.get("sell_ask_behavior", "Normal"),
+            )
+            sa_row.addWidget(self._sa_toggle)
+        else:
+            self._sa_spin = _text_input(str(tp.get("sell_ask_offset", 0)), "+/- amt")
+            self._sa_unit = _combo(["amt", "%", inc], tp.get("sell_ask_unit", inc))
+            sa_row.addWidget(self._sa_spin)
+            sa_row.addWidget(self._sa_unit)
+
         sa_row.addStretch()
         root.addLayout(sa_row)
 
@@ -568,28 +586,36 @@ class _AssetSettingsGroup(QWidget):
         self._lc_spin.valueChanged.connect(self.changed)
         self._lc_unit.currentTextChanged.connect(self.changed)
         self._mid_toggle.value_changed.connect(self.changed)
-        self._bb_spin.editingFinished.connect(self.changed)
-        self._bb_unit.currentTextChanged.connect(self.changed)
-        self._sa_spin.editingFinished.connect(self.changed)
-        self._sa_unit.currentTextChanged.connect(self.changed)
-        # Enter handled by eventFilter — returnPressed intentionally NOT wired
-        self._bb_spin.installEventFilter(self)
-        self._sa_spin.installEventFilter(self)
 
-        # ── Validators ────────────────────────────────────────────────────────
-        self._bb_unit.currentTextChanged.connect(
-            lambda unit: self._apply_unit_validator(self._bb_spin, unit)
-        )
-        self._sa_unit.currentTextChanged.connect(
-            lambda unit: self._apply_unit_validator(self._sa_spin, unit)
-        )
-        self._apply_unit_validator(self._bb_spin, self._bb_unit.currentText())
-        self._apply_unit_validator(self._sa_spin, self._sa_unit.currentText())
+        if self._use_urgency:
+            self._bb_toggle.value_changed.connect(self.changed)
+            self._sa_toggle.value_changed.connect(self.changed)
+        else:
+            self._bb_spin.editingFinished.connect(self.changed)
+            self._bb_unit.currentTextChanged.connect(self.changed)
+            self._sa_spin.editingFinished.connect(self.changed)
+            self._sa_unit.currentTextChanged.connect(self.changed)
+            # Enter handled by eventFilter — returnPressed intentionally NOT wired
+            self._bb_spin.installEventFilter(self)
+            self._sa_spin.installEventFilter(self)
+
+        # ── Validators (only for text-input mode) ─────────────────────────────
+        if not self._use_urgency:
+            self._bb_unit.currentTextChanged.connect(
+                lambda unit: self._apply_unit_validator(self._bb_spin, unit)
+            )
+            self._sa_unit.currentTextChanged.connect(
+                lambda unit: self._apply_unit_validator(self._sa_spin, unit)
+            )
+            self._apply_unit_validator(self._bb_spin, self._bb_unit.currentText())
+            self._apply_unit_validator(self._sa_spin, self._sa_unit.currentText())
 
     # ── Event filter ──────────────────────────────────────────────────────────
 
     def eventFilter(self, source, event) -> bool:
         """Intercept Return/Enter on offset fields: save, advance focus, consume."""
+        if self._use_urgency:
+            return super().eventFilter(source, event)
         if (event.type() == QEvent.Type.KeyPress
                 and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
                 and source in (self._bb_spin, self._sa_spin)):
@@ -634,27 +660,36 @@ class _AssetSettingsGroup(QWidget):
         self._lc_spin.setValue(d["limit_cap"])
         self._lc_unit.setCurrentText(d["limit_cap_unit"])
         self._mid_toggle.set_value(d["mid_price_behavior"])
-        self._bb_spin.setText(str(d["buy_bid_offset"]))
-        self._bb_unit.setCurrentText(d["buy_bid_unit"])
-        self._sa_spin.setText(str(d["sell_ask_offset"]))
-        self._sa_unit.setCurrentText(d["sell_ask_unit"])
+        if self._use_urgency:
+            self._bb_toggle.set_value(d.get("buy_bid_behavior", "Normal"))
+            self._sa_toggle.set_value(d.get("sell_ask_behavior", "Normal"))
+        else:
+            self._bb_spin.setText(str(d.get("buy_bid_offset", 0)))
+            self._bb_unit.setCurrentText(d.get("buy_bid_unit", "ticks"))
+            self._sa_spin.setText(str(d.get("sell_ask_offset", 0)))
+            self._sa_unit.setCurrentText(d.get("sell_ask_unit", "ticks"))
         log.info("%s preferences reverted to defaults", self._title)
         self.changed.emit()
 
     # ── Collect ───────────────────────────────────────────────────────────────
 
     def collect(self) -> dict:
-        return {
+        result = {
             "quantity":           self._qty_spin.value(),
             "quantity_unit":      self._qty_label,
             "limit_cap":          self._lc_spin.value(),
             "limit_cap_unit":     self._lc_unit.currentText(),
             "mid_price_behavior": self._mid_toggle.value(),
-            "buy_bid_offset":     self._parse_offset(self._bb_spin.text()),
-            "buy_bid_unit":       self._bb_unit.currentText(),
-            "sell_ask_offset":    self._parse_offset(self._sa_spin.text()),
-            "sell_ask_unit":      self._sa_unit.currentText(),
         }
+        if self._use_urgency:
+            result["buy_bid_behavior"] = self._bb_toggle.value()
+            result["sell_ask_behavior"] = self._sa_toggle.value()
+        else:
+            result["buy_bid_offset"] = self._parse_offset(self._bb_spin.text())
+            result["buy_bid_unit"] = self._bb_unit.currentText()
+            result["sell_ask_offset"] = self._parse_offset(self._sa_spin.text())
+            result["sell_ask_unit"] = self._sa_unit.currentText()
+        return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -690,7 +725,8 @@ class _TradingPage(QWidget):
 
         # ── Futures block ─────────────────────────────────────────────────────
         self._futures_group = _AssetSettingsGroup(
-            "Futures", "Contracts", "ticks", "trading_futures", self._prefs
+            "Futures", "Contracts", "ticks", "trading_futures", self._prefs,
+            use_urgency_toggles=True,
         )
         lay.addWidget(self._futures_group)
 
@@ -880,4 +916,9 @@ class PreferencesDialog(QDialog):
         self._prefs["trading_futures"] = futures_data
         self._prefs["trading_stocks"] = stocks_data
         config_manager.save_preferences(self._prefs)
+
+        # Push into the in-memory singleton so the next trade uses fresh values
+        from src.core.trading_prefs import trading_prefs
+        trading_prefs.update(futures=futures_data, stocks=stocks_data)
+
         log.info("Preferences saved")

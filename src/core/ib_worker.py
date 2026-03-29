@@ -467,7 +467,7 @@ class IBWorkerThread(QThread):
             return
 
         try:
-            from ib_async import Contract, MarketOrder, LimitOrder
+            from ib_async import Contract, MarketOrder, LimitOrder, TagValue
 
             # ── Build contract from conId only ────────────────────────────
             conid = int(params.get("conid", 0))
@@ -485,7 +485,39 @@ class IBWorkerThread(QThread):
             account = params.get("account", "")
             tif = params.get("tif", "DAY")
 
-            if order_type == "LMT":
+            if order_type == "ADAPTIVE":
+                # IB Adaptive Algo — a LimitOrder with the Adaptive algo
+                # strategy attached.  IB works the order at mid and sweeps
+                # toward the limit price based on the urgency parameter.
+                limit_price = float(params.get("limit_price", 0))
+                priority = params.get("adaptive_priority", "Normal")
+                order = LimitOrder(action, qty, limit_price)
+                order.algoStrategy = "Adaptive"
+                order.algoParams = [TagValue("adaptivePriority", priority)]
+                log.info("Worker %s: Adaptive order %s %d @ limit %.4f "
+                         "priority=%s",
+                         self._label, action, qty, limit_price, priority)
+            elif order_type == "PEG_PRIM":
+                # Pegged to Primary (REL) — pegs to the NBBO with an
+                # optional offset, capped by a limit price.
+                #   orderType  = "REL"
+                #   auxPrice   = offset from the primary (bid for BUY, ask
+                #                for SELL) — must be >= 0
+                #   lmtPrice   = hard price cap (ceiling BUY / floor SELL)
+                from ib_async import Order
+                limit_price = float(params.get("limit_price", 0))
+                peg_offset = float(params.get("peg_offset", 0))
+                order = Order(
+                    action=action,
+                    totalQuantity=qty,
+                    orderType="REL",
+                    lmtPrice=limit_price,
+                    auxPrice=peg_offset,
+                )
+                log.info("Worker %s: PEG_PRIM order %s %d lmt=%.4f "
+                         "auxPrice(offset)=%.4f",
+                         self._label, action, qty, limit_price, peg_offset)
+            elif order_type == "LMT":
                 limit_price = float(params.get("limit_price", 0))
                 order = LimitOrder(action, qty, limit_price)
             else:
