@@ -88,7 +88,7 @@ class MainWindow(QWidget):
         # ── Top tab bar ───────────────────────────────────────────────────────
         self._tab_bar = TopTabBar(self)
         self._tab_bar.nav_changed.connect(self._on_nav_changed)
-        self._tab_bar.settings_clicked.connect(self._on_settings)
+        self._tab_bar.tabBarClicked.connect(self._on_tab_clicked)  # Handle all tab clicks
         root_layout.addWidget(self._tab_bar)
 
         # ── Stacked pages ─────────────────────────────────────────────────────
@@ -139,6 +139,16 @@ class MainWindow(QWidget):
             log.debug("Nav → %s (page %d)", name, idx)
             self._pages.setCurrentIndex(idx)
 
+    def _on_tab_clicked(self, name: str) -> None:
+        """Handle tab bar clicks - intercept Settings tab and launch modeless dialog."""
+        if name == "Settings":
+            # Launch PreferencesDialog as modeless (detached floating window)
+            dlg = PreferencesDialog(self)
+            dlg.show()  # Use show() not exec_() for modeless
+        else:
+            # Normal tab navigation
+            self._on_nav_changed(name)
+
     def _on_settings(self) -> None:
         """Open the Preferences dialog."""
         dlg = PreferencesDialog(self)
@@ -169,10 +179,29 @@ class MainWindow(QWidget):
         """Save geometry and stop all worker threads before closing."""
         self._save_geometry()
         log.info("closeEvent – shutting down %d worker(s)", len(self.active_threads))
+        
+        # Signal all workers to stop
         for label, worker in list(self.active_threads.items()):
-            log.info("Shutting down worker: %s", label)
+            log.info("Requesting worker shutdown: %s", label)
             worker.stop()
-            worker.wait(5000)
+        
+        # Wait for all workers to finish with a longer timeout (10 seconds per worker)
+        all_stopped = True
+        for label, worker in list(self.active_threads.items()):
+            log.debug("Waiting for worker %s to finish...", label)
+            if not worker.wait(10000):  # 10 second timeout per worker
+                log.warning("Worker %s did not stop gracefully after 10s", label)
+                all_stopped = False
+            else:
+                log.debug("Worker %s stopped successfully", label)
+        
+        # Clear the threads dict
         self.active_threads.clear()
+        
+        if all_stopped:
+            log.info("All workers stopped gracefully")
+        else:
+            log.warning("Some workers did not stop gracefully – forcing exit")
+        
         super().closeEvent(event)
 

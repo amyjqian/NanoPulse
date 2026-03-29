@@ -118,7 +118,12 @@ class IBWorkerThread(QThread):
     # ── Public control ────────────────────────────────────────────────────────
 
     def stop(self) -> None:
-        """Request a graceful shutdown."""
+        """Request a graceful shutdown.
+        
+        Sets the running flag to False, which causes the asyncio loops to exit
+        gracefully on their next iteration.
+        """
+        log.debug("Worker %s: stop() requested", self._label)
         self._running = False
 
     def request_order_snapshot(self) -> None:
@@ -161,14 +166,14 @@ class IBWorkerThread(QThread):
             log.debug("Worker %s: request_portfolio_refresh but loop not ready", self._label)
 
     async def _do_portfolio_refresh(self) -> None:
-        """Re-subscribe to reqAccountUpdates for each managed account."""
+        """Request account updates for each managed account to refresh positions."""
         if self._ib is None or not self._ib.isConnected():
             return
         for acct in self._ib.managedAccounts():
-            # Unsubscribe then re-subscribe to force a full position refresh
-            self._ib.reqAccountUpdates(False, acct)
-            self._ib.reqAccountUpdates(True, acct)
-        log.debug("Worker %s: portfolio refresh (re-subscribed for %d account(s))",
+            # Note: Modern ib_async doesn't support subscribe/unsubscribe toggles.
+            # This will trigger fresh position data from the server.
+            self._ib.reqAccountUpdates(acct)
+        log.debug("Worker %s: portfolio refresh (requested for %d account(s))",
                   self._label, len(self._ib.managedAccounts()))
 
     def request_browse(self, params: dict) -> None:
@@ -246,10 +251,31 @@ class IBWorkerThread(QThread):
         except Exception:
             log.exception("Worker %s crashed", self._label)
         finally:
-            if self._ib.isConnected():
-                self._ib.disconnect()
+            # Graceful disconnection
+            if self._ib is not None:
+                if self._ib.isConnected():
+                    try:
+                        self._ib.disconnect()
+                        log.debug("Worker %s disconnected from IB", self._label)
+                    except Exception as e:
+                        log.warning("Worker %s: error during IB disconnect: %s", self._label, e)
+            
+            # Cancel all remaining tasks to prevent "thread destroyed while running" errors
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+                log.debug("Worker %s: cancelled task %s", self._label, task.get_name())
+            
+            # Give cancelled tasks a moment to finish
+            if pending:
+                try:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                except Exception:
+                    pass
+            
             self._loop = None
             loop.close()
+            log.info("Worker %s: thread shutdown complete", self._label)
             self.connection_status_changed.emit(self._label, False)
 
     # ── Async core ────────────────────────────────────────────────────────────
@@ -296,7 +322,7 @@ class IBWorkerThread(QThread):
 
                     # Subscribe to portfolio updates (positions, market values)
                     for acct in self._ib.managedAccounts():
-                        self._ib.reqAccountUpdates(True, acct)
+                        self._ib.reqAccountUpdates(acct)
                         log.info("Worker %s subscribed to portfolio for %s", self._label, acct)
 
                     # Snapshot existing open + completed orders so the

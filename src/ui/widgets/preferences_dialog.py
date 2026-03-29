@@ -7,14 +7,17 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import Qt, Signal, QTimer
+from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QPoint, QRect
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QDialog,
+    QDoubleSpinBox,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QPushButton,
@@ -106,7 +109,7 @@ def _styled_sidebar() -> QListWidget:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _INPUT_QSS = f"""
-    QSpinBox, QComboBox {{
+    QSpinBox, QComboBox, QLineEdit {{
         background: {_BG_INPUT};
         color: {_TEXT};
         border: 1px solid {_BORDER};
@@ -146,6 +149,17 @@ def _spin(value: int = 0, minimum: int = 0, maximum: int = 9999) -> QSpinBox:
     sb.setFixedWidth(80)
     sb.setStyleSheet(_INPUT_QSS)
     return sb
+
+
+def _text_input(value: str = "", placeholder: str = "") -> QLineEdit:
+    """Create a QLineEdit for text input."""
+    le = QLineEdit()
+    le.setText(str(value))
+    if placeholder:
+        le.setPlaceholderText(placeholder)
+    le.setFixedWidth(80)
+    le.setStyleSheet(_INPUT_QSS)
+    return le
 
 
 def _combo(items: list[str], current: str = "") -> QComboBox:
@@ -461,7 +475,7 @@ class _TradingPage(QWidget):
         # ── Mid price Behavior ───────────────────────────────────────────────
         mid_row = QHBoxLayout()
         mid_row.setSpacing(10)
-        mid_lbl = QLabel("Mid price Behavior")
+        mid_lbl = QLabel("Buy/Sell @Mid")
         mid_lbl.setStyleSheet(lbl_qss)
         mid_lbl.setFixedWidth(130)
         self._mid_toggle = _ToggleGroup(
@@ -478,10 +492,10 @@ class _TradingPage(QWidget):
         # ── buy bid ──────────────────────────────────────────────────────────
         bb_row = QHBoxLayout()
         bb_row.setSpacing(10)
-        bb_lbl = QLabel("buy bid")
+        bb_lbl = QLabel("Buy @Bid")
         bb_lbl.setStyleSheet(lbl_qss)
         bb_lbl.setFixedWidth(130)
-        self._bb_spin = _spin(tp.get("buy_bid_offset", 0), 0, 99999)
+        self._bb_spin = _text_input(tp.get("buy_bid_offset", "0"), "+/- amt")
         self._bb_unit = _combo(["amt", "%", "ticks"], tp.get("buy_bid_unit", "ticks"))
         bb_row.addWidget(bb_lbl)
         bb_row.addWidget(self._bb_spin)
@@ -492,10 +506,10 @@ class _TradingPage(QWidget):
         # ── sell ask ─────────────────────────────────────────────────────────
         sa_row = QHBoxLayout()
         sa_row.setSpacing(10)
-        sa_lbl = QLabel("sell ask")
+        sa_lbl = QLabel("Sell @Ask")
         sa_lbl.setStyleSheet(lbl_qss)
         sa_lbl.setFixedWidth(130)
-        self._sa_spin = _spin(tp.get("sell_ask_offset", 0), 0, 99999)
+        self._sa_spin = _text_input(tp.get("sell_ask_offset", "0"), "+/- amt")
         self._sa_unit = _combo(["amt", "%", "ticks"], tp.get("sell_ask_unit", "ticks"))
         sa_row.addWidget(sa_lbl)
         sa_row.addWidget(self._sa_spin)
@@ -513,9 +527,9 @@ class _TradingPage(QWidget):
         self._lc_spin.setValue(d["limit_cap"])
         self._lc_unit.setCurrentText(d["limit_cap_unit"])
         self._mid_toggle.set_value(d["mid_price_behavior"])
-        self._bb_spin.setValue(d["buy_bid_offset"])
+        self._bb_spin.setText(str(d["buy_bid_offset"]))
         self._bb_unit.setCurrentText(d["buy_bid_unit"])
-        self._sa_spin.setValue(d["sell_ask_offset"])
+        self._sa_spin.setText(str(d["sell_ask_offset"]))
         self._sa_unit.setCurrentText(d["sell_ask_unit"])
         log.info("Trading preferences reverted to defaults")
 
@@ -526,9 +540,9 @@ class _TradingPage(QWidget):
             "limit_cap": self._lc_spin.value(),
             "limit_cap_unit": self._lc_unit.currentText(),
             "mid_price_behavior": self._mid_toggle.value(),
-            "buy_bid_offset": self._bb_spin.value(),
+            "buy_bid_offset": float(self._bb_spin.text()) if self._bb_spin.text() else 0,
             "buy_bid_unit": self._bb_unit.currentText(),
-            "sell_ask_offset": self._sa_spin.value(),
+            "sell_ask_offset": float(self._sa_spin.text()) if self._sa_spin.text() else 0,
             "sell_ask_unit": self._sa_unit.currentText(),
         }
 
@@ -607,7 +621,45 @@ class PreferencesDialog(QDialog):
     def _on_page_changed(self, idx: int) -> None:
         self._stack.setCurrentIndex(idx)
 
-    # ── Auto-close on focus loss (deferred to avoid combo-popup false trigger)
+    # ── Auto-close on focus loss (geometry-based with absolute screen coordinates)
+
+    def event(self, e) -> bool:
+        """Override event to handle WindowDeactivate with geometry-based auto-close.
+        
+        Uses absolute screen coordinates (via mapToGlobal) to correctly detect
+        dialog position across multiple monitors, including second monitors.
+        
+        Includes debug logging to verify coordinate calculations.
+        """
+        if e.type() == QEvent.WindowDeactivate:
+            # Verify if main window is now the active window
+            active_win = QApplication.activeWindow()
+            if active_win is self.parent():
+                # Get absolute screen coordinates for dialog
+                # mapToGlobal(QPoint(0,0)) gives top-left corner in screen coordinates
+                dialog_top_left_global = self.mapToGlobal(QPoint(0, 0))
+                dialog_rect_global = QRect(dialog_top_left_global, self.size())
+
+                # Get absolute screen coordinates for main window
+                parent_top_left_global = self.parent().mapToGlobal(QPoint(0, 0))
+                parent_rect_global = QRect(parent_top_left_global, self.parent().size())
+
+                # Debug output for coordinate verification
+                print(f"[WindowDeactivate] Dialog global coords: {dialog_rect_global} "
+                      f"(top-left={dialog_top_left_global}, size={self.size()})")
+                print(f"[WindowDeactivate] Main global coords: {parent_rect_global} "
+                      f"(top-left={parent_top_left_global}, size={self.parent().size()})")
+                print(f"[WindowDeactivate] Intersects: {dialog_rect_global.intersects(parent_rect_global)}")
+
+                # If dialog does NOT overlap with main window, close it
+                if not dialog_rect_global.intersects(parent_rect_global):
+                    print("[WindowDeactivate] ✓ Closing dialog (completely outside main window)")
+                    self.close()
+                    return True
+                else:
+                    print("[WindowDeactivate] ✓ Keeping dialog open (overlaps main window)")
+
+        return super().event(e)
 
     def changeEvent(self, event) -> None:
         super().changeEvent(event)
@@ -632,5 +684,3 @@ class PreferencesDialog(QDialog):
         self._prefs["trading_futures"] = self._trading_page.collect()
         config_manager.save_preferences(self._prefs)
         log.info("Preferences saved")
-
-
