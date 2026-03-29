@@ -218,6 +218,7 @@ class FlashTradeView(QWidget):
 
         # ── Compute limit price when user has offsets configured ──────────
         limit_price = None
+        adaptive_priority = None
         if last_price > 0:
             from src.utils.helpers import calculate_capped_price, tick_size_for_contract
             from src.core.trading_prefs import trading_prefs
@@ -229,18 +230,57 @@ class FlashTradeView(QWidget):
             )
             prefs = trading_prefs.get(sec_type)
 
-            if order_type in ("BID", "ASK", "MID"):
-                # Buy @Bid / Sell @Ask / @Mid → use buy_bid_offset / sell_ask_offset
+            if order_type == "MID":
+                # Buy/Sell @Mid → IB Adaptive Algo with limit cap price protection
                 limit_price = calculate_capped_price(
                     symbol_type=sec_type,
                     side=action,
                     base_price=last_price,
                     tick_size=tick,
-                    offset_key="side",
+                    offset_key="limit_cap",
                 )
-                log.info("FlashTrade: %s %s %s base=%.4f tick=%.4f → limit=%.4f",
-                         action, order_type, symbol, last_price, tick, limit_price)
-                order_type = "LMT"
+                adaptive_priority = prefs.get("mid_price_behavior", "Normal")
+                log.info("FlashTrade: %s @Mid %s base=%.4f tick=%.4f → "
+                         "ADAPTIVE limit=%.4f priority=%s",
+                         action, symbol, last_price, tick,
+                         limit_price, adaptive_priority)
+                order_type = "ADAPTIVE"
+
+            elif order_type in ("BID", "ASK"):
+                # Determine if this asset class uses urgency toggles (Futures)
+                # or numeric offsets (Stocks) for Buy @Bid / Sell @Ask.
+                if action == "BUY":
+                    behavior = prefs.get("buy_bid_behavior")
+                else:
+                    behavior = prefs.get("sell_ask_behavior")
+
+                if behavior is not None:
+                    # Futures mode → IB Adaptive Algo with limit cap
+                    limit_price = calculate_capped_price(
+                        symbol_type=sec_type,
+                        side=action,
+                        base_price=last_price,
+                        tick_size=tick,
+                        offset_key="limit_cap",
+                    )
+                    adaptive_priority = behavior
+                    log.info("FlashTrade: %s @%s %s base=%.4f tick=%.4f → "
+                             "ADAPTIVE limit=%.4f priority=%s",
+                             action, order_type, symbol, last_price, tick,
+                             limit_price, adaptive_priority)
+                    order_type = "ADAPTIVE"
+                else:
+                    # Stocks mode → offset-based LMT
+                    limit_price = calculate_capped_price(
+                        symbol_type=sec_type,
+                        side=action,
+                        base_price=last_price,
+                        tick_size=tick,
+                        offset_key="side",
+                    )
+                    log.info("FlashTrade: %s %s %s base=%.4f tick=%.4f → limit=%.4f",
+                             action, order_type, symbol, last_price, tick, limit_price)
+                    order_type = "LMT"
 
             elif order_type == "MKT":
                 # MKT → check if Limit Cap Offset is set; if so, cap the MKT
@@ -290,6 +330,8 @@ class FlashTradeView(QWidget):
             }
             if limit_price is not None:
                 params["limit_price"] = limit_price
+            if adaptive_priority is not None:
+                params["adaptive_priority"] = adaptive_priority
             worker.place_order(params)
 
     def _find_worker_for_account(self, account: str) -> IBWorkerThread | None:

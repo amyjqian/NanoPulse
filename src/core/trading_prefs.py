@@ -36,10 +36,8 @@ _FUTURES_DEFAULTS: dict[str, Any] = {
     "limit_cap": 0,
     "limit_cap_unit": "ticks",
     "mid_price_behavior": "Normal",
-    "buy_bid_offset": 0,
-    "buy_bid_unit": "ticks",
-    "sell_ask_offset": 0,
-    "sell_ask_unit": "ticks",
+    "buy_bid_behavior": "Patient",
+    "sell_ask_behavior": "Patient",
 }
 
 _STOCKS_DEFAULTS: dict[str, Any] = {
