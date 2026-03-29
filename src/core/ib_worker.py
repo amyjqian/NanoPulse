@@ -92,6 +92,7 @@ class IBWorkerThread(QThread):
         self._running = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._ib: IB | None = None
+        self._main_task: asyncio.Task | None = None
 
         # De-dupe buffer keyed by (account, tag) → (value, currency)
         self._buffer: dict[tuple[str, str], tuple[str, str]] = {}
@@ -118,8 +119,16 @@ class IBWorkerThread(QThread):
     # ── Public control ────────────────────────────────────────────────────────
 
     def stop(self) -> None:
-        """Request a graceful shutdown."""
+        """Request an immediate graceful shutdown.
+
+        Sets the running flag to False and cancels the main asyncio task so
+        any sleeping coroutines (reconnect / throttler) are interrupted
+        instantly rather than waiting for their next sleep to expire.
+        """
+        log.debug("Worker %s: stop() requested", self._label)
         self._running = False
+        if self._loop is not None and not self._loop.is_closed() and self._main_task is not None:
+            self._loop.call_soon_threadsafe(self._main_task.cancel)
 
     def request_order_snapshot(self) -> None:
         """Thread-safe: re-emit all known open + completed orders.
@@ -161,14 +170,14 @@ class IBWorkerThread(QThread):
             log.debug("Worker %s: request_portfolio_refresh but loop not ready", self._label)
 
     async def _do_portfolio_refresh(self) -> None:
-        """Re-subscribe to reqAccountUpdates for each managed account."""
+        """Request account updates for each managed account to refresh positions."""
         if self._ib is None or not self._ib.isConnected():
             return
         for acct in self._ib.managedAccounts():
-            # Unsubscribe then re-subscribe to force a full position refresh
-            self._ib.reqAccountUpdates(False, acct)
-            self._ib.reqAccountUpdates(True, acct)
-        log.debug("Worker %s: portfolio refresh (re-subscribed for %d account(s))",
+            # Note: Modern ib_async doesn't support subscribe/unsubscribe toggles.
+            # This will trigger fresh position data from the server.
+            self._ib.reqAccountUpdates(acct)
+        log.debug("Worker %s: portfolio refresh (requested for %d account(s))",
                   self._label, len(self._ib.managedAccounts()))
 
     def request_browse(self, params: dict) -> None:
@@ -243,21 +252,34 @@ class IBWorkerThread(QThread):
 
         try:
             loop.run_until_complete(self._main_loop())
+        except asyncio.CancelledError:
+            log.debug("Worker %s: main loop cancelled (shutdown)", self._label)
         except Exception:
             log.exception("Worker %s crashed", self._label)
         finally:
-            if self._ib.isConnected():
-                self._ib.disconnect()
+            # Graceful disconnection
+            if self._ib is not None:
+                if self._ib.isConnected():
+                    try:
+                        self._ib.disconnect()
+                        log.debug("Worker %s disconnected from IB", self._label)
+                    except Exception as e:
+                        log.warning("Worker %s: error during IB disconnect: %s", self._label, e)
+
+            self._main_task = None
             self._loop = None
             loop.close()
+            log.info("Worker %s: thread shutdown complete", self._label)
             self.connection_status_changed.emit(self._label, False)
 
     # ── Async core ────────────────────────────────────────────────────────────
 
     async def _main_loop(self) -> None:
+        self._main_task = asyncio.current_task()
         await asyncio.gather(
             self._reconnect_loop(),
             self._throttler_loop(),
+            return_exceptions=True,
         )
 
     async def _reconnect_loop(self) -> None:
@@ -296,7 +318,7 @@ class IBWorkerThread(QThread):
 
                     # Subscribe to portfolio updates (positions, market values)
                     for acct in self._ib.managedAccounts():
-                        self._ib.reqAccountUpdates(True, acct)
+                        self._ib.reqAccountUpdates(acct)
                         log.info("Worker %s subscribed to portfolio for %s", self._label, acct)
 
                     # Snapshot existing open + completed orders so the

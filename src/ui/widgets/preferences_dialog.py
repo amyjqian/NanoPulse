@@ -7,17 +7,21 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import Qt, Signal, QTimer
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QPoint, QRect
+from PySide6.QtGui import QColor, QFont, QPainter, QPen, QIntValidator, QDoubleValidator
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QDialog,
+    QDoubleSpinBox,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSpinBox,
     QStackedWidget,
@@ -54,6 +58,17 @@ _DEFAULTS: dict = {
     "trading_futures": {
         "quantity": 1,
         "quantity_unit": "Contracts",
+        "limit_cap": 0,
+        "limit_cap_unit": "ticks",
+        "mid_price_behavior": "Normal",
+        "buy_bid_offset": 0,
+        "buy_bid_unit": "ticks",
+        "sell_ask_offset": 0,
+        "sell_ask_unit": "ticks",
+    },
+    "trading_stocks": {
+        "quantity": 100,
+        "quantity_unit": "Shares",
         "limit_cap": 0,
         "limit_cap_unit": "ticks",
         "mid_price_behavior": "Normal",
@@ -106,7 +121,7 @@ def _styled_sidebar() -> QListWidget:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _INPUT_QSS = f"""
-    QSpinBox, QComboBox {{
+    QSpinBox, QComboBox, QLineEdit {{
         background: {_BG_INPUT};
         color: {_TEXT};
         border: 1px solid {_BORDER};
@@ -146,6 +161,17 @@ def _spin(value: int = 0, minimum: int = 0, maximum: int = 9999) -> QSpinBox:
     sb.setFixedWidth(80)
     sb.setStyleSheet(_INPUT_QSS)
     return sb
+
+
+def _text_input(value: str = "", placeholder: str = "") -> QLineEdit:
+    """Create a QLineEdit for text input."""
+    le = QLineEdit()
+    le.setText(str(value))
+    if placeholder:
+        le.setPlaceholderText(placeholder)
+    le.setFixedWidth(80)
+    le.setStyleSheet(_INPUT_QSS)
+    return le
 
 
 def _combo(items: list[str], current: str = "") -> QComboBox:
@@ -320,6 +346,8 @@ class _ThemeCard(QFrame):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class _DisplayPage(QWidget):
+    changed = Signal()
+
     def __init__(self, prefs: dict, parent=None):
         super().__init__(parent)
         self._prefs = prefs
@@ -369,34 +397,67 @@ class _DisplayPage(QWidget):
         self._dark_card.set_selected(label == "Dark")
         self._light_card.set_selected(label == "Light")
         self._prefs.setdefault("display", {})["theme"] = label
+        self.changed.emit()
 
     def collect(self) -> dict:
         return {"theme": self._prefs.get("display", {}).get("theme", "Dark")}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Trading (Futures) settings page
+#  Reusable asset-settings block  (Futures / Stocks / …)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class _TradingPage(QWidget):
-    def __init__(self, prefs: dict, parent=None):
+class _AssetSettingsGroup(QWidget):
+    """Self-contained settings block for one asset class.
+
+    Parameters
+    ----------
+    title           : str  – Section heading  (e.g. ``"Futures"``).
+    qty_label       : str  – Quantity unit    (e.g. ``"Contracts"``).
+    increment_label : str  – Integer-step unit for offset combos
+                             and ``QIntValidator`` branch (e.g. ``"ticks"``).
+    prefs_key       : str  – Key inside the global prefs dict
+                             (e.g. ``"trading_futures"``).
+    prefs           : dict – Shared preferences dict (read at init;
+                             written via ``collect()`` / ``_revert_defaults``).
+    """
+
+    changed = Signal()
+
+    def __init__(
+        self,
+        title: str,
+        qty_label: str,
+        increment_label: str,
+        prefs_key: str,
+        prefs: dict,
+        parent=None,
+    ):
         super().__init__(parent)
+        self._title = title
+        self._qty_label = qty_label
+        self._increment_label = increment_label
+        self._prefs_key = prefs_key
         self._prefs = prefs
         self._build_ui()
+
+    # ── Build ──────────────────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 16, 24, 16)
         root.setSpacing(14)
 
-        tp = self._prefs.get("trading_futures", {})
+        tp  = self._prefs.get(self._prefs_key, {})
+        inc = self._increment_label
+        lbl_qss = f"color: {_TEXT}; border: none; font-size: 12px;"
 
         # ── Header: title + Revert to Defaults ──────────────────────────────
         hdr = QHBoxLayout()
-        title = QLabel("Futures")
-        title.setFont(_FONT_TITLE)
-        title.setStyleSheet(f"color: {_TEXT}; border: none;")
-        hdr.addWidget(title)
+        title_lbl = QLabel(self._title)
+        title_lbl.setFont(_FONT_TITLE)
+        title_lbl.setStyleSheet(f"color: {_TEXT}; border: none;")
+        hdr.addWidget(title_lbl)
         hdr.addStretch()
         revert_btn = QPushButton("Revert to Defaults")
         revert_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -423,19 +484,17 @@ class _TradingPage(QWidget):
         sep.setStyleSheet(f"color: {_BORDER};")
         sep.setFixedHeight(1)
         root.addWidget(sep)
-
         root.addSpacing(4)
-
-        lbl_qss = f"color: {_TEXT}; border: none; font-size: 12px;"
 
         # ── Quantity ─────────────────────────────────────────────────────────
         qty_row = QHBoxLayout()
         qty_row.setSpacing(10)
         qty_lbl = QLabel("Quantity")
         qty_lbl.setStyleSheet(lbl_qss)
-        qty_lbl.setFixedWidth(130)
+        qty_lbl.setFixedWidth(160)
         self._qty_spin = _spin(tp.get("quantity", 1), 1, 9999)
-        self._qty_unit = _combo(["Contracts"], tp.get("quantity_unit", "Contracts"))
+        self._qty_unit = QLabel(self._qty_label)
+        self._qty_unit.setStyleSheet(f"color: {_TEXT_DIM}; border: none; font-size: 12px;")
         qty_row.addWidget(qty_lbl)
         qty_row.addWidget(self._qty_spin)
         qty_row.addWidget(self._qty_unit)
@@ -445,11 +504,11 @@ class _TradingPage(QWidget):
         # ── Limit cap ────────────────────────────────────────────────────────
         lc_row = QHBoxLayout()
         lc_row.setSpacing(10)
-        lc_lbl = QLabel("Limit cap")
+        lc_lbl = QLabel("Limit Cap Offset")
         lc_lbl.setStyleSheet(lbl_qss)
-        lc_lbl.setFixedWidth(130)
+        lc_lbl.setFixedWidth(160)
         self._lc_spin = _spin(tp.get("limit_cap", 0), 0, 99999)
-        self._lc_unit = _combo(["amt", "%", "ticks"], tp.get("limit_cap_unit", "ticks"))
+        self._lc_unit = _combo(["amt", "%", inc], tp.get("limit_cap_unit", inc))
         lc_row.addWidget(lc_lbl)
         lc_row.addWidget(self._lc_spin)
         lc_row.addWidget(self._lc_unit)
@@ -458,12 +517,12 @@ class _TradingPage(QWidget):
 
         root.addSpacing(6)
 
-        # ── Mid price Behavior ───────────────────────────────────────────────
+        # ── Buy/Sell @Mid ─────────────────────────────────────────────────────
         mid_row = QHBoxLayout()
         mid_row.setSpacing(10)
-        mid_lbl = QLabel("Mid price Behavior")
+        mid_lbl = QLabel("Buy/Sell @Mid")
         mid_lbl.setStyleSheet(lbl_qss)
-        mid_lbl.setFixedWidth(130)
+        mid_lbl.setFixedWidth(160)
         self._mid_toggle = _ToggleGroup(
             ["Patient", "Normal", "Urgent"],
             tp.get("mid_price_behavior", "Normal"),
@@ -475,62 +534,190 @@ class _TradingPage(QWidget):
 
         root.addSpacing(6)
 
-        # ── buy bid ──────────────────────────────────────────────────────────
+        # ── Buy @Bid ──────────────────────────────────────────────────────────
         bb_row = QHBoxLayout()
         bb_row.setSpacing(10)
-        bb_lbl = QLabel("buy bid")
+        bb_lbl = QLabel("Buy @Bid Offset")
         bb_lbl.setStyleSheet(lbl_qss)
-        bb_lbl.setFixedWidth(130)
-        self._bb_spin = _spin(tp.get("buy_bid_offset", 0), 0, 99999)
-        self._bb_unit = _combo(["amt", "%", "ticks"], tp.get("buy_bid_unit", "ticks"))
+        bb_lbl.setFixedWidth(160)
+        self._bb_spin = _text_input(str(tp.get("buy_bid_offset", 0)), "+/- amt")
+        self._bb_unit = _combo(["amt", "%", inc], tp.get("buy_bid_unit", inc))
         bb_row.addWidget(bb_lbl)
         bb_row.addWidget(self._bb_spin)
         bb_row.addWidget(self._bb_unit)
         bb_row.addStretch()
         root.addLayout(bb_row)
 
-        # ── sell ask ─────────────────────────────────────────────────────────
+        # ── Sell @Ask ─────────────────────────────────────────────────────────
         sa_row = QHBoxLayout()
         sa_row.setSpacing(10)
-        sa_lbl = QLabel("sell ask")
+        sa_lbl = QLabel("Sell @Ask Offset")
         sa_lbl.setStyleSheet(lbl_qss)
-        sa_lbl.setFixedWidth(130)
-        self._sa_spin = _spin(tp.get("sell_ask_offset", 0), 0, 99999)
-        self._sa_unit = _combo(["amt", "%", "ticks"], tp.get("sell_ask_unit", "ticks"))
+        sa_lbl.setFixedWidth(160)
+        self._sa_spin = _text_input(str(tp.get("sell_ask_offset", 0)), "+/- amt")
+        self._sa_unit = _combo(["amt", "%", inc], tp.get("sell_ask_unit", inc))
         sa_row.addWidget(sa_lbl)
         sa_row.addWidget(self._sa_spin)
         sa_row.addWidget(self._sa_unit)
         sa_row.addStretch()
         root.addLayout(sa_row)
 
-        root.addStretch()
+        # ── Wire all widgets → changed ────────────────────────────────────────
+        self._qty_spin.valueChanged.connect(self.changed)
+        # qty_unit is a static QLabel — no signal needed
+        self._lc_spin.valueChanged.connect(self.changed)
+        self._lc_unit.currentTextChanged.connect(self.changed)
+        self._mid_toggle.value_changed.connect(self.changed)
+        self._bb_spin.editingFinished.connect(self.changed)
+        self._bb_unit.currentTextChanged.connect(self.changed)
+        self._sa_spin.editingFinished.connect(self.changed)
+        self._sa_unit.currentTextChanged.connect(self.changed)
+        # Enter handled by eventFilter — returnPressed intentionally NOT wired
+        self._bb_spin.installEventFilter(self)
+        self._sa_spin.installEventFilter(self)
+
+        # ── Validators ────────────────────────────────────────────────────────
+        self._bb_unit.currentTextChanged.connect(
+            lambda unit: self._apply_unit_validator(self._bb_spin, unit)
+        )
+        self._sa_unit.currentTextChanged.connect(
+            lambda unit: self._apply_unit_validator(self._sa_spin, unit)
+        )
+        self._apply_unit_validator(self._bb_spin, self._bb_unit.currentText())
+        self._apply_unit_validator(self._sa_spin, self._sa_unit.currentText())
+
+    # ── Event filter ──────────────────────────────────────────────────────────
+
+    def eventFilter(self, source, event) -> bool:
+        """Intercept Return/Enter on offset fields: save, advance focus, consume."""
+        if (event.type() == QEvent.Type.KeyPress
+                and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                and source in (self._bb_spin, self._sa_spin)):
+            self.changed.emit()
+            source.focusNextChild()
+            return True          # consumed — never reaches QDialog
+        return super().eventFilter(source, event)
+
+    # ── Validator helper ──────────────────────────────────────────────────────
+
+    def _apply_unit_validator(self, field: QLineEdit, unit: str) -> None:
+        """QIntValidator for increment_label, QDoubleValidator(2dp) otherwise."""
+        text = field.text().strip()
+        if unit == self._increment_label:
+            field.setValidator(QIntValidator(-999999, 999999))
+            field.setPlaceholderText(f"+/- {self._increment_label}")
+            try:
+                if text and "." in text:
+                    field.setText(str(int(round(float(text)))))
+            except ValueError:
+                field.setText("0")
+        else:
+            v = QDoubleValidator(-999999.99, 999999.99, 2)
+            v.setNotation(QDoubleValidator.Notation.StandardNotation)
+            field.setValidator(v)
+            field.setPlaceholderText("+/- amt")
+
+    @staticmethod
+    def _parse_offset(text: str) -> float:
+        """Safe float conversion — returns 0.0 for blank / non-numeric text."""
+        try:
+            return float(text.strip()) if text.strip() else 0.0
+        except ValueError:
+            return 0.0
+
+    # ── Revert ────────────────────────────────────────────────────────────────
 
     def _revert_defaults(self) -> None:
-        """Reset all widgets to their default values."""
-        d = _DEFAULTS["trading_futures"]
+        d = _DEFAULTS.get(self._prefs_key, _DEFAULTS["trading_futures"])
         self._qty_spin.setValue(d["quantity"])
-        self._qty_unit.setCurrentText(d["quantity_unit"])
+        # qty_unit is a static QLabel — no reset needed
         self._lc_spin.setValue(d["limit_cap"])
         self._lc_unit.setCurrentText(d["limit_cap_unit"])
         self._mid_toggle.set_value(d["mid_price_behavior"])
-        self._bb_spin.setValue(d["buy_bid_offset"])
+        self._bb_spin.setText(str(d["buy_bid_offset"]))
         self._bb_unit.setCurrentText(d["buy_bid_unit"])
-        self._sa_spin.setValue(d["sell_ask_offset"])
+        self._sa_spin.setText(str(d["sell_ask_offset"]))
         self._sa_unit.setCurrentText(d["sell_ask_unit"])
-        log.info("Trading preferences reverted to defaults")
+        log.info("%s preferences reverted to defaults", self._title)
+        self.changed.emit()
+
+    # ── Collect ───────────────────────────────────────────────────────────────
 
     def collect(self) -> dict:
         return {
-            "quantity": self._qty_spin.value(),
-            "quantity_unit": self._qty_unit.currentText(),
-            "limit_cap": self._lc_spin.value(),
-            "limit_cap_unit": self._lc_unit.currentText(),
+            "quantity":           self._qty_spin.value(),
+            "quantity_unit":      self._qty_label,
+            "limit_cap":          self._lc_spin.value(),
+            "limit_cap_unit":     self._lc_unit.currentText(),
             "mid_price_behavior": self._mid_toggle.value(),
-            "buy_bid_offset": self._bb_spin.value(),
-            "buy_bid_unit": self._bb_unit.currentText(),
-            "sell_ask_offset": self._sa_spin.value(),
-            "sell_ask_unit": self._sa_unit.currentText(),
+            "buy_bid_offset":     self._parse_offset(self._bb_spin.text()),
+            "buy_bid_unit":       self._bb_unit.currentText(),
+            "sell_ask_offset":    self._parse_offset(self._sa_spin.text()),
+            "sell_ask_unit":      self._sa_unit.currentText(),
         }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Trading settings page  (Futures + Stocks stacked in a scroll area)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class _TradingPage(QWidget):
+    """Thin host widget: stacks a Futures and a Stocks _AssetSettingsGroup."""
+
+    changed = Signal()
+
+    def __init__(self, prefs: dict, parent=None):
+        super().__init__(parent)
+        self._prefs = prefs
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # Scroll area keeps both blocks accessible on smaller windows
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+
+        container = QWidget()
+        container.setStyleSheet(f"background: {_BG_PANEL};")
+        lay = QVBoxLayout(container)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        # ── Futures block ─────────────────────────────────────────────────────
+        self._futures_group = _AssetSettingsGroup(
+            "Futures", "Contracts", "ticks", "trading_futures", self._prefs
+        )
+        lay.addWidget(self._futures_group)
+
+        # ── Divider ───────────────────────────────────────────────────────────
+        div = QFrame()
+        div.setFrameShape(QFrame.Shape.HLine)
+        div.setStyleSheet(f"color: {_BORDER};")
+        div.setFixedHeight(1)
+        lay.addWidget(div)
+
+        # ── Stocks block ──────────────────────────────────────────────────────
+        self._stocks_group = _AssetSettingsGroup(
+            "Stocks", "Shares", "ticks", "trading_stocks", self._prefs
+        )
+        lay.addWidget(self._stocks_group)
+        lay.addStretch()
+
+        scroll.setWidget(container)
+        outer.addWidget(scroll)
+
+        # Bubble both groups' changes up to this page's changed signal
+        self._futures_group.changed.connect(self.changed)
+        self._stocks_group.changed.connect(self.changed)
+
+    def collect(self) -> tuple[dict, dict]:
+        """Return ``(futures_dict, stocks_dict)`` for direct config storage."""
+        return self._futures_group.collect(), self._stocks_group.collect()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -602,23 +789,83 @@ class PreferencesDialog(QDialog):
         self._stack.addWidget(self._trading_page)
         main_lay.addWidget(self._stack, stretch=1)
 
+        # Auto-save: any change on either page persists to config immediately
+        self._display_page.changed.connect(self._save)
+        self._trading_page.changed.connect(self._save)
+
     # ── Navigation ────────────────────────────────────────────────────────────
 
     def _on_page_changed(self, idx: int) -> None:
         self._stack.setCurrentIndex(idx)
 
-    # ── Auto-close on focus loss (deferred to avoid combo-popup false trigger)
+    # ── Auto-close on focus loss (geometry-based with absolute screen coordinates) ──
 
     def changeEvent(self, event) -> None:
         super().changeEvent(event)
-        if event.type() == event.Type.ActivationChange:
+        if event.type() == QEvent.Type.ActivationChange:
             if not self.isActiveWindow():
+                # Defer the check so combo-box popups have time to return focus
                 self._close_timer.start()
 
     def _check_should_close(self) -> None:
-        """Only close if this dialog is still not the active window after
-        the timer fires (gives combo popups time to return focus)."""
-        if self.isVisible() and not self.isActiveWindow():
+        """Close only if the dialog is 100% contained within the main window.
+
+        Logic
+        -----
+        * ``mapToGlobal(QPoint(0, 0))`` gives the widget's CLIENT-AREA top-left
+          in absolute screen pixels — reliable across all monitors and DPI
+          configurations.
+        * We subtract the frame delta (titlebar height, border widths) to
+          extend the rect to the full OS-chrome boundary so the title-bar of
+          the dialog is included in the check.
+        * ``QRect.contains(other)`` returns True only when *every* pixel of
+          ``other`` lies inside ``self``.  Even a 1-pixel overhang returns
+          False — so a partially-dragged or second-monitor dialog stays open.
+        """
+        if not self.isVisible() or self.isActiveWindow():
+            return
+
+        parent = self.parent()
+        if parent is None:
+            self.close()
+            return
+
+        def _abs_frame_rect(widget) -> QRect:
+            """Return widget's full frame rect in absolute screen coordinates.
+
+            Steps:
+              1. mapToGlobal(QPoint(0,0))  → client-area top-left in screen px
+              2. frameGeometry / geometry delta → frame insets (title-bar, borders)
+              3. Subtract insets to reach the true frame top-left
+            """
+            client_tl   = widget.mapToGlobal(QPoint(0, 0))
+            frame_geo   = widget.frameGeometry()   # screen-absolute on top-levels,
+            client_geo  = widget.geometry()         # but we derive it ourselves to
+                                                    # be explicit about the mapping.
+            # How far the OS frame extends beyond the client area on each side
+            frame_dx = client_geo.left() - frame_geo.left()   # left border width
+            frame_dy = client_geo.top()  - frame_geo.top()    # title-bar height
+            return QRect(
+                client_tl.x() - frame_dx,
+                client_tl.y() - frame_dy,
+                frame_geo.width(),
+                frame_geo.height(),
+            )
+
+        dialog_rect = _abs_frame_rect(self)
+        parent_rect = _abs_frame_rect(parent)
+        contained   = parent_rect.contains(dialog_rect)
+
+        print(f"[AutoClose] dialog  rect (screen px): {dialog_rect}  "
+              f"tl=({dialog_rect.left()}, {dialog_rect.top()})  "
+              f"br=({dialog_rect.right()}, {dialog_rect.bottom()})")
+        print(f"[AutoClose] parent  rect (screen px): {parent_rect}  "
+              f"tl=({parent_rect.left()}, {parent_rect.top()})  "
+              f"br=({parent_rect.right()}, {parent_rect.bottom()})")
+        print(f"[AutoClose] contained               : {contained}  → "
+              f"{'CLOSING  (dialog fully inside main window)' if contained else 'KEEPING OPEN  (hanging outside or on 2nd monitor)'}")
+
+        if contained:
             self.close()
 
     # ── Save on close ─────────────────────────────────────────────────────────
@@ -629,8 +876,8 @@ class PreferencesDialog(QDialog):
 
     def _save(self) -> None:
         self._prefs["display"] = self._display_page.collect()
-        self._prefs["trading_futures"] = self._trading_page.collect()
+        futures_data, stocks_data = self._trading_page.collect()
+        self._prefs["trading_futures"] = futures_data
+        self._prefs["trading_stocks"] = stocks_data
         config_manager.save_preferences(self._prefs)
         log.info("Preferences saved")
-
-
