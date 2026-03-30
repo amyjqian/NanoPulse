@@ -290,6 +290,18 @@ class FlashTradeView(QWidget):
                          limit_price, peg_offset)
                 order_type = "PEG_PRIM"
 
+        elif order_type in ("BID_LMT", "ASK_LMT"):
+            # Buy @Bid Limit / Sell @Ask Limit — plain LimitOrder at the
+            # exact bid or ask price provided by the order entry panel.
+            limit_price = float(payload.get("limit_price", 0))
+            if limit_price <= 0:
+                log.warning("FlashTrade: %s %s but limit_price=%.4f – aborting",
+                            action, order_type, limit_price)
+                return
+            log.info("FlashTrade: %s %s %s → LMT @ %.4f",
+                     action, order_type, symbol, limit_price)
+            order_type = "LMT"
+
         elif order_type == "MKT" and last_price > 0:
             # MKT → cap with a limit if Limit Cap Offset is set
             cap_value = float(prefs.get("limit_cap", 0))

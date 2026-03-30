@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any
 
 from PySide6.QtCore import Qt, Signal
@@ -12,6 +13,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
     QVBoxLayout,
@@ -33,6 +35,8 @@ ACCENT = "#3FB950"
 
 CLR_BUY = "#2e7d32"
 CLR_SELL = "#c62828"
+CLR_BUY_LMT = "#1b5e20"
+CLR_SELL_LMT = "#8b0000"
 CLR_FLATTEN = "#cc6600"
 CLR_REVERSE = "#8E44AD"
 CLR_CLOSE = "#8E8E93"
@@ -163,6 +167,8 @@ class OrderEntryPanel(QWidget):
         self._price_retry_workers: list = []
         self._price_params: dict = {}
         self._last_price: float = 0.0  # latest live price for limit-order calculation
+        self._last_bid: float = 0.0    # latest live bid price
+        self._last_ask: float = 0.0    # latest live ask price
         self._symbols: list[str] = config_manager.load_order_entry_symbols()
         self._active_symbol: str | None = self._symbols[0] if self._symbols else None
         self._active_qty: int = 1
@@ -270,7 +276,7 @@ class OrderEntryPanel(QWidget):
 
         root.addSpacing(12)
 
-        # ── Action buttons (2×2) ─────────────────────────────────────────────
+        # ── Action buttons (4×2) ─────────────────────────────────────────────
         action_grid = QGridLayout()
         action_grid.setSpacing(4)
         action_grid.setContentsMargins(0, 0, 0, 0)
@@ -280,12 +286,16 @@ class OrderEntryPanel(QWidget):
         self._btn_sell_mid = _make_btn("Sell @Mid", CLR_SELL, 36)
         self._btn_buy_bid = _make_btn("Buy @Bid", CLR_BUY, 36)
         self._btn_sell_ask = _make_btn("Sell @Ask", CLR_SELL, 36)
+        self._btn_buy_bid_lmt = _make_btn("Buy @Bid Limit", CLR_BUY, 36)
+        self._btn_sell_ask_lmt = _make_btn("Sell @Ask Limit", CLR_SELL, 36)
         action_grid.addWidget(self._btn_buy_mkt, 0, 0)
         action_grid.addWidget(self._btn_sell_mkt, 0, 1)
         action_grid.addWidget(self._btn_buy_mid, 1, 0)
         action_grid.addWidget(self._btn_sell_mid, 1, 1)
         action_grid.addWidget(self._btn_buy_bid, 2, 0)
         action_grid.addWidget(self._btn_sell_ask, 2, 1)
+        action_grid.addWidget(self._btn_buy_bid_lmt, 3, 0)
+        action_grid.addWidget(self._btn_sell_ask_lmt, 3, 1)
 
         self._btn_buy_mkt.clicked.connect(lambda: self._emit_order("BUY", "MKT"))
         self._btn_sell_mkt.clicked.connect(lambda: self._emit_order("SELL", "MKT"))
@@ -293,6 +303,8 @@ class OrderEntryPanel(QWidget):
         self._btn_sell_mid.clicked.connect(lambda: self._emit_order("SELL", "MID"))
         self._btn_buy_bid.clicked.connect(lambda: self._emit_order("BUY", "BID"))
         self._btn_sell_ask.clicked.connect(lambda: self._emit_order("SELL", "ASK"))
+        self._btn_buy_bid_lmt.clicked.connect(lambda: self._emit_bid_ask_lmt_order("BUY"))
+        self._btn_sell_ask_lmt.clicked.connect(lambda: self._emit_bid_ask_lmt_order("SELL"))
 
         action_w = QWidget()
         action_w.setStyleSheet("border: none;")
@@ -493,11 +505,15 @@ class OrderEntryPanel(QWidget):
             self._lbl_symbol.setText(self._active_symbol)
             self._lbl_price.setText("")  # clear until live tick arrives
             self._last_price = 0.0
+            self._last_bid = 0.0
+            self._last_ask = 0.0
             self._subscribe_price(self._active_symbol)
         else:
             self._lbl_symbol.setText("")
             self._lbl_price.setText("")
             self._last_price = 0.0
+            self._last_bid = 0.0
+            self._last_ask = 0.0
             self._cancel_price_subscription()
 
     def _remove_symbol(self, sym: str) -> None:
@@ -586,6 +602,8 @@ class OrderEntryPanel(QWidget):
         self._btn_sell_mid.setText(f"Sell {q} @Mid")
         self._btn_buy_bid.setText(f"Buy {q} @Bid")
         self._btn_sell_ask.setText(f"Sell {q} @Ask")
+        self._btn_buy_bid_lmt.setText(f"Buy {q} @Bid Limit")
+        self._btn_sell_ask_lmt.setText(f"Sell {q} @Ask Limit")
 
     # ── Order signal ──────────────────────────────────────────────────────────
 
@@ -602,6 +620,46 @@ class OrderEntryPanel(QWidget):
             "last_price": self._last_price,
         }
         log.info("Order requested: %s", payload)
+        self.order_requested.emit(payload)
+
+    def _emit_bid_ask_lmt_order(self, action: str) -> None:
+        """Emit a BID_LMT or ASK_LMT order using the live bid/ask as the limit price.
+
+        BUY  → uses ``self._last_bid`` (buy at the current bid)
+        SELL → uses ``self._last_ask`` (sell at the current ask)
+        """
+        if not self._active_symbol:
+            return
+
+        if action == "BUY":
+            price = self._last_bid
+            label = "bid"
+        else:
+            price = self._last_ask
+            label = "ask"
+
+        # ── Safety check ──────────────────────────────────────────────────
+        if math.isnan(price) or price <= 0:
+            QMessageBox.warning(
+                self,
+                "Invalid Price",
+                f"Cannot place order: live {label} price is unavailable or invalid.\n"
+                f"Please wait for market data.",
+            )
+            return
+
+        sec = _sec_type_for(self._active_symbol)
+        order_type = "BID_LMT" if action == "BUY" else "ASK_LMT"
+        payload = {
+            "action": action,
+            "type": order_type,
+            "symbol": self._active_symbol,
+            "qty": self._active_qty,
+            "sec_type": sec,
+            "last_price": self._last_price,
+            "limit_price": price,
+        }
+        log.info("Order requested (%s): %s @ %.4f", order_type, self._active_symbol, price)
         self.order_requested.emit(payload)
 
     # ── TWS fallback lookup ─────────────────────────────────────────────────────
@@ -804,6 +862,10 @@ class OrderEntryPanel(QWidget):
             except (RuntimeError, TypeError):
                 pass
             try:
+                self._price_worker.bid_ask_updated.disconnect(self._on_bid_ask_update)
+            except (RuntimeError, TypeError):
+                pass
+            try:
                 self._price_worker.market_data_failed.disconnect(self._on_market_data_failed)
             except (RuntimeError, TypeError):
                 pass
@@ -812,6 +874,7 @@ class OrderEntryPanel(QWidget):
         self._price_received = False
         self._price_worker = worker
         worker.price_updated.connect(self._on_price_update)
+        worker.bid_ask_updated.connect(self._on_bid_ask_update)
         worker.market_data_failed.connect(self._on_market_data_failed)
         worker.request_market_data(self._price_params)
         log.info("OrderEntry: subscribed to price for '%s' (conId=%s) via worker %s",
@@ -836,6 +899,10 @@ class OrderEntryPanel(QWidget):
             except (RuntimeError, TypeError):
                 pass
             try:
+                self._price_worker.bid_ask_updated.disconnect(self._on_bid_ask_update)
+            except (RuntimeError, TypeError):
+                pass
+            try:
                 self._price_worker.market_data_failed.disconnect(self._on_market_data_failed)
             except (RuntimeError, TypeError):
                 pass
@@ -852,6 +919,12 @@ class OrderEntryPanel(QWidget):
             if hasattr(self, "_price_timeout") and self._price_timeout.isActive():
                 self._price_timeout.stop()
             self._lbl_price.setText(f"{price:,.2f}")
+
+    def _on_bid_ask_update(self, sym: str, bid: float, ask: float) -> None:
+        """Receive live bid/ask from the worker thread."""
+        if sym.upper() == (self._active_symbol or "").upper():
+            self._last_bid = bid
+            self._last_ask = ask
 
     def _on_price_timeout(self) -> None:
         """No price arrived within 3 seconds — try the next priority worker."""

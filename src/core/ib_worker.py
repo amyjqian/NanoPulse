@@ -81,6 +81,7 @@ class IBWorkerThread(QThread):
     browse_results = Signal(list)                  # list[dict] from reqContractDetails
     browse_failed = Signal(str)                    # error message
     price_updated = Signal(str, float)             # (symbol, last_price)
+    bid_ask_updated = Signal(str, float, float)    # (symbol, bid, ask)
     market_data_failed = Signal(str)               # (symbol) – e.g. error 10197
     order_status_updated = Signal(dict)            # order status dict → main thread
     portfolio_updated = Signal(list)               # list[dict] – portfolio position batch
@@ -713,12 +714,14 @@ class IBWorkerThread(QThread):
                 price = last
                 source = "last"
 
-            # 2. Fallback: bid/ask midpoint
+            # 2. Extract bid / ask once (reused for midpoint fallback + signal)
+            bid = getattr(ticker, "bid", float('nan'))
+            ask = getattr(ticker, "ask", float('nan'))
+            bid_valid = not math.isnan(bid) and bid > 0 and bid < 1e12
+            ask_valid = not math.isnan(ask) and ask > 0 and ask < 1e12
+
             if math.isnan(price):
-                bid = getattr(ticker, "bid", float('nan'))
-                ask = getattr(ticker, "ask", float('nan'))
-                if (not math.isnan(bid) and not math.isnan(ask)
-                        and bid > 0 and ask > 0 and bid < 1e12 and ask < 1e12):
+                if bid_valid and ask_valid:
                     price = (bid + ask) / 2.0
                     source = "bid/ask mid"
 
@@ -731,6 +734,11 @@ class IBWorkerThread(QThread):
 
             if not math.isnan(price):
                 self.price_updated.emit(sym, price)
+
+            # Always emit bid/ask when both are valid
+            if bid_valid and ask_valid:
+                self.bid_ask_updated.emit(sym, bid, ask)
+
         except Exception:
             log.debug("Worker %s: bad price tick: %s", self._label, ticker)
 
