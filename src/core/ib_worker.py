@@ -548,6 +548,13 @@ class IBWorkerThread(QThread):
             order.tif = tif
             order.orderRef = _generate_order_ref()
 
+            # Stocks: allow extended-hours execution for simple order types.
+            # ADAPTIVE and PEG_PRIM (REL) set their own RTH flags internally;
+            # adding outsideRth causes IB Error 437.
+            sec_type = params.get("sec_type", "")
+            if sec_type == "STK" and order_type in ("MKT", "LMT"):
+                order.outsideRth = True
+
             # ── Place ─────────────────────────────────────────────────────
             trade = self._ib.placeOrder(c, order)
 

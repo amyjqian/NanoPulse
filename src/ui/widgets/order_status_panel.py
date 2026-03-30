@@ -3,8 +3,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtCore import Qt, Signal, QSettings
+from PySide6.QtGui import QColor, QFont, QFontMetrics
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
@@ -52,15 +52,15 @@ COL_TYPE = 3
 COL_QTY = 4
 COL_FILL = 5
 COL_STATUS = 6
-COL_TIME = 7
-COL_LMT = 8
-COL_STP = 9
-COL_TIF = 10
-COL_CANCEL = 11
+COL_CANCEL = 7
+COL_TIME = 8
+COL_LMT = 9
+COL_STP = 10
+COL_TIF = 11
 
 _COLUMNS = [
     "Symbol", "Account", "Action", "Type", "Qty",
-    "Fill", "Status", "Time", "Limit", "Stop", "TIF", "",
+    "Fill", "Status", "", "Time", "Limit", "Stop", "TIF",
 ]
 
 # ── Filter categories ────────────────────────────────────────────────────────
@@ -100,12 +100,12 @@ _TABLE_STYLE = f"""
         border: none;
         border-bottom: 1px solid {BORDER};
         border-right: 1px solid {BORDER};
-        padding: 5px 8px;
+        padding: 2px 2px;
         font-weight: 600;
         font-size: 11px;
     }}
     QTableWidget::item {{
-        padding: 4px 8px;
+        padding: 0px 2px;
     }}
     QScrollBar:vertical {{
         background: {BG_TABLE};
@@ -250,18 +250,67 @@ class OrderStatusPanel(QWidget):
         hdr.setStretchLastSection(True)
         # All columns are user-resizable via drag
         hdr.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        # Sensible default widths
-        _default_widths = {
-            COL_SYMBOL: 80, COL_ACCOUNT: 100, COL_ACTION: 55,
-            COL_TYPE: 55,   COL_QTY: 45,     COL_FILL: 60,
-            COL_STATUS: 80, COL_TIME: 70,    COL_LMT: 60,
-            COL_STP: 60,    COL_TIF: 45,     COL_CANCEL: 64,
-        }
-        for col, w in _default_widths.items():
-            self._table.setColumnWidth(col, w)
+
+        # Restore saved column widths, or fall back to QFontMetrics defaults
+        self._restore_table_state()
 
         self._table.verticalHeader().setDefaultSectionSize(30)
         root.addWidget(self._table, stretch=1)
+
+    # ── Column state persistence (QSettings) ──────────────────────────────────
+
+    _SETTINGS_KEY = "OrderStatusPanel/headerState"
+
+    def _restore_table_state(self) -> None:
+        """Restore saved column widths from QSettings.
+
+        If no saved state exists (first launch), fall back to the default
+        QFontMetrics-based sizing.
+        """
+        settings = QSettings("NanoPulse", "Dashboard")
+        state = settings.value(self._SETTINGS_KEY)
+        if state is not None:
+            if self._table.horizontalHeader().restoreState(state):
+                log.debug("OrderStatus: restored header state from QSettings")
+                return
+        # First launch or corrupt state → use font-metrics defaults
+        self._apply_font_metrics_widths()
+        log.debug("OrderStatus: applied default QFontMetrics column widths")
+
+    def save_table_state(self) -> None:
+        """Persist the current column widths to QSettings."""
+        settings = QSettings("NanoPulse", "Dashboard")
+        state = self._table.horizontalHeader().saveState()
+        settings.setValue(self._SETTINGS_KEY, state)
+        log.debug("OrderStatus: saved header state to QSettings")
+
+    # ── Dynamic column sizing ────────────────────────────────────────────────
+
+    def _apply_font_metrics_widths(self) -> None:
+        """Set each column width using QFontMetrics so sizes adapt to the
+        table's current font rather than relying on hardcoded pixel values.
+        """
+        fm = QFontMetrics(self._table.font())
+        pad = fm.horizontalAdvance("W")  # ~1 char extra breathing room
+
+        col_samples = {
+            COL_SYMBOL:  "WWWWWW",      # 6 letters
+            COL_ACCOUNT: "WWWWWWWWW",   # 9 letters
+            COL_ACTION:  "WWWWW",       # 5 letters
+            COL_TYPE:    "WWWWW",       # 5 letters
+            COL_QTY:     "9999",        # 4 digits
+            COL_FILL:    "999999999",   # 9 digits
+            COL_STATUS:  "WWWWWWWWWW",  # 10 letters
+            COL_CANCEL:  "WWWWWWWW",    # 8 letters
+            COL_TIME:    "00:00:00",    # 8 characters
+            COL_LMT:     "999999999",   # 9 digits
+            COL_STP:     "999999999",   # 9 digits
+            COL_TIF:     "WWWW",        # 4 letters
+        }
+
+        for col, sample in col_samples.items():
+            w = fm.horizontalAdvance(sample) + pad
+            self._table.setColumnWidth(col, w)
 
     # ── Filter bar ────────────────────────────────────────────────────────────
 
@@ -397,13 +446,22 @@ class OrderStatusPanel(QWidget):
 
         is_internal = _is_internal_order(order_ref)
 
-        values = [
-            str(symbol), str(account), str(action), str(order_type),
-            str(quantity), str(fill_price), str(status), str(time_str),
-            str(limit_price), str(stop_price), str(tif),
+        # Explicit (column_index, text) pairs – COL_CANCEL is a widget, not text.
+        cell_values = [
+            (COL_SYMBOL,  str(symbol)),
+            (COL_ACCOUNT, str(account)),
+            (COL_ACTION,  str(action)),
+            (COL_TYPE,    str(order_type)),
+            (COL_QTY,     str(quantity)),
+            (COL_FILL,    str(fill_price)),
+            (COL_STATUS,  str(status)),
+            (COL_TIME,    str(time_str)),
+            (COL_LMT,     str(limit_price)),
+            (COL_STP,     str(stop_price)),
+            (COL_TIF,     str(tif)),
         ]
 
-        for col, text in enumerate(values):
+        for col, text in cell_values:
             item = QTableWidgetItem(text)
             item.setTextAlignment(
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
@@ -441,7 +499,7 @@ class OrderStatusPanel(QWidget):
 
     def _embed_cancel_button(self, row: int, order_id: str, status: str,
                              is_internal: bool = True) -> None:
-        """Place a Cancel button in the last column.
+        """Place a Cancel button in the Cancel column (next to Status).
 
         The button is only visible and enabled for **internal** orders
         (orderRef starts with ``nano_``) that are in an open state.
