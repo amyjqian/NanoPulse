@@ -408,6 +408,7 @@ class FlashTradeView(QWidget):
                 display_account = alias
 
         self._order_status.update_order(order_id, {
+            "order_ref": data.get("order_ref", ""),
             "symbol": data.get("symbol", "–"),
             "account": display_account,
             "action": data.get("action", "–"),

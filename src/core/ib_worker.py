@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import random
+import string
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -30,6 +32,13 @@ def _to_eastern(dt: datetime | None) -> datetime:
         # naive → assume UTC
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(_ET)
+
+
+def _generate_order_ref() -> str:
+    """Generate a custom orderRef: ``nano_{MMDD}_{HHMMSS}_{4 random lowercase letters}``."""
+    now = datetime.now(_ET)
+    tag = "".join(random.choices(string.ascii_lowercase, k=4))
+    return f"nano_{now:%m%d}_{now:%H%M%S}_{tag}"
 
 
 def _parse_ib_time(s: str) -> datetime | None:
@@ -536,6 +545,7 @@ class IBWorkerThread(QThread):
 
             order.account = account
             order.tif = tif
+            order.orderRef = _generate_order_ref()
 
             # ── Place ─────────────────────────────────────────────────────
             trade = self._ib.placeOrder(c, order)
@@ -667,6 +677,7 @@ class IBWorkerThread(QThread):
 
         d = {
             "order_id": order_id,
+            "order_ref": getattr(trade.order, "orderRef", "") or "",
             "symbol": params.get("symbol", ""),
             "account": params.get("account", ""),
             "action": params.get("action", ""),
@@ -992,6 +1003,7 @@ class IBWorkerThread(QThread):
 
             return {
                 "order_id": order_id,
+                "order_ref": getattr(order, "orderRef", "") or "",
                 "symbol": symbol,
                 "account": getattr(order, "account", ""),
                 "action": getattr(order, "action", ""),
