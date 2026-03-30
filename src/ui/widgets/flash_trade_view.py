@@ -491,11 +491,16 @@ class FlashTradeView(QWidget):
         log.info("FlashTrade: refresh triggered for %d worker(s)", count)
 
     def _on_position_refresh_requested(self) -> None:
-        """Refresh button clicked in AccountPositionPanel → ask worker to refresh portfolio."""
+        """Refresh button clicked in AccountPositionPanel.
+
+        1. Re-emit the cached positions immediately (instant UI update).
+        2. Ask IB to re-push account updates so any new changes arrive.
+        """
         for label, worker in self._active_threads.items():
             if worker.isRunning() and worker.is_ib_connected:
+                worker.request_portfolio_snapshot()
                 worker.request_portfolio_refresh()
-                log.info("FlashTrade: portfolio refresh requested for worker %s", label)
+                log.info("FlashTrade: portfolio snapshot + refresh for worker %s", label)
 
     # ── Layout persistence ────────────────────────────────────────────────────
 

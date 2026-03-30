@@ -414,9 +414,8 @@ class AccountPositionPanel(QWidget):
             self._rebuild_timer.start()
 
     def _on_refresh_clicked(self) -> None:
-        """Clear all rows and ask the workers to re-fetch positions from TWS."""
+        """Ask the workers to re-push positions (from cache + IB refresh)."""
         log.info("AcctPos: refresh requested by user")
-        self.clear_positions()
         self.refresh_requested.emit()
 
     def clear_positions(self) -> None:
