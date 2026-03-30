@@ -298,15 +298,27 @@ class IBWorkerThread(QThread):
                     await self._ib.connectAsync(
                         self._host, self._port, clientId=self._client_id,
                     )
-                    self.connection_status_changed.emit(self._label, True)
-                    log.info("Worker %s connected – seeding initial snapshot", self._label)
+                except Exception as exc:
+                    log.warning("Worker %s connect failed: %s", self._label, exc)
+                    self.connection_status_changed.emit(self._label, False)
+                    reconnect_countdown = 5.0
+                    await asyncio.sleep(1)
+                    reconnect_countdown -= 1.0
+                    continue
 
+                # Connection established — update status immediately
+                self.connection_status_changed.emit(self._label, True)
+                log.info("Worker %s connected – seeding initial snapshot", self._label)
+
+                # Post-connect setup: errors here should NOT reset the
+                # connection status — the IB link is alive; only the
+                # setup step failed and will be retried on next cycle.
+                try:
                     # Forward manual TWS orders + surviving orders to this client
                     self._ib.reqAutoOpenOrders(True)
 
                     # Seed the buffer from the snapshot that connectAsync
                     # already fetched during synchronisation.
-                    # Must use the async version to avoid re-entering the loop.
                     for v in await self._ib.accountSummaryAsync():
                         self._buffer[(v.account, v.tag)] = (v.value, v.currency)
                     log.info("Worker %s buffer seeded with %d tag(s)", self._label, len(self._buffer))
@@ -321,14 +333,13 @@ class IBWorkerThread(QThread):
                         self._ib.reqAccountUpdates(acct)
                         log.info("Worker %s subscribed to portfolio for %s", self._label, acct)
 
-                    # Snapshot existing open + completed orders so the
-                    # Order Status table is populated immediately after
-                    # app restart or reconnection.
+                    # Snapshot existing open + completed orders
                     await self._snapshot_existing_orders()
 
                 except Exception as exc:
-                    log.warning("Worker %s connect failed: %s", self._label, exc)
-                    self.connection_status_changed.emit(self._label, False)
+                    log.warning("Worker %s post-connect setup error (connection still alive): %s",
+                                self._label, exc)
+
                 reconnect_countdown = 5.0
 
             await asyncio.sleep(1)

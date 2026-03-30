@@ -674,7 +674,9 @@ class ConnectionsView(QWidget):
         self._active_threads[label] = worker
         worker.start()
 
-        self._set_row_state(row, connected=True)
+        # Show a "Connecting…" state; the real Connected / Disconnected
+        # will arrive via connection_status_changed signal.
+        self._set_row_state(row, connected=False, connecting=True)
         log.info("Started worker for %s (%s:%d cid=%d)", label, host, port, client_id)
 
     def _disconnect_label(self, label: str) -> None:
@@ -736,12 +738,15 @@ class ConnectionsView(QWidget):
 
     # ── Row state (Action + Status) ─────────────────────────────────────────────
 
-    def _set_row_state(self, row: int, *, connected: bool) -> None:
+    def _set_row_state(self, row: int, *, connected: bool, connecting: bool = False) -> None:
         """Update both the Action button and Status cell for *row* in one place."""
         # Action button (inside a container widget)
         btn = self._get_action_button(row)
         if btn is not None:
-            if connected:
+            if connecting:
+                btn.setText("Disconnect")
+                btn.setStyleSheet(_DISCONNECT_SS)
+            elif connected:
                 btn.setText("Disconnect")
                 btn.setStyleSheet(_DISCONNECT_SS)
             else:
@@ -751,7 +756,10 @@ class ConnectionsView(QWidget):
         # Status cell
         status_item = self._cfg_table.item(row, _COL_STATUS)
         if status_item:
-            if connected:
+            if connecting:
+                status_item.setText("Connecting…")
+                status_item.setForeground(QColor("#FFA657"))  # amber
+            elif connected:
                 status_item.setText("Connected")
                 status_item.setForeground(QColor(GREEN))
             else:
