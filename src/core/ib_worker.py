@@ -548,14 +548,35 @@ class IBWorkerThread(QThread):
             order.tif = tif
             order.orderRef = _generate_order_ref()
 
-            # Stocks: allow extended-hours execution for simple order types.
-            # ADAPTIVE and PEG_PRIM (REL) set their own RTH flags internally;
-            # adding outsideRth causes IB Error 437.
+            # Stocks: always allow extended-hours execution.
+            # Setting allowPreOpen = False avoids IB Error 437
+            # ("Order can have only one flag Outside RTH or Allow PreOpen").
             sec_type = params.get("sec_type", "")
-            if sec_type == "STK" and order_type in ("MKT", "LMT"):
+            if sec_type == "STK":
                 order.outsideRth = True
+                order.allowPreOpen = False
 
             # ── Place ─────────────────────────────────────────────────────
+            # Log every parameter sent to ib_async for debugging
+            log.info(
+                "Worker %s: placeOrder params → "
+                "Contract(conId=%s, exchange=%s) | "
+                "Order(action=%s, totalQuantity=%s, orderType=%s, "
+                "lmtPrice=%s, auxPrice=%s, tif=%s, account=%s, "
+                "outsideRth=%s, allowPreOpen=%s, "
+                "algoStrategy=%s, algoParams=%s, orderRef=%s)",
+                self._label,
+                c.conId, c.exchange,
+                order.action, order.totalQuantity, order.orderType,
+                getattr(order, "lmtPrice", "N/A"),
+                getattr(order, "auxPrice", "N/A"),
+                order.tif, order.account,
+                getattr(order, "outsideRth", False),
+                getattr(order, "allowPreOpen", "N/A"),
+                getattr(order, "algoStrategy", ""),
+                getattr(order, "algoParams", []),
+                order.orderRef,
+            )
             trade = self._ib.placeOrder(c, order)
 
             # Use _build_trade_dict for consistent order_id generation.
