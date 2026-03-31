@@ -121,6 +121,11 @@ class IBWorkerThread(QThread):
         # Order tracking: order_id → Trade
         self._trades: dict[str, object] = {}
 
+        # order_ids that have a live per-trade _on_status closure
+        # (placed by _do_place_order in the current session).
+        # Snapshot-registered trades are in _trades but NOT here.
+        self._has_status_handler: set[str] = set()
+
     @property
     def is_ib_connected(self) -> bool:
         """Thread-safe check: is the underlying IB instance connected?"""
@@ -326,6 +331,13 @@ class IBWorkerThread(QThread):
                 # Connection established — update status immediately
                 self.connection_status_changed.emit(self._label, True)
                 log.info("Worker %s connected – seeding initial snapshot", self._label)
+
+                # Old Trade objects and their _on_status closures are invalid
+                # after a disconnect — ib_async clears its internal collection.
+                # Reset tracking so the global handler doesn't skip status
+                # updates for orders restored from the upcoming snapshot.
+                self._trades.clear()
+                self._has_status_handler.clear()
 
                 # Post-connect setup: errors here should NOT reset the
                 # connection status — the IB link is alive; only the
@@ -619,6 +631,7 @@ class IBWorkerThread(QThread):
             # canonical, immutable key.  No migration will ever be needed.
             order_id = f"{self._label}_{order.orderRef}"
             self._trades[order_id] = trade
+            self._has_status_handler.add(order_id)
 
             log.info("Worker %s: placed %s %s %d %s for account %s → %s",
                      self._label, action, order_type, qty,
@@ -643,10 +656,54 @@ class IBWorkerThread(QThread):
             log.exception("Worker %s: place_order failed: %s", self._label, exc)
 
     async def _do_cancel_order(self, order_id: str) -> None:
-        """Cancel an open order by its *order_id*."""
+        """Cancel an open order by its *order_id*.
+
+        Uses a multi-tier fallback strategy so that cancel works even when
+        the order wasn't captured by the initial snapshot (e.g. TWS was
+        still syncing after a restart when the snapshot ran).
+        """
         trade = self._trades.get(order_id)
+
+        # ── Fallback 1: search ib_async's local open-trade cache ──────────
+        # The order may exist in ib_async's collection (delivered via
+        # reqAutoOpenOrders) but not yet in our _trades dict.
+        if trade is None and self._ib is not None and self._ib.isConnected():
+            # Extract orderRef: "L-paper-ib_nano_0331_..." → "nano_0331_..."
+            parts = order_id.split("_", 1)
+            target_ref = parts[1] if len(parts) == 2 else ""
+            if target_ref.startswith("nano_"):
+                for t in self._ib.openTrades():
+                    ref = getattr(t.order, "orderRef", "") or ""
+                    if ref == target_ref:
+                        trade = t
+                        self._trades[order_id] = trade
+                        log.info("Worker %s: found %s via local orderRef lookup",
+                                 self._label, order_id)
+                        break
+
+        # ── Fallback 2: fresh request to TWS ──────────────────────────────
+        # If TWS was still booting when we reconnected, this picks up
+        # orders that have since become available.
+        if trade is None and self._ib is not None and self._ib.isConnected():
+            try:
+                open_trades = await self._ib.reqAllOpenOrdersAsync()
+                parts = order_id.split("_", 1)
+                target_ref = parts[1] if len(parts) == 2 else ""
+                for t in open_trades:
+                    ref = getattr(t.order, "orderRef", "") or ""
+                    if target_ref.startswith("nano_") and ref == target_ref:
+                        trade = t
+                        self._trades[order_id] = trade
+                        log.info("Worker %s: found %s via fresh TWS request",
+                                 self._label, order_id)
+                        break
+            except Exception:
+                log.debug("Worker %s: cancel fallback reqAllOpenOrders failed",
+                          self._label, exc_info=True)
+
         if trade is None:
-            log.warning("Worker %s: cancel_order – unknown order_id %s", self._label, order_id)
+            log.warning("Worker %s: cancel_order – unknown order_id %s",
+                        self._label, order_id)
             return
         try:
             self._ib.cancelOrder(trade.order)
@@ -1127,20 +1184,29 @@ class IBWorkerThread(QThread):
         status change on this IB connection, including orders that were placed
         before a disconnect/reconnect cycle and orders placed manually in TWS.
 
-        For orders placed by *this* client (tracked in ``_trades``), the
-        per-trade ``_on_status`` closure already emits with the correct
-        symbol from the original params — so we skip them here to avoid
-        overwriting with an empty symbol from an unqualified Contract.
+        Only skip orders that have a dedicated per-trade ``_on_status``
+        closure (placed by ``_do_place_order`` in this session).  Orders
+        restored from snapshot do NOT have closures, so we must emit for
+        them here — otherwise cancel/fill updates after reconnect are lost.
         """
         d = self._build_trade_dict(trade)
         if not d:
             return
 
-        # If this trade is already tracked by a per-trade handler, skip.
-        # The per-trade closure has the correct original params (symbol etc).
+        # Only skip if a per-trade _on_status closure is handling this order.
+        # Snapshot-registered trades (in _trades but NOT _has_status_handler)
+        # must be emitted here so cancel/fill status reaches the UI.
         order_id = d["order_id"]
-        if order_id in self._trades:
+        if order_id in self._has_status_handler:
             return
+
+        # Register in _trades so cancel routing works for orders that
+        # arrive after the initial snapshot (e.g. TWS delivers them
+        # late after a restart while ib_async is already connected).
+        if order_id not in self._trades:
+            self._trades[order_id] = trade
+            log.debug("Worker %s: global handler registered %s in _trades",
+                       self._label, order_id)
 
         self.order_status_updated.emit(d)
 
