@@ -627,6 +627,9 @@ class OrderEntryPanel(QWidget):
 
         BUY  → uses ``self._last_bid`` (buy at the current bid)
         SELL → uses ``self._last_ask`` (sell at the current ask)
+
+        Falls back to ``self._last_price`` when bid/ask are unavailable
+        (e.g. overnight hours where SMART doesn't stream quotes).
         """
         if not self._active_symbol:
             return
@@ -637,6 +640,14 @@ class OrderEntryPanel(QWidget):
         else:
             price = self._last_ask
             label = "ask"
+
+        # Fall back to last traded / displayed price when bid/ask are
+        # not available (common during overnight sessions).
+        if math.isnan(price) or price <= 0:
+            price = self._last_price
+            if not math.isnan(price) and price > 0:
+                log.info("OrderEntry: %s price unavailable, falling back to last price %.4f",
+                         label, price)
 
         # ── Safety check ──────────────────────────────────────────────────
         if math.isnan(price) or price <= 0:

@@ -499,6 +499,19 @@ class IBWorkerThread(QThread):
             c = Contract(conId=conid)
             c.exchange = params.get("exchange") or "SMART"
 
+            # Stocks: route to IBEOS (IBKR Overnight ATS) during overnight
+            # session (20:00–03:59 ET), otherwise SMART.
+            sec_type = params.get("sec_type", "")
+            if sec_type == "STK":
+                now_et = datetime.now(_ET)
+                hour = now_et.hour
+                if hour >= 20 or hour < 4:
+                    c.exchange = "IBEOS"
+                    log.info("Worker %s: STK overnight → exchange=IBEOS (ET %02d:%02d)",
+                             self._label, hour, now_et.minute)
+                else:
+                    c.exchange = "SMART"
+
             # ── Build order ───────────────────────────────────────────────
             action = params.get("action", "BUY")
             qty = int(params.get("qty", 1))
@@ -548,13 +561,16 @@ class IBWorkerThread(QThread):
             order.tif = tif
             order.orderRef = _generate_order_ref()
 
-            # Stocks: always allow extended-hours execution.
-            # Setting allowPreOpen = False avoids IB Error 437
-            # ("Order can have only one flag Outside RTH or Allow PreOpen").
-            sec_type = params.get("sec_type", "")
+            # Stocks: configure extended-hours flags based on exchange.
             if sec_type == "STK":
-                order.outsideRth = True
-                order.allowPreOpen = False
+                if c.exchange == "IBEOS":
+                    # IBEOS is an overnight venue — no RTH flags needed.
+                    # advancedErrorOverride bypasses TWS precautionary
+                    # Error 10329 that blocks direct-routed IBEOS orders.
+                    order.advancedErrorOverride = "10329"
+                else:
+                    order.outsideRth = True
+                    order.allowPreOpen = False
 
             # ── Place ─────────────────────────────────────────────────────
             # Log every parameter sent to ib_async for debugging
@@ -564,6 +580,7 @@ class IBWorkerThread(QThread):
                 "Order(action=%s, totalQuantity=%s, orderType=%s, "
                 "lmtPrice=%s, auxPrice=%s, tif=%s, account=%s, "
                 "outsideRth=%s, allowPreOpen=%s, "
+                "advancedErrorOverride=%s, "
                 "algoStrategy=%s, algoParams=%s, orderRef=%s)",
                 self._label,
                 c.conId, c.exchange,
@@ -573,6 +590,7 @@ class IBWorkerThread(QThread):
                 order.tif, order.account,
                 getattr(order, "outsideRth", False),
                 getattr(order, "allowPreOpen", "N/A"),
+                getattr(order, "advancedErrorOverride", ""),
                 getattr(order, "algoStrategy", ""),
                 getattr(order, "algoParams", []),
                 order.orderRef,
