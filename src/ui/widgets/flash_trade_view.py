@@ -153,6 +153,7 @@ class FlashTradeView(QWidget):
 
         # ── Wire order entry → order placement ───────────────────────────────
         self._order_entry.order_requested.connect(self._on_order_requested)
+        self._order_entry.cancel_all_requested.connect(self._on_cancel_all_for_symbol)
 
         # ── Wire order status cancel button → cancel logic ───────────────────
         self._order_status.cancel_requested.connect(self._on_cancel_requested)
@@ -492,6 +493,18 @@ class FlashTradeView(QWidget):
             log.info("FlashTrade: cancel forwarded to worker %s for order %s", label, order_id)
         else:
             log.warning("FlashTrade: worker %s not available for cancel of %s", label, order_id)
+
+    def _on_cancel_all_for_symbol(self, symbol: str) -> None:
+        """Cancel button clicked in OrderEntryPanel → cancel all open orders
+        for *symbol* across every connected worker."""
+        count = 0
+        for label, worker in self._active_threads.items():
+            if worker.isRunning() and worker.is_ib_connected:
+                self._ensure_worker_connected(worker)
+                worker.cancel_all_for_symbol(symbol)
+                count += 1
+        log.info("FlashTrade: cancel_all_for_symbol '%s' → sent to %d worker(s)",
+                 symbol, count)
 
     def _on_refresh_requested(self) -> None:
         """Refresh button clicked → ask every connected worker to re-snapshot."""

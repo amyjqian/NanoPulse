@@ -158,6 +158,10 @@ class OrderEntryPanel(QWidget):
     #    "symbol": str, "qty": int}
     order_requested = Signal(dict)
 
+    # Emitted when user clicks the Cancel button in position management:
+    #   symbol (str) – cancel all open orders for this symbol.
+    cancel_all_requested = Signal(str)
+
     def __init__(self, active_threads: dict | None = None, parent=None):
         super().__init__(parent)
         self._active_threads: dict = active_threads if active_threads is not None else {}
@@ -321,7 +325,9 @@ class OrderEntryPanel(QWidget):
         pm_grid.addWidget(_make_btn("75%", CLR_CLOSE, 30), 1, 0)
         pm_grid.addWidget(_make_btn("Flatten", CLR_FLATTEN, 30), 1, 1)
         pm_grid.addWidget(_make_btn("Reverse", CLR_REVERSE, 30), 2, 0)
-        pm_grid.addWidget(_make_btn("Cancel", CLR_CANCEL, 30), 2, 1)
+        self._btn_cancel = _make_btn("Cancel", CLR_CANCEL, 30)
+        pm_grid.addWidget(self._btn_cancel, 2, 1)
+        self._btn_cancel.clicked.connect(self._on_cancel_all)
 
         pm_w = QWidget()
         pm_w.setStyleSheet("border: none;")
@@ -332,6 +338,14 @@ class OrderEntryPanel(QWidget):
         root.addStretch(1)
 
     # ── Combo / symbol search ─────────────────────────────────────────────────
+
+    def _on_cancel_all(self) -> None:
+        """Cancel button clicked → emit cancel_all_requested for the active symbol."""
+        sym = self._active_symbol
+        if sym:
+            self.cancel_all_requested.emit(sym)
+        else:
+            log.warning("OrderEntryPanel: Cancel clicked but no active symbol")
 
     def _refresh_combo_items(self) -> None:
         """Populate the combo dropdown with saved contracts not already added."""

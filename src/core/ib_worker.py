@@ -237,6 +237,13 @@ class IBWorkerThread(QThread):
         else:
             log.warning("Worker %s: cancel_order but loop not ready", self._label)
 
+    def cancel_all_for_symbol(self, symbol: str) -> None:
+        """Thread-safe: cancel all open orders whose symbol matches *symbol*."""
+        if self._loop is not None and not self._loop.is_closed():
+            asyncio.run_coroutine_threadsafe(self._do_cancel_all_for_symbol(symbol), self._loop)
+        else:
+            log.warning("Worker %s: cancel_all_for_symbol but loop not ready", self._label)
+
     # ── Thread entry-point ────────────────────────────────────────────────────
 
     def run(self) -> None:  # noqa: D401 – Qt override
@@ -490,7 +497,7 @@ class IBWorkerThread(QThread):
         try:
             from ib_async import Contract, MarketOrder, LimitOrder, TagValue
 
-            # ── Build contract from conId only ────────────────────────────
+            # ── Build contract ─────────────────────────────────────────────
             conid = int(params.get("conid", 0))
             if conid <= 0:
                 log.warning("Worker %s: invalid conid for order: %s", self._label, conid)
@@ -498,6 +505,17 @@ class IBWorkerThread(QThread):
 
             c = Contract(conId=conid)
             c.exchange = params.get("exchange") or "SMART"
+            # Populate symbol fields so the Trade object kept by ib_async
+            # retains them across reqAllOpenOrdersAsync() snapshots (ib_async
+            # does NOT overwrite the contract on existing Trade objects).
+            c.symbol = params.get("symbol", "")
+            c.secType = params.get("sec_type", "")
+            c.currency = params.get("currency", "USD")
+            c.localSymbol = params.get("local_symbol", "")
+            if params.get("expiry"):
+                c.lastTradeDateOrContractMonth = params["expiry"]
+            if params.get("multiplier"):
+                c.multiplier = params["multiplier"]
 
             # Stocks: route to IBEOS (IBKR Overnight ATS) during overnight
             # session (20:00–03:59 ET), otherwise SMART.
@@ -597,14 +615,9 @@ class IBWorkerThread(QThread):
             )
             trade = self._ib.placeOrder(c, order)
 
-            # Use _build_trade_dict for consistent order_id generation.
-            # At this point permId may still be 0, so it falls back to orderId.
-            d = self._build_trade_dict(trade)
-            if d:
-                order_id = d["order_id"]
-            else:
-                order_id = f"{self._label}_{trade.order.orderId}"
-
+            # orderRef is already set on the order object — use it as the
+            # canonical, immutable key.  No migration will ever be needed.
+            order_id = f"{self._label}_{order.orderRef}"
             self._trades[order_id] = trade
 
             log.info("Worker %s: placed %s %s %d %s for account %s → %s",
@@ -616,30 +629,13 @@ class IBWorkerThread(QThread):
             self._emit_order_status(trade, order_id, params, status)
 
             # ── Bind trade.statusEvent for live updates ───────────────────
-            # The global orderStatusEvent also catches these, but this
-            # binding carries the original params (with our symbol name).
+            # The key never changes (orderRef-based), so the closure is
+            # trivially simple — no migration, no supersedes.
             frozen_params = dict(params)
-            # Mutable container so the closure can update the tracked key
-            # when migrating from orderId → permId.
-            key_ref = [order_id]
+            frozen_oid = order_id
 
-            def _on_status(t, _kr=key_ref, _p=frozen_params):
-                # Once TWS assigns a permId, re-register under the canonical key
-                new_d = self._build_trade_dict(t)
-                if new_d:
-                    canonical = new_d["order_id"]
-                    old_key = None
-                    if canonical != _kr[0]:
-                        # Migrate from orderId-based key to permId-based key
-                        old_key = _kr[0]
-                        self._trades.pop(old_key, None)
-                        self._trades[canonical] = t
-                        _kr[0] = canonical
-                    self._emit_order_status(t, canonical, _p,
-                                            t.orderStatus.status,
-                                            supersedes=old_key)
-                else:
-                    self._emit_order_status(t, _kr[0], _p, t.orderStatus.status)
+            def _on_status(t, _oid=frozen_oid, _p=frozen_params):
+                self._emit_order_status(t, _oid, _p, t.orderStatus.status)
 
             trade.statusEvent += _on_status
 
@@ -657,6 +653,35 @@ class IBWorkerThread(QThread):
             log.info("Worker %s: cancel requested for order %s", self._label, order_id)
         except Exception as exc:
             log.exception("Worker %s: cancel_order failed: %s", self._label, exc)
+
+    async def _do_cancel_all_for_symbol(self, symbol: str) -> None:
+        """Cancel every open order whose contract symbol matches *symbol*."""
+        if self._ib is None or not self._ib.isConnected():
+            return
+        symbol_upper = symbol.upper()
+        cancelled = 0
+        for oid, trade in list(self._trades.items()):
+            contract = getattr(trade, "contract", None)
+            if contract is None:
+                continue
+            trade_sym = (getattr(contract, "localSymbol", "") or
+                         getattr(contract, "symbol", "")).upper()
+            if trade_sym != symbol_upper:
+                continue
+            # Only cancel if the order is still active
+            status = ""
+            if getattr(trade, "orderStatus", None):
+                status = getattr(trade.orderStatus, "status", "")
+            if status in ("Filled", "Cancelled", "Inactive", "ApiCancelled"):
+                continue
+            try:
+                self._ib.cancelOrder(trade.order)
+                cancelled += 1
+            except Exception as exc:
+                log.warning("Worker %s: cancel_all_for_symbol failed for %s: %s",
+                            self._label, oid, exc)
+        log.info("Worker %s: cancel_all_for_symbol '%s' → cancelled %d order(s)",
+                 self._label, symbol, cancelled)
 
     def _on_trade_status(self, trade, order_id: str, params: dict) -> None:
         """Callback fired by trade.statusEvent – runs in the worker's event loop.
@@ -941,9 +966,13 @@ class IBWorkerThread(QThread):
         Returns ``None`` if the trade has no usable status.
         Shared by ``_on_global_order_status`` and ``_snapshot_existing_orders``.
 
-        Uses ``permId`` as the unique key because ``orderId`` is often 0 for
-        completed orders returned by ``reqCompletedOrdersAsync``.  ``permId``
-        is globally unique and persists across sessions.
+        Key strategy
+        ------------
+        * **Internal (NanoPulse) orders** — ``orderRef`` starts with ``nano_``.
+          The canonical key is ``{label}_{orderRef}``.  This never changes,
+          so there is no orderId → permId migration needed.
+        * **External orders** (TWS / other clients) — keyed by ``permId``
+          (globally unique, survives restarts).  Falls back to ``orderId``.
 
         Parameters
         ----------
@@ -961,11 +990,14 @@ class IBWorkerThread(QThread):
             contract = trade.contract
 
             # ── Unique key ────────────────────────────────────────────────
-            # Prefer permId (globally unique, survives restarts).
-            # Fall back to orderId for orders that haven't received a
-            # permId yet (e.g. PendingSubmit).
+            order_ref = getattr(order, "orderRef", "") or ""
             perm_id = getattr(order, "permId", 0) or getattr(trade.orderStatus, "permId", 0)
-            if perm_id:
+
+            if order_ref.startswith("nano_"):
+                # Internal NanoPulse order — orderRef is the immutable key.
+                # No orderId → permId migration ever needed.
+                order_id = f"{self._label}_{order_ref}"
+            elif perm_id:
                 order_id = f"{self._label}_p{perm_id}"
             else:
                 order_id = f"{self._label}_{order.orderId}"
@@ -1014,6 +1046,21 @@ class IBWorkerThread(QThread):
 
             symbol = (getattr(contract, "localSymbol", "")
                       or getattr(contract, "symbol", ""))
+
+            # Fallback: if symbol is still empty (contract built with conId
+            # only and ib_async didn't update it), resolve from saved config.
+            if not symbol:
+                con_id = getattr(contract, "conId", 0)
+                if con_id:
+                    try:
+                        from src.core import config_manager
+                        for sc in config_manager.load_contracts():
+                            if sc.get("conid") == con_id:
+                                symbol = (sc.get("local_symbol", "")
+                                          or sc.get("symbol", ""))
+                                break
+                    except Exception:
+                        pass
 
             lmt = getattr(order, "lmtPrice", 0)
             stp = getattr(order, "auxPrice", 0)
