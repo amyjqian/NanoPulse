@@ -166,6 +166,10 @@ class OrderEntryPanel(QWidget):
     #   symbol (str) – cancel all open orders then close position for this symbol.
     flatten_requested = Signal(str)
 
+    # Emitted when user clicks the Reverse button:
+    #   symbol (str) – cancel all open orders then flip position for this symbol.
+    reverse_requested = Signal(str)
+
     def __init__(self, active_threads: dict | None = None, parent=None):
         super().__init__(parent)
         self._active_threads: dict = active_threads if active_threads is not None else {}
@@ -338,7 +342,9 @@ class OrderEntryPanel(QWidget):
         self._btn_flatten = _make_btn("Flatten", CLR_FLATTEN, 30)
         pm_grid.addWidget(self._btn_flatten, 1, 1)
         self._btn_flatten.clicked.connect(self._on_flatten)
-        pm_grid.addWidget(_make_btn("Reverse", CLR_REVERSE, 30), 2, 0)
+        self._btn_reverse = _make_btn("Reverse", CLR_REVERSE, 30)
+        pm_grid.addWidget(self._btn_reverse, 2, 0)
+        self._btn_reverse.clicked.connect(self._on_reverse)
         self._btn_cancel = _make_btn("Cancel", CLR_CANCEL, 30)
         pm_grid.addWidget(self._btn_cancel, 2, 1)
         self._btn_cancel.clicked.connect(self._on_cancel_all)
@@ -368,6 +374,14 @@ class OrderEntryPanel(QWidget):
             self.flatten_requested.emit(sym)
         else:
             log.warning("OrderEntryPanel: Flatten clicked but no active symbol")
+
+    def _on_reverse(self) -> None:
+        """Reverse button clicked → emit reverse_requested for the active symbol."""
+        sym = self._active_symbol
+        if sym:
+            self.reverse_requested.emit(sym)
+        else:
+            log.warning("OrderEntryPanel: Reverse clicked but no active symbol")
 
     def _refresh_combo_items(self) -> None:
         """Populate the combo dropdown with saved contracts not already added."""

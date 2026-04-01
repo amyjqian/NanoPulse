@@ -103,6 +103,18 @@ from src.utils.logger import tws_log, order_log
 log = logging.getLogger(__name__)
 
 
+def _symbol_matches(contract, query_upper: str) -> bool:
+    """Return True if *contract*'s symbol or localSymbol matches *query_upper*.
+
+    The user may pass a root symbol (``"MNQ"``) or a localSymbol
+    (``"MNQM6"``).  IB positions/trades always carry *both* fields, so we
+    check both.  *query_upper* must already be upper-cased.
+    """
+    local = (getattr(contract, "localSymbol", "") or "").upper()
+    root = (getattr(contract, "symbol", "") or "").upper()
+    return query_upper in (local, root)
+
+
 class IBWorkerThread(QThread):
     """One thread ↔ one TWS/Gateway connection."""
 
@@ -117,7 +129,8 @@ class IBWorkerThread(QThread):
     order_status_updated = Signal(dict)            # order status dict → main thread
     portfolio_updated = Signal(list)               # list[dict] – portfolio position batch
     bg_price_updated = Signal(str, float, float, float)  # (symbol, last, bid, ask) – background cache
-    flatten_close_needed = Signal(dict)            # {symbol, account, action, qty, sec_type} → UI places the close order
+    flatten_close_needed = Signal(dict)            # {symbol, account, action, qty} → UI places the close order
+    reverse_close_needed = Signal(dict)            # {symbol, account, action, qty} → UI places the reverse order
 
     def __init__(
         self,
@@ -314,6 +327,15 @@ class IBWorkerThread(QThread):
                 self._do_flatten(symbol, account), self._loop)
         else:
             log.warning("Worker %s: flatten but loop not ready", self._label)
+
+    def reverse(self, symbol: str, account: str) -> None:
+        """Thread-safe: cancel all open orders for *symbol*/*account*, then
+        flip the position (long→short or short→long) with a 2× MKT order."""
+        if self._loop is not None and not self._loop.is_closed():
+            asyncio.run_coroutine_threadsafe(
+                self._do_reverse(symbol, account), self._loop)
+        else:
+            log.warning("Worker %s: reverse but loop not ready", self._label)
 
     # ── Background market data (multi-symbol cache) ───────────────────────────
 
@@ -974,9 +996,7 @@ class IBWorkerThread(QThread):
             contract = getattr(trade, "contract", None)
             if contract is None:
                 continue
-            trade_sym = (getattr(contract, "localSymbol", "") or
-                         getattr(contract, "symbol", "")).upper()
-            if trade_sym != symbol_upper:
+            if not _symbol_matches(contract, symbol_upper):
                 continue
             # ── Account filter ────────────────────────────────────────────
             trade_acct = getattr(trade.order, "account", "") or ""
@@ -1044,9 +1064,7 @@ class IBWorkerThread(QThread):
             if getattr(pos, "account", "") != account:
                 continue
             contract = pos.contract
-            pos_sym = (getattr(contract, "localSymbol", "") or
-                       getattr(contract, "symbol", "")).upper()
-            if pos_sym != symbol_upper:
+            if not _symbol_matches(contract, symbol_upper):
                 continue
 
             net_pos = float(getattr(pos, "position", 0))
@@ -1062,6 +1080,65 @@ class IBWorkerThread(QThread):
             # Emit to UI thread — the UI will route through the normal
             # order-placement path (limit cap, RTH, prefs, etc.).
             self.flatten_close_needed.emit({
+                "symbol":  symbol,
+                "account": account,
+                "action":  action,
+                "qty":     qty,
+            })
+
+    async def _do_reverse(self, symbol: str, account: str) -> None:
+        """Cancel all open orders for *symbol*/*account*, then signal the UI
+        to reverse (flip) the position via the normal order-placement path.
+
+        Reverse means: if currently Long 5, send SELL 10 → end up Short 5.
+        If currently Short 3, send BUY 6 → end up Long 3.
+        Qty = 2 × abs(position).  If there is no position, nothing is sent.
+
+        Step 1 delegates to ``_do_cancel_all_for_symbol``.
+        Step 2 reads the current position and emits ``reverse_close_needed``
+        so the UI thread routes the order through the same logic as
+        Buy/Sell @MKT (limit cap, RTH, prefs, etc.).
+        """
+        if self._ib is None or not self._ib.isConnected():
+            return
+
+        symbol_upper = symbol.upper()
+
+        # ── Step 1: cancel open orders ────────────────────────────────────────
+        await self._do_cancel_all_for_symbol(symbol, {account})
+
+        # Brief pause so cancel ACKs arrive before reading positions.
+        await asyncio.sleep(0.1)
+
+        # ── Step 2: read position and signal UI to reverse ────────────────────
+        try:
+            positions = self._ib.positions()
+        except Exception:
+            log.warning("Worker %s: reverse could not read positions", self._label)
+            return
+
+        for pos in positions:
+            if getattr(pos, "account", "") != account:
+                continue
+            contract = pos.contract
+            if not _symbol_matches(contract, symbol_upper):
+                continue
+
+            net_pos = float(getattr(pos, "position", 0))
+            if net_pos == 0:
+                continue
+
+            # Opposite direction, double quantity to flip through zero.
+            action = "SELL" if net_pos > 0 else "BUY"
+            qty = 2 * abs(int(net_pos))
+
+            order_log.info("[%s] ORDER-REVERSE  %s %s %d (pos=%+d) | account=%s",
+                           self._label, action, symbol, qty,
+                           int(net_pos), account)
+
+            # Emit to UI thread — the UI will route through the normal
+            # order-placement path (limit cap, RTH, prefs, etc.).
+            self.reverse_close_needed.emit({
                 "symbol":  symbol,
                 "account": account,
                 "action":  action,
