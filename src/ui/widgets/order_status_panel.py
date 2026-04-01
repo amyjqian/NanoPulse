@@ -81,8 +81,7 @@ _STATUS_CATEGORY: dict[str, str] = {
     "Completed":    _FILTER_COMPLETED,
     "Cancelled":    _FILTER_CANCELLED,
     "Canceled":     _FILTER_CANCELLED,
-    "Inactive":     _FILTER_CANCELLED,
-    "Rejected":     _FILTER_CANCELLED,   # IB error 201 – order rejected by TWS/IB
+    "Inactive":     _FILTER_CANCELLED,   # IB sets rejected orders to Inactive
 }
 
 # ── Table QSS ────────────────────────────────────────────────────────────────
