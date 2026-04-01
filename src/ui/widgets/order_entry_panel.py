@@ -166,10 +166,8 @@ class OrderEntryPanel(QWidget):
         super().__init__(parent)
         self._active_threads: dict = active_threads if active_threads is not None else {}
         self._connected_worker = None  # track worker for TWS lookup
-        self._price_worker = None      # track worker for live price subscription
-        self._price_received = False   # set True when first price tick arrives
-        self._price_retry_workers: list = []
-        self._price_params: dict = {}
+        self._bg_worker = None         # track worker for background price streams
+        self._price_cache: dict[str, tuple[float, float, float]] = {}  # sym → (last, bid, ask)
         self._last_price: float = 0.0  # latest live price for limit-order calculation
         self._last_bid: float = 0.0    # latest live bid price
         self._last_ask: float = 0.0    # latest live ask price
@@ -243,12 +241,22 @@ class OrderEntryPanel(QWidget):
         self._lbl_price.setFont(_PRICE_FONT)
         self._lbl_price.setStyleSheet(f"color: {ACCENT}; border: none;")
 
-        # Right side: symbol + price, right-aligned
-        right_side = QHBoxLayout()
-        right_side.setSpacing(6)
-        right_side.addStretch()
-        right_side.addWidget(self._lbl_symbol)
-        right_side.addWidget(self._lbl_price)
+        self._lbl_bid_ask = QLabel("")
+        self._lbl_bid_ask.setFont(QFont("Menlo, Consolas, monospace", 10))
+        self._lbl_bid_ask.setStyleSheet(f"color: {TEXT_DIM}; border: none;")
+        self._lbl_bid_ask.setAlignment(Qt.AlignmentFlag.AlignRight)
+
+        # Right side: symbol + price row, then bid/ask below
+        sym_price_row = QHBoxLayout()
+        sym_price_row.setSpacing(6)
+        sym_price_row.addStretch()
+        sym_price_row.addWidget(self._lbl_symbol)
+        sym_price_row.addWidget(self._lbl_price)
+
+        right_side = QVBoxLayout()
+        right_side.setSpacing(2)
+        right_side.addLayout(sym_price_row)
+        right_side.addWidget(self._lbl_bid_ask, alignment=Qt.AlignmentFlag.AlignRight)
 
         top_row.addWidget(self._combo, stretch=1)
         top_row.addLayout(right_side, stretch=1)
@@ -436,6 +444,13 @@ class OrderEntryPanel(QWidget):
         if sym not in self._symbols:
             self._symbols.append(sym)
             config_manager.save_order_entry_symbols(self._symbols)
+            # Subscribe new symbol to background stream
+            if (self._bg_worker is not None
+                    and self._bg_worker.isRunning()
+                    and self._bg_worker.is_ib_connected):
+                params = self._build_bg_params_for_symbol(sym)
+                if params:
+                    self._bg_worker.subscribe_background_symbols([params])
         self._active_symbol = sym
         self._combo.setCurrentText("")
         # Restore full list for next search
@@ -517,24 +532,45 @@ class OrderEntryPanel(QWidget):
     def _update_symbol_display(self) -> None:
         if self._active_symbol:
             self._lbl_symbol.setText(self._active_symbol)
-            self._lbl_price.setText("")  # clear until live tick arrives
-            self._last_price = 0.0
-            self._last_bid = 0.0
-            self._last_ask = 0.0
-            self._subscribe_price(self._active_symbol)
+
+            # Instant read from background cache
+            cached = self._price_cache.get(self._active_symbol.upper())
+            if cached:
+                last, bid, ask = cached
+                self._last_price = last
+                self._last_bid = bid
+                self._last_ask = ask
+                if last > 0:
+                    self._lbl_price.setText(f"{last:,.2f}")
+                else:
+                    self._lbl_price.setText("")
+                self._update_bid_ask_display(bid, ask)
+            else:
+                self._lbl_price.setText("")
+                self._lbl_bid_ask.setText("")
+                self._last_price = 0.0
+                self._last_bid = 0.0
+                self._last_ask = 0.0
+
+            # Ensure background subscriptions are active
+            self._ensure_bg_subscriptions()
         else:
             self._lbl_symbol.setText("")
             self._lbl_price.setText("")
+            self._lbl_bid_ask.setText("")
             self._last_price = 0.0
             self._last_bid = 0.0
             self._last_ask = 0.0
-            self._cancel_price_subscription()
 
     def _remove_symbol(self, sym: str) -> None:
         """Right-click removes a symbol button."""
         if sym in self._symbols:
             self._symbols.remove(sym)
             config_manager.save_order_entry_symbols(self._symbols)
+        # Unsubscribe from background stream
+        if self._bg_worker is not None:
+            self._bg_worker.unsubscribe_background_symbol(sym)
+        self._price_cache.pop(sym.upper(), None)
         if self._active_symbol == sym:
             self._active_symbol = self._symbols[0] if self._symbols else None
         self._rebuild_symbol_buttons()
@@ -823,163 +859,147 @@ class OrderEntryPanel(QWidget):
         self._lbl_price.setText(price_str)
 
     def refresh_price_subscription(self) -> None:
-        """Re-subscribe to the active symbol's price if the current worker
-        is no longer valid (e.g. after disconnect/reconnect)."""
-        if not self._active_symbol:
+        """Re-subscribe background streams if the current worker is stale.
+
+        Called from FlashTradeView.showEvent and _wire_all_workers to ensure
+        background market data is always flowing.
+        """
+        if not self._symbols:
             return
-        # Check if current price worker is still alive and connected
-        pw = self._price_worker
+        pw = self._bg_worker
+        if pw is not None and pw.isRunning() and pw.is_ib_connected:
+            # Worker still valid — re-submit in case it reconnected and
+            # lost subscriptions.  The worker skips already-subscribed symbols.
+            params = self._build_bg_params()
+            if params:
+                pw.subscribe_background_symbols(params)
+            return
+        # Worker is gone or disconnected — find a new one
+        log.info("OrderEntry: refreshing background price subscriptions")
+        if self._bg_worker is not None:
+            try:
+                self._bg_worker.bg_price_updated.disconnect(self._on_bg_price_update)
+            except (RuntimeError, TypeError):
+                pass
+            self._bg_worker = None
+        self._subscribe_all_background()
+
+    # ── Background market data cache ──────────────────────────────────────────
+
+    def _subscribe_all_background(self) -> None:
+        """Subscribe to background market data for all symbol chips via the
+        highest-priority connected worker."""
+        workers = self._find_workers_by_priority()
+        if not workers:
+            return
+        worker = workers[0]
+
+        # If already subscribed on this worker, skip
+        if self._bg_worker is worker:
+            return
+
+        # Disconnect from old worker
+        if self._bg_worker is not None:
+            try:
+                self._bg_worker.bg_price_updated.disconnect(self._on_bg_price_update)
+            except (RuntimeError, TypeError):
+                pass
+            self._bg_worker.unsubscribe_all_background()
+            self._bg_worker = None
+
+        # Build params for all symbols
+        params_list = self._build_bg_params()
+        if not params_list:
+            return
+
+        # Connect signal and subscribe
+        self._bg_worker = worker
+        worker.bg_price_updated.connect(self._on_bg_price_update)
+        worker.subscribe_background_symbols(params_list)
+        log.info("OrderEntry: background streams for %d symbol(s) via worker %s",
+                 len(params_list), worker._label)
+
+    def _ensure_bg_subscriptions(self) -> None:
+        """Ensure background subscriptions are active on a valid worker."""
+        pw = self._bg_worker
         if pw is not None and pw.isRunning() and pw.is_ib_connected:
             return  # still good
-        log.info("OrderEntry: refreshing stale price subscription for '%s'",
-                 self._active_symbol)
-        self._subscribe_price(self._active_symbol)
+        self._subscribe_all_background()
 
-    # ── Live price subscription ───────────────────────────────────────────────
+    def _build_bg_params(self) -> list[dict]:
+        """Build market data params for all symbol chips."""
+        params_list = []
+        seen: set[str] = set()
+        for sym in self._symbols:
+            q = sym.upper()
+            if q in seen:
+                continue
+            p = self._build_bg_params_for_symbol(sym)
+            if p:
+                params_list.append(p)
+                seen.add(q)
+        return params_list
 
-    def _subscribe_price(self, sym: str) -> None:
-        """Subscribe to live market data for *sym* via the highest-priority worker."""
-        self._cancel_price_subscription()
-
-        # Look up contract details from saved contracts
+    def _build_bg_params_for_symbol(self, sym: str) -> dict | None:
+        """Build market data params for a single symbol from saved contracts."""
         contracts = config_manager.load_contracts()
-        contract = None
         q = sym.upper()
         for c in contracts:
             if (c.get("symbol", "").upper() == q
                     or c.get("local_symbol", "").upper() == q):
-                contract = c
-                break
-        if contract is None:
-            log.warning("OrderEntry: no saved contract for '%s' – cannot subscribe price", sym)
-            return
+                conid = c.get("conid")
+                if conid:
+                    return {
+                        "conid": int(conid),
+                        "symbol": sym,
+                        "sec_type": c.get("sec_type", ""),
+                        "exchange": c.get("exchange", "SMART"),
+                        "currency": c.get("currency", "USD"),
+                        "local_symbol": c.get("local_symbol", ""),
+                        "expiry": c.get("expiry", ""),
+                        "multiplier": c.get("multiplier", ""),
+                    }
+        return None
 
-        conid = contract.get("conid")
-        if not conid:
-            log.warning("OrderEntry: saved contract for '%s' has no conid", sym)
-            return
+    def _on_bg_price_update(self, sym: str, last: float, bid: float, ask: float) -> None:
+        """Receive a background price tick — update cache and display if active."""
+        self._price_cache[sym.upper()] = (last, bid, ask)
 
-        workers = self._find_workers_by_priority()
-        if not workers:
-            log.warning("OrderEntry: no connected worker for price subscription of '%s'", sym)
-            return
-
-        # Store params and remaining workers for retry on error 10197
-        self._price_params = {
-            "conid": int(conid),
-            "symbol": sym,
-            "sec_type": contract.get("sec_type", ""),
-            "exchange": contract.get("exchange", "SMART"),
-            "currency": contract.get("currency", "USD"),
-            "local_symbol": contract.get("local_symbol", ""),
-            "expiry": contract.get("expiry", ""),
-            "multiplier": contract.get("multiplier", ""),
-        }
-        self._price_retry_workers = workers[1:]  # remaining workers for fallback
-        self._start_price_with_worker(workers[0])
-
-    def _start_price_with_worker(self, worker) -> None:
-        """Wire signals to *worker* and start price subscription."""
-        # Disconnect previous worker if any
-        if self._price_worker is not None:
-            try:
-                self._price_worker.price_updated.disconnect(self._on_price_update)
-            except (RuntimeError, TypeError):
-                pass
-            try:
-                self._price_worker.bid_ask_updated.disconnect(self._on_bid_ask_update)
-            except (RuntimeError, TypeError):
-                pass
-            try:
-                self._price_worker.market_data_failed.disconnect(self._on_market_data_failed)
-            except (RuntimeError, TypeError):
-                pass
-            self._price_worker.cancel_market_data()
-
-        self._price_received = False
-        self._price_worker = worker
-        worker.price_updated.connect(self._on_price_update)
-        worker.bid_ask_updated.connect(self._on_bid_ask_update)
-        worker.market_data_failed.connect(self._on_market_data_failed)
-        worker.request_market_data(self._price_params)
-        log.info("OrderEntry: subscribed to price for '%s' (conId=%s) via worker %s",
-                 self._price_params.get("symbol"), self._price_params.get("conid"),
-                 worker._label)
-
-        # Start a 3-second timeout — if no price arrives, try next worker
-        if not hasattr(self, "_price_timeout"):
-            from PySide6.QtCore import QTimer
-            self._price_timeout = QTimer(self)
-            self._price_timeout.setSingleShot(True)
-            self._price_timeout.timeout.connect(self._on_price_timeout)
-        self._price_timeout.start(3000)
-
-    def _cancel_price_subscription(self) -> None:
-        """Cancel the current market data subscription."""
-        if hasattr(self, "_price_timeout") and self._price_timeout.isActive():
-            self._price_timeout.stop()
-        if self._price_worker is not None:
-            try:
-                self._price_worker.price_updated.disconnect(self._on_price_update)
-            except (RuntimeError, TypeError):
-                pass
-            try:
-                self._price_worker.bid_ask_updated.disconnect(self._on_bid_ask_update)
-            except (RuntimeError, TypeError):
-                pass
-            try:
-                self._price_worker.market_data_failed.disconnect(self._on_market_data_failed)
-            except (RuntimeError, TypeError):
-                pass
-            self._price_worker.cancel_market_data()
-            self._price_worker = None
-        self._price_retry_workers = []
-        self._price_params = {}
-
-    def _on_price_update(self, sym: str, price: float) -> None:
-        """Receive a live price tick from the worker thread."""
         if sym.upper() == (self._active_symbol or "").upper():
-            self._price_received = True
-            self._last_price = price
-            if hasattr(self, "_price_timeout") and self._price_timeout.isActive():
-                self._price_timeout.stop()
-            self._lbl_price.setText(f"{price:,.2f}")
-
-    def _on_bid_ask_update(self, sym: str, bid: float, ask: float) -> None:
-        """Receive live bid/ask from the worker thread."""
-        if sym.upper() == (self._active_symbol or "").upper():
+            self._last_price = last
             self._last_bid = bid
             self._last_ask = ask
+            if last > 0:
+                self._lbl_price.setText(f"{last:,.2f}")
+            self._update_bid_ask_display(bid, ask)
+            self._update_bid_ask_buttons(bid, ask)
 
-    def _on_price_timeout(self) -> None:
-        """No price arrived within 3 seconds — try the next priority worker."""
-        if self._price_received:
-            return  # price already arrived, ignore stale timeout
-        sym = self._price_params.get("symbol", "")
-        log.warning("OrderEntry: no price for '%s' within 3s from worker %s — trying next",
-                    sym, self._price_worker._label if self._price_worker else "?")
-        self._on_market_data_failed(sym)
-
-    def _on_market_data_failed(self, sym: str) -> None:
-        """Market data blocked (e.g. error 10197 or timeout) — try the next priority worker."""
-        if sym.upper() != (self._active_symbol or "").upper():
-            return  # stale signal from a previous symbol
-
-        retry = getattr(self, "_price_retry_workers", [])
-        if retry:
-            next_worker = retry.pop(0)
-            log.info("OrderEntry: market data failed on %s for '%s', "
-                     "retrying with worker %s",
-                     self._price_worker._label if self._price_worker else "?",
-                     sym, next_worker._label)
-            self._start_price_with_worker(next_worker)
+    def _update_bid_ask_display(self, bid: float, ask: float) -> None:
+        """Update the bid/ask label beneath the price."""
+        if bid > 0 and ask > 0:
+            self._lbl_bid_ask.setText(f"B: {bid:,.2f}  ·  A: {ask:,.2f}")
+        elif bid > 0:
+            self._lbl_bid_ask.setText(f"B: {bid:,.2f}")
+        elif ask > 0:
+            self._lbl_bid_ask.setText(f"A: {ask:,.2f}")
         else:
-            log.warning("OrderEntry: market data failed for '%s' – "
-                        "all workers exhausted", sym)
+            self._lbl_bid_ask.setText("")
 
-
-
-
+    def _update_bid_ask_buttons(self, bid: float, ask: float) -> None:
+        """Update the @Bid / @Ask button labels with live prices."""
+        q = self._active_qty
+        if bid > 0:
+            self._btn_buy_bid.setText(f"Buy {q} @Bid {bid:,.2f}")
+            self._btn_buy_bid_lmt.setText(f"Buy {q} @Bid Lmt {bid:,.2f}")
+        else:
+            self._btn_buy_bid.setText(f"Buy {q} @Bid")
+            self._btn_buy_bid_lmt.setText(f"Buy {q} @Bid Limit")
+        if ask > 0:
+            self._btn_sell_ask.setText(f"Sell {q} @Ask {ask:,.2f}")
+            self._btn_sell_ask_lmt.setText(f"Sell {q} @Ask Lmt {ask:,.2f}")
+        else:
+            self._btn_sell_ask.setText(f"Sell {q} @Ask")
+            self._btn_sell_ask_lmt.setText(f"Sell {q} @Ask Limit")
 
 
 

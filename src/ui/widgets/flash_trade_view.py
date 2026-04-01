@@ -169,6 +169,8 @@ class FlashTradeView(QWidget):
         for label, worker in self._active_threads.items():
             if worker.isRunning():
                 self._ensure_worker_connected(worker)
+        # Ensure background price subscriptions are active
+        self._order_entry.refresh_price_subscription()
 
     def _on_order_requested(self, payload: dict) -> None:
         """Handle Buy/Sell button click from OrderEntryPanel.
