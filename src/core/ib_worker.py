@@ -41,6 +41,35 @@ def _generate_order_ref() -> str:
     return f"nano_{now:%m%d}_{now:%H%M%S}_{tag}"
 
 
+def _parse_orderref_time(order_ref: str) -> datetime | None:
+    """Extract the submission timestamp embedded in a NanoPulse orderRef.
+
+    Format: ``nano_{MMDD}_{HHMMSS}_{4-letter tag}``
+    Example: ``nano_0401_103045_abcd`` → 10:30:45 ET on April 1st.
+
+    Uses the current year (edge case: orders placed on Dec 31 viewed on
+    Jan 1 will show the wrong year, acceptable for an intraday blotter).
+    Returns ``None`` if the format does not match.
+    """
+    try:
+        parts = order_ref.split("_")
+        # Expected: ["nano", "MMDD", "HHMMSS", "xxxx"]
+        if len(parts) != 4 or parts[0] != "nano":
+            return None
+        mmdd, hhmmss = parts[1], parts[2]
+        if len(mmdd) != 4 or len(hhmmss) != 6:
+            return None
+        month  = int(mmdd[:2])
+        day    = int(mmdd[2:])
+        hour   = int(hhmmss[:2])
+        minute = int(hhmmss[2:4])
+        second = int(hhmmss[4:])
+        year   = datetime.now(_ET).year
+        return datetime(year, month, day, hour, minute, second, tzinfo=_ET)
+    except Exception:
+        return None
+
+
 def _parse_ib_time(s: str) -> datetime | None:
     """Parse a TWS time string (e.g. ``"20260327-14:30:45"``,
     ``"20260327  14:30:45"``) into an Eastern datetime.
@@ -131,6 +160,26 @@ class IBWorkerThread(QThread):
         # (placed by _do_place_order in the current session).
         # Snapshot-registered trades are in _trades but NOT here.
         self._has_status_handler: set[str] = set()
+
+        # Rejection/error messages keyed by orderRef (nano_...).
+        # NOT cleared on reconnect — survives self._trades.clear() cycles
+        # so rejection reasons persist through reconnect + refresh.
+        self._order_error_messages: dict[str, str] = {}
+
+        # Full order-status dicts for rejected orders, keyed by order_id.
+        # TWS does NOT return rejected (Inactive) orders via reqAllOpenOrders
+        # or reqCompletedOrders after a short time, so we maintain our own
+        # persistent cache and re-emit them on every snapshot/refresh.
+        # NOT cleared on reconnect.
+        self._rejected_order_cache: dict[str, dict] = {}
+
+        # First valid timestamp observed per orderRef (nano_...), ISO format.
+        # Cancelled orders have no completedTime and no fills, so their
+        # timestamp is lost after a reconnect.  This cache lets _build_trade_dict
+        # and _emit_order_status restore the real time on every subsequent
+        # refresh instead of falling back to 00:00:00.
+        # NOT cleared on reconnect.
+        self._order_times: dict[str, str] = {}
 
     @property
     def is_ib_connected(self) -> bool:
@@ -955,9 +1004,16 @@ class IBWorkerThread(QThread):
         timestamp = et_dt.strftime("%H:%M:%S")
         time_sort = et_dt.isoformat()
 
+        # Cache the timestamp keyed by orderRef so _build_trade_dict's step 5
+        # can recover the real time on post-reconnect snapshots.  Live orders
+        # always have a valid time here (fallback is now(), not midnight).
+        order_ref = getattr(trade.order, "orderRef", "") or ""
+        if order_ref and order_ref.startswith("nano_"):
+            self._order_times.setdefault(order_ref, et_dt.isoformat())
+
         d = {
             "order_id": order_id,
-            "order_ref": getattr(trade.order, "orderRef", "") or "",
+            "order_ref": order_ref,
             "symbol": params.get("symbol", ""),
             "account": params.get("account", ""),
             "action": params.get("action", ""),
@@ -970,6 +1026,8 @@ class IBWorkerThread(QThread):
             "status": status,
             "time": timestamp,
             "time_sort": time_sort,
+            # Persisted rejection reason keyed by orderRef — survives reconnect
+            "error_message": self._order_error_messages.get(order_ref, ""),
         }
         if supersedes:
             d["supersedes"] = supersedes
@@ -1293,10 +1351,12 @@ class IBWorkerThread(QThread):
             log.debug("Worker %s: bad portfolio item: %s", self._label, item)
 
     def _on_ib_error(self, reqId, errorCode, errorString, contract) -> None:
-        """Handle IB error events – detect market-data failures like 10197."""
+        """Handle IB error events – detect market-data failures like 10197
+        and order rejections like 201."""
         tws_log.warning("[%s] EVENT     errorEvent → reqId=%s errorCode=%s "
                         "errorString=%s contract=%s",
                         self._label, reqId, errorCode, errorString, contract)
+
         if errorCode == 10197 and self._active_ticker is not None:
             # "No market data during competing live session"
             # The paper account can't get data – signal the UI to try another worker.
@@ -1305,6 +1365,49 @@ class IBWorkerThread(QThread):
                         "signalling fallback", self._label, sym)
             if sym:
                 self.market_data_failed.emit(sym)
+
+        # ── Order rejection / warning errors ──────────────────────────────
+        # 201 = Order rejected, 202 = Order cancelled by IB,
+        # 399 = Order message error
+        if errorCode in (201, 202, 399):
+            # reqId == IB orderId for order errors.
+            # Walk self._trades (still intact at error-fire time, before any
+            # reconnect clears it) to find the matching trade and its orderRef.
+            matched_trade = None
+            order_ref = ""
+            for oid, t in self._trades.items():
+                if getattr(t.order, "orderId", None) == reqId:
+                    matched_trade = t
+                    order_ref = getattr(t.order, "orderRef", "") or ""
+                    break
+
+            if order_ref.startswith("nano_"):
+                # Normalise IB's HTML line breaks to \n so the UI can
+                # word-wrap the tooltip properly. Persisted keyed by orderRef
+                # — survives self._trades.clear() on reconnect.
+                clean_msg = (errorString
+                             .replace("<br />", "\n")
+                             .replace("<br/>", "\n")
+                             .replace("<br>", "\n")
+                             .strip())
+                self._order_error_messages[order_ref] = clean_msg
+
+                order_log.warning("[%s] ORDER-REJECT  orderRef=%s errorCode=%s: %s",
+                                  self._label, order_ref, errorCode, clean_msg)
+                log.warning("Worker %s: order %s rejected (code %s): %s",
+                            self._label, order_ref, errorCode, clean_msg)
+
+                # Immediately push updated status + error message to the UI.
+                # _build_trade_dict reads _order_error_messages so the
+                # error_message field will be populated automatically.
+                if matched_trade:
+                    d = self._build_trade_dict(matched_trade)
+                    if d:
+                        # Cache the full dict so _snapshot_existing_orders can
+                        # re-emit it on refresh — TWS stops returning rejected
+                        # orders from reqAllOpenOrders/reqCompletedOrders quickly.
+                        self._rejected_order_cache[d["order_id"]] = d
+                        self.order_status_updated.emit(d)
 
     # ── Global order listener ─────────────────────────────────────────────────
 
@@ -1446,11 +1549,37 @@ class IBWorkerThread(QThread):
                 if fm_entry and len(fm_entry) >= 3:
                     et_dt = fm_entry[2]  # Eastern datetime stored by snapshot
 
+            # 5. orderRef timestamp — NanoPulse embeds MMDD_HHMMSS in every
+            #    orderRef, so we always know the submission time even for
+            #    cancelled orders that TWS stops returning after a reconnect.
+            #    This is more reliable than _order_times because it requires
+            #    no prior observation of the order in the current session.
+            if et_dt is None and order_ref.startswith("nano_"):
+                et_dt = _parse_orderref_time(order_ref)
+
+            # 6. Persistent timestamp cache — first valid time we ever observed
+            #    for this order.  Cancelled orders have no completedTime and no
+            #    fills, so after a reconnect all four sources above are empty and
+            #    they show 00:00:00.  This cache fixes that.
+            if et_dt is None and order_ref:
+                cached_iso = self._order_times.get(order_ref)
+                if cached_iso:
+                    try:
+                        et_dt = datetime.fromisoformat(cached_iso)
+                    except Exception:
+                        pass
+
             # Fallback: start of today so unknown-time orders sort to bottom.
             if et_dt is None:
                 et_dt = datetime.now(_ET).replace(hour=0, minute=0, second=0, microsecond=0)
             timestamp = et_dt.strftime("%H:%M:%S")
             time_sort = et_dt.isoformat()
+
+            # Persist the first valid (non-midnight) timestamp so future
+            # refreshes/reconnects can recover it via step 5 above.
+            if order_ref and order_ref.startswith("nano_"):
+                if et_dt.hour != 0 or et_dt.minute != 0 or et_dt.second != 0:
+                    self._order_times.setdefault(order_ref, et_dt.isoformat())
 
             return {
                 "order_id": order_id,
@@ -1467,6 +1596,9 @@ class IBWorkerThread(QThread):
                 "status": status,
                 "time": timestamp,
                 "time_sort": time_sort,
+                # Persisted rejection reason keyed by orderRef — survives
+                # reconnect because _order_error_messages is never cleared.
+                "error_message": self._order_error_messages.get(order_ref, ""),
             }
         except Exception:
             log.debug("Worker %s: _build_trade_dict error", self._label, exc_info=True)
@@ -1613,6 +1745,24 @@ class IBWorkerThread(QThread):
         except Exception:
             log.exception("Worker %s: snapshot completed orders error", self._label)
             tws_log.error("[%s] API-ERR   reqCompletedOrdersAsync failed", self._label)
+
+        # 3. Re-emit cached rejected orders that TWS no longer returns.
+        # Rejected (Inactive) orders vanish from both reqAllOpenOrders and
+        # reqCompletedOrders within seconds.  Our cache keeps them visible
+        # across every refresh and reconnect cycle.
+        for oid, cached_d in self._rejected_order_cache.items():
+            if oid not in seen_ids:
+                # Refresh the error_message in case it was somehow updated
+                order_ref = cached_d.get("order_ref", "")
+                if order_ref:
+                    cached_d["error_message"] = self._order_error_messages.get(
+                        order_ref, cached_d.get("error_message", "")
+                    )
+                self.order_status_updated.emit(cached_d)
+                seen_ids.add(oid)
+                emitted += 1
+                order_log.info("[%s] ORDER-SNAPSHOT  %s | status=%s (from rejected cache)",
+                               self._label, oid, cached_d.get("status"))
 
         log.info("Worker %s: order snapshot emitted %d order(s)", self._label, emitted)
         tws_log.info("[%s] API-RESP  _snapshot_existing_orders → total %d order(s) emitted",

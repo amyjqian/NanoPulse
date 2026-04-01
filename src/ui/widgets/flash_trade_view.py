@@ -436,6 +436,7 @@ class FlashTradeView(QWidget):
             "status": status,
             "time": data.get("time", "–"),
             "time_sort": data.get("time_sort", ""),
+            "error_message": data.get("error_message", ""),
         })
 
         # When an order fills, IB *should* fire updatePortfolioEvent but

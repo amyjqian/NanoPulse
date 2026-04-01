@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import textwrap
 from typing import Any
 
 from PySide6.QtCore import Qt, Signal, QSettings
@@ -65,10 +66,11 @@ _COLUMNS = [
 
 # ── Filter categories ────────────────────────────────────────────────────────
 _FILTER_ALL = "All"
+_FILTER_ACTIVE = "Active"       # Open + Completed combined (excludes Cancelled)
 _FILTER_OPEN = "Open"
 _FILTER_CANCELLED = "Cancelled"
 _FILTER_COMPLETED = "Completed"
-_FILTERS = [_FILTER_ALL, _FILTER_OPEN, _FILTER_CANCELLED, _FILTER_COMPLETED]
+_FILTERS = [_FILTER_ALL, _FILTER_ACTIVE, _FILTER_OPEN, _FILTER_COMPLETED, _FILTER_CANCELLED]
 
 # Map raw status strings to our categories
 _STATUS_CATEGORY: dict[str, str] = {
@@ -80,6 +82,7 @@ _STATUS_CATEGORY: dict[str, str] = {
     "Cancelled":    _FILTER_CANCELLED,
     "Canceled":     _FILTER_CANCELLED,
     "Inactive":     _FILTER_CANCELLED,
+    "Rejected":     _FILTER_CANCELLED,   # IB error 201 – order rejected by TWS/IB
 }
 
 # ── Table QSS ────────────────────────────────────────────────────────────────
@@ -357,10 +360,18 @@ class OrderStatusPanel(QWidget):
             status_item = self._table.item(row, COL_STATUS)
             if status_item is None:
                 continue
-            status = status_item.text()
+            # UserRole stores the raw status string when the display text
+            # has been decorated (e.g. "Inactive ⚠"). Fall back to .text().
+            raw_status = status_item.data(Qt.ItemDataRole.UserRole)
+            status = raw_status if isinstance(raw_status, str) else status_item.text()
             category = _STATUS_CATEGORY.get(status, _FILTER_OPEN)
-            visible = (self._active_filter == _FILTER_ALL
-                       or category == self._active_filter)
+            if self._active_filter == _FILTER_ALL:
+                visible = True
+            elif self._active_filter == _FILTER_ACTIVE:
+                # Active = Open + Completed; hides cancelled/rejected noise
+                visible = category in (_FILTER_OPEN, _FILTER_COMPLETED)
+            else:
+                visible = category == self._active_filter
             self._table.setRowHidden(row, not visible)
 
     # ── Public data API ───────────────────────────────────────────────────────
@@ -443,6 +454,7 @@ class OrderStatusPanel(QWidget):
         time_str = data.get("time", dash)
         time_sort = data.get("time_sort", "")
         order_ref = data.get("order_ref", "")
+        error_message = data.get("error_message", "")
 
         is_internal = _is_internal_order(order_ref)
 
@@ -480,6 +492,19 @@ class OrderStatusPanel(QWidget):
             elif col == COL_STATUS:
                 item.setForeground(QColor(self._status_colour(text)))
                 item.setFont(QFont("Helvetica Neue, Arial", 11, QFont.Weight.Bold))
+                if error_message:
+                    # Show ⚠ so the user knows there is more info on hover.
+                    # Store the raw status in UserRole so _apply_row_visibility
+                    # can still look it up in _STATUS_CATEGORY correctly.
+                    item.setData(Qt.ItemDataRole.UserRole, text)
+                    item.setText(f"{text} ⚠")
+                    # Build a word-wrapped HTML tooltip (~60 chars per line)
+                    lines: list[str] = []
+                    for para in error_message.splitlines():
+                        para = para.strip()
+                        if para:
+                            lines.extend(textwrap.wrap(para, width=60))
+                    item.setToolTip("<html>" + "<br>".join(lines) + "</html>")
 
             # External order → muted background on every cell
             if not is_internal:
