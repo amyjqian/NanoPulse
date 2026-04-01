@@ -93,6 +93,8 @@ class AccountsTableModel(QAbstractTableModel):
         self._table_data: list[list[str]] = []
         # (connection_label, account) → row index
         self._row_map: dict[tuple[str, str], int] = {}
+        # Reverse index: account → connection_label  (O(1) cancel routing)
+        self._acct_to_label: dict[str, str] = {}
         # account_number → alias  (persisted in app_config.json)
         self._aliases: dict[str, str] = config_manager.load_aliases()
 
@@ -210,6 +212,7 @@ class AccountsTableModel(QAbstractTableModel):
         self.beginInsertRows(QModelIndex(), row_idx, row_idx)
         self._table_data.append([label, account, acct_type, alias, "", "", "", "", ""])
         self._row_map[(label, account)] = row_idx
+        self._acct_to_label[account] = label  # Update reverse index
         self.endInsertRows()
 
     def remove_rows_by_label(self, label: str) -> None:
@@ -224,10 +227,12 @@ class AccountsTableModel(QAbstractTableModel):
             self.beginRemoveRows(QModelIndex(), idx, idx)
             self._table_data.pop(idx)
             self.endRemoveRows()
-        # Rebuild _row_map after removals
+        # Rebuild _row_map and _acct_to_label after removals
         self._row_map.clear()
+        self._acct_to_label.clear()
         for i, row in enumerate(self._table_data):
             self._row_map[(row[COL_CONNECTION], row[COL_ACCOUNT])] = i
+            self._acct_to_label[row[COL_ACCOUNT]] = row[COL_CONNECTION]
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -244,8 +249,9 @@ class AccountsTableModel(QAbstractTableModel):
         return f"{val:,.2f}"
 
     def connection_for_account(self, account: str) -> str | None:
-        """Return the connection_label that manages *account*, or None."""
-        for (label, acct), _ in self._row_map.items():
-            if acct == account:
-                return label
-        return None
+        """Return the connection_label that manages *account*, or None.
+
+        Uses the O(1) reverse index ``_acct_to_label`` which is kept in
+        sync by ``_insert_row`` and ``remove_rows_by_label``.
+        """
+        return self._acct_to_label.get(account)

@@ -733,9 +733,9 @@ class IBWorkerThread(QThread):
 
             trade = self._ib.placeOrder(c, order)
 
-            # orderRef is already set on the order object — use it as the
-            # canonical, immutable key.  No migration will ever be needed.
-            order_id = f"{self._label}_{order.orderRef}"
+            # Account + orderRef = immutable canonical key.
+            # Account numbers never change; connection labels can be renamed.
+            order_id = f"{account}_{order.orderRef}"
             self._trades[order_id] = trade
             self._has_status_handler.add(order_id)
 
@@ -1270,7 +1270,7 @@ class IBWorkerThread(QThread):
                           float(getattr(item, "marketPrice", 0)),
                           float(getattr(item, "marketValue", 0)),
                           float(getattr(item, "unrealizedPNL", 0)),
-                          float(getattr(item, "realizedPNL", 0)))
+                          float(getattr(item, "realizedPnL", 0)))
             self._portfolio_buffer[(acct, con_id)] = {
                 "label": self._label,
                 "account": acct,
@@ -1285,7 +1285,7 @@ class IBWorkerThread(QThread):
                 "market_price": float(getattr(item, "marketPrice", 0)),
                 "market_value": float(getattr(item, "marketValue", 0)),
                 "unrealized_pnl": float(getattr(item, "unrealizedPNL", 0)),
-                "realized_pnl": float(getattr(item, "realizedPNL", 0)),
+                "realized_pnl": float(getattr(item, "realizedPnL", 0)),
             }
             # Also persist into the long-lived cache for late subscribers
             self._portfolio_cache[(acct, con_id)] = self._portfolio_buffer[(acct, con_id)]
@@ -1317,10 +1317,12 @@ class IBWorkerThread(QThread):
         Key strategy
         ------------
         * **Internal (NanoPulse) orders** — ``orderRef`` starts with ``nano_``.
-          The canonical key is ``{label}_{orderRef}``.  This never changes,
-          so there is no orderId → permId migration needed.
-        * **External orders** (TWS / other clients) — keyed by ``permId``
-          (globally unique, survives restarts).  Falls back to ``orderId``.
+          The canonical key is ``{account}_{orderRef}``.  Account numbers are
+          immutable (assigned by IBKR), so the key survives connection-label
+          renames without any migration.
+        * **External orders** (TWS / other clients) — keyed by
+          ``{account}_p{permId}`` (globally unique, survives restarts).
+          Falls back to ``{account}_{orderId}``.
 
         Parameters
         ----------
@@ -1337,18 +1339,18 @@ class IBWorkerThread(QThread):
             order = trade.order
             contract = trade.contract
 
-            # ── Unique key ────────────────────────────────────────────────
+            # ── Unique key (account-based, survives label renames) ────────
             order_ref = getattr(order, "orderRef", "") or ""
             perm_id = getattr(order, "permId", 0) or getattr(trade.orderStatus, "permId", 0)
+            acct = getattr(order, "account", "") or ""
 
             if order_ref.startswith("nano_"):
-                # Internal NanoPulse order — orderRef is the immutable key.
-                # No orderId → permId migration ever needed.
-                order_id = f"{self._label}_{order_ref}"
+                # Internal NanoPulse order — account + orderRef is immutable.
+                order_id = f"{acct}_{order_ref}"
             elif perm_id:
-                order_id = f"{self._label}_p{perm_id}"
+                order_id = f"{acct}_p{perm_id}"
             else:
-                order_id = f"{self._label}_{order.orderId}"
+                order_id = f"{acct}_{order.orderId}"
 
             # ── Fill price ────────────────────────────────────────────────
             # 1. orderStatus.avgFillPrice (populated for live orders)

@@ -481,14 +481,22 @@ class FlashTradeView(QWidget):
     def _on_cancel_requested(self, order_id: str) -> None:
         """Cancel button clicked in OrderStatusPanel → route to correct worker.
 
-        order_id format: ``{connection_label}_{orderId}``
+        order_id format: ``{account}_{orderRef}``
+        Extract the account prefix, look up the connection label via the
+        accounts model, and forward the cancel to the right worker.
         """
         parts = order_id.split("_", 1)
         if len(parts) < 2:
             log.warning("FlashTrade: malformed order_id for cancel: %s", order_id)
             return
 
-        label = parts[0]
+        account = parts[0]
+        label = self._accounts_model.connection_for_account(account)
+        if not label:
+            log.warning("FlashTrade: no connection found for account %s (order %s)",
+                        account, order_id)
+            return
+
         worker = self._active_threads.get(label)
         if worker and worker.isRunning() and worker.is_ib_connected:
             worker.cancel_order(order_id)
