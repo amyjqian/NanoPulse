@@ -337,6 +337,16 @@ class IBWorkerThread(QThread):
         else:
             log.warning("Worker %s: reverse but loop not ready", self._label)
 
+    def close_pct(self, symbol: str, account: str, pct: int) -> None:
+        """Thread-safe: close *pct* percent (25/50/75) of the position for
+        *symbol*/*account* with an offsetting MKT order.  No open orders are
+        cancelled — only the position is partially closed."""
+        if self._loop is not None and not self._loop.is_closed():
+            asyncio.run_coroutine_threadsafe(
+                self._do_close_pct(symbol, account, pct), self._loop)
+        else:
+            log.warning("Worker %s: close_pct but loop not ready", self._label)
+
     # ── Background market data (multi-symbol cache) ───────────────────────────
 
     def subscribe_background_symbols(self, params_list: list[dict]) -> None:
@@ -1150,6 +1160,61 @@ class IBWorkerThread(QThread):
             # Emit to UI thread — the UI will route through the normal
             # order-placement path (limit cap, RTH, prefs, etc.).
             self.reverse_close_needed.emit({
+                "symbol":  symbol,
+                "account": account,
+                "action":  action,
+                "qty":     qty,
+            })
+
+    async def _do_close_pct(self, symbol: str, account: str, pct: int) -> None:
+        """Close *pct* percent of the current position for *symbol*/*account*.
+
+        No open orders are cancelled — only a partial offsetting MKT order
+        is sent.  Emits ``flatten_close_needed`` (same shape as flatten)
+        so the UI routes it through the normal order-placement path with
+        limit-price caps, RTH routing, etc.
+
+        The close quantity is ``math.ceil(abs(position) * pct / 100)``,
+        rounded up to prioritise reducing risk, but never more than the
+        full position size.  If the result is 0, nothing is sent.
+        """
+        if self._ib is None or not self._ib.isConnected():
+            return
+
+        symbol_upper = symbol.upper()
+
+        try:
+            positions = self._ib.positions()
+        except Exception:
+            log.warning("Worker %s: close_pct could not read positions", self._label)
+            return
+
+        for pos in positions:
+            if getattr(pos, "account", "") != account:
+                continue
+            contract = pos.contract
+            if not _symbol_matches(contract, symbol_upper):
+                continue
+
+            net_pos = float(getattr(pos, "position", 0))
+            if net_pos == 0:
+                continue
+
+            abs_pos = abs(int(net_pos))
+            action = "SELL" if net_pos > 0 else "BUY"
+            # ceil → always round up to prioritise taking profit / reducing risk
+            qty = math.ceil(abs_pos * pct / 100.0)
+            # Safety: never close more than you actually hold
+            qty = min(qty, abs_pos)
+            if qty <= 0:
+                continue
+
+            order_log.info("[%s] ORDER-CLOSE-%d%%  %s %s %d (pos=%+d) | account=%s",
+                           self._label, pct, action, symbol, qty,
+                           int(net_pos), account)
+
+            # Reuse flatten_close_needed — same data shape, same UI handling.
+            self.flatten_close_needed.emit({
                 "symbol":  symbol,
                 "account": account,
                 "action":  action,

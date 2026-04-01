@@ -170,6 +170,10 @@ class OrderEntryPanel(QWidget):
     #   symbol (str) – cancel all open orders then flip position for this symbol.
     reverse_requested = Signal(str)
 
+    # Emitted when user clicks a partial-close button (25% / 50% / 75%):
+    #   (symbol: str, pct: int) – close *pct* percent of the position.
+    close_pct_requested = Signal(str, int)
+
     def __init__(self, active_threads: dict | None = None, parent=None):
         super().__init__(parent)
         self._active_threads: dict = active_threads if active_threads is not None else {}
@@ -336,9 +340,15 @@ class OrderEntryPanel(QWidget):
         pm_grid = QGridLayout()
         pm_grid.setSpacing(4)
         pm_grid.setContentsMargins(0, 0, 0, 0)
-        pm_grid.addWidget(_make_btn("25%", CLR_CLOSE, 30), 0, 0)
-        pm_grid.addWidget(_make_btn("50%", CLR_CLOSE, 30), 0, 1)
-        pm_grid.addWidget(_make_btn("75%", CLR_CLOSE, 30), 1, 0)
+        self._btn_close25 = _make_btn("25%", CLR_CLOSE, 30)
+        self._btn_close50 = _make_btn("50%", CLR_CLOSE, 30)
+        self._btn_close75 = _make_btn("75%", CLR_CLOSE, 30)
+        pm_grid.addWidget(self._btn_close25, 0, 0)
+        pm_grid.addWidget(self._btn_close50, 0, 1)
+        pm_grid.addWidget(self._btn_close75, 1, 0)
+        self._btn_close25.clicked.connect(lambda: self._on_close_pct(25))
+        self._btn_close50.clicked.connect(lambda: self._on_close_pct(50))
+        self._btn_close75.clicked.connect(lambda: self._on_close_pct(75))
         self._btn_flatten = _make_btn("Flatten", CLR_FLATTEN, 30)
         pm_grid.addWidget(self._btn_flatten, 1, 1)
         self._btn_flatten.clicked.connect(self._on_flatten)
@@ -382,6 +392,14 @@ class OrderEntryPanel(QWidget):
             self.reverse_requested.emit(sym)
         else:
             log.warning("OrderEntryPanel: Reverse clicked but no active symbol")
+
+    def _on_close_pct(self, pct: int) -> None:
+        """Partial close button clicked → emit close_pct_requested."""
+        sym = self._active_symbol
+        if sym:
+            self.close_pct_requested.emit(sym, pct)
+        else:
+            log.warning("OrderEntryPanel: Close %d%% clicked but no active symbol", pct)
 
     def _refresh_combo_items(self) -> None:
         """Populate the combo dropdown with saved contracts not already added."""

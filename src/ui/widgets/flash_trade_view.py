@@ -156,6 +156,7 @@ class FlashTradeView(QWidget):
         self._order_entry.cancel_all_requested.connect(self._on_cancel_all_for_symbol)
         self._order_entry.flatten_requested.connect(self._on_flatten_requested)
         self._order_entry.reverse_requested.connect(self._on_reverse_requested)
+        self._order_entry.close_pct_requested.connect(self._on_close_pct_requested)
 
         # ── Wire order status cancel button → cancel logic ───────────────────
         self._order_status.cancel_requested.connect(self._on_cancel_requested)
@@ -691,6 +692,34 @@ class FlashTradeView(QWidget):
                  "account=%s last=%.4f through normal order path",
                  action, qty, symbol, account, last_price)
         self._on_order_requested(payload)
+
+    def _on_close_pct_requested(self, symbol: str, pct: int) -> None:
+        """Partial-close button (25%/50%/75%) clicked → close *pct* percent
+        of the position for *symbol* on every checked account.
+
+        No open orders are cancelled — only a partial offsetting MKT order
+        is sent.  The worker reads the position, computes the quantity, and
+        emits ``flatten_close_needed`` which routes through the normal
+        order-placement path (limit cap, RTH, prefs, etc.).
+        """
+        if not isinstance(self._account_list, AccountListPanel):
+            log.warning("FlashTrade: close_%d%% blocked — AccountListPanel not available", pct)
+            return
+
+        checked: set[str] = set(self._account_list.get_selected_accounts())
+        if not checked:
+            log.warning("FlashTrade: close_%d%% blocked for '%s' — no accounts checked", pct, symbol)
+            return
+
+        count = 0
+        for label, worker in self._active_threads.items():
+            if worker.isRunning() and worker.is_ib_connected:
+                self._ensure_worker_connected(worker)
+                for acct in checked:
+                    worker.close_pct(symbol, acct, pct)
+                count += 1
+        log.info("FlashTrade: close_%d%% '%s' → %d worker(s) accounts=%s",
+                 pct, symbol, count, sorted(checked))
 
     def _on_refresh_requested(self) -> None:
         """Refresh button clicked → ask every connected worker to re-snapshot."""
