@@ -162,6 +162,18 @@ class OrderEntryPanel(QWidget):
     #   symbol (str) – cancel all open orders for this symbol.
     cancel_all_requested = Signal(str)
 
+    # Emitted when user clicks the Flatten button:
+    #   symbol (str) – cancel all open orders then close position for this symbol.
+    flatten_requested = Signal(str)
+
+    # Emitted when user clicks the Reverse button:
+    #   symbol (str) – cancel all open orders then flip position for this symbol.
+    reverse_requested = Signal(str)
+
+    # Emitted when user clicks a partial-close button (25% / 50% / 75%):
+    #   (symbol: str, pct: int) – close *pct* percent of the position.
+    close_pct_requested = Signal(str, int)
+
     def __init__(self, active_threads: dict | None = None, parent=None):
         super().__init__(parent)
         self._active_threads: dict = active_threads if active_threads is not None else {}
@@ -328,11 +340,21 @@ class OrderEntryPanel(QWidget):
         pm_grid = QGridLayout()
         pm_grid.setSpacing(4)
         pm_grid.setContentsMargins(0, 0, 0, 0)
-        pm_grid.addWidget(_make_btn("25%", CLR_CLOSE, 30), 0, 0)
-        pm_grid.addWidget(_make_btn("50%", CLR_CLOSE, 30), 0, 1)
-        pm_grid.addWidget(_make_btn("75%", CLR_CLOSE, 30), 1, 0)
-        pm_grid.addWidget(_make_btn("Flatten", CLR_FLATTEN, 30), 1, 1)
-        pm_grid.addWidget(_make_btn("Reverse", CLR_REVERSE, 30), 2, 0)
+        self._btn_close25 = _make_btn("25%", CLR_CLOSE, 30)
+        self._btn_close50 = _make_btn("50%", CLR_CLOSE, 30)
+        self._btn_close75 = _make_btn("75%", CLR_CLOSE, 30)
+        pm_grid.addWidget(self._btn_close25, 0, 0)
+        pm_grid.addWidget(self._btn_close50, 0, 1)
+        pm_grid.addWidget(self._btn_close75, 1, 0)
+        self._btn_close25.clicked.connect(lambda: self._on_close_pct(25))
+        self._btn_close50.clicked.connect(lambda: self._on_close_pct(50))
+        self._btn_close75.clicked.connect(lambda: self._on_close_pct(75))
+        self._btn_flatten = _make_btn("Flatten", CLR_FLATTEN, 30)
+        pm_grid.addWidget(self._btn_flatten, 1, 1)
+        self._btn_flatten.clicked.connect(self._on_flatten)
+        self._btn_reverse = _make_btn("Reverse", CLR_REVERSE, 30)
+        pm_grid.addWidget(self._btn_reverse, 2, 0)
+        self._btn_reverse.clicked.connect(self._on_reverse)
         self._btn_cancel = _make_btn("Cancel", CLR_CANCEL, 30)
         pm_grid.addWidget(self._btn_cancel, 2, 1)
         self._btn_cancel.clicked.connect(self._on_cancel_all)
@@ -354,6 +376,30 @@ class OrderEntryPanel(QWidget):
             self.cancel_all_requested.emit(sym)
         else:
             log.warning("OrderEntryPanel: Cancel clicked but no active symbol")
+
+    def _on_flatten(self) -> None:
+        """Flatten button clicked → emit flatten_requested for the active symbol."""
+        sym = self._active_symbol
+        if sym:
+            self.flatten_requested.emit(sym)
+        else:
+            log.warning("OrderEntryPanel: Flatten clicked but no active symbol")
+
+    def _on_reverse(self) -> None:
+        """Reverse button clicked → emit reverse_requested for the active symbol."""
+        sym = self._active_symbol
+        if sym:
+            self.reverse_requested.emit(sym)
+        else:
+            log.warning("OrderEntryPanel: Reverse clicked but no active symbol")
+
+    def _on_close_pct(self, pct: int) -> None:
+        """Partial close button clicked → emit close_pct_requested."""
+        sym = self._active_symbol
+        if sym:
+            self.close_pct_requested.emit(sym, pct)
+        else:
+            log.warning("OrderEntryPanel: Close %d%% clicked but no active symbol", pct)
 
     def _refresh_combo_items(self) -> None:
         """Populate the combo dropdown with saved contracts not already added."""
@@ -986,20 +1032,12 @@ class OrderEntryPanel(QWidget):
             self._lbl_bid_ask.setText("")
 
     def _update_bid_ask_buttons(self, bid: float, ask: float) -> None:
-        """Update the @Bid / @Ask button labels with live prices."""
-        q = self._active_qty
-        if bid > 0:
-            self._btn_buy_bid.setText(f"Buy {q} @Bid {bid:,.2f}")
-            self._btn_buy_bid_lmt.setText(f"Buy {q} @Bid Lmt {bid:,.2f}")
-        else:
-            self._btn_buy_bid.setText(f"Buy {q} @Bid")
-            self._btn_buy_bid_lmt.setText(f"Buy {q} @Bid Limit")
-        if ask > 0:
-            self._btn_sell_ask.setText(f"Sell {q} @Ask {ask:,.2f}")
-            self._btn_sell_ask_lmt.setText(f"Sell {q} @Ask Lmt {ask:,.2f}")
-        else:
-            self._btn_sell_ask.setText(f"Sell {q} @Ask")
-            self._btn_sell_ask_lmt.setText(f"Sell {q} @Ask Limit")
+        """Keep @Bid / @Ask button labels in sync with the current quantity.
+
+        Prices are shown in the bid/ask label beneath the main price display,
+        not on the buttons themselves, so the buttons stay concise.
+        """
+        self._refresh_action_labels()
 
 
 

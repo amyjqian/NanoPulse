@@ -154,6 +154,9 @@ class FlashTradeView(QWidget):
         # ── Wire order entry → order placement ───────────────────────────────
         self._order_entry.order_requested.connect(self._on_order_requested)
         self._order_entry.cancel_all_requested.connect(self._on_cancel_all_for_symbol)
+        self._order_entry.flatten_requested.connect(self._on_flatten_requested)
+        self._order_entry.reverse_requested.connect(self._on_reverse_requested)
+        self._order_entry.close_pct_requested.connect(self._on_close_pct_requested)
 
         # ── Wire order status cancel button → cancel logic ───────────────────
         self._order_status.cancel_requested.connect(self._on_cancel_requested)
@@ -180,14 +183,20 @@ class FlashTradeView(QWidget):
         3. For each account, find the correct IBWorkerThread and place the order.
         """
         # ── 1. Validate: get checked accounts ─────────────────────────────
-        if not isinstance(self._account_list, AccountListPanel):
-            log.warning("FlashTrade: AccountListPanel not available – aborting order")
-            return
+        # When called from flatten, the payload carries ``_flatten_account``
+        # so we target only that specific account (not all checked ones).
+        flatten_account = payload.get("_flatten_account")
+        if flatten_account:
+            accounts = [flatten_account]
+        else:
+            if not isinstance(self._account_list, AccountListPanel):
+                log.warning("FlashTrade: AccountListPanel not available – aborting order")
+                return
 
-        accounts = self._account_list.get_selected_accounts()
-        if not accounts:
-            log.warning("FlashTrade: no accounts checked – aborting order")
-            return
+            accounts = self._account_list.get_selected_accounts()
+            if not accounts:
+                log.warning("FlashTrade: no accounts checked – aborting order")
+                return
 
         # ── 2. Look up contract from saved config ─────────────────────────
         symbol = payload.get("symbol", "")
@@ -368,7 +377,8 @@ class FlashTradeView(QWidget):
         return None
 
     def _ensure_worker_connected(self, worker: IBWorkerThread) -> None:
-        """Connect order_status_updated and portfolio_updated signals if not already connected.
+        """Connect order_status_updated, portfolio_updated, and
+        flatten_close_needed signals if not already connected.
 
         If the worker for this label has been replaced (disconnect/reconnect
         cycle), disconnect from the old instance and wire the new one.
@@ -390,13 +400,23 @@ class FlashTradeView(QWidget):
                 prev.portfolio_updated.disconnect(self._on_portfolio_updated)
             except RuntimeError:
                 pass
+            try:
+                prev.flatten_close_needed.disconnect(self._on_flatten_close_needed)
+            except RuntimeError:
+                pass
+            try:
+                prev.reverse_close_needed.disconnect(self._on_reverse_close_needed)
+            except RuntimeError:
+                pass
             log.debug("FlashTrade: unwired stale signals for worker %s", label)
 
         worker.order_status_updated.connect(self._on_order_status_updated)
         worker.portfolio_updated.connect(self._on_portfolio_updated)
+        worker.flatten_close_needed.connect(self._on_flatten_close_needed)
+        worker.reverse_close_needed.connect(self._on_reverse_close_needed)
         self._connected_order_workers[label] = worker
         self._connected_portfolio_workers[label] = worker
-        log.debug("FlashTrade: wired order_status_updated + portfolio_updated for worker %s", label)
+        log.debug("FlashTrade: wired order_status_updated + portfolio_updated + flatten_close_needed for worker %s", label)
 
         # Re-snapshot: the worker's initial snapshot may have fired before
         # this signal was connected.  Ask it to emit all known orders again.
@@ -483,8 +503,9 @@ class FlashTradeView(QWidget):
         """Cancel button clicked in OrderStatusPanel → route to correct worker.
 
         order_id format: ``{account}_{orderRef}``
-        Extract the account prefix, look up the connection label via the
-        accounts model, and forward the cancel to the right worker.
+        The cancel is only forwarded when the order's account has its checkbox
+        checked in the AccountListPanel.  If the AccountListPanel is not
+        available the cancel is blocked entirely (fail-safe).
         """
         parts = order_id.split("_", 1)
         if len(parts) < 2:
@@ -492,6 +513,24 @@ class FlashTradeView(QWidget):
             return
 
         account = parts[0]
+
+        # Always require the account checkbox to be checked.
+        # get_selected_accounts() returns only accounts where is_checked=True,
+        # so an empty set means nothing is checked — cancel is blocked.
+        if not isinstance(self._account_list, AccountListPanel):
+            log.warning("FlashTrade: cancel blocked for order %s — "
+                        "AccountListPanel not available", order_id)
+            return
+
+        checked = set(self._account_list.get_selected_accounts())
+        if account not in checked:
+            log.warning(
+                "FlashTrade: cancel blocked for order %s — account %s "
+                "is not checked (checked: %s)",
+                order_id, account, sorted(checked) or "none",
+            )
+            return
+
         label = self._accounts_model.connection_for_account(account)
         if not label:
             log.warning("FlashTrade: no connection found for account %s (order %s)",
@@ -507,15 +546,180 @@ class FlashTradeView(QWidget):
 
     def _on_cancel_all_for_symbol(self, symbol: str) -> None:
         """Cancel button clicked in OrderEntryPanel → cancel all open orders
-        for *symbol* across every connected worker."""
+        for *symbol* on the checked accounts across every connected worker.
+
+        Only accounts with their checkbox checked in the AccountListPanel are
+        affected.  If no accounts are checked nothing is cancelled.
+        """
+        if not isinstance(self._account_list, AccountListPanel):
+            log.warning("FlashTrade: cancel-all blocked — AccountListPanel not available")
+            return
+
+        checked: set[str] = set(self._account_list.get_selected_accounts())
+        if not checked:
+            log.warning("FlashTrade: cancel-all blocked for '%s' — no accounts checked", symbol)
+            return
+
         count = 0
         for label, worker in self._active_threads.items():
             if worker.isRunning() and worker.is_ib_connected:
                 self._ensure_worker_connected(worker)
-                worker.cancel_all_for_symbol(symbol)
+                worker.cancel_all_for_symbol(symbol, checked)
                 count += 1
-        log.info("FlashTrade: cancel_all_for_symbol '%s' → sent to %d worker(s)",
-                 symbol, count)
+        log.info("FlashTrade: cancel_all_for_symbol '%s' → %d worker(s) "
+                 "accounts=%s", symbol, count, sorted(checked))
+
+    def _on_flatten_requested(self, symbol: str) -> None:
+        """Flatten button clicked → cancel open orders then close position
+        for *symbol* on every checked account across all connected workers.
+
+        Each checked account is flattened individually so the worker can
+        read the per-account position and send the correct offsetting order.
+        """
+        if not isinstance(self._account_list, AccountListPanel):
+            log.warning("FlashTrade: flatten blocked — AccountListPanel not available")
+            return
+
+        checked: set[str] = set(self._account_list.get_selected_accounts())
+        if not checked:
+            log.warning("FlashTrade: flatten blocked for '%s' — no accounts checked", symbol)
+            return
+
+        count = 0
+        for label, worker in self._active_threads.items():
+            if worker.isRunning() and worker.is_ib_connected:
+                self._ensure_worker_connected(worker)
+                for acct in checked:
+                    worker.flatten(symbol, acct)
+                count += 1
+        log.info("FlashTrade: flatten '%s' → %d worker(s) accounts=%s",
+                 symbol, count, sorted(checked))
+
+    def _on_flatten_close_needed(self, data: dict) -> None:
+        """Worker read a non-zero position during flatten → place the closing
+        order through the normal order-placement path so that limit-price cap,
+        RTH routing, and trading preferences are all applied (same as
+        Buy/Sell @MKT button).
+        """
+        symbol = data.get("symbol", "")
+        action = data.get("action", "BUY")
+        qty = data.get("qty", 0)
+        account = data.get("account", "")
+
+        if not symbol or qty <= 0 or not account:
+            log.warning("FlashTrade: flatten_close_needed invalid data: %s", data)
+            return
+
+        # Read current last price from the order entry cache so the limit
+        # cap calculation has a base price (same source as the MKT button).
+        last_price = 0.0
+        cached = self._order_entry._price_cache.get(symbol.upper())
+        if cached:
+            last_price = cached[0]  # (last, bid, ask)
+
+        # Build the same payload that _emit_order("BUY"/"SELL", "MKT")
+        # would produce, then feed it through _on_order_requested which
+        # applies limit cap, RTH, prefs, etc.
+        payload = {
+            "action": action,
+            "type": "MKT",
+            "symbol": symbol,
+            "qty": qty,
+            "last_price": last_price,
+            # Force to a single account — override normal "all checked" logic
+            "_flatten_account": account,
+        }
+        log.info("FlashTrade: flatten close → routing %s %d %s @MKT "
+                 "account=%s last=%.4f through normal order path",
+                 action, qty, symbol, account, last_price)
+        self._on_order_requested(payload)
+
+    def _on_reverse_requested(self, symbol: str) -> None:
+        """Reverse button clicked → cancel open orders then flip position
+        for *symbol* on every checked account across all connected workers.
+        """
+        if not isinstance(self._account_list, AccountListPanel):
+            log.warning("FlashTrade: reverse blocked — AccountListPanel not available")
+            return
+
+        checked: set[str] = set(self._account_list.get_selected_accounts())
+        if not checked:
+            log.warning("FlashTrade: reverse blocked for '%s' — no accounts checked", symbol)
+            return
+
+        count = 0
+        for label, worker in self._active_threads.items():
+            if worker.isRunning() and worker.is_ib_connected:
+                self._ensure_worker_connected(worker)
+                for acct in checked:
+                    worker.reverse(symbol, acct)
+                count += 1
+        log.info("FlashTrade: reverse '%s' → %d worker(s) accounts=%s",
+                 symbol, count, sorted(checked))
+
+    def _on_reverse_close_needed(self, data: dict) -> None:
+        """Worker read a non-zero position during reverse → place the
+        reversing order through the normal order-placement path so that
+        limit-price cap, RTH routing, and trading preferences are all
+        applied (same as Buy/Sell @MKT button).
+        """
+        symbol = data.get("symbol", "")
+        action = data.get("action", "BUY")
+        qty = data.get("qty", 0)
+        account = data.get("account", "")
+
+        if not symbol or qty <= 0 or not account:
+            log.warning("FlashTrade: reverse_close_needed invalid data: %s", data)
+            return
+
+        # Read current last price from the order entry cache so the limit
+        # cap calculation has a base price (same source as the MKT button).
+        last_price = 0.0
+        cached = self._order_entry._price_cache.get(symbol.upper())
+        if cached:
+            last_price = cached[0]  # (last, bid, ask)
+
+        payload = {
+            "action": action,
+            "type": "MKT",
+            "symbol": symbol,
+            "qty": qty,
+            "last_price": last_price,
+            # Force to a single account — override normal "all checked" logic
+            "_flatten_account": account,
+        }
+        log.info("FlashTrade: reverse close → routing %s %d %s @MKT "
+                 "account=%s last=%.4f through normal order path",
+                 action, qty, symbol, account, last_price)
+        self._on_order_requested(payload)
+
+    def _on_close_pct_requested(self, symbol: str, pct: int) -> None:
+        """Partial-close button (25%/50%/75%) clicked → close *pct* percent
+        of the position for *symbol* on every checked account.
+
+        No open orders are cancelled — only a partial offsetting MKT order
+        is sent.  The worker reads the position, computes the quantity, and
+        emits ``flatten_close_needed`` which routes through the normal
+        order-placement path (limit cap, RTH, prefs, etc.).
+        """
+        if not isinstance(self._account_list, AccountListPanel):
+            log.warning("FlashTrade: close_%d%% blocked — AccountListPanel not available", pct)
+            return
+
+        checked: set[str] = set(self._account_list.get_selected_accounts())
+        if not checked:
+            log.warning("FlashTrade: close_%d%% blocked for '%s' — no accounts checked", pct, symbol)
+            return
+
+        count = 0
+        for label, worker in self._active_threads.items():
+            if worker.isRunning() and worker.is_ib_connected:
+                self._ensure_worker_connected(worker)
+                for acct in checked:
+                    worker.close_pct(symbol, acct, pct)
+                count += 1
+        log.info("FlashTrade: close_%d%% '%s' → %d worker(s) accounts=%s",
+                 pct, symbol, count, sorted(checked))
 
     def _on_refresh_requested(self) -> None:
         """Refresh button clicked → ask every connected worker to re-snapshot."""
