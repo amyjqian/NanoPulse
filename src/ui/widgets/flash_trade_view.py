@@ -483,8 +483,9 @@ class FlashTradeView(QWidget):
         """Cancel button clicked in OrderStatusPanel → route to correct worker.
 
         order_id format: ``{account}_{orderRef}``
-        Extract the account prefix, look up the connection label via the
-        accounts model, and forward the cancel to the right worker.
+        The cancel is only forwarded when the order's account has its checkbox
+        checked in the AccountListPanel.  If the AccountListPanel is not
+        available the cancel is blocked entirely (fail-safe).
         """
         parts = order_id.split("_", 1)
         if len(parts) < 2:
@@ -492,6 +493,24 @@ class FlashTradeView(QWidget):
             return
 
         account = parts[0]
+
+        # Always require the account checkbox to be checked.
+        # get_selected_accounts() returns only accounts where is_checked=True,
+        # so an empty set means nothing is checked — cancel is blocked.
+        if not isinstance(self._account_list, AccountListPanel):
+            log.warning("FlashTrade: cancel blocked for order %s — "
+                        "AccountListPanel not available", order_id)
+            return
+
+        checked = set(self._account_list.get_selected_accounts())
+        if account not in checked:
+            log.warning(
+                "FlashTrade: cancel blocked for order %s — account %s "
+                "is not checked (checked: %s)",
+                order_id, account, sorted(checked) or "none",
+            )
+            return
+
         label = self._accounts_model.connection_for_account(account)
         if not label:
             log.warning("FlashTrade: no connection found for account %s (order %s)",
@@ -507,15 +526,28 @@ class FlashTradeView(QWidget):
 
     def _on_cancel_all_for_symbol(self, symbol: str) -> None:
         """Cancel button clicked in OrderEntryPanel → cancel all open orders
-        for *symbol* across every connected worker."""
+        for *symbol* on the checked accounts across every connected worker.
+
+        Only accounts with their checkbox checked in the AccountListPanel are
+        affected.  If no accounts are checked nothing is cancelled.
+        """
+        if not isinstance(self._account_list, AccountListPanel):
+            log.warning("FlashTrade: cancel-all blocked — AccountListPanel not available")
+            return
+
+        checked: set[str] = set(self._account_list.get_selected_accounts())
+        if not checked:
+            log.warning("FlashTrade: cancel-all blocked for '%s' — no accounts checked", symbol)
+            return
+
         count = 0
         for label, worker in self._active_threads.items():
             if worker.isRunning() and worker.is_ib_connected:
                 self._ensure_worker_connected(worker)
-                worker.cancel_all_for_symbol(symbol)
+                worker.cancel_all_for_symbol(symbol, checked)
                 count += 1
-        log.info("FlashTrade: cancel_all_for_symbol '%s' → sent to %d worker(s)",
-                 symbol, count)
+        log.info("FlashTrade: cancel_all_for_symbol '%s' → %d worker(s) "
+                 "accounts=%s", symbol, count, sorted(checked))
 
     def _on_refresh_requested(self) -> None:
         """Refresh button clicked → ask every connected worker to re-snapshot."""

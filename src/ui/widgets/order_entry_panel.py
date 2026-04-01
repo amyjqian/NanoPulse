@@ -986,20 +986,12 @@ class OrderEntryPanel(QWidget):
             self._lbl_bid_ask.setText("")
 
     def _update_bid_ask_buttons(self, bid: float, ask: float) -> None:
-        """Update the @Bid / @Ask button labels with live prices."""
-        q = self._active_qty
-        if bid > 0:
-            self._btn_buy_bid.setText(f"Buy {q} @Bid {bid:,.2f}")
-            self._btn_buy_bid_lmt.setText(f"Buy {q} @Bid Lmt {bid:,.2f}")
-        else:
-            self._btn_buy_bid.setText(f"Buy {q} @Bid")
-            self._btn_buy_bid_lmt.setText(f"Buy {q} @Bid Limit")
-        if ask > 0:
-            self._btn_sell_ask.setText(f"Sell {q} @Ask {ask:,.2f}")
-            self._btn_sell_ask_lmt.setText(f"Sell {q} @Ask Lmt {ask:,.2f}")
-        else:
-            self._btn_sell_ask.setText(f"Sell {q} @Ask")
-            self._btn_sell_ask_lmt.setText(f"Sell {q} @Ask Limit")
+        """Keep @Bid / @Ask button labels in sync with the current quantity.
+
+        Prices are shown in the bid/ask label beneath the main price display,
+        not on the buttons themselves, so the buttons stay concise.
+        """
+        self._refresh_action_labels()
 
 
 

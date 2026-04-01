@@ -297,10 +297,11 @@ class IBWorkerThread(QThread):
         else:
             log.warning("Worker %s: cancel_order but loop not ready", self._label)
 
-    def cancel_all_for_symbol(self, symbol: str) -> None:
-        """Thread-safe: cancel all open orders whose symbol matches *symbol*."""
+    def cancel_all_for_symbol(self, symbol: str, accounts: set[str]) -> None:
+        """Thread-safe: cancel all open orders for *symbol* whose account is in *accounts*."""
         if self._loop is not None and not self._loop.is_closed():
-            asyncio.run_coroutine_threadsafe(self._do_cancel_all_for_symbol(symbol), self._loop)
+            asyncio.run_coroutine_threadsafe(
+                self._do_cancel_all_for_symbol(symbol, accounts), self._loop)
         else:
             log.warning("Worker %s: cancel_all_for_symbol but loop not ready", self._label)
 
@@ -886,6 +887,47 @@ class IBWorkerThread(QThread):
             order_log.warning("[%s] ORDER-CANCEL  FAILED – unknown order_id %s",
                               self._label, order_id)
             return
+
+        # ── Status guard (two-tier) ───────────────────────────────────────────
+        #
+        # The race condition: our local state is a cache updated asynchronously
+        # via orderStatusEvent.  If TWS fills the order while the fill event is
+        # still in transit, we may read "Submitted" and fire a cancel that TWS
+        # will reject with error 202.  Error 202 is handled gracefully in
+        # _on_ib_error (log-only, no tooltip); the fill event arrives moments
+        # later and updates the UI row correctly.  A TWS round-trip
+        # (reqAllOpenOrdersAsync) would eliminate the race but adds 50-200 ms
+        # latency — unacceptable for a fast cancel button.
+        #
+        # Tier 1 — ib_async openTrades() (most authoritative local source):
+        #   ib_async removes a trade from openTrades() the moment it processes
+        #   a terminal status event, so this is the best local signal we have.
+        _open_ids = {getattr(t.order, "orderId", None)
+                     for t in self._ib.openTrades()}
+        _order_ib_id = getattr(trade.order, "orderId", None)
+        if _order_ib_id is not None and _order_ib_id not in _open_ids:
+            _status = (getattr(trade.orderStatus, "status", "?")
+                       if getattr(trade, "orderStatus", None) else "?")
+            log.warning("Worker %s: cancel_order skipped for %s — orderId=%s "
+                        "not in ib.openTrades() (last known status=%s)",
+                        self._label, order_id, _order_ib_id, _status)
+            order_log.warning("[%s] ORDER-CANCEL  SKIPPED – %s not in "
+                              "openTrades() (status=%s)",
+                              self._label, order_id, _status)
+            return
+
+        # Tier 2 — cached trade.orderStatus.status (same race window as tier 1,
+        #   but catches orders whose orderId we couldn't resolve above):
+        _status = (getattr(trade.orderStatus, "status", "")
+                   if getattr(trade, "orderStatus", None) else "")
+        if _status in ("Filled", "Cancelled", "Canceled",
+                       "Inactive", "ApiCancelled", "Completed"):
+            log.warning("Worker %s: cancel_order skipped for %s – "
+                        "status is already '%s'", self._label, order_id, _status)
+            order_log.warning("[%s] ORDER-CANCEL  SKIPPED – %s already '%s'",
+                              self._label, order_id, _status)
+            return
+
         try:
             self._ib.cancelOrder(trade.order)
             log.info("Worker %s: cancel requested for order %s", self._label, order_id)
@@ -903,12 +945,21 @@ class IBWorkerThread(QThread):
             order_log.error("[%s] ORDER-CANCEL  ERROR for %s: %s",
                             self._label, order_id, exc)
 
-    async def _do_cancel_all_for_symbol(self, symbol: str) -> None:
-        """Cancel every open order whose contract symbol matches *symbol*."""
+    async def _do_cancel_all_for_symbol(self, symbol: str,
+                                        accounts: set[str]) -> None:
+        """Cancel every open order for *symbol* whose account is in *accounts*."""
         if self._ib is None or not self._ib.isConnected():
             return
         symbol_upper = symbol.upper()
         cancelled = 0
+
+        # Build the authoritative open-order set once from ib_async's own
+        # tracking.  Same race window as trade.orderStatus.status (both are
+        # local caches), but openTrades() is ib_async's primary source of truth
+        # and is updated immediately when a terminal status event is processed.
+        open_ids: set = {getattr(t.order, "orderId", None)
+                         for t in self._ib.openTrades()}
+
         for oid, trade in list(self._trades.items()):
             contract = getattr(trade, "contract", None)
             if contract is None:
@@ -917,11 +968,19 @@ class IBWorkerThread(QThread):
                          getattr(contract, "symbol", "")).upper()
             if trade_sym != symbol_upper:
                 continue
-            # Only cancel if the order is still active
-            status = ""
-            if getattr(trade, "orderStatus", None):
-                status = getattr(trade.orderStatus, "status", "")
-            if status in ("Filled", "Cancelled", "Inactive", "ApiCancelled"):
+            # ── Account filter ────────────────────────────────────────────
+            trade_acct = getattr(trade.order, "account", "") or ""
+            if trade_acct not in accounts:
+                continue
+            # ── Status guard tier 1: ib_async openTrades() ───────────────
+            ib_id = getattr(trade.order, "orderId", None)
+            if ib_id is not None and ib_id not in open_ids:
+                continue
+            # ── Status guard tier 2: cached orderStatus ───────────────────
+            status = (getattr(trade.orderStatus, "status", "")
+                      if getattr(trade, "orderStatus", None) else "")
+            if status in ("Filled", "Cancelled", "Canceled",
+                          "Inactive", "ApiCancelled", "Completed"):
                 continue
             try:
                 self._ib.cancelOrder(trade.order)
@@ -935,10 +994,12 @@ class IBWorkerThread(QThread):
                             self._label, oid, exc)
                 order_log.error("[%s] ORDER-CANCEL  ERROR for %s (cancel-all %s): %s",
                                 self._label, oid, symbol, exc)
-        log.info("Worker %s: cancel_all_for_symbol '%s' → cancelled %d order(s)",
-                 self._label, symbol, cancelled)
-        order_log.info("[%s] ORDER-CANCEL-ALL  symbol=%s → %d order(s) cancelled",
-                       self._label, symbol, cancelled)
+        log.info("Worker %s: cancel_all_for_symbol '%s' accounts=%s → cancelled %d order(s)",
+                 self._label, symbol,
+                 sorted(accounts) if accounts else "all", cancelled)
+        order_log.info("[%s] ORDER-CANCEL-ALL  symbol=%s accounts=%s → %d order(s) cancelled",
+                       self._label, symbol,
+                       sorted(accounts) if accounts else "all", cancelled)
 
     def _on_trade_status(self, trade, order_id: str, params: dict) -> None:
         """Callback fired by trade.statusEvent – runs in the worker's event loop.
@@ -1366,13 +1427,25 @@ class IBWorkerThread(QThread):
             if sym:
                 self.market_data_failed.emit(sym)
 
-        # ── Order rejection / warning errors ──────────────────────────────
-        # 201 = Order rejected, 202 = Order cancelled by IB,
-        # 399 = Order message error
-        if errorCode in (201, 202, 399):
-            # reqId == IB orderId for order errors.
-            # Walk self._trades (still intact at error-fire time, before any
-            # reconnect clears it) to find the matching trade and its orderRef.
+        # ── Order-related errors ───────────────────────────────────────────
+        #
+        # Error 201 — Order rejected by IB/TWS (e.g. insufficient funds).
+        #   → Persist the reason and surface it as a tooltip on the order row.
+        #
+        # Error 202 — Cancel request rejected by TWS.
+        #   This fires when we call cancelOrder() on an order that TWS has
+        #   already filled or cancelled.  This is a natural race condition:
+        #   our in-memory trade.orderStatus.status is a local cache updated
+        #   asynchronously via orderStatusEvent; TWS may have filled the order
+        #   milliseconds before our cancel arrived.  The order itself is fine —
+        #   do NOT write an error tooltip.  The orderStatusEvent ("Filled") will
+        #   update the row correctly on its own.
+        #
+        # Error 399 — Order message error (e.g. invalid TIF for the exchange).
+        #   → Treat the same as 201.
+
+        if errorCode == 201 or errorCode == 399:
+            # Order was rejected by IB — find the trade and surface the reason.
             matched_trade = None
             order_ref = ""
             for oid, t in self._trades.items():
@@ -1382,9 +1455,6 @@ class IBWorkerThread(QThread):
                     break
 
             if order_ref.startswith("nano_"):
-                # Normalise IB's HTML line breaks to \n so the UI can
-                # word-wrap the tooltip properly. Persisted keyed by orderRef
-                # — survives self._trades.clear() on reconnect.
                 clean_msg = (errorString
                              .replace("<br />", "\n")
                              .replace("<br/>", "\n")
@@ -1397,17 +1467,21 @@ class IBWorkerThread(QThread):
                 log.warning("Worker %s: order %s rejected (code %s): %s",
                             self._label, order_ref, errorCode, clean_msg)
 
-                # Immediately push updated status + error message to the UI.
-                # _build_trade_dict reads _order_error_messages so the
-                # error_message field will be populated automatically.
                 if matched_trade:
                     d = self._build_trade_dict(matched_trade)
                     if d:
-                        # Cache the full dict so _snapshot_existing_orders can
-                        # re-emit it on refresh — TWS stops returning rejected
-                        # orders from reqAllOpenOrders/reqCompletedOrders quickly.
                         self._rejected_order_cache[d["order_id"]] = d
                         self.order_status_updated.emit(d)
+
+        elif errorCode == 202:
+            # Cancel request rejected — log only, no tooltip.
+            # The order's own status event (Filled / Cancelled) will update
+            # the UI row; writing an error here would be misleading.
+            order_log.warning("[%s] ORDER-CANCEL-REJECTED  reqId=%s: %s",
+                              self._label, reqId, errorString)
+            log.warning("Worker %s: cancel rejected for reqId=%s (likely race "
+                        "condition — order already filled/cancelled): %s",
+                        self._label, reqId, errorString)
 
     # ── Global order listener ─────────────────────────────────────────────────
 
