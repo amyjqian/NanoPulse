@@ -744,7 +744,12 @@ class IBWorkerThread(QThread):
             order.tif = tif
             order.orderRef = _generate_order_ref()
 
-            # Stocks: configure extended-hours flags based on exchange.
+            # Stocks: configure extended-hours flags based on exchange and
+            # current time of day (Eastern).
+            #   20:00–03:59  → IBEOS overnight venue, no RTH flags
+            #   04:00–09:29  → pre-market,   outsideRth=True
+            #   09:30–15:59  → regular hours, outsideRth=False
+            #   16:00–19:59  → after-hours,  outsideRth=True
             if sec_type == "STK":
                 if c.exchange == "IBEOS":
                     # IBEOS is an overnight venue — no RTH flags needed.
@@ -752,8 +757,14 @@ class IBWorkerThread(QThread):
                     # Error 10329 that blocks direct-routed IBEOS orders.
                     order.advancedErrorOverride = "10329"
                 else:
-                    order.outsideRth = True
+                    now_et = datetime.now(_ET)
+                    h, m = now_et.hour, now_et.minute
+                    in_rth = (h > 9 or (h == 9 and m >= 30)) and h < 16
+                    order.outsideRth = not in_rth
                     order.allowPreOpen = False
+                    log.info("Worker %s: STK RTH flags → outsideRth=%s "
+                             "(ET %02d:%02d, in_rth=%s)",
+                             self._label, order.outsideRth, h, m, in_rth)
 
             # ── Place ─────────────────────────────────────────────────────
             # Log every parameter sent to ib_async for debugging
