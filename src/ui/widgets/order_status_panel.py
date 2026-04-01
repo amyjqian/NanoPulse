@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import logging
+import textwrap
 from typing import Any
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtCore import Qt, Signal, QSettings
+from PySide6.QtGui import QColor, QFont, QFontMetrics
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
@@ -36,6 +37,7 @@ CLR_FILLED = "#3FB950"
 CLR_CANCELLED = "#8B949E"
 CLR_CANCEL_BTN = "#3A1A1A"
 CLR_CANCEL_BTN_BORDER = "#4A2A2A"
+CLR_EXTERNAL_BG = "#2A2420"          # muted row background for external orders
 
 # ── Fonts ─────────────────────────────────────────────────────────────────────
 _TITLE_FONT = QFont("Helvetica Neue, Arial", 11)
@@ -51,23 +53,24 @@ COL_TYPE = 3
 COL_QTY = 4
 COL_FILL = 5
 COL_STATUS = 6
-COL_TIME = 7
-COL_LMT = 8
-COL_STP = 9
-COL_TIF = 10
-COL_CANCEL = 11
+COL_CANCEL = 7
+COL_TIME = 8
+COL_LMT = 9
+COL_STP = 10
+COL_TIF = 11
 
 _COLUMNS = [
     "Symbol", "Account", "Action", "Type", "Qty",
-    "Fill", "Status", "Time", "Limit", "Stop", "TIF", "",
+    "Fill", "Status", "", "Time", "Limit", "Stop", "TIF",
 ]
 
 # ── Filter categories ────────────────────────────────────────────────────────
 _FILTER_ALL = "All"
+_FILTER_ACTIVE = "Active"       # Open + Completed combined (excludes Cancelled)
 _FILTER_OPEN = "Open"
 _FILTER_CANCELLED = "Cancelled"
 _FILTER_COMPLETED = "Completed"
-_FILTERS = [_FILTER_ALL, _FILTER_OPEN, _FILTER_CANCELLED, _FILTER_COMPLETED]
+_FILTERS = [_FILTER_ALL, _FILTER_ACTIVE, _FILTER_OPEN, _FILTER_COMPLETED, _FILTER_CANCELLED]
 
 # Map raw status strings to our categories
 _STATUS_CATEGORY: dict[str, str] = {
@@ -78,7 +81,7 @@ _STATUS_CATEGORY: dict[str, str] = {
     "Completed":    _FILTER_COMPLETED,
     "Cancelled":    _FILTER_CANCELLED,
     "Canceled":     _FILTER_CANCELLED,
-    "Inactive":     _FILTER_CANCELLED,
+    "Inactive":     _FILTER_CANCELLED,   # IB sets rejected orders to Inactive
 }
 
 # ── Table QSS ────────────────────────────────────────────────────────────────
@@ -99,12 +102,12 @@ _TABLE_STYLE = f"""
         border: none;
         border-bottom: 1px solid {BORDER};
         border-right: 1px solid {BORDER};
-        padding: 5px 8px;
+        padding: 2px 2px;
         font-weight: 600;
         font-size: 11px;
     }}
     QTableWidget::item {{
-        padding: 4px 8px;
+        padding: 0px 2px;
     }}
     QScrollBar:vertical {{
         background: {BG_TABLE};
@@ -128,6 +131,13 @@ _TABLE_STYLE = f"""
         height: 0; width: 0;
     }}
 """
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _is_internal_order(order_ref: str) -> bool:
+    """Return True if the order was placed by NanoPulse (orderRef starts with 'nano_')."""
+    return bool(order_ref) and order_ref.startswith("nano_")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -242,18 +252,67 @@ class OrderStatusPanel(QWidget):
         hdr.setStretchLastSection(True)
         # All columns are user-resizable via drag
         hdr.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        # Sensible default widths
-        _default_widths = {
-            COL_SYMBOL: 80, COL_ACCOUNT: 100, COL_ACTION: 55,
-            COL_TYPE: 55,   COL_QTY: 45,     COL_FILL: 60,
-            COL_STATUS: 80, COL_TIME: 70,    COL_LMT: 60,
-            COL_STP: 60,    COL_TIF: 45,     COL_CANCEL: 64,
-        }
-        for col, w in _default_widths.items():
-            self._table.setColumnWidth(col, w)
+
+        # Restore saved column widths, or fall back to QFontMetrics defaults
+        self._restore_table_state()
 
         self._table.verticalHeader().setDefaultSectionSize(30)
         root.addWidget(self._table, stretch=1)
+
+    # ── Column state persistence (QSettings) ──────────────────────────────────
+
+    _SETTINGS_KEY = "OrderStatusPanel/headerState"
+
+    def _restore_table_state(self) -> None:
+        """Restore saved column widths from QSettings.
+
+        If no saved state exists (first launch), fall back to the default
+        QFontMetrics-based sizing.
+        """
+        settings = QSettings("NanoPulse", "Dashboard")
+        state = settings.value(self._SETTINGS_KEY)
+        if state is not None:
+            if self._table.horizontalHeader().restoreState(state):
+                log.debug("OrderStatus: restored header state from QSettings")
+                return
+        # First launch or corrupt state → use font-metrics defaults
+        self._apply_font_metrics_widths()
+        log.debug("OrderStatus: applied default QFontMetrics column widths")
+
+    def save_table_state(self) -> None:
+        """Persist the current column widths to QSettings."""
+        settings = QSettings("NanoPulse", "Dashboard")
+        state = self._table.horizontalHeader().saveState()
+        settings.setValue(self._SETTINGS_KEY, state)
+        log.debug("OrderStatus: saved header state to QSettings")
+
+    # ── Dynamic column sizing ────────────────────────────────────────────────
+
+    def _apply_font_metrics_widths(self) -> None:
+        """Set each column width using QFontMetrics so sizes adapt to the
+        table's current font rather than relying on hardcoded pixel values.
+        """
+        fm = QFontMetrics(self._table.font())
+        pad = fm.horizontalAdvance("W")  # ~1 char extra breathing room
+
+        col_samples = {
+            COL_SYMBOL:  "WWWWWW",      # 6 letters
+            COL_ACCOUNT: "WWWWWWWWW",   # 9 letters
+            COL_ACTION:  "WWWWW",       # 5 letters
+            COL_TYPE:    "WWWWW",       # 5 letters
+            COL_QTY:     "9999",        # 4 digits
+            COL_FILL:    "999999999",   # 9 digits
+            COL_STATUS:  "WWWWWWWWWW",  # 10 letters
+            COL_CANCEL:  "WWWWWWWW",    # 8 letters
+            COL_TIME:    "00:00:00",    # 8 characters
+            COL_LMT:     "999999999",   # 9 digits
+            COL_STP:     "999999999",   # 9 digits
+            COL_TIF:     "WWWW",        # 4 letters
+        }
+
+        for col, sample in col_samples.items():
+            w = fm.horizontalAdvance(sample) + pad
+            self._table.setColumnWidth(col, w)
 
     # ── Filter bar ────────────────────────────────────────────────────────────
 
@@ -300,10 +359,18 @@ class OrderStatusPanel(QWidget):
             status_item = self._table.item(row, COL_STATUS)
             if status_item is None:
                 continue
-            status = status_item.text()
+            # UserRole stores the raw status string when the display text
+            # has been decorated (e.g. "Inactive ⚠"). Fall back to .text().
+            raw_status = status_item.data(Qt.ItemDataRole.UserRole)
+            status = raw_status if isinstance(raw_status, str) else status_item.text()
             category = _STATUS_CATEGORY.get(status, _FILTER_OPEN)
-            visible = (self._active_filter == _FILTER_ALL
-                       or category == self._active_filter)
+            if self._active_filter == _FILTER_ALL:
+                visible = True
+            elif self._active_filter == _FILTER_ACTIVE:
+                # Active = Open + Completed; hides cancelled/rejected noise
+                visible = category in (_FILTER_OPEN, _FILTER_COMPLETED)
+            else:
+                visible = category == self._active_filter
             self._table.setRowHidden(row, not visible)
 
     # ── Public data API ───────────────────────────────────────────────────────
@@ -385,14 +452,27 @@ class OrderStatusPanel(QWidget):
         status = data.get("status", "Open")
         time_str = data.get("time", dash)
         time_sort = data.get("time_sort", "")
+        order_ref = data.get("order_ref", "")
+        error_message = data.get("error_message", "")
 
-        values = [
-            str(symbol), str(account), str(action), str(order_type),
-            str(quantity), str(fill_price), str(status), str(time_str),
-            str(limit_price), str(stop_price), str(tif),
+        is_internal = _is_internal_order(order_ref)
+
+        # Explicit (column_index, text) pairs – COL_CANCEL is a widget, not text.
+        cell_values = [
+            (COL_SYMBOL,  str(symbol)),
+            (COL_ACCOUNT, str(account)),
+            (COL_ACTION,  str(action)),
+            (COL_TYPE,    str(order_type)),
+            (COL_QTY,     str(quantity)),
+            (COL_FILL,    str(fill_price)),
+            (COL_STATUS,  str(status)),
+            (COL_TIME,    str(time_str)),
+            (COL_LMT,     str(limit_price)),
+            (COL_STP,     str(stop_price)),
+            (COL_TIF,     str(tif)),
         ]
 
-        for col, text in enumerate(values):
+        for col, text in cell_values:
             item = QTableWidgetItem(text)
             item.setTextAlignment(
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
@@ -411,11 +491,28 @@ class OrderStatusPanel(QWidget):
             elif col == COL_STATUS:
                 item.setForeground(QColor(self._status_colour(text)))
                 item.setFont(QFont("Helvetica Neue, Arial", 11, QFont.Weight.Bold))
+                if error_message:
+                    # Show ⚠ so the user knows there is more info on hover.
+                    # Store the raw status in UserRole so _apply_row_visibility
+                    # can still look it up in _STATUS_CATEGORY correctly.
+                    item.setData(Qt.ItemDataRole.UserRole, text)
+                    item.setText(f"{text} ⚠")
+                    # Build a word-wrapped HTML tooltip (~60 chars per line)
+                    lines: list[str] = []
+                    for para in error_message.splitlines():
+                        para = para.strip()
+                        if para:
+                            lines.extend(textwrap.wrap(para, width=60))
+                    item.setToolTip("<html>" + "<br>".join(lines) + "</html>")
+
+            # External order → muted background on every cell
+            if not is_internal:
+                item.setBackground(QColor(CLR_EXTERNAL_BG))
 
             self._table.setItem(row, col, item)
 
-        # Cancel button – visible only when status is "open"
-        self._embed_cancel_button(row, order_id, status)
+        # Cancel button – only for internal open orders
+        self._embed_cancel_button(row, order_id, status, is_internal)
 
     def _update_existing_row(self, order_id: str, data: dict[str, Any]) -> None:
         """Overwrite cell contents for an already-existing order row."""
@@ -424,10 +521,16 @@ class OrderStatusPanel(QWidget):
         self._apply_row_visibility()
         log.debug("OrderStatus: updated order %s at row %d", order_id, row)
 
-    def _embed_cancel_button(self, row: int, order_id: str, status: str) -> None:
-        """Place a Cancel button in the last column (only active for open orders)."""
+    def _embed_cancel_button(self, row: int, order_id: str, status: str,
+                             is_internal: bool = True) -> None:
+        """Place a Cancel button in the Cancel column (next to Status).
+
+        The button is only visible and enabled for **internal** orders
+        (orderRef starts with ``nano_``) that are in an open state.
+        External orders never get a Cancel button.
+        """
         category = _STATUS_CATEGORY.get(status, _FILTER_OPEN)
-        if category == _FILTER_OPEN:
+        if is_internal and category == _FILTER_OPEN:
             btn = QPushButton("Cancel")
             btn.setFixedHeight(24)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -452,9 +555,11 @@ class OrderStatusPanel(QWidget):
             btn.clicked.connect(lambda _, oid=order_id: self._on_cancel_clicked(oid))
             self._table.setCellWidget(row, COL_CANCEL, btn)
         else:
-            # Remove any existing button for non-open statuses
+            # Remove any existing button for non-open or external orders
             self._table.removeCellWidget(row, COL_CANCEL)
             placeholder = QTableWidgetItem("")
+            if not is_internal:
+                placeholder.setBackground(QColor(CLR_EXTERNAL_BG))
             self._table.setItem(row, COL_CANCEL, placeholder)
 
     def _on_cancel_clicked(self, order_id: str) -> None:

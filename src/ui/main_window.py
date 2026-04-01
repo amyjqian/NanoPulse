@@ -178,6 +178,10 @@ class MainWindow(QWidget):
     def closeEvent(self, event) -> None:
         """Save geometry and stop all worker threads before closing."""
         self._save_geometry()
+
+        # Persist order-status column widths
+        self._flash_trade._order_status.save_table_state()
+
         log.info("closeEvent – shutting down %d worker(s)", len(self.active_threads))
         
         # Signal all workers to stop

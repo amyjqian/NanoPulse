@@ -153,6 +153,7 @@ class FlashTradeView(QWidget):
 
         # ── Wire order entry → order placement ───────────────────────────────
         self._order_entry.order_requested.connect(self._on_order_requested)
+        self._order_entry.cancel_all_requested.connect(self._on_cancel_all_for_symbol)
 
         # ── Wire order status cancel button → cancel logic ───────────────────
         self._order_status.cancel_requested.connect(self._on_cancel_requested)
@@ -168,6 +169,8 @@ class FlashTradeView(QWidget):
         for label, worker in self._active_threads.items():
             if worker.isRunning():
                 self._ensure_worker_connected(worker)
+        # Ensure background price subscriptions are active
+        self._order_entry.refresh_price_subscription()
 
     def _on_order_requested(self, payload: dict) -> None:
         """Handle Buy/Sell button click from OrderEntryPanel.
@@ -290,6 +293,18 @@ class FlashTradeView(QWidget):
                          limit_price, peg_offset)
                 order_type = "PEG_PRIM"
 
+        elif order_type in ("BID_LMT", "ASK_LMT"):
+            # Buy @Bid Limit / Sell @Ask Limit — plain LimitOrder at the
+            # exact bid or ask price provided by the order entry panel.
+            limit_price = float(payload.get("limit_price", 0))
+            if limit_price <= 0:
+                log.warning("FlashTrade: %s %s but limit_price=%.4f – aborting",
+                            action, order_type, limit_price)
+                return
+            log.info("FlashTrade: %s %s %s → LMT @ %.4f",
+                     action, order_type, symbol, limit_price)
+            order_type = "LMT"
+
         elif order_type == "MKT" and last_price > 0:
             # MKT → cap with a limit if Limit Cap Offset is set
             cap_value = float(prefs.get("limit_cap", 0))
@@ -408,6 +423,7 @@ class FlashTradeView(QWidget):
                 display_account = alias
 
         self._order_status.update_order(order_id, {
+            "order_ref": data.get("order_ref", ""),
             "symbol": data.get("symbol", "–"),
             "account": display_account,
             "action": data.get("action", "–"),
@@ -420,6 +436,7 @@ class FlashTradeView(QWidget):
             "status": status,
             "time": data.get("time", "–"),
             "time_sort": data.get("time_sort", ""),
+            "error_message": data.get("error_message", ""),
         })
 
         # When an order fills, IB *should* fire updatePortfolioEvent but
@@ -465,20 +482,40 @@ class FlashTradeView(QWidget):
     def _on_cancel_requested(self, order_id: str) -> None:
         """Cancel button clicked in OrderStatusPanel → route to correct worker.
 
-        order_id format: ``{connection_label}_{orderId}``
+        order_id format: ``{account}_{orderRef}``
+        Extract the account prefix, look up the connection label via the
+        accounts model, and forward the cancel to the right worker.
         """
         parts = order_id.split("_", 1)
         if len(parts) < 2:
             log.warning("FlashTrade: malformed order_id for cancel: %s", order_id)
             return
 
-        label = parts[0]
+        account = parts[0]
+        label = self._accounts_model.connection_for_account(account)
+        if not label:
+            log.warning("FlashTrade: no connection found for account %s (order %s)",
+                        account, order_id)
+            return
+
         worker = self._active_threads.get(label)
         if worker and worker.isRunning() and worker.is_ib_connected:
             worker.cancel_order(order_id)
             log.info("FlashTrade: cancel forwarded to worker %s for order %s", label, order_id)
         else:
             log.warning("FlashTrade: worker %s not available for cancel of %s", label, order_id)
+
+    def _on_cancel_all_for_symbol(self, symbol: str) -> None:
+        """Cancel button clicked in OrderEntryPanel → cancel all open orders
+        for *symbol* across every connected worker."""
+        count = 0
+        for label, worker in self._active_threads.items():
+            if worker.isRunning() and worker.is_ib_connected:
+                self._ensure_worker_connected(worker)
+                worker.cancel_all_for_symbol(symbol)
+                count += 1
+        log.info("FlashTrade: cancel_all_for_symbol '%s' → sent to %d worker(s)",
+                 symbol, count)
 
     def _on_refresh_requested(self) -> None:
         """Refresh button clicked → ask every connected worker to re-snapshot."""

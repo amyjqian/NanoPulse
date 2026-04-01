@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import random
+import string
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -30,6 +32,42 @@ def _to_eastern(dt: datetime | None) -> datetime:
         # naive → assume UTC
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(_ET)
+
+
+def _generate_order_ref() -> str:
+    """Generate a custom orderRef: ``nano_{MMDD}_{HHMMSS}_{4 random lowercase letters}``."""
+    now = datetime.now(_ET)
+    tag = "".join(random.choices(string.ascii_lowercase, k=4))
+    return f"nano_{now:%m%d}_{now:%H%M%S}_{tag}"
+
+
+def _parse_orderref_time(order_ref: str) -> datetime | None:
+    """Extract the submission timestamp embedded in a NanoPulse orderRef.
+
+    Format: ``nano_{MMDD}_{HHMMSS}_{4-letter tag}``
+    Example: ``nano_0401_103045_abcd`` → 10:30:45 ET on April 1st.
+
+    Uses the current year (edge case: orders placed on Dec 31 viewed on
+    Jan 1 will show the wrong year, acceptable for an intraday blotter).
+    Returns ``None`` if the format does not match.
+    """
+    try:
+        parts = order_ref.split("_")
+        # Expected: ["nano", "MMDD", "HHMMSS", "xxxx"]
+        if len(parts) != 4 or parts[0] != "nano":
+            return None
+        mmdd, hhmmss = parts[1], parts[2]
+        if len(mmdd) != 4 or len(hhmmss) != 6:
+            return None
+        month  = int(mmdd[:2])
+        day    = int(mmdd[2:])
+        hour   = int(hhmmss[:2])
+        minute = int(hhmmss[2:4])
+        second = int(hhmmss[4:])
+        year   = datetime.now(_ET).year
+        return datetime(year, month, day, hour, minute, second, tzinfo=_ET)
+    except Exception:
+        return None
 
 
 def _parse_ib_time(s: str) -> datetime | None:
@@ -60,6 +98,8 @@ except ImportError:  # allow UI dev without TWS dependency installed
     IB = None  # type: ignore[assignment,misc]
     AccountValue = None  # type: ignore[assignment,misc]
 
+from src.utils.logger import tws_log, order_log
+
 log = logging.getLogger(__name__)
 
 
@@ -72,9 +112,11 @@ class IBWorkerThread(QThread):
     browse_results = Signal(list)                  # list[dict] from reqContractDetails
     browse_failed = Signal(str)                    # error message
     price_updated = Signal(str, float)             # (symbol, last_price)
+    bid_ask_updated = Signal(str, float, float)    # (symbol, bid, ask)
     market_data_failed = Signal(str)               # (symbol) – e.g. error 10197
     order_status_updated = Signal(dict)            # order status dict → main thread
     portfolio_updated = Signal(list)               # list[dict] – portfolio position batch
+    bg_price_updated = Signal(str, float, float, float)  # (symbol, last, bid, ask) – background cache
 
     def __init__(
         self,
@@ -108,8 +150,36 @@ class IBWorkerThread(QThread):
         self._active_ticker = None
         self._active_price_symbol: str = ""
 
+        # Background market data cache: multiple simultaneous subscriptions
+        self._bg_tickers: dict[str, object] = {}  # symbol → ib_async Ticker
+
         # Order tracking: order_id → Trade
         self._trades: dict[str, object] = {}
+
+        # order_ids that have a live per-trade _on_status closure
+        # (placed by _do_place_order in the current session).
+        # Snapshot-registered trades are in _trades but NOT here.
+        self._has_status_handler: set[str] = set()
+
+        # Rejection/error messages keyed by orderRef (nano_...).
+        # NOT cleared on reconnect — survives self._trades.clear() cycles
+        # so rejection reasons persist through reconnect + refresh.
+        self._order_error_messages: dict[str, str] = {}
+
+        # Full order-status dicts for rejected orders, keyed by order_id.
+        # TWS does NOT return rejected (Inactive) orders via reqAllOpenOrders
+        # or reqCompletedOrders after a short time, so we maintain our own
+        # persistent cache and re-emit them on every snapshot/refresh.
+        # NOT cleared on reconnect.
+        self._rejected_order_cache: dict[str, dict] = {}
+
+        # First valid timestamp observed per orderRef (nano_...), ISO format.
+        # Cancelled orders have no completedTime and no fills, so their
+        # timestamp is lost after a reconnect.  This cache lets _build_trade_dict
+        # and _emit_order_status restore the real time on every subsequent
+        # refresh instead of falling back to 00:00:00.
+        # NOT cleared on reconnect.
+        self._order_times: dict[str, str] = {}
 
     @property
     def is_ib_connected(self) -> bool:
@@ -174,9 +244,9 @@ class IBWorkerThread(QThread):
         if self._ib is None or not self._ib.isConnected():
             return
         for acct in self._ib.managedAccounts():
-            # Note: Modern ib_async doesn't support subscribe/unsubscribe toggles.
-            # This will trigger fresh position data from the server.
             self._ib.reqAccountUpdates(acct)
+            tws_log.info("[%s] API-CALL  reqAccountUpdates(account=%s) [refresh]",
+                         self._label, acct)
         log.debug("Worker %s: portfolio refresh (requested for %d account(s))",
                   self._label, len(self._ib.managedAccounts()))
 
@@ -227,6 +297,40 @@ class IBWorkerThread(QThread):
         else:
             log.warning("Worker %s: cancel_order but loop not ready", self._label)
 
+    def cancel_all_for_symbol(self, symbol: str) -> None:
+        """Thread-safe: cancel all open orders whose symbol matches *symbol*."""
+        if self._loop is not None and not self._loop.is_closed():
+            asyncio.run_coroutine_threadsafe(self._do_cancel_all_for_symbol(symbol), self._loop)
+        else:
+            log.warning("Worker %s: cancel_all_for_symbol but loop not ready", self._label)
+
+    # ── Background market data (multi-symbol cache) ───────────────────────────
+
+    def subscribe_background_symbols(self, params_list: list[dict]) -> None:
+        """Thread-safe: subscribe to background market data for multiple symbols.
+
+        Each dict in *params_list* must have ``conid``, ``symbol``, and
+        optionally ``sec_type``, ``exchange``, ``currency``, ``local_symbol``,
+        ``expiry``, ``multiplier``.  Symbols already subscribed are skipped.
+        """
+        if self._loop is not None and not self._loop.is_closed():
+            asyncio.run_coroutine_threadsafe(
+                self._do_subscribe_bg_symbols(params_list), self._loop)
+        else:
+            log.warning("Worker %s: subscribe_background_symbols but loop not ready", self._label)
+
+    def unsubscribe_background_symbol(self, symbol: str) -> None:
+        """Thread-safe: unsubscribe one background market-data stream."""
+        if self._loop is not None and not self._loop.is_closed():
+            asyncio.run_coroutine_threadsafe(
+                self._do_unsubscribe_bg_symbol(symbol), self._loop)
+
+    def unsubscribe_all_background(self) -> None:
+        """Thread-safe: unsubscribe all background market-data streams."""
+        if self._loop is not None and not self._loop.is_closed():
+            asyncio.run_coroutine_threadsafe(
+                self._do_unsubscribe_all_bg(), self._loop)
+
     # ── Thread entry-point ────────────────────────────────────────────────────
 
     def run(self) -> None:  # noqa: D401 – Qt override
@@ -250,6 +354,11 @@ class IBWorkerThread(QThread):
         # Portfolio updates – fires for each PortfolioItem change
         self._ib.updatePortfolioEvent += self._on_portfolio_update
 
+        tws_log.info("[%s] IB instance created – event subscriptions: "
+                     "accountSummaryEvent, pnlEvent, errorEvent, "
+                     "pendingTickersEvent, orderStatusEvent, updatePortfolioEvent",
+                     self._label)
+
         try:
             loop.run_until_complete(self._main_loop())
         except asyncio.CancelledError:
@@ -263,13 +372,16 @@ class IBWorkerThread(QThread):
                     try:
                         self._ib.disconnect()
                         log.debug("Worker %s disconnected from IB", self._label)
+                        tws_log.info("[%s] API-CALL  disconnect() → OK", self._label)
                     except Exception as e:
                         log.warning("Worker %s: error during IB disconnect: %s", self._label, e)
+                        tws_log.error("[%s] API-ERR   disconnect() failed: %s", self._label, e)
 
             self._main_task = None
             self._loop = None
             loop.close()
             log.info("Worker %s: thread shutdown complete", self._label)
+            tws_log.info("[%s] SHUTDOWN  thread shutdown complete", self._label)
             self.connection_status_changed.emit(self._label, False)
 
     # ── Async core ────────────────────────────────────────────────────────────
@@ -295,11 +407,15 @@ class IBWorkerThread(QThread):
                 try:
                     log.info("Worker %s connecting to %s:%d (cid=%d) …",
                              self._label, self._host, self._port, self._client_id)
+                    tws_log.info("[%s] API-CALL  connectAsync(host=%s, port=%d, clientId=%d)",
+                                self._label, self._host, self._port, self._client_id)
                     await self._ib.connectAsync(
                         self._host, self._port, clientId=self._client_id,
                     )
                 except Exception as exc:
                     log.warning("Worker %s connect failed: %s", self._label, exc)
+                    tws_log.error("[%s] API-ERR   connectAsync FAILED: %s",
+                                 self._label, exc)
                     self.connection_status_changed.emit(self._label, False)
                     reconnect_countdown = 5.0
                     await asyncio.sleep(1)
@@ -309,6 +425,15 @@ class IBWorkerThread(QThread):
                 # Connection established — update status immediately
                 self.connection_status_changed.emit(self._label, True)
                 log.info("Worker %s connected – seeding initial snapshot", self._label)
+                tws_log.info("[%s] API-RESP  connectAsync → CONNECTED", self._label)
+
+                # Old Trade objects and their _on_status closures are invalid
+                # after a disconnect — ib_async clears its internal collection.
+                # Reset tracking so the global handler doesn't skip status
+                # updates for orders restored from the upcoming snapshot.
+                self._trades.clear()
+                self._has_status_handler.clear()
+                self._bg_tickers.clear()
 
                 # Post-connect setup: errors here should NOT reset the
                 # connection status — the IB link is alive; only the
@@ -316,24 +441,31 @@ class IBWorkerThread(QThread):
                 try:
                     # Forward manual TWS orders + surviving orders to this client
                     self._ib.reqAutoOpenOrders(True)
+                    tws_log.info("[%s] API-CALL  reqAutoOpenOrders(True)", self._label)
 
                     # Seed the buffer from the snapshot that connectAsync
                     # already fetched during synchronisation.
+                    tws_log.info("[%s] API-CALL  accountSummaryAsync()", self._label)
                     for v in await self._ib.accountSummaryAsync():
                         self._buffer[(v.account, v.tag)] = (v.value, v.currency)
                     log.info("Worker %s buffer seeded with %d tag(s)", self._label, len(self._buffer))
+                    tws_log.info("[%s] API-RESP  accountSummaryAsync → %d tag(s)",
+                                self._label, len(self._buffer))
 
                     # Subscribe to P&L stream for DailyPnL
                     for acct in self._ib.managedAccounts():
                         self._ib.reqPnL(acct)
                         log.info("Worker %s subscribed to pnlEvent for %s", self._label, acct)
+                        tws_log.info("[%s] API-CALL  reqPnL(account=%s)", self._label, acct)
 
                     # Subscribe to portfolio updates (positions, market values)
                     for acct in self._ib.managedAccounts():
                         self._ib.reqAccountUpdates(acct)
                         log.info("Worker %s subscribed to portfolio for %s", self._label, acct)
+                        tws_log.info("[%s] API-CALL  reqAccountUpdates(account=%s)", self._label, acct)
 
                     # Snapshot existing open + completed orders
+                    tws_log.info("[%s] API-CALL  _snapshot_existing_orders()", self._label)
                     await self._snapshot_existing_orders()
 
                 except Exception as exc:
@@ -402,6 +534,8 @@ class IBWorkerThread(QThread):
                 # ── STK: fast qualify path ─────────────────────────────────
                 log.info("Worker %s qualifying STK: %s %s",
                          self._label, c.symbol, c.exchange)
+                tws_log.info("[%s] API-CALL  qualifyContractsAsync(secType=STK, symbol=%s, exchange=%s)",
+                             self._label, c.symbol, c.exchange)
                 qualified = await asyncio.wait_for(
                     self._ib.qualifyContractsAsync(c), timeout=_TIMEOUT,
                 )
@@ -421,19 +555,28 @@ class IBWorkerThread(QThread):
                     }]
                     log.info("Worker %s qualified STK: %s → conId=%s",
                              self._label, q.symbol, q.conId)
+                    tws_log.info("[%s] API-RESP  qualifyContractsAsync → STK %s conId=%s exchange=%s",
+                                self._label, q.symbol, q.conId, q.exchange)
                     self.browse_results.emit(results)
                 else:
+                    tws_log.warning("[%s] API-RESP  qualifyContractsAsync → no match for STK %s",
+                                   self._label, c.symbol)
                     self.browse_failed.emit(
                         f"No match found for STK {c.symbol} on {c.exchange}")
             else:
                 # ── FUT / OPT: full browse via reqContractDetails ──────────
                 log.info("Worker %s browsing: %s %s",
                          self._label, c.secType, c.symbol)
+                tws_log.info("[%s] API-CALL  reqContractDetailsAsync(secType=%s, symbol=%s, exchange=%s, expiry=%s)",
+                             self._label, c.secType, c.symbol, c.exchange,
+                             getattr(c, "lastTradeDateOrContractMonth", ""))
                 details = await asyncio.wait_for(
                     self._ib.reqContractDetailsAsync(c), timeout=_TIMEOUT,
                 )
 
                 if not details:
+                    tws_log.warning("[%s] API-RESP  reqContractDetailsAsync → 0 contracts for %s %s",
+                                   self._label, c.secType, c.symbol)
                     self.browse_failed.emit(
                         f"No contracts found for {c.secType} {c.symbol}")
                     return
@@ -456,17 +599,23 @@ class IBWorkerThread(QThread):
 
                 log.info("Worker %s browse returned %d contract(s) for %s",
                          self._label, len(results), c.symbol)
+                tws_log.info("[%s] API-RESP  reqContractDetailsAsync → %d contract(s) for %s %s",
+                             self._label, len(results), c.secType, c.symbol)
                 self.browse_results.emit(results)
 
         except asyncio.TimeoutError:
             log.warning("Worker %s browse timed out after %ds for %s %s",
                         self._label, _TIMEOUT,
                         params.get("sec_type"), params.get("symbol"))
+            tws_log.error("[%s] API-ERR   browse timed out after %ds for %s %s",
+                          self._label, _TIMEOUT,
+                          params.get("sec_type"), params.get("symbol"))
             self.browse_failed.emit(
                 f"Search timed out after {_TIMEOUT}s — TWS may have lost "
                 f"connectivity. Please try again.")
         except Exception as exc:
             log.warning("Worker %s browse failed: %s", self._label, exc)
+            tws_log.error("[%s] API-ERR   browse failed: %s", self._label, exc)
             self.browse_failed.emit(str(exc))
 
     # ── Order placement ───────────────────────────────────────────────────────
@@ -480,7 +629,7 @@ class IBWorkerThread(QThread):
         try:
             from ib_async import Contract, MarketOrder, LimitOrder, TagValue
 
-            # ── Build contract from conId only ────────────────────────────
+            # ── Build contract ─────────────────────────────────────────────
             conid = int(params.get("conid", 0))
             if conid <= 0:
                 log.warning("Worker %s: invalid conid for order: %s", self._label, conid)
@@ -488,6 +637,30 @@ class IBWorkerThread(QThread):
 
             c = Contract(conId=conid)
             c.exchange = params.get("exchange") or "SMART"
+            # Populate symbol fields so the Trade object kept by ib_async
+            # retains them across reqAllOpenOrdersAsync() snapshots (ib_async
+            # does NOT overwrite the contract on existing Trade objects).
+            c.symbol = params.get("symbol", "")
+            c.secType = params.get("sec_type", "")
+            c.currency = params.get("currency", "USD")
+            c.localSymbol = params.get("local_symbol", "")
+            if params.get("expiry"):
+                c.lastTradeDateOrContractMonth = params["expiry"]
+            if params.get("multiplier"):
+                c.multiplier = params["multiplier"]
+
+            # Stocks: route to IBEOS (IBKR Overnight ATS) during overnight
+            # session (20:00–03:59 ET), otherwise SMART.
+            sec_type = params.get("sec_type", "")
+            if sec_type == "STK":
+                now_et = datetime.now(_ET)
+                hour = now_et.hour
+                if hour >= 20 or hour < 4:
+                    c.exchange = "IBEOS"
+                    log.info("Worker %s: STK overnight → exchange=IBEOS (ET %02d:%02d)",
+                             self._label, hour, now_et.minute)
+                else:
+                    c.exchange = "SMART"
 
             # ── Build order ───────────────────────────────────────────────
             action = params.get("action", "BUY")
@@ -536,70 +709,236 @@ class IBWorkerThread(QThread):
 
             order.account = account
             order.tif = tif
+            order.orderRef = _generate_order_ref()
+
+            # Stocks: configure extended-hours flags based on exchange.
+            if sec_type == "STK":
+                if c.exchange == "IBEOS":
+                    # IBEOS is an overnight venue — no RTH flags needed.
+                    # advancedErrorOverride bypasses TWS precautionary
+                    # Error 10329 that blocks direct-routed IBEOS orders.
+                    order.advancedErrorOverride = "10329"
+                else:
+                    order.outsideRth = True
+                    order.allowPreOpen = False
 
             # ── Place ─────────────────────────────────────────────────────
+            # Log every parameter sent to ib_async for debugging
+            log.info(
+                "Worker %s: placeOrder params → "
+                "Contract(conId=%s, exchange=%s) | "
+                "Order(action=%s, totalQuantity=%s, orderType=%s, "
+                "lmtPrice=%s, auxPrice=%s, tif=%s, account=%s, "
+                "outsideRth=%s, allowPreOpen=%s, "
+                "advancedErrorOverride=%s, "
+                "algoStrategy=%s, algoParams=%s, orderRef=%s)",
+                self._label,
+                c.conId, c.exchange,
+                order.action, order.totalQuantity, order.orderType,
+                getattr(order, "lmtPrice", "N/A"),
+                getattr(order, "auxPrice", "N/A"),
+                order.tif, order.account,
+                getattr(order, "outsideRth", False),
+                getattr(order, "allowPreOpen", "N/A"),
+                getattr(order, "advancedErrorOverride", ""),
+                getattr(order, "algoStrategy", ""),
+                getattr(order, "algoParams", []),
+                order.orderRef,
+            )
+
+            # TWS log: full API call detail
+            tws_log.info(
+                "[%s] API-CALL  placeOrder → "
+                "Contract(conId=%s, symbol=%s, secType=%s, exchange=%s, currency=%s, "
+                "localSymbol=%s, expiry=%s, multiplier=%s) | "
+                "Order(action=%s, qty=%s, orderType=%s, lmtPrice=%s, auxPrice=%s, "
+                "tif=%s, account=%s, outsideRth=%s, allowPreOpen=%s, "
+                "advancedErrorOverride=%s, algoStrategy=%s, algoParams=%s, orderRef=%s)",
+                self._label,
+                c.conId, c.symbol, c.secType, c.exchange, c.currency,
+                c.localSymbol, getattr(c, "lastTradeDateOrContractMonth", ""),
+                getattr(c, "multiplier", ""),
+                order.action, order.totalQuantity, order.orderType,
+                getattr(order, "lmtPrice", "N/A"),
+                getattr(order, "auxPrice", "N/A"),
+                order.tif, order.account,
+                getattr(order, "outsideRth", False),
+                getattr(order, "allowPreOpen", "N/A"),
+                getattr(order, "advancedErrorOverride", ""),
+                getattr(order, "algoStrategy", ""),
+                getattr(order, "algoParams", []),
+                order.orderRef,
+            )
+
+            # Order log: submission
+            order_log.info(
+                "[%s] ORDER-SUBMIT  %s %s %d %s | orderType=%s lmt=%s "
+                "account=%s orderRef=%s conId=%s exchange=%s",
+                self._label, action, params.get("symbol", "?"), qty,
+                sec_type, order_type,
+                getattr(order, "lmtPrice", "N/A"),
+                account, order.orderRef, c.conId, c.exchange,
+            )
+
             trade = self._ib.placeOrder(c, order)
 
-            # Use _build_trade_dict for consistent order_id generation.
-            # At this point permId may still be 0, so it falls back to orderId.
-            d = self._build_trade_dict(trade)
-            if d:
-                order_id = d["order_id"]
-            else:
-                order_id = f"{self._label}_{trade.order.orderId}"
-
+            # Account + orderRef = immutable canonical key.
+            # Account numbers never change; connection labels can be renamed.
+            order_id = f"{account}_{order.orderRef}"
             self._trades[order_id] = trade
+            self._has_status_handler.add(order_id)
 
             log.info("Worker %s: placed %s %s %d %s for account %s → %s",
                      self._label, action, order_type, qty,
                      params.get("symbol", "?"), account, order_id)
 
+            tws_log.info("[%s] API-RESP  placeOrder → orderId=%s orderRef=%s",
+                         self._label, trade.order.orderId, order.orderRef)
+            order_log.info("[%s] ORDER-ACCEPTED  orderId=%s orderRef=%s → key=%s",
+                           self._label, trade.order.orderId, order.orderRef, order_id)
+
             # ── Emit initial status to UI ─────────────────────────────────
             status = trade.orderStatus.status if trade.orderStatus.status else "Submitted"
             self._emit_order_status(trade, order_id, params, status)
 
-            # ── Bind trade.statusEvent for live updates ───────────────────
-            # The global orderStatusEvent also catches these, but this
-            # binding carries the original params (with our symbol name).
-            frozen_params = dict(params)
-            # Mutable container so the closure can update the tracked key
-            # when migrating from orderId → permId.
-            key_ref = [order_id]
+            order_log.info("[%s] ORDER-STATUS  %s | status=%s symbol=%s account=%s",
+                           self._label, order_id, status,
+                           params.get("symbol", "?"), account)
 
-            def _on_status(t, _kr=key_ref, _p=frozen_params):
-                # Once TWS assigns a permId, re-register under the canonical key
-                new_d = self._build_trade_dict(t)
-                if new_d:
-                    canonical = new_d["order_id"]
-                    old_key = None
-                    if canonical != _kr[0]:
-                        # Migrate from orderId-based key to permId-based key
-                        old_key = _kr[0]
-                        self._trades.pop(old_key, None)
-                        self._trades[canonical] = t
-                        _kr[0] = canonical
-                    self._emit_order_status(t, canonical, _p,
-                                            t.orderStatus.status,
-                                            supersedes=old_key)
-                else:
-                    self._emit_order_status(t, _kr[0], _p, t.orderStatus.status)
+            # ── Bind trade.statusEvent for live updates ───────────────────
+            # The key never changes (orderRef-based), so the closure is
+            # trivially simple — no migration, no supersedes.
+            frozen_params = dict(params)
+            frozen_oid = order_id
+
+            def _on_status(t, _oid=frozen_oid, _p=frozen_params):
+                new_status = t.orderStatus.status
+                self._emit_order_status(t, _oid, _p, new_status)
+                # Log every status change to both TWS and order logs
+                tws_log.info("[%s] EVENT     orderStatusEvent → orderId=%s "
+                             "status=%s filled=%s avgFillPrice=%s",
+                             self._label, t.order.orderId, new_status,
+                             t.orderStatus.filled, t.orderStatus.avgFillPrice)
+                order_log.info("[%s] ORDER-STATUS  %s | status=%s filled=%s "
+                               "avgFill=%s symbol=%s account=%s orderRef=%s",
+                               self._label, _oid, new_status,
+                               t.orderStatus.filled, t.orderStatus.avgFillPrice,
+                               _p.get("symbol", "?"), _p.get("account", ""),
+                               getattr(t.order, "orderRef", ""))
 
             trade.statusEvent += _on_status
 
         except Exception as exc:
             log.exception("Worker %s: place_order failed: %s", self._label, exc)
+            tws_log.error("[%s] API-ERR   placeOrder failed: %s", self._label, exc)
+            order_log.error("[%s] ORDER-ERROR  placeOrder failed: %s | params=%s",
+                            self._label, exc, params)
 
     async def _do_cancel_order(self, order_id: str) -> None:
-        """Cancel an open order by its *order_id*."""
+        """Cancel an open order by its *order_id*.
+
+        Uses a multi-tier fallback strategy so that cancel works even when
+        the order wasn't captured by the initial snapshot (e.g. TWS was
+        still syncing after a restart when the snapshot ran).
+        """
         trade = self._trades.get(order_id)
+
+        # ── Fallback 1: search ib_async's local open-trade cache ──────────
+        # The order may exist in ib_async's collection (delivered via
+        # reqAutoOpenOrders) but not yet in our _trades dict.
+        if trade is None and self._ib is not None and self._ib.isConnected():
+            # Extract orderRef: "L-paper-ib_nano_0331_..." → "nano_0331_..."
+            parts = order_id.split("_", 1)
+            target_ref = parts[1] if len(parts) == 2 else ""
+            if target_ref.startswith("nano_"):
+                for t in self._ib.openTrades():
+                    ref = getattr(t.order, "orderRef", "") or ""
+                    if ref == target_ref:
+                        trade = t
+                        self._trades[order_id] = trade
+                        log.info("Worker %s: found %s via local orderRef lookup",
+                                 self._label, order_id)
+                        break
+
+        # ── Fallback 2: fresh request to TWS ──────────────────────────────
+        # If TWS was still booting when we reconnected, this picks up
+        # orders that have since become available.
+        if trade is None and self._ib is not None and self._ib.isConnected():
+            try:
+                open_trades = await self._ib.reqAllOpenOrdersAsync()
+                parts = order_id.split("_", 1)
+                target_ref = parts[1] if len(parts) == 2 else ""
+                for t in open_trades:
+                    ref = getattr(t.order, "orderRef", "") or ""
+                    if target_ref.startswith("nano_") and ref == target_ref:
+                        trade = t
+                        self._trades[order_id] = trade
+                        log.info("Worker %s: found %s via fresh TWS request",
+                                 self._label, order_id)
+                        break
+            except Exception:
+                log.debug("Worker %s: cancel fallback reqAllOpenOrders failed",
+                          self._label, exc_info=True)
+
         if trade is None:
-            log.warning("Worker %s: cancel_order – unknown order_id %s", self._label, order_id)
+            log.warning("Worker %s: cancel_order – unknown order_id %s",
+                        self._label, order_id)
+            order_log.warning("[%s] ORDER-CANCEL  FAILED – unknown order_id %s",
+                              self._label, order_id)
             return
         try:
             self._ib.cancelOrder(trade.order)
             log.info("Worker %s: cancel requested for order %s", self._label, order_id)
+            tws_log.info("[%s] API-CALL  cancelOrder(orderId=%s) for key=%s",
+                         self._label, trade.order.orderId, order_id)
+            order_log.info("[%s] ORDER-CANCEL  requested for %s | orderId=%s "
+                           "symbol=%s orderRef=%s",
+                           self._label, order_id, trade.order.orderId,
+                           getattr(trade.contract, "symbol", "?"),
+                           getattr(trade.order, "orderRef", ""))
         except Exception as exc:
             log.exception("Worker %s: cancel_order failed: %s", self._label, exc)
+            tws_log.error("[%s] API-ERR   cancelOrder failed for %s: %s",
+                          self._label, order_id, exc)
+            order_log.error("[%s] ORDER-CANCEL  ERROR for %s: %s",
+                            self._label, order_id, exc)
+
+    async def _do_cancel_all_for_symbol(self, symbol: str) -> None:
+        """Cancel every open order whose contract symbol matches *symbol*."""
+        if self._ib is None or not self._ib.isConnected():
+            return
+        symbol_upper = symbol.upper()
+        cancelled = 0
+        for oid, trade in list(self._trades.items()):
+            contract = getattr(trade, "contract", None)
+            if contract is None:
+                continue
+            trade_sym = (getattr(contract, "localSymbol", "") or
+                         getattr(contract, "symbol", "")).upper()
+            if trade_sym != symbol_upper:
+                continue
+            # Only cancel if the order is still active
+            status = ""
+            if getattr(trade, "orderStatus", None):
+                status = getattr(trade.orderStatus, "status", "")
+            if status in ("Filled", "Cancelled", "Inactive", "ApiCancelled"):
+                continue
+            try:
+                self._ib.cancelOrder(trade.order)
+                cancelled += 1
+                tws_log.info("[%s] API-CALL  cancelOrder(orderId=%s) [cancel_all_for_symbol '%s']",
+                             self._label, trade.order.orderId, symbol)
+                order_log.info("[%s] ORDER-CANCEL  %s (cancel-all for %s) | orderId=%s",
+                               self._label, oid, symbol, trade.order.orderId)
+            except Exception as exc:
+                log.warning("Worker %s: cancel_all_for_symbol failed for %s: %s",
+                            self._label, oid, exc)
+                order_log.error("[%s] ORDER-CANCEL  ERROR for %s (cancel-all %s): %s",
+                                self._label, oid, symbol, exc)
+        log.info("Worker %s: cancel_all_for_symbol '%s' → cancelled %d order(s)",
+                 self._label, symbol, cancelled)
+        order_log.info("[%s] ORDER-CANCEL-ALL  symbol=%s → %d order(s) cancelled",
+                       self._label, symbol, cancelled)
 
     def _on_trade_status(self, trade, order_id: str, params: dict) -> None:
         """Callback fired by trade.statusEvent – runs in the worker's event loop.
@@ -665,8 +1004,16 @@ class IBWorkerThread(QThread):
         timestamp = et_dt.strftime("%H:%M:%S")
         time_sort = et_dt.isoformat()
 
+        # Cache the timestamp keyed by orderRef so _build_trade_dict's step 5
+        # can recover the real time on post-reconnect snapshots.  Live orders
+        # always have a valid time here (fallback is now(), not midnight).
+        order_ref = getattr(trade.order, "orderRef", "") or ""
+        if order_ref and order_ref.startswith("nano_"):
+            self._order_times.setdefault(order_ref, et_dt.isoformat())
+
         d = {
             "order_id": order_id,
+            "order_ref": order_ref,
             "symbol": params.get("symbol", ""),
             "account": params.get("account", ""),
             "action": params.get("action", ""),
@@ -679,6 +1026,8 @@ class IBWorkerThread(QThread):
             "status": status,
             "time": timestamp,
             "time_sort": time_sort,
+            # Persisted rejection reason keyed by orderRef — survives reconnect
+            "error_message": self._order_error_messages.get(order_ref, ""),
         }
         if supersedes:
             d["supersedes"] = supersedes
@@ -702,12 +1051,14 @@ class IBWorkerThread(QThread):
                 price = last
                 source = "last"
 
-            # 2. Fallback: bid/ask midpoint
+            # 2. Extract bid / ask once (reused for midpoint fallback + signal)
+            bid = getattr(ticker, "bid", float('nan'))
+            ask = getattr(ticker, "ask", float('nan'))
+            bid_valid = not math.isnan(bid) and bid > 0 and bid < 1e12
+            ask_valid = not math.isnan(ask) and ask > 0 and ask < 1e12
+
             if math.isnan(price):
-                bid = getattr(ticker, "bid", float('nan'))
-                ask = getattr(ticker, "ask", float('nan'))
-                if (not math.isnan(bid) and not math.isnan(ask)
-                        and bid > 0 and ask > 0 and bid < 1e12 and ask < 1e12):
+                if bid_valid and ask_valid:
                     price = (bid + ask) / 2.0
                     source = "bid/ask mid"
 
@@ -720,6 +1071,11 @@ class IBWorkerThread(QThread):
 
             if not math.isnan(price):
                 self.price_updated.emit(sym, price)
+
+            # Always emit bid/ask when both are valid
+            if bid_valid and ask_valid:
+                self.bid_ask_updated.emit(sym, bid, ask)
+
         except Exception:
             log.debug("Worker %s: bad price tick: %s", self._label, ticker)
 
@@ -727,14 +1083,22 @@ class IBWorkerThread(QThread):
         """Called by ib_async when any subscribed tickers have pending updates.
 
         This is the most reliable streaming hook — fires for live, delayed,
-        and frozen data.
+        and frozen data.  Handles both the single active ticker and background
+        tickers for the multi-symbol cache.
         """
-        if self._active_ticker is None or not self._active_price_symbol:
-            return
         for ticker in tickers:
-            if ticker is self._active_ticker:
+            # Single-symbol active subscription (existing behavior)
+            if (self._active_ticker is not None
+                    and self._active_price_symbol
+                    and ticker is self._active_ticker):
                 self._on_price_update(ticker)
-                break
+
+            # Background multi-symbol subscriptions
+            if self._bg_tickers:
+                for sym, bg_ticker in self._bg_tickers.items():
+                    if ticker is bg_ticker:
+                        self._emit_bg_price(sym, ticker)
+                        break
 
     async def _do_market_data(self, params: dict) -> None:
         """Subscribe to live top-of-book data for the contract in *params*."""
@@ -775,6 +1139,9 @@ class IBWorkerThread(QThread):
             self._active_ticker = ticker
             log.info("Worker %s: subscribed to market data for %s (conId=%d)",
                      self._label, self._active_price_symbol, conid)
+            tws_log.info("[%s] API-CALL  reqMktData(conId=%d, symbol=%s, exchange=%s, "
+                         "snapshot=False)",
+                         self._label, conid, self._active_price_symbol, c.exchange)
 
             # Emit immediately if ticker already has a price
             self._on_price_update(ticker)
@@ -790,11 +1157,120 @@ class IBWorkerThread(QThread):
                     self._ib.cancelMktData(self._active_ticker.contract)
                     log.debug("Worker %s: cancelled market data for %s",
                               self._label, self._active_price_symbol)
+                    tws_log.info("[%s] API-CALL  cancelMktData(symbol=%s)",
+                                self._label, self._active_price_symbol)
             except Exception as exc:
                 log.debug("Worker %s: cancel market data error: %s", self._label, exc)
             finally:
                 self._active_ticker = None
                 self._active_price_symbol = ""
+
+    # ── Background market data (multi-symbol cache) ───────────────────────────
+
+    async def _do_subscribe_bg_symbols(self, params_list: list[dict]) -> None:
+        """Subscribe to background market data for multiple symbols.
+
+        Symbols already subscribed (present in ``_bg_tickers``) are skipped.
+        Emits ``bg_price_updated`` immediately for any ticker that already
+        has data cached by ib_async.
+        """
+        if self._ib is None or not self._ib.isConnected():
+            return
+
+        from ib_async import Contract
+
+        self._ib.reqMarketDataType(3)  # delayed as fallback
+
+        for params in params_list:
+            sym = params.get("symbol", "")
+            if not sym or sym in self._bg_tickers:
+                continue  # already subscribed
+
+            conid = int(params.get("conid", 0))
+            if conid <= 0:
+                continue
+
+            c = Contract(conId=conid)
+            c.exchange = params.get("exchange") or "SMART"
+            c.currency = params.get("currency") or "USD"
+            if params.get("sec_type"):
+                c.secType = params["sec_type"]
+            if params.get("local_symbol"):
+                c.localSymbol = params["local_symbol"]
+            if params.get("expiry"):
+                c.lastTradeDateOrContractMonth = params["expiry"]
+            if params.get("multiplier"):
+                c.multiplier = params["multiplier"]
+
+            try:
+                ticker = self._ib.reqMktData(c, genericTickList="", snapshot=False)
+                self._bg_tickers[sym] = ticker
+                log.info("Worker %s: bg subscribed to %s (conId=%d)",
+                         self._label, sym, conid)
+                tws_log.info("[%s] API-CALL  reqMktData(conId=%d, symbol=%s, exchange=%s, "
+                             "snapshot=False) [background]",
+                             self._label, conid, sym, c.exchange)
+                # Emit immediately if ticker already has cached data
+                self._emit_bg_price(sym, ticker)
+            except Exception as exc:
+                log.warning("Worker %s: bg subscribe failed for %s: %s",
+                            self._label, sym, exc)
+
+        log.info("Worker %s: background subscriptions active for %d symbol(s)",
+                 self._label, len(self._bg_tickers))
+
+    async def _do_unsubscribe_bg_symbol(self, symbol: str) -> None:
+        """Unsubscribe one background market-data stream."""
+        ticker = self._bg_tickers.pop(symbol, None)
+        if ticker is not None and self._ib is not None and self._ib.isConnected():
+            try:
+                self._ib.cancelMktData(ticker.contract)
+                log.debug("Worker %s: bg unsubscribed %s", self._label, symbol)
+            except Exception as exc:
+                log.debug("Worker %s: bg cancel error for %s: %s",
+                          self._label, symbol, exc)
+
+    async def _do_unsubscribe_all_bg(self) -> None:
+        """Unsubscribe all background market-data streams."""
+        if self._ib is not None and self._ib.isConnected():
+            for sym, ticker in list(self._bg_tickers.items()):
+                try:
+                    self._ib.cancelMktData(ticker.contract)
+                except Exception:
+                    pass
+        count = len(self._bg_tickers)
+        self._bg_tickers.clear()
+        log.debug("Worker %s: all %d bg subscriptions cleared", self._label, count)
+
+    def _emit_bg_price(self, sym: str, ticker) -> None:
+        """Extract last/bid/ask from a background ticker and emit ``bg_price_updated``."""
+        try:
+            last = getattr(ticker, "last", float('nan'))
+            bid = getattr(ticker, "bid", float('nan'))
+            ask = getattr(ticker, "ask", float('nan'))
+
+            bid_valid = not math.isnan(bid) and bid > 0 and bid < 1e12
+            ask_valid = not math.isnan(ask) and ask > 0 and ask < 1e12
+
+            # Derive last from midpoint if unavailable
+            if math.isnan(last) or last <= 0:
+                if bid_valid and ask_valid:
+                    last = (bid + ask) / 2.0
+
+            # Fallback to close
+            if math.isnan(last) or last <= 0:
+                close = getattr(ticker, "close", float('nan'))
+                if not math.isnan(close) and close > 0:
+                    last = close
+
+            if math.isnan(last):
+                last = 0.0
+            bid_out = bid if bid_valid else 0.0
+            ask_out = ask if ask_valid else 0.0
+
+            self.bg_price_updated.emit(sym, last, bid_out, ask_out)
+        except Exception:
+            log.debug("Worker %s: bg price emit error for %s", self._label, sym)
 
     def _on_account_summary(self, value) -> None:
         """De-duplicate rapid ticks into the buffer dict.
@@ -803,6 +1279,10 @@ class IBWorkerThread(QThread):
         """
         try:
             self._buffer[(value.account, value.tag)] = (value.value, value.currency)
+            tws_log.debug("[%s] EVENT     accountSummaryEvent → account=%s tag=%s "
+                          "value=%s currency=%s",
+                          self._label, value.account, value.tag,
+                          value.value, value.currency)
         except Exception:
             log.debug("Worker %s: bad AccountValue: %s", self._label, value)
 
@@ -814,6 +1294,10 @@ class IBWorkerThread(QThread):
         """
         try:
             acct = entry.account
+            tws_log.debug("[%s] EVENT     pnlEvent → account=%s dailyPnL=%s "
+                          "realizedPnL=%s unrealizedPnL=%s",
+                          self._label, acct,
+                          entry.dailyPnL, entry.realizedPnL, entry.unrealizedPnL)
             if entry.dailyPnL is not None and not math.isnan(entry.dailyPnL):
                 self._buffer[(acct, "DailyPnL")] = (str(entry.dailyPnL), "BASE")
         except Exception:
@@ -836,6 +1320,15 @@ class IBWorkerThread(QThread):
             pos = float(getattr(item, "position", 0))
             log.debug("Worker %s: portfolio event %s %s pos=%.1f acct=%s",
                       self._label, sym, con_id, pos, acct)
+            tws_log.debug("[%s] EVENT     updatePortfolioEvent → account=%s symbol=%s "
+                          "conId=%s pos=%.1f avgCost=%.2f mktPrice=%.2f mktValue=%.2f "
+                          "unrealizedPnL=%.2f realizedPnL=%.2f",
+                          self._label, acct, sym, con_id, pos,
+                          float(getattr(item, "averageCost", 0)),
+                          float(getattr(item, "marketPrice", 0)),
+                          float(getattr(item, "marketValue", 0)),
+                          float(getattr(item, "unrealizedPNL", 0)),
+                          float(getattr(item, "realizedPnL", 0)))
             self._portfolio_buffer[(acct, con_id)] = {
                 "label": self._label,
                 "account": acct,
@@ -850,7 +1343,7 @@ class IBWorkerThread(QThread):
                 "market_price": float(getattr(item, "marketPrice", 0)),
                 "market_value": float(getattr(item, "marketValue", 0)),
                 "unrealized_pnl": float(getattr(item, "unrealizedPNL", 0)),
-                "realized_pnl": float(getattr(item, "realizedPNL", 0)),
+                "realized_pnl": float(getattr(item, "realizedPnL", 0)),
             }
             # Also persist into the long-lived cache for late subscribers
             self._portfolio_cache[(acct, con_id)] = self._portfolio_buffer[(acct, con_id)]
@@ -858,7 +1351,12 @@ class IBWorkerThread(QThread):
             log.debug("Worker %s: bad portfolio item: %s", self._label, item)
 
     def _on_ib_error(self, reqId, errorCode, errorString, contract) -> None:
-        """Handle IB error events – detect market-data failures like 10197."""
+        """Handle IB error events – detect market-data failures like 10197
+        and order rejections like 201."""
+        tws_log.warning("[%s] EVENT     errorEvent → reqId=%s errorCode=%s "
+                        "errorString=%s contract=%s",
+                        self._label, reqId, errorCode, errorString, contract)
+
         if errorCode == 10197 and self._active_ticker is not None:
             # "No market data during competing live session"
             # The paper account can't get data – signal the UI to try another worker.
@@ -868,6 +1366,49 @@ class IBWorkerThread(QThread):
             if sym:
                 self.market_data_failed.emit(sym)
 
+        # ── Order rejection / warning errors ──────────────────────────────
+        # 201 = Order rejected, 202 = Order cancelled by IB,
+        # 399 = Order message error
+        if errorCode in (201, 202, 399):
+            # reqId == IB orderId for order errors.
+            # Walk self._trades (still intact at error-fire time, before any
+            # reconnect clears it) to find the matching trade and its orderRef.
+            matched_trade = None
+            order_ref = ""
+            for oid, t in self._trades.items():
+                if getattr(t.order, "orderId", None) == reqId:
+                    matched_trade = t
+                    order_ref = getattr(t.order, "orderRef", "") or ""
+                    break
+
+            if order_ref.startswith("nano_"):
+                # Normalise IB's HTML line breaks to \n so the UI can
+                # word-wrap the tooltip properly. Persisted keyed by orderRef
+                # — survives self._trades.clear() on reconnect.
+                clean_msg = (errorString
+                             .replace("<br />", "\n")
+                             .replace("<br/>", "\n")
+                             .replace("<br>", "\n")
+                             .strip())
+                self._order_error_messages[order_ref] = clean_msg
+
+                order_log.warning("[%s] ORDER-REJECT  orderRef=%s errorCode=%s: %s",
+                                  self._label, order_ref, errorCode, clean_msg)
+                log.warning("Worker %s: order %s rejected (code %s): %s",
+                            self._label, order_ref, errorCode, clean_msg)
+
+                # Immediately push updated status + error message to the UI.
+                # _build_trade_dict reads _order_error_messages so the
+                # error_message field will be populated automatically.
+                if matched_trade:
+                    d = self._build_trade_dict(matched_trade)
+                    if d:
+                        # Cache the full dict so _snapshot_existing_orders can
+                        # re-emit it on refresh — TWS stops returning rejected
+                        # orders from reqAllOpenOrders/reqCompletedOrders quickly.
+                        self._rejected_order_cache[d["order_id"]] = d
+                        self.order_status_updated.emit(d)
+
     # ── Global order listener ─────────────────────────────────────────────────
 
     def _build_trade_dict(self, trade, fill_map: dict | None = None) -> dict | None:
@@ -876,9 +1417,15 @@ class IBWorkerThread(QThread):
         Returns ``None`` if the trade has no usable status.
         Shared by ``_on_global_order_status`` and ``_snapshot_existing_orders``.
 
-        Uses ``permId`` as the unique key because ``orderId`` is often 0 for
-        completed orders returned by ``reqCompletedOrdersAsync``.  ``permId``
-        is globally unique and persists across sessions.
+        Key strategy
+        ------------
+        * **Internal (NanoPulse) orders** — ``orderRef`` starts with ``nano_``.
+          The canonical key is ``{account}_{orderRef}``.  Account numbers are
+          immutable (assigned by IBKR), so the key survives connection-label
+          renames without any migration.
+        * **External orders** (TWS / other clients) — keyed by
+          ``{account}_p{permId}`` (globally unique, survives restarts).
+          Falls back to ``{account}_{orderId}``.
 
         Parameters
         ----------
@@ -895,15 +1442,18 @@ class IBWorkerThread(QThread):
             order = trade.order
             contract = trade.contract
 
-            # ── Unique key ────────────────────────────────────────────────
-            # Prefer permId (globally unique, survives restarts).
-            # Fall back to orderId for orders that haven't received a
-            # permId yet (e.g. PendingSubmit).
+            # ── Unique key (account-based, survives label renames) ────────
+            order_ref = getattr(order, "orderRef", "") or ""
             perm_id = getattr(order, "permId", 0) or getattr(trade.orderStatus, "permId", 0)
-            if perm_id:
-                order_id = f"{self._label}_p{perm_id}"
+            acct = getattr(order, "account", "") or ""
+
+            if order_ref.startswith("nano_"):
+                # Internal NanoPulse order — account + orderRef is immutable.
+                order_id = f"{acct}_{order_ref}"
+            elif perm_id:
+                order_id = f"{acct}_p{perm_id}"
             else:
-                order_id = f"{self._label}_{order.orderId}"
+                order_id = f"{acct}_{order.orderId}"
 
             # ── Fill price ────────────────────────────────────────────────
             # 1. orderStatus.avgFillPrice (populated for live orders)
@@ -950,6 +1500,21 @@ class IBWorkerThread(QThread):
             symbol = (getattr(contract, "localSymbol", "")
                       or getattr(contract, "symbol", ""))
 
+            # Fallback: if symbol is still empty (contract built with conId
+            # only and ib_async didn't update it), resolve from saved config.
+            if not symbol:
+                con_id = getattr(contract, "conId", 0)
+                if con_id:
+                    try:
+                        from src.core import config_manager
+                        for sc in config_manager.load_contracts():
+                            if sc.get("conid") == con_id:
+                                symbol = (sc.get("local_symbol", "")
+                                          or sc.get("symbol", ""))
+                                break
+                    except Exception:
+                        pass
+
             lmt = getattr(order, "lmtPrice", 0)
             stp = getattr(order, "auxPrice", 0)
 
@@ -984,14 +1549,41 @@ class IBWorkerThread(QThread):
                 if fm_entry and len(fm_entry) >= 3:
                     et_dt = fm_entry[2]  # Eastern datetime stored by snapshot
 
+            # 5. orderRef timestamp — NanoPulse embeds MMDD_HHMMSS in every
+            #    orderRef, so we always know the submission time even for
+            #    cancelled orders that TWS stops returning after a reconnect.
+            #    This is more reliable than _order_times because it requires
+            #    no prior observation of the order in the current session.
+            if et_dt is None and order_ref.startswith("nano_"):
+                et_dt = _parse_orderref_time(order_ref)
+
+            # 6. Persistent timestamp cache — first valid time we ever observed
+            #    for this order.  Cancelled orders have no completedTime and no
+            #    fills, so after a reconnect all four sources above are empty and
+            #    they show 00:00:00.  This cache fixes that.
+            if et_dt is None and order_ref:
+                cached_iso = self._order_times.get(order_ref)
+                if cached_iso:
+                    try:
+                        et_dt = datetime.fromisoformat(cached_iso)
+                    except Exception:
+                        pass
+
             # Fallback: start of today so unknown-time orders sort to bottom.
             if et_dt is None:
                 et_dt = datetime.now(_ET).replace(hour=0, minute=0, second=0, microsecond=0)
             timestamp = et_dt.strftime("%H:%M:%S")
             time_sort = et_dt.isoformat()
 
+            # Persist the first valid (non-midnight) timestamp so future
+            # refreshes/reconnects can recover it via step 5 above.
+            if order_ref and order_ref.startswith("nano_"):
+                if et_dt.hour != 0 or et_dt.minute != 0 or et_dt.second != 0:
+                    self._order_times.setdefault(order_ref, et_dt.isoformat())
+
             return {
                 "order_id": order_id,
+                "order_ref": getattr(order, "orderRef", "") or "",
                 "symbol": symbol,
                 "account": getattr(order, "account", ""),
                 "action": getattr(order, "action", ""),
@@ -1004,6 +1596,9 @@ class IBWorkerThread(QThread):
                 "status": status,
                 "time": timestamp,
                 "time_sort": time_sort,
+                # Persisted rejection reason keyed by orderRef — survives
+                # reconnect because _order_error_messages is never cleared.
+                "error_message": self._order_error_messages.get(order_ref, ""),
             }
         except Exception:
             log.debug("Worker %s: _build_trade_dict error", self._label, exc_info=True)
@@ -1014,20 +1609,54 @@ class IBWorkerThread(QThread):
         status change on this IB connection, including orders that were placed
         before a disconnect/reconnect cycle and orders placed manually in TWS.
 
-        For orders placed by *this* client (tracked in ``_trades``), the
-        per-trade ``_on_status`` closure already emits with the correct
-        symbol from the original params — so we skip them here to avoid
-        overwriting with an empty symbol from an unqualified Contract.
+        Only skip orders that have a dedicated per-trade ``_on_status``
+        closure (placed by ``_do_place_order`` in this session).  Orders
+        restored from snapshot do NOT have closures, so we must emit for
+        them here — otherwise cancel/fill updates after reconnect are lost.
         """
         d = self._build_trade_dict(trade)
         if not d:
             return
 
-        # If this trade is already tracked by a per-trade handler, skip.
-        # The per-trade closure has the correct original params (symbol etc).
+        # Log every global order status event to TWS log
+        tws_log.info("[%s] EVENT     global orderStatusEvent → orderId=%s "
+                     "status=%s symbol=%s action=%s filled=%s avgFill=%s "
+                     "orderRef=%s permId=%s",
+                     self._label,
+                     getattr(trade.order, "orderId", "?"),
+                     d.get("status", "?"),
+                     d.get("symbol", "?"),
+                     d.get("action", "?"),
+                     getattr(trade.orderStatus, "filled", 0),
+                     getattr(trade.orderStatus, "avgFillPrice", 0),
+                     d.get("order_ref", ""),
+                     getattr(trade.order, "permId", 0))
+
+        # Only skip if a per-trade _on_status closure is handling this order.
+        # Snapshot-registered trades (in _trades but NOT _has_status_handler)
+        # must be emitted here so cancel/fill status reaches the UI.
         order_id = d["order_id"]
-        if order_id in self._trades:
+        if order_id in self._has_status_handler:
             return
+
+        # Log to order log for external or snapshot-restored orders
+        order_log.info("[%s] ORDER-STATUS  %s | status=%s symbol=%s "
+                       "account=%s action=%s filled=%s avgFill=%s orderRef=%s "
+                       "(via global handler)",
+                       self._label, order_id, d.get("status", "?"),
+                       d.get("symbol", "?"), d.get("account", ""),
+                       d.get("action", "?"),
+                       getattr(trade.orderStatus, "filled", 0),
+                       getattr(trade.orderStatus, "avgFillPrice", 0),
+                       d.get("order_ref", ""))
+
+        # Register in _trades so cancel routing works for orders that
+        # arrive after the initial snapshot (e.g. TWS delivers them
+        # late after a restart while ib_async is already connected).
+        if order_id not in self._trades:
+            self._trades[order_id] = trade
+            log.debug("Worker %s: global handler registered %s in _trades",
+                       self._label, order_id)
 
         self.order_status_updated.emit(d)
 
@@ -1052,7 +1681,10 @@ class IBWorkerThread(QThread):
         fill_map: dict[int, tuple] = {}
         try:
             from ib_async import ExecutionFilter
+            tws_log.info("[%s] API-CALL  reqExecutionsAsync()", self._label)
             fresh_fills = await self._ib.reqExecutionsAsync(ExecutionFilter())
+            tws_log.info("[%s] API-RESP  reqExecutionsAsync → %d execution(s)",
+                         self._label, len(fresh_fills))
             for f in fresh_fills:
                 ex = f.execution
                 pid = getattr(ex, "permId", 0)
@@ -1064,11 +1696,15 @@ class IBWorkerThread(QThread):
                 log.info("Worker %s: built fill_map with %d execution(s)", self._label, len(fill_map))
         except Exception:
             log.debug("Worker %s: fill_map build error", self._label, exc_info=True)
+            tws_log.error("[%s] API-ERR   reqExecutionsAsync failed", self._label)
 
         try:
             # 1. Open / working orders – fresh request to TWS (all clients).
+            tws_log.info("[%s] API-CALL  reqAllOpenOrdersAsync()", self._label)
             open_trades = await self._ib.reqAllOpenOrdersAsync()
             log.info("Worker %s: snapshot found %d open trade(s)", self._label, len(open_trades))
+            tws_log.info("[%s] API-RESP  reqAllOpenOrdersAsync → %d open trade(s)",
+                         self._label, len(open_trades))
             for trade in open_trades:
                 d = self._build_trade_dict(trade, fill_map)
                 if d and d["order_id"] not in seen_ids:
@@ -1077,22 +1713,57 @@ class IBWorkerThread(QThread):
                     emitted += 1
                     # Register in _trades so cancel works
                     self._trades[d["order_id"]] = trade
+                    order_log.info("[%s] ORDER-SNAPSHOT  %s | status=%s symbol=%s "
+                                   "action=%s qty=%s fill=%s (open)",
+                                   self._label, d["order_id"], d.get("status"),
+                                   d.get("symbol"), d.get("action"),
+                                   d.get("quantity"), d.get("fill_price"))
         except Exception:
             log.exception("Worker %s: snapshot open trades error", self._label)
+            tws_log.error("[%s] API-ERR   reqAllOpenOrdersAsync failed", self._label)
 
         try:
             # 2. Completed (filled / cancelled) orders from today's session.
             #    reqCompletedOrdersAsync(apiOnly=False) includes ALL orders
             #    (manual TWS + all API clients).
+            tws_log.info("[%s] API-CALL  reqCompletedOrdersAsync(apiOnly=False)", self._label)
             completed = await self._ib.reqCompletedOrdersAsync(apiOnly=False)
             log.info("Worker %s: snapshot found %d completed order(s)", self._label, len(completed))
+            tws_log.info("[%s] API-RESP  reqCompletedOrdersAsync → %d completed order(s)",
+                         self._label, len(completed))
             for trade in completed:
                 d = self._build_trade_dict(trade, fill_map)
                 if d and d["order_id"] not in seen_ids:
                     seen_ids.add(d["order_id"])
                     self.order_status_updated.emit(d)
                     emitted += 1
+                    order_log.info("[%s] ORDER-SNAPSHOT  %s | status=%s symbol=%s "
+                                   "action=%s qty=%s fill=%s (completed)",
+                                   self._label, d["order_id"], d.get("status"),
+                                   d.get("symbol"), d.get("action"),
+                                   d.get("quantity"), d.get("fill_price"))
         except Exception:
             log.exception("Worker %s: snapshot completed orders error", self._label)
+            tws_log.error("[%s] API-ERR   reqCompletedOrdersAsync failed", self._label)
+
+        # 3. Re-emit cached rejected orders that TWS no longer returns.
+        # Rejected (Inactive) orders vanish from both reqAllOpenOrders and
+        # reqCompletedOrders within seconds.  Our cache keeps them visible
+        # across every refresh and reconnect cycle.
+        for oid, cached_d in self._rejected_order_cache.items():
+            if oid not in seen_ids:
+                # Refresh the error_message in case it was somehow updated
+                order_ref = cached_d.get("order_ref", "")
+                if order_ref:
+                    cached_d["error_message"] = self._order_error_messages.get(
+                        order_ref, cached_d.get("error_message", "")
+                    )
+                self.order_status_updated.emit(cached_d)
+                seen_ids.add(oid)
+                emitted += 1
+                order_log.info("[%s] ORDER-SNAPSHOT  %s | status=%s (from rejected cache)",
+                               self._label, oid, cached_d.get("status"))
 
         log.info("Worker %s: order snapshot emitted %d order(s)", self._label, emitted)
+        tws_log.info("[%s] API-RESP  _snapshot_existing_orders → total %d order(s) emitted",
+                     self._label, emitted)
