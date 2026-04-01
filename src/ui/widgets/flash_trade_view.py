@@ -154,6 +154,7 @@ class FlashTradeView(QWidget):
         # ── Wire order entry → order placement ───────────────────────────────
         self._order_entry.order_requested.connect(self._on_order_requested)
         self._order_entry.cancel_all_requested.connect(self._on_cancel_all_for_symbol)
+        self._order_entry.flatten_requested.connect(self._on_flatten_requested)
 
         # ── Wire order status cancel button → cancel logic ───────────────────
         self._order_status.cancel_requested.connect(self._on_cancel_requested)
@@ -180,14 +181,20 @@ class FlashTradeView(QWidget):
         3. For each account, find the correct IBWorkerThread and place the order.
         """
         # ── 1. Validate: get checked accounts ─────────────────────────────
-        if not isinstance(self._account_list, AccountListPanel):
-            log.warning("FlashTrade: AccountListPanel not available – aborting order")
-            return
+        # When called from flatten, the payload carries ``_flatten_account``
+        # so we target only that specific account (not all checked ones).
+        flatten_account = payload.get("_flatten_account")
+        if flatten_account:
+            accounts = [flatten_account]
+        else:
+            if not isinstance(self._account_list, AccountListPanel):
+                log.warning("FlashTrade: AccountListPanel not available – aborting order")
+                return
 
-        accounts = self._account_list.get_selected_accounts()
-        if not accounts:
-            log.warning("FlashTrade: no accounts checked – aborting order")
-            return
+            accounts = self._account_list.get_selected_accounts()
+            if not accounts:
+                log.warning("FlashTrade: no accounts checked – aborting order")
+                return
 
         # ── 2. Look up contract from saved config ─────────────────────────
         symbol = payload.get("symbol", "")
@@ -368,7 +375,8 @@ class FlashTradeView(QWidget):
         return None
 
     def _ensure_worker_connected(self, worker: IBWorkerThread) -> None:
-        """Connect order_status_updated and portfolio_updated signals if not already connected.
+        """Connect order_status_updated, portfolio_updated, and
+        flatten_close_needed signals if not already connected.
 
         If the worker for this label has been replaced (disconnect/reconnect
         cycle), disconnect from the old instance and wire the new one.
@@ -390,13 +398,18 @@ class FlashTradeView(QWidget):
                 prev.portfolio_updated.disconnect(self._on_portfolio_updated)
             except RuntimeError:
                 pass
+            try:
+                prev.flatten_close_needed.disconnect(self._on_flatten_close_needed)
+            except RuntimeError:
+                pass
             log.debug("FlashTrade: unwired stale signals for worker %s", label)
 
         worker.order_status_updated.connect(self._on_order_status_updated)
         worker.portfolio_updated.connect(self._on_portfolio_updated)
+        worker.flatten_close_needed.connect(self._on_flatten_close_needed)
         self._connected_order_workers[label] = worker
         self._connected_portfolio_workers[label] = worker
-        log.debug("FlashTrade: wired order_status_updated + portfolio_updated for worker %s", label)
+        log.debug("FlashTrade: wired order_status_updated + portfolio_updated + flatten_close_needed for worker %s", label)
 
         # Re-snapshot: the worker's initial snapshot may have fired before
         # this signal was connected.  Ask it to emit all known orders again.
@@ -548,6 +561,71 @@ class FlashTradeView(QWidget):
                 count += 1
         log.info("FlashTrade: cancel_all_for_symbol '%s' → %d worker(s) "
                  "accounts=%s", symbol, count, sorted(checked))
+
+    def _on_flatten_requested(self, symbol: str) -> None:
+        """Flatten button clicked → cancel open orders then close position
+        for *symbol* on every checked account across all connected workers.
+
+        Each checked account is flattened individually so the worker can
+        read the per-account position and send the correct offsetting order.
+        """
+        if not isinstance(self._account_list, AccountListPanel):
+            log.warning("FlashTrade: flatten blocked — AccountListPanel not available")
+            return
+
+        checked: set[str] = set(self._account_list.get_selected_accounts())
+        if not checked:
+            log.warning("FlashTrade: flatten blocked for '%s' — no accounts checked", symbol)
+            return
+
+        count = 0
+        for label, worker in self._active_threads.items():
+            if worker.isRunning() and worker.is_ib_connected:
+                self._ensure_worker_connected(worker)
+                for acct in checked:
+                    worker.flatten(symbol, acct)
+                count += 1
+        log.info("FlashTrade: flatten '%s' → %d worker(s) accounts=%s",
+                 symbol, count, sorted(checked))
+
+    def _on_flatten_close_needed(self, data: dict) -> None:
+        """Worker read a non-zero position during flatten → place the closing
+        order through the normal order-placement path so that limit-price cap,
+        RTH routing, and trading preferences are all applied (same as
+        Buy/Sell @MKT button).
+        """
+        symbol = data.get("symbol", "")
+        action = data.get("action", "BUY")
+        qty = data.get("qty", 0)
+        account = data.get("account", "")
+
+        if not symbol or qty <= 0 or not account:
+            log.warning("FlashTrade: flatten_close_needed invalid data: %s", data)
+            return
+
+        # Read current last price from the order entry cache so the limit
+        # cap calculation has a base price (same source as the MKT button).
+        last_price = 0.0
+        cached = self._order_entry._price_cache.get(symbol.upper())
+        if cached:
+            last_price = cached[0]  # (last, bid, ask)
+
+        # Build the same payload that _emit_order("BUY"/"SELL", "MKT")
+        # would produce, then feed it through _on_order_requested which
+        # applies limit cap, RTH, prefs, etc.
+        payload = {
+            "action": action,
+            "type": "MKT",
+            "symbol": symbol,
+            "qty": qty,
+            "last_price": last_price,
+            # Force to a single account — override normal "all checked" logic
+            "_flatten_account": account,
+        }
+        log.info("FlashTrade: flatten close → routing %s %d %s @MKT "
+                 "account=%s last=%.4f through normal order path",
+                 action, qty, symbol, account, last_price)
+        self._on_order_requested(payload)
 
     def _on_refresh_requested(self) -> None:
         """Refresh button clicked → ask every connected worker to re-snapshot."""

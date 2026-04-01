@@ -162,6 +162,10 @@ class OrderEntryPanel(QWidget):
     #   symbol (str) – cancel all open orders for this symbol.
     cancel_all_requested = Signal(str)
 
+    # Emitted when user clicks the Flatten button:
+    #   symbol (str) – cancel all open orders then close position for this symbol.
+    flatten_requested = Signal(str)
+
     def __init__(self, active_threads: dict | None = None, parent=None):
         super().__init__(parent)
         self._active_threads: dict = active_threads if active_threads is not None else {}
@@ -331,7 +335,9 @@ class OrderEntryPanel(QWidget):
         pm_grid.addWidget(_make_btn("25%", CLR_CLOSE, 30), 0, 0)
         pm_grid.addWidget(_make_btn("50%", CLR_CLOSE, 30), 0, 1)
         pm_grid.addWidget(_make_btn("75%", CLR_CLOSE, 30), 1, 0)
-        pm_grid.addWidget(_make_btn("Flatten", CLR_FLATTEN, 30), 1, 1)
+        self._btn_flatten = _make_btn("Flatten", CLR_FLATTEN, 30)
+        pm_grid.addWidget(self._btn_flatten, 1, 1)
+        self._btn_flatten.clicked.connect(self._on_flatten)
         pm_grid.addWidget(_make_btn("Reverse", CLR_REVERSE, 30), 2, 0)
         self._btn_cancel = _make_btn("Cancel", CLR_CANCEL, 30)
         pm_grid.addWidget(self._btn_cancel, 2, 1)
@@ -354,6 +360,14 @@ class OrderEntryPanel(QWidget):
             self.cancel_all_requested.emit(sym)
         else:
             log.warning("OrderEntryPanel: Cancel clicked but no active symbol")
+
+    def _on_flatten(self) -> None:
+        """Flatten button clicked → emit flatten_requested for the active symbol."""
+        sym = self._active_symbol
+        if sym:
+            self.flatten_requested.emit(sym)
+        else:
+            log.warning("OrderEntryPanel: Flatten clicked but no active symbol")
 
     def _refresh_combo_items(self) -> None:
         """Populate the combo dropdown with saved contracts not already added."""

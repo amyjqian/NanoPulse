@@ -117,6 +117,7 @@ class IBWorkerThread(QThread):
     order_status_updated = Signal(dict)            # order status dict → main thread
     portfolio_updated = Signal(list)               # list[dict] – portfolio position batch
     bg_price_updated = Signal(str, float, float, float)  # (symbol, last, bid, ask) – background cache
+    flatten_close_needed = Signal(dict)            # {symbol, account, action, qty, sec_type} → UI places the close order
 
     def __init__(
         self,
@@ -304,6 +305,15 @@ class IBWorkerThread(QThread):
                 self._do_cancel_all_for_symbol(symbol, accounts), self._loop)
         else:
             log.warning("Worker %s: cancel_all_for_symbol but loop not ready", self._label)
+
+    def flatten(self, symbol: str, account: str) -> None:
+        """Thread-safe: cancel all open orders for *symbol*/*account*, then
+        close the position with an offsetting MKT order."""
+        if self._loop is not None and not self._loop.is_closed():
+            asyncio.run_coroutine_threadsafe(
+                self._do_flatten(symbol, account), self._loop)
+        else:
+            log.warning("Worker %s: flatten but loop not ready", self._label)
 
     # ── Background market data (multi-symbol cache) ───────────────────────────
 
@@ -1000,6 +1010,63 @@ class IBWorkerThread(QThread):
         order_log.info("[%s] ORDER-CANCEL-ALL  symbol=%s accounts=%s → %d order(s) cancelled",
                        self._label, symbol,
                        sorted(accounts) if accounts else "all", cancelled)
+
+    async def _do_flatten(self, symbol: str, account: str) -> None:
+        """Cancel all open orders for *symbol*/*account*, then signal the UI
+        to close the position via the normal order-placement path (which
+        applies limit-price caps, RTH routing, trading preferences, etc.).
+
+        Step 1 delegates to ``_do_cancel_all_for_symbol`` (reuses the
+        two-tier status guard and account filter).
+        Step 2 reads the current position and emits ``flatten_close_needed``
+        so the UI thread routes the close order through the same logic as
+        Buy/Sell @MKT.
+        """
+        if self._ib is None or not self._ib.isConnected():
+            return
+
+        symbol_upper = symbol.upper()
+
+        # ── Step 1: cancel open orders ────────────────────────────────────────
+        await self._do_cancel_all_for_symbol(symbol, {account})
+
+        # Brief pause so cancel ACKs arrive before reading positions.
+        await asyncio.sleep(0.1)
+
+        # ── Step 2: read position and signal UI to close ──────────────────────
+        try:
+            positions = self._ib.positions()
+        except Exception:
+            log.warning("Worker %s: flatten could not read positions", self._label)
+            return
+
+        for pos in positions:
+            if getattr(pos, "account", "") != account:
+                continue
+            contract = pos.contract
+            pos_sym = (getattr(contract, "localSymbol", "") or
+                       getattr(contract, "symbol", "")).upper()
+            if pos_sym != symbol_upper:
+                continue
+
+            net_pos = float(getattr(pos, "position", 0))
+            if net_pos == 0:
+                continue
+
+            action = "SELL" if net_pos > 0 else "BUY"
+            qty = abs(int(net_pos))
+
+            order_log.info("[%s] ORDER-FLATTEN  %s %s %d | account=%s",
+                           self._label, action, symbol, qty, account)
+
+            # Emit to UI thread — the UI will route through the normal
+            # order-placement path (limit cap, RTH, prefs, etc.).
+            self.flatten_close_needed.emit({
+                "symbol":  symbol,
+                "account": account,
+                "action":  action,
+                "qty":     qty,
+            })
 
     def _on_trade_status(self, trade, order_id: str, params: dict) -> None:
         """Callback fired by trade.statusEvent – runs in the worker's event loop.
