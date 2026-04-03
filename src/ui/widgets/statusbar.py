@@ -113,7 +113,8 @@ class StatusBar(QWidget):
     # ── Timer ─────────────────────────────────────────────────────────────────
 
     def _tick(self) -> None:
-        self._time_lbl.setText(QDateTime.currentDateTime().toString("hh:mm:ss"))
+        self._time_lbl.setText(
+            QDateTime.currentDateTime().toString("hh:mm:ss"))
 
     def _apply_colors(self) -> None:
         self._dot.set_color(ACCENT)
@@ -135,5 +136,3 @@ class StatusBar(QWidget):
         p.setPen(QPen(QColor(BORDER), 1))
         p.drawLine(0, 0, self.width(), 0)
         p.end()
-
-

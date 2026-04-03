@@ -56,7 +56,8 @@ def load_connections(path: Path | str | None = None) -> list[dict[str, Any]]:
             data = json.load(fh)
         _next_client_id = int(data.get("next_client_id", _next_client_id))
         rows = list(data.get("connections", []))
-        log.info("Loaded %d connection(s) from %s  (next_client_id=%d)", len(rows), p, _next_client_id)
+        log.info("Loaded %d connection(s) from %s  (next_client_id=%d)",
+                 len(rows), p, _next_client_id)
         return rows
     except Exception:
         log.exception("Failed to load config from %s", p)
@@ -315,4 +316,3 @@ def _write_json(p: Path, data: dict[str, Any]) -> None:
             raise
     except Exception:
         log.exception("Failed to write config to %s", p)
-

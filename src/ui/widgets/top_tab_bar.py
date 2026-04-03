@@ -59,7 +59,8 @@ class TabButton(QWidget):
 
         self.setFixedHeight(BAR_HEIGHT)
         self.setMinimumWidth(90)
-        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred,
+                           QSizePolicy.Policy.Fixed)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
@@ -116,7 +117,8 @@ class TopTabBar(QWidget):
     """Horizontal top navigation bar."""
 
     nav_changed = Signal(str)
-    tabBarClicked = Signal(str)  # Emits tab name for ALL tabs (including Settings)
+    # Emits tab name for ALL tabs (including Settings)
+    tabBarClicked = Signal(str)
 
     _TABS = ["Connect", "Contracts", "FlashTrade", "Executions", "Settings"]
 

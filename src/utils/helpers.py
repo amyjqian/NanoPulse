@@ -160,17 +160,17 @@ _FUT_TICK_SIZES: dict[str, float] = {
     "MGC": 0.10,   # Micro Gold
     "SI":  0.005,  # Silver
     "SIL": 0.005,  # Micro Silver (1000 oz)
-    "HG":  0.0005, # Copper
+    "HG":  0.0005,  # Copper
     "NG":  0.001,  # Natural Gas
     "ZB":  0.03125,  # 30-Year US Treasury Bond
-    "ZN":  0.015625, # 10-Year US Treasury Note
-    "ZF":  0.0078125, # 5-Year US Treasury Note
+    "ZN":  0.015625,  # 10-Year US Treasury Note
+    "ZF":  0.0078125,  # 5-Year US Treasury Note
     "ZC":  0.25,   # Corn
     "ZS":  0.25,   # Soybeans
     "ZW":  0.25,   # Wheat
-    "6E":  0.00005, # Euro FX
-    "6J":  0.0000005, # Japanese Yen
-    "6B":  0.0001, # British Pound
+    "6E":  0.00005,  # Euro FX
+    "6J":  0.0000005,  # Japanese Yen
+    "6B":  0.0001,  # British Pound
 }
 
 
@@ -214,5 +214,3 @@ def tick_size_for_contract(
 
     # OPT and everything else
     return 0.01
-
-

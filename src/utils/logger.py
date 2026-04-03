@@ -136,5 +136,3 @@ def setup_logging(level: int = logging.DEBUG) -> None:
     # Keep them in the log file at DEBUG, but only show WARNING+ on screen.
     for name in ("ib_async", "ib_async.wrapper", "ib_async.client", "ib_async.ib"):
         logging.getLogger(name).setLevel(logging.WARNING)
-
-

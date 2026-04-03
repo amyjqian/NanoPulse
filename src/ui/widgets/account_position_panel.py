@@ -27,23 +27,23 @@ from PySide6.QtWidgets import (
 log = logging.getLogger(__name__)
 
 # ── Theme tokens (shared with OrderStatusPanel) ──────────────────────────────
-BG_PANEL   = "#1e2230"
-BG_TABLE   = "#1A1D24"
+BG_PANEL = "#1e2230"
+BG_TABLE = "#1A1D24"
 BG_TABLE_ALT = "#1E222A"
-BG_HEADER  = "#14171D"
-BORDER     = "#30363D"
-TEXT       = "#C9D1D9"
-TEXT_DIM   = "#8B949E"
+BG_HEADER = "#14171D"
+BORDER = "#30363D"
+TEXT = "#C9D1D9"
+TEXT_DIM = "#8B949E"
 
-CLR_LONG     = "#2e7d32"
-CLR_SHORT    = "#c62828"
-CLR_FLATTEN  = "#cc6600"
-CLR_REVERSE  = "#8E44AD"
-CLR_CLOSE    = "#8E8E93"
-CLR_PNL_POS  = "#3FB950"
-CLR_PNL_NEG  = "#F85149"
+CLR_LONG = "#2e7d32"
+CLR_SHORT = "#c62828"
+CLR_FLATTEN = "#cc6600"
+CLR_REVERSE = "#8E44AD"
+CLR_CLOSE = "#8E8E93"
+CLR_PNL_POS = "#3FB950"
+CLR_PNL_NEG = "#F85149"
 CLR_ACCT_ROW = "#181C28"
-CLR_OPEN     = "#58A6FF"
+CLR_OPEN = "#58A6FF"
 
 # ── Fonts ─────────────────────────────────────────────────────────────────────
 _TITLE_FONT = QFont("Helvetica Neue, Arial", 11)
@@ -58,13 +58,13 @@ _ACCT_FONT = QFont("Helvetica Neue, Arial", 11)
 _ACCT_FONT.setWeight(QFont.Weight.Bold)
 
 # ── Column indices ────────────────────────────────────────────────────────────
-COL_SYMBOL  = 0
+COL_SYMBOL = 0
 COL_ACCOUNT = 1
-COL_SIDE    = 2
-COL_QTY     = 3
-COL_AVG     = 4
+COL_SIDE = 2
+COL_QTY = 3
+COL_AVG = 4
 COL_CURRENT = 5
-COL_PNL     = 6
+COL_PNL = 6
 COL_ACTIONS = 7
 
 _COLUMNS = ["Symbol", "Account", "Side", "Qty", "Avg", "Current", "P&L", ""]
@@ -260,16 +260,20 @@ class AccountPositionPanel(QWidget):
         self._table = QTableWidget(0, len(_COLUMNS))
         self._table.setHorizontalHeaderLabels(_COLUMNS)
         self._table.setAlternatingRowColors(True)
-        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection)
+        self._table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers)
         self._table.verticalHeader().setVisible(False)
         self._table.setShowGrid(True)
         self._table.setFont(_TABLE_FONT)
         self._table.setStyleSheet(_TABLE_STYLE)
 
         hdr = self._table.horizontalHeader()
-        hdr.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        hdr.setDefaultAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         hdr.setStretchLastSection(True)
         hdr.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
 
@@ -303,10 +307,12 @@ class AccountPositionPanel(QWidget):
                 old_pos = old.get("position", 0)
                 if new_pos == 0 and old_pos != 0:
                     needs_rebuild = True
-                    log.debug("AcctPos: position closed %s → rebuild", pos.get("symbol"))
+                    log.debug("AcctPos: position closed %s → rebuild",
+                              pos.get("symbol"))
                 elif new_pos != 0 and old_pos == 0:
                     needs_rebuild = True
-                    log.debug("AcctPos: position reopened %s → rebuild", pos.get("symbol"))
+                    log.debug(
+                        "AcctPos: position reopened %s → rebuild", pos.get("symbol"))
                 else:
                     self._update_row_in_place(key, pos)
             else:
@@ -346,7 +352,8 @@ class AccountPositionPanel(QWidget):
 
         display_avg = avg_cost
         if sec_type == "FUT" and position != 0 and market_price != 0:
-            implied_mult = abs(pos.get("market_value", 0) / (position * market_price))
+            implied_mult = abs(pos.get("market_value", 0) /
+                               (position * market_price))
             if implied_mult > 1:
                 display_avg = avg_cost / implied_mult
 
@@ -473,12 +480,14 @@ class AccountPositionPanel(QWidget):
         alias = self._get_alias(account)
         alias_lbl = QLabel(alias if alias else account)
         alias_lbl.setFont(_ACCT_FONT)
-        alias_lbl.setStyleSheet("color:#ffffff;border:none;font-weight:bold;font-size:12px;")
+        alias_lbl.setStyleSheet(
+            "color:#ffffff;border:none;font-weight:bold;font-size:12px;")
         layout.addWidget(alias_lbl)
 
         if alias:
             acct_lbl = QLabel(account)
-            acct_lbl.setStyleSheet(f"color:{TEXT_DIM};border:none;font-size:10px;")
+            acct_lbl.setStyleSheet(
+                f"color:{TEXT_DIM};border:none;font-size:10px;")
             layout.addWidget(acct_lbl)
 
         layout.addStretch()
@@ -530,7 +539,8 @@ class AccountPositionPanel(QWidget):
 
         display_avg = avg_cost
         if sec_type == "FUT" and position != 0 and market_price != 0:
-            implied_mult = abs(pos.get("market_value", 0) / (position * market_price))
+            implied_mult = abs(pos.get("market_value", 0) /
+                               (position * market_price))
             if implied_mult > 1:
                 display_avg = avg_cost / implied_mult
 
@@ -542,7 +552,8 @@ class AccountPositionPanel(QWidget):
         # Symbol
         item = QTableWidgetItem(symbol)
         item.setForeground(QColor(TEXT))
-        item.setFont(QFont("Menlo, Consolas, monospace", 11, QFont.Weight.Bold))
+        item.setFont(
+            QFont("Menlo, Consolas, monospace", 11, QFont.Weight.Bold))
         self._table.setItem(row, COL_SYMBOL, item)
 
         # Account
@@ -565,22 +576,26 @@ class AccountPositionPanel(QWidget):
 
         # Avg
         item = QTableWidgetItem(_fmt_price(display_avg))
-        item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        item.setTextAlignment(Qt.AlignmentFlag.AlignRight |
+                              Qt.AlignmentFlag.AlignVCenter)
         item.setForeground(QColor(TEXT))
         self._table.setItem(row, COL_AVG, item)
 
         # Current
         item = QTableWidgetItem(_fmt_price(market_price))
-        item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        item.setTextAlignment(Qt.AlignmentFlag.AlignRight |
+                              Qt.AlignmentFlag.AlignVCenter)
         item.setForeground(QColor(TEXT))
         self._table.setItem(row, COL_CURRENT, item)
 
         # P&L
         pnl_clr = CLR_PNL_POS if unrealized_pnl >= 0 else CLR_PNL_NEG
         item = QTableWidgetItem(_fmt_pnl(unrealized_pnl))
-        item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        item.setTextAlignment(Qt.AlignmentFlag.AlignRight |
+                              Qt.AlignmentFlag.AlignVCenter)
         item.setForeground(QColor(pnl_clr))
-        item.setFont(QFont("Menlo, Consolas, monospace", 11, QFont.Weight.Bold))
+        item.setFont(
+            QFont("Menlo, Consolas, monospace", 11, QFont.Weight.Bold))
         self._table.setItem(row, COL_PNL, item)
 
         # Action buttons
@@ -632,4 +647,3 @@ class AccountPositionPanel(QWidget):
         if self._accounts_model is not None:
             return self._accounts_model._aliases.get(account, "")
         return ""
-
