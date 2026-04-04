@@ -145,14 +145,19 @@ _TABLE_STYLE = f"""
     QTableWidget::item, QTableView::item {{
         padding: 4px 8px;
     }}
-    QTableWidget QLineEdit {{
+    QTableWidget QLineEdit, QTableView QLineEdit {{
         background-color: {BG_SECONDARY};
         color: {TEXT};
-        border: 1px solid {Theme.ACCENT};
+        border: 1px solid #484F58;
         border-radius: 2px;
         padding: 4px 8px;
         selection-background-color: #253545;
         selection-color: {TEXT};
+        outline: none;
+    }}
+    QTableWidget QLineEdit:focus, QTableView QLineEdit:focus {{
+        border: 1px solid #484F58;
+        outline: none;
     }}
     QScrollBar:vertical {{ background: {BG_PRIMARY}; width: 8px; }}
     QScrollBar::handle:vertical {{ background: #3A3E48; border-radius: 4px; min-height: 20px; }}
