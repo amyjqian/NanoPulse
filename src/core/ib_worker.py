@@ -279,7 +279,7 @@ class IBWorkerThread(QThread):
         if self._ib is None or not self._ib.isConnected():
             return
         for acct in self._ib.managedAccounts():
-            self._ib.reqAccountUpdates(acct)
+            await self._ib.reqAccountUpdatesAsync(acct)
             tws_log.info("[%s] API-CALL  reqAccountUpdates(account=%s) [refresh]",
                          self._label, acct)
         log.debug("Worker %s: portfolio refresh (requested for %d account(s))",
@@ -569,7 +569,7 @@ class IBWorkerThread(QThread):
 
                     # Subscribe to portfolio updates (positions, market values)
                     for acct in self._ib.managedAccounts():
-                        self._ib.reqAccountUpdates(acct)
+                        await self._ib.reqAccountUpdatesAsync(acct)
                         log.info(
                             "Worker %s subscribed to portfolio for %s", self._label, acct)
                         tws_log.info(
