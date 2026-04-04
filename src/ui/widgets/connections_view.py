@@ -696,7 +696,15 @@ class ConnectionsView(QWidget):
         log.info("Connect All requested (%d rows)", self._cfg_table.rowCount())
         for row in range(self._cfg_table.rowCount()):
             label = self._row_label(row)
-            if label and label not in self._active_threads:
+            if not label:
+                continue
+            # Clean up dead worker threads still sitting in the dict
+            existing = self._active_threads.get(label)
+            if existing is not None and not existing.isRunning():
+                log.info("Removing dead worker for %s before reconnect", label)
+                self._active_threads.pop(label, None)
+                existing = None
+            if existing is None:
                 self._connect_row(row)
 
     def _on_disconnect_all(self) -> None:
@@ -717,7 +725,14 @@ class ConnectionsView(QWidget):
                 "Action clicked on row %d but label is empty – ignoring", row)
             return
 
-        if label in self._active_threads:
+        # Clean up dead worker threads still sitting in the dict
+        existing = self._active_threads.get(label)
+        if existing is not None and not existing.isRunning():
+            log.info("Removing dead worker for %s", label)
+            self._active_threads.pop(label, None)
+            existing = None
+
+        if existing is not None:
             log.info("Disconnect requested for %r", label)
             self._disconnect_label(label)
             self._set_row_state(row, connected=False)
