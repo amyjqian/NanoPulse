@@ -754,11 +754,18 @@ class ConnectionsView(QWidget):
         if not label:
             return
 
+        # Read the Auto Reconnect toggle so the worker honours the flag
+        recon_cb = self._get_reconnect_checkbox(row)
+        auto_reconnect = recon_cb.isChecked() if recon_cb is not None else True
+
+        log.info("Connecting %s (auto_reconnect=%s)", label, auto_reconnect)
+
         worker = IBWorkerThread(
             connection_label=label,
             host=host,
             port=port,
             client_id=client_id,
+            auto_reconnect=auto_reconnect,
         )
         # The Funnel: worker → shared model
         worker.summary_batch_updated.connect(self._model.update_batch)
