@@ -163,10 +163,6 @@ class IBWorkerThread(QThread):
         self._main_task: asyncio.Task | None = None
         self._first_connect_attempted = False
 
-    def set_auto_reconnect(self, auto_reconnect: bool) -> None:
-        """Update the auto-reconnect flag natively while running."""
-        self._auto_reconnect = auto_reconnect
-
         # De-dupe buffer keyed by (account, tag) → (value, currency)
         self._buffer: dict[tuple[str, str], tuple[str, str]] = {}
 
@@ -211,6 +207,10 @@ class IBWorkerThread(QThread):
         # refresh instead of falling back to 00:00:00.
         # NOT cleared on reconnect.
         self._order_times: dict[str, str] = {}
+
+    def set_auto_reconnect(self, auto_reconnect: bool) -> None:
+        """Update the auto-reconnect flag natively while running."""
+        self._auto_reconnect = auto_reconnect
 
     @property
     def is_ib_connected(self) -> bool:
@@ -469,11 +469,17 @@ class IBWorkerThread(QThread):
 
     async def _main_loop(self) -> None:
         self._main_task = asyncio.current_task()
-        await asyncio.gather(
+        results = await asyncio.gather(
             self._reconnect_loop(),
             self._throttler_loop(),
             return_exceptions=True,
         )
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                coro_name = ("_reconnect_loop", "_throttler_loop")[i]
+                log.exception("Worker %s: %s crashed: %s",
+                              self._label, coro_name, result,
+                              exc_info=result)
 
     async def _reconnect_loop(self) -> None:
         """Check connectivity every 1 s; reconnect every 5 s when down."""

@@ -145,14 +145,19 @@ _TABLE_STYLE = f"""
     QTableWidget::item, QTableView::item {{
         padding: 4px 8px;
     }}
-    QTableWidget QLineEdit {{
+    QTableWidget QLineEdit, QTableView QLineEdit {{
         background-color: {BG_SECONDARY};
         color: {TEXT};
-        border: 1px solid {Theme.ACCENT};
+        border: 1px solid #484F58;
         border-radius: 2px;
         padding: 4px 8px;
         selection-background-color: #253545;
         selection-color: {TEXT};
+        outline: none;
+    }}
+    QTableWidget QLineEdit:focus, QTableView QLineEdit:focus {{
+        border: 1px solid #484F58;
+        outline: none;
     }}
     QScrollBar:vertical {{ background: {BG_PRIMARY}; width: 8px; }}
     QScrollBar::handle:vertical {{ background: #3A3E48; border-radius: 4px; min-height: 20px; }}
@@ -645,10 +650,14 @@ class ConnectionsView(QWidget):
         self._cfg_table.setCellWidget(row, _COL_ACTION, btn_container)
 
         # Status (read-only placeholder)
-        status_item = QTableWidgetItem("")
-        status_item.setFlags(status_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        status_item.setForeground(QColor(TEXT_DIM))
-        self._cfg_table.setItem(row, _COL_STATUS, status_item)
+        status_lbl = QLabel("")
+        status_lbl.setStyleSheet(f"color: {TEXT_DIM}; background: transparent; padding-left: 4px;")
+        status_container = QWidget()
+        status_container.setStyleSheet("background: transparent;")
+        status_layout = QHBoxLayout(status_container)
+        status_layout.setContentsMargins(0, 0, 0, 0)
+        status_layout.addWidget(status_lbl)
+        self._cfg_table.setCellWidget(row, _COL_STATUS, status_container)
 
         self._cfg_table.blockSignals(False)
         return row
@@ -687,7 +696,15 @@ class ConnectionsView(QWidget):
         log.info("Connect All requested (%d rows)", self._cfg_table.rowCount())
         for row in range(self._cfg_table.rowCount()):
             label = self._row_label(row)
-            if label and label not in self._active_threads:
+            if not label:
+                continue
+            # Clean up dead worker threads still sitting in the dict
+            existing = self._active_threads.get(label)
+            if existing is not None and not existing.isRunning():
+                log.info("Removing dead worker for %s before reconnect", label)
+                self._active_threads.pop(label, None)
+                existing = None
+            if existing is None:
                 self._connect_row(row)
 
     def _on_disconnect_all(self) -> None:
@@ -708,7 +725,14 @@ class ConnectionsView(QWidget):
                 "Action clicked on row %d but label is empty – ignoring", row)
             return
 
-        if label in self._active_threads:
+        # Clean up dead worker threads still sitting in the dict
+        existing = self._active_threads.get(label)
+        if existing is not None and not existing.isRunning():
+            log.info("Removing dead worker for %s", label)
+            self._active_threads.pop(label, None)
+            existing = None
+
+        if existing is not None:
             log.info("Disconnect requested for %r", label)
             self._disconnect_label(label)
             self._set_row_state(row, connected=False)
@@ -730,11 +754,18 @@ class ConnectionsView(QWidget):
         if not label:
             return
 
+        # Read the Auto Reconnect toggle so the worker honours the flag
+        recon_cb = self._get_reconnect_checkbox(row)
+        auto_reconnect = recon_cb.isChecked() if recon_cb is not None else True
+
+        log.info("Connecting %s (auto_reconnect=%s)", label, auto_reconnect)
+
         worker = IBWorkerThread(
             connection_label=label,
             host=host,
             port=port,
             client_id=client_id,
+            auto_reconnect=auto_reconnect,
         )
         # The Funnel: worker → shared model
         worker.summary_batch_updated.connect(self._model.update_batch)
@@ -825,17 +856,19 @@ class ConnectionsView(QWidget):
                 btn.setStyleSheet(_CONNECT_SS)
 
         # Status cell
-        status_item = self._cfg_table.item(row, _COL_STATUS)
-        if status_item:
-            if connecting:
-                status_item.setText("Connecting…")
-                status_item.setForeground(QColor("#FFA657"))  # amber
-            elif connected:
-                status_item.setText("Connected")
-                status_item.setForeground(QColor(GREEN))
-            else:
-                status_item.setText("Disconnected")
-                status_item.setForeground(QColor(RED))
+        status_container = self._cfg_table.cellWidget(row, _COL_STATUS)
+        if status_container:
+            status_item = status_container.findChild(QLabel)
+            if status_item:
+                if connecting:
+                    status_item.setText("Connecting…")
+                    status_item.setStyleSheet("color: #FFA657; background: transparent; padding-left: 4px;")  # amber
+                elif connected:
+                    status_item.setText("Connected")
+                    status_item.setStyleSheet(f"color: {GREEN}; background: transparent; padding-left: 4px;")
+                else:
+                    status_item.setText("Disconnected")
+                    status_item.setStyleSheet(f"color: {RED}; background: transparent; padding-left: 4px;")
 
     def _reindex_action_buttons(self) -> None:
         """After row deletion, update each action button's captured row index."""
