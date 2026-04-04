@@ -650,10 +650,14 @@ class ConnectionsView(QWidget):
         self._cfg_table.setCellWidget(row, _COL_ACTION, btn_container)
 
         # Status (read-only placeholder)
-        status_item = QTableWidgetItem("")
-        status_item.setFlags(status_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        status_item.setForeground(QColor(TEXT_DIM))
-        self._cfg_table.setItem(row, _COL_STATUS, status_item)
+        status_lbl = QLabel("")
+        status_lbl.setStyleSheet(f"color: {TEXT_DIM}; background: transparent; padding-left: 4px;")
+        status_container = QWidget()
+        status_container.setStyleSheet("background: transparent;")
+        status_layout = QHBoxLayout(status_container)
+        status_layout.setContentsMargins(0, 0, 0, 0)
+        status_layout.addWidget(status_lbl)
+        self._cfg_table.setCellWidget(row, _COL_STATUS, status_container)
 
         self._cfg_table.blockSignals(False)
         return row
@@ -830,17 +834,19 @@ class ConnectionsView(QWidget):
                 btn.setStyleSheet(_CONNECT_SS)
 
         # Status cell
-        status_item = self._cfg_table.item(row, _COL_STATUS)
-        if status_item:
-            if connecting:
-                status_item.setText("Connecting…")
-                status_item.setForeground(QColor("#FFA657"))  # amber
-            elif connected:
-                status_item.setText("Connected")
-                status_item.setForeground(QColor(GREEN))
-            else:
-                status_item.setText("Disconnected")
-                status_item.setForeground(QColor(RED))
+        status_container = self._cfg_table.cellWidget(row, _COL_STATUS)
+        if status_container:
+            status_item = status_container.findChild(QLabel)
+            if status_item:
+                if connecting:
+                    status_item.setText("Connecting…")
+                    status_item.setStyleSheet("color: #FFA657; background: transparent; padding-left: 4px;")  # amber
+                elif connected:
+                    status_item.setText("Connected")
+                    status_item.setStyleSheet(f"color: {GREEN}; background: transparent; padding-left: 4px;")
+                else:
+                    status_item.setText("Disconnected")
+                    status_item.setStyleSheet(f"color: {RED}; background: transparent; padding-left: 4px;")
 
     def _reindex_action_buttons(self) -> None:
         """After row deletion, update each action button's captured row index."""
