@@ -148,6 +148,7 @@ class IBWorkerThread(QThread):
         host: str = "127.1.1.1",
         port: int = 1000,
         client_id: int = 100,
+        auto_reconnect: bool = True,
         parent=None,
     ):
         super().__init__(parent)
@@ -155,10 +156,16 @@ class IBWorkerThread(QThread):
         self._host = host
         self._port = port
         self._client_id = client_id
+        self._auto_reconnect = auto_reconnect
         self._running = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._ib: IB | None = None
         self._main_task: asyncio.Task | None = None
+        self._first_connect_attempted = False
+
+    def set_auto_reconnect(self, auto_reconnect: bool) -> None:
+        """Update the auto-reconnect flag natively while running."""
+        self._auto_reconnect = auto_reconnect
 
         # De-dupe buffer keyed by (account, tag) → (value, currency)
         self._buffer: dict[tuple[str, str], tuple[str, str]] = {}
@@ -478,6 +485,13 @@ class IBWorkerThread(QThread):
                 continue
 
             if reconnect_countdown <= 0:
+                if self._first_connect_attempted and not self._auto_reconnect:
+                    log.info("Worker %s disconnected and auto-reconnect is OFF. Quitting.", self._label)
+                    self._running = False
+                    break
+                    
+                self._first_connect_attempted = True
+
                 try:
                     log.info("Worker %s connecting to %s:%d (cid=%d) …",
                              self._label, self._host, self._port, self._client_id)
@@ -492,6 +506,12 @@ class IBWorkerThread(QThread):
                     tws_log.error("[%s] API-ERR   connectAsync FAILED: %s",
                                   self._label, exc)
                     self.connection_status_changed.emit(self._label, False)
+                    
+                    if not self._auto_reconnect:
+                        log.info("Worker %s: Auto-reconnect is OFF. Quitting.", self._label)
+                        self._running = False
+                        break
+
                     reconnect_countdown = 5.0
                     await asyncio.sleep(1)
                     reconnect_countdown -= 1.0

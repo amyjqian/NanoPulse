@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from PySide6.QtCore import QEvent, Qt
+from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtGui import QPainter, QColor
 
 from .widgets.top_tab_bar import TopTabBar
@@ -55,7 +55,18 @@ class MainWindow(QWidget):
 
         self._setup_ui()
         self._restore_geometry()
+
+        self._status_timer = QTimer(self)
+        self._status_timer.timeout.connect(self._update_status)
+        self._status_timer.start(1000)
+        self._update_status()
+
         log.info("MainWindow initialised (%dx%d)", self.width(), self.height())
+
+    def _update_status(self) -> None:
+        conn_count = sum(1 for w in self.active_threads.values() if w._ib and w._ib.isConnected())
+        acct_count = self._accounts_model.rowCount()
+        self._tab_bar.set_status(conn_count, acct_count)
 
     # ── Window geometry persistence ───────────────────────────────────────────
 

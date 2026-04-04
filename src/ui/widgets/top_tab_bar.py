@@ -6,7 +6,7 @@ dark background, icon + label per tab, accent underline on the active tab.
 """
 from __future__ import annotations
 
-from PySide6.QtWidgets import QWidget, QHBoxLayout, QSizePolicy
+from PySide6.QtWidgets import QWidget, QHBoxLayout, QSizePolicy, QLabel
 from PySide6.QtCore import Qt, Signal, QSize
 from PySide6.QtGui import QPainter, QColor, QFont, QPen
 
@@ -142,9 +142,28 @@ class TopTabBar(QWidget):
 
         layout.addStretch(1)
 
+        self._status_label = QLabel(self)
+        self._status_label.setFont(_FONT_NORMAL)
+        self._status_label.setStyleSheet(f"QLabel {{ color: {TEXT_PRIMARY}; padding-right: 20px; }}")
+        self._status_label.setText("")
+        layout.addWidget(self._status_label)
+
         # Activate first tab
         first = next(iter(self._buttons.values()))
         first.set_active(True)
+
+    def set_status(self, conn_count: int, acct_count: int) -> None:
+        if conn_count == 0 and acct_count == 0:
+            self._status_label.setText("")
+            return
+            
+        parts = []
+        if conn_count > 0:
+            parts.append(f"Connections — {conn_count} Active")
+        if acct_count > 0:
+            parts.append(f"Accounts — {acct_count} Total")
+            
+        self._status_label.setText("  |  ".join(parts))
 
     def _on_tab_click(self, name: str) -> None:
         for label, btn in self._buttons.items():
