@@ -1,3 +1,4 @@
+# top_half.py - The new UI layout and styles for contracts_view.py
 from __future__ import annotations
 
 import logging
@@ -18,80 +19,108 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
+    QButtonGroup,
 )
 
 from src.core import config_manager
 from src.core.ib_worker import IBWorkerThread
+from src.ui.theme import Theme
 
 log = logging.getLogger(__name__)
 
-# ── Theme tokens ──────────────────────────────────────────────────────────────
+# ── Theme tokens mapping ──────────────────────────────────────────────────────
 BG_PRIMARY = "#1A1D24"
 BG_SECONDARY = "#1E222A"
 BG_HEADER = "#14171D"
 BORDER = "#2A2E37"
 TEXT = "#C9D1D9"
 TEXT_DIM = "#8B949E"
-GREEN = "#3FB950"
-RED = "#F85149"
+
 BLUE = "#58A6FF"
+GREEN = Theme.ACCENT
 ORANGE = "#D29922"
 
-_TOOLBAR_BTN = """
+_TOOLBAR_BTN = f"""
     QPushButton {{
-        background-color: {bg};
-        color: {fg};
-        border: 1px solid {border};
+        background-color: transparent;
+        color: {TEXT};
+        border: 1px solid #30363D;
         border-radius: 4px;
-        padding: 4px 14px;
+        padding: 6px 14px;
+        font-weight: 500;
+        font-size: 13px;
+    }}
+    QPushButton:hover {{ background-color: #2A2E38; }}
+    QPushButton:pressed {{ background-color: {BG_PRIMARY}; }}
+    QPushButton:disabled {{ background-color: {BG_PRIMARY}; color: #484F58; border-color: {BORDER}; }}
+    QPushButton:checked {{ background-color: {BLUE}; color: #ffffff; border: none; font-weight: bold; }}
+"""
+
+_REMOVE_SS = f"""
+    QPushButton {{
+        background-color: #2A1A1A;
+        color: {Theme.CLR_SELL};
+        border: 1px solid #3A2A2A;
+        border-radius: 4px;
+        padding: 6px 14px;
         font-weight: 500;
         font-size: 12px;
     }}
-    QPushButton:hover {{ background-color: {hover}; }}
-    QPushButton:pressed {{ background-color: {pressed}; }}
-    QPushButton:disabled {{ background-color: #22262E; color: #484F58; border-color: #2A2E37; }}
+    QPushButton:hover {{ background-color: #3A2424; }}
+    QPushButton:pressed {{ background-color: #2A1A1A; }}
 """
+_NEUTRAL_SS = _TOOLBAR_BTN
 
-_BTN_BLUE = _TOOLBAR_BTN.format(bg="#1A2A3A", fg=BLUE, border="#2A3A4A", hover="#243A4A", pressed="#1A2A3A")
-_BTN_GREEN = _TOOLBAR_BTN.format(bg="#1A3A2A", fg=GREEN, border="#2A4A3A", hover="#244A34", pressed="#1A3A2A")
-_BTN_ORANGE = _TOOLBAR_BTN.format(bg="#2A2A1A", fg=ORANGE, border="#3A3A2A", hover="#3A3424", pressed="#2A2A1A")
-_REMOVE_SS = _TOOLBAR_BTN.format(bg="#2A1A1A", fg=RED, border="#3A2A2A", hover="#3A2424", pressed="#2A1A1A")
-_NEUTRAL_SS = _TOOLBAR_BTN.format(bg="#22262E", fg=TEXT, border=BORDER, hover="#2A2E38", pressed="#22262E")
+_ACTION_BTN = f"""
+    QPushButton {{
+        background-color: {BLUE};
+        color: #ffffff;
+        border: none;
+        border-radius: 4px;
+        padding: 6px 14px;
+        font-weight: bold;
+        font-size: 13px;
+    }}
+    QPushButton:hover {{ background-color: #4b97f0; }}
+    QPushButton:pressed {{ background-color: #2a72d1; }}
+    QPushButton:disabled {{ background-color: #1A2A3A; color: #484F58; }}
+"""
 
 _INPUT_SS = f"""
     QLineEdit {{
-        background-color: {BG_SECONDARY};
+        background-color: {BG_PRIMARY};
         color: {TEXT};
         border: 1px solid {BORDER};
-        border-radius: 3px;
-        padding: 4px 8px;
-        font-size: 12px;
+        border-radius: 4px;
+        padding: 5px 10px;
+        font-size: 13px;
     }}
     QLineEdit:focus {{
-        border-color: {BLUE};
+        border-color: {Theme.ACCENT};
     }}
     QLineEdit:disabled {{
-        background-color: #14171D;
+        background-color: {BG_HEADER};
         color: #484F58;
     }}
 """
 
 _COMBO_SS = f"""
     QComboBox {{
-        background-color: {BG_SECONDARY};
+        background-color: {BG_PRIMARY};
         color: {TEXT};
         border: 1px solid {BORDER};
-        border-radius: 3px;
-        padding: 4px 8px;
-        font-size: 12px;
+        border-radius: 4px;
+        padding: 5px 10px;
+        font-size: 13px;
         min-width: 60px;
     }}
     QComboBox:focus {{
-        border-color: {BLUE};
+        border-color: {Theme.ACCENT};
     }}
     QComboBox::drop-down {{
         border: none;
@@ -138,27 +167,11 @@ _TABLE_STYLE = f"""
     QTableWidget::item {{
         padding: 4px 8px;
     }}
-    QScrollBar:vertical {{
-        background: {BG_PRIMARY};
-        width: 8px;
-    }}
-    QScrollBar::handle:vertical {{
-        background: #3A3E48;
-        border-radius: 4px;
-        min-height: 20px;
-    }}
-    QScrollBar:horizontal {{
-        background: {BG_PRIMARY};
-        height: 8px;
-    }}
-    QScrollBar::handle:horizontal {{
-        background: #3A3E48;
-        border-radius: 4px;
-        min-width: 20px;
-    }}
-    QScrollBar::add-line, QScrollBar::sub-line {{
-        height: 0; width: 0;
-    }}
+    QScrollBar:vertical {{ background: {BG_PRIMARY}; width: 8px; }}
+    QScrollBar::handle:vertical {{ background: #3A3E48; border-radius: 4px; min-height: 20px; }}
+    QScrollBar:horizontal {{ background: {BG_PRIMARY}; height: 8px; }}
+    QScrollBar::handle:horizontal {{ background: #3A3E48; border-radius: 4px; min-width: 20px; }}
+    QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
 """
 
 # Saved-contracts table columns
@@ -189,19 +202,6 @@ _FUT_EXCHANGE: dict[str, str] = {
 }
 
 
-
-def _card_ss(accent: str) -> str:
-    """Return stylesheet for a search-section card with the given accent."""
-    return f"""
-        QFrame#searchCard {{
-            background-color: {BG_SECONDARY};
-            border: 1px solid {BORDER};
-            border-top: 2px solid {accent};
-            border-radius: 4px;
-        }}
-    """
-
-
 # ── Main view ─────────────────────────────────────────────────────────────────
 
 class ContractsView(QWidget):
@@ -209,8 +209,6 @@ class ContractsView(QWidget):
     Contract Universe page – find stocks / futures / options and
     persist them for quick lookup during order entry.
     """
-
-    # Emitted when saved contracts list changes (add/remove/clear)
     contracts_changed = Signal()
 
     def __init__(
@@ -227,76 +225,52 @@ class ContractsView(QWidget):
         self._setup_ui()
         self._load_saved_contracts()
 
-    # ── UI construction ───────────────────────────────────────────────────────
-
     def _setup_ui(self) -> None:
-        self.setStyleSheet(f"ContractsView {{ background-color: {BG_PRIMARY}; }}")
+        self.setStyleSheet(
+            f"ContractsView {{ background-color: {BG_PRIMARY}; }}")
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(16)
 
-        splitter = QSplitter(Qt.Orientation.Vertical, self)
-        splitter.setHandleWidth(3)
-        splitter.setChildrenCollapsible(False)
-        splitter.setStyleSheet(f"""
-            QSplitter {{
-                background-color: {BG_PRIMARY};
-            }}
-            QSplitter::handle {{
-                background-color: {BORDER};
-            }}
-        """)
-
-        # ── Top pane: 3 search cards ──────────────────────────────────────────
+        # ── Top pane: Search Card ─────────────────────────────────────────────
         top_pane = QWidget()
-        top_pane.setMinimumHeight(220)
-        top_pane.setStyleSheet(f"QWidget {{ background-color: {BG_PRIMARY}; }}")
+        top_pane.setStyleSheet(
+            f"QWidget {{ background-color: {BG_PRIMARY}; }}")
         top_layout = QVBoxLayout(top_pane)
-        top_layout.setContentsMargins(12, 10, 12, 4)
-        top_layout.setSpacing(8)
+        top_layout.setContentsMargins(0, 0, 0, 0)
 
         lbl_title = QLabel("Find Contracts")
-        lbl_title.setFont(QFont("Helvetica Neue, Arial", 13, QFont.Weight.DemiBold))
-        lbl_title.setStyleSheet(f"QLabel {{ color: {TEXT}; background: transparent; padding: 0 0 2px 0; }}")
+        lbl_title.setFont(QFont("Helvetica Neue, Arial",
+                          18, QFont.Weight.DemiBold))
+        lbl_title.setStyleSheet(
+            f"QLabel {{ color: {TEXT}; background: transparent; }}")
         top_layout.addWidget(lbl_title)
 
-        cards_row = QHBoxLayout()
-        cards_row.setSpacing(10)
-
-        stk_card, stk_widgets = self._build_stk_card()
-        self._stk = stk_widgets
-        cards_row.addWidget(stk_card)
-
-        fut_card, fut_widgets = self._build_fut_card()
-        self._fut = fut_widgets
-        cards_row.addWidget(fut_card)
-
-        opt_card, opt_widgets = self._build_opt_card()
-        self._opt = opt_widgets
-        cards_row.addWidget(opt_card)
-
-        top_layout.addLayout(cards_row)
+        search_card = self._build_search_card()
+        top_layout.addWidget(search_card)
         top_layout.addStretch()
 
         # ── Bottom pane: Saved Contracts ───────────────────────────────────────
         bottom_pane = QWidget()
-        bottom_pane.setMinimumHeight(150)
-        bottom_pane.setStyleSheet(f"QWidget {{ background-color: {BG_PRIMARY}; }}")
+        bottom_pane.setStyleSheet(
+            f"QWidget {{ background-color: {BG_PRIMARY}; }}")
         bottom_layout = QVBoxLayout(bottom_pane)
-        bottom_layout.setContentsMargins(12, 8, 12, 10)
-        bottom_layout.setSpacing(6)
+        bottom_layout.setContentsMargins(0, 0, 0, 0)
+        bottom_layout.setSpacing(10)
 
-        lbl_saved = QLabel("📌 Saved Contracts (available for Order Entry)")
-        lbl_saved.setFont(QFont("Helvetica Neue, Arial", 13, QFont.Weight.DemiBold))
-        lbl_saved.setStyleSheet(f"QLabel {{ color: {ORANGE}; background: transparent; padding: 0 0 2px 0; }}")
+        lbl_saved = QLabel("Saved Contracts (available for Order Entry)")
+        lbl_saved.setFont(QFont("Helvetica Neue, Arial",
+                          14, QFont.Weight.DemiBold))
+        lbl_saved.setStyleSheet(
+            f"QLabel {{ color: {TEXT}; background: transparent; }}")
         bottom_layout.addWidget(lbl_saved)
 
         self._saved_table = self._build_saved_table()
         bottom_layout.addWidget(self._saved_table)
 
         bot_bar = QHBoxLayout()
-        bot_bar.setSpacing(8)
+        bot_bar.setSpacing(12)
 
         btn_remove = QPushButton("Remove Selected")
         btn_remove.setStyleSheet(_REMOVE_SS)
@@ -313,73 +287,187 @@ class ContractsView(QWidget):
         bot_bar.addStretch()
         bottom_layout.addLayout(bot_bar)
 
+        splitter = QSplitter(Qt.Orientation.Vertical, self)
+        splitter.setHandleWidth(1)
+        splitter.setChildrenCollapsible(False)
+        splitter.setStyleSheet(f"""
+            QSplitter {{ background-color: transparent; }}
+            QSplitter::handle {{ background-color: transparent; }}
+        """)
         splitter.addWidget(top_pane)
         splitter.addWidget(bottom_pane)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 5)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 4)
 
         layout.addWidget(splitter)
 
-    # ── Card builders ─────────────────────────────────────────────────────────
+    # ── Search Card Builder ───────────────────────────────────────────────────
 
-    def _build_stk_card(self) -> tuple[QFrame, dict]:
+    def _build_search_card(self) -> QFrame:
         card = QFrame()
-        card.setObjectName("searchCard")
-        card.setStyleSheet(_card_ss(BLUE))
+        card.setStyleSheet(f"""
+            QFrame {{
+                background-color: {BG_SECONDARY};
+                border: 1px solid {BORDER};
+                border-radius: 8px;
+            }}
+        """)
         vbox = QVBoxLayout(card)
-        vbox.setContentsMargins(10, 8, 10, 10)
-        vbox.setSpacing(6)
+        vbox.setContentsMargins(20, 20, 20, 20)
+        vbox.setSpacing(16)
 
-        title = QLabel("Stock")
-        title.setFont(QFont("Helvetica Neue, Arial", 12, QFont.Weight.DemiBold))
-        title.setStyleSheet(f"QLabel {{ color: {BLUE}; background: transparent; }}")
-        vbox.addWidget(title)
+        # Segmented Control
+        seg_layout = QHBoxLayout()
+        seg_layout.setSpacing(0)
+        self._btn_grp = QButtonGroup(self)
 
-        sym = self._make_field_row(vbox, "Symbol:", placeholder="e.g. AAPL, TSLA")
-        sym.returnPressed.connect(self._on_find_stk)
-        exch = self._make_field_row(vbox, "Exchange:", default="SMART")
-        cur = self._make_field_row(vbox, "Currency:", default="USD")
+        btn_stk = QPushButton("Stock")
+        btn_stk.setCheckable(True)
+        btn_stk.setChecked(True)
+        btn_stk.setStyleSheet(
+            _TOOLBAR_BTN + "QPushButton { border-top-right-radius: 0; border-bottom-right-radius: 0; }")
 
-        vbox.addStretch()
+        btn_fut = QPushButton("Future")
+        btn_fut.setCheckable(True)
+        btn_fut.setStyleSheet(
+            _TOOLBAR_BTN + "QPushButton { border-radius: 0; border-left: none; border-right: none; }")
 
-        btn = QPushButton("Find Stock")
-        btn.setStyleSheet(_BTN_BLUE)
-        btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn.clicked.connect(self._on_find_stk)
-        vbox.addWidget(btn)
+        btn_opt = QPushButton("Option")
+        btn_opt.setCheckable(True)
+        btn_opt.setStyleSheet(
+            _TOOLBAR_BTN + "QPushButton { border-top-left-radius: 0; border-bottom-left-radius: 0; }")
 
-        return card, {"symbol": sym, "exchange": exch, "currency": cur, "btn": btn}
+        self._btn_grp.addButton(btn_stk, 0)
+        self._btn_grp.addButton(btn_fut, 1)
+        self._btn_grp.addButton(btn_opt, 2)
 
-    def _build_fut_card(self) -> tuple[QFrame, dict]:
-        card = QFrame()
-        card.setObjectName("searchCard")
-        card.setStyleSheet(_card_ss(GREEN))
-        vbox = QVBoxLayout(card)
-        vbox.setContentsMargins(10, 8, 10, 10)
-        vbox.setSpacing(6)
+        seg_layout.addWidget(btn_stk)
+        seg_layout.addWidget(btn_fut)
+        seg_layout.addWidget(btn_opt)
+        seg_layout.addStretch()
 
-        title = QLabel("Future")
-        title.setFont(QFont("Helvetica Neue, Arial", 12, QFont.Weight.DemiBold))
-        title.setStyleSheet(f"QLabel {{ color: {GREEN}; background: transparent; }}")
-        vbox.addWidget(title)
+        vbox.addLayout(seg_layout)
 
-        sym = self._make_field_row(vbox, "Symbol:", placeholder="e.g. RTY, M@K, YM, MYM, MGC, MCL")
-        sym.returnPressed.connect(self._on_find_fut)
-        exch = self._make_field_row(vbox, "Exchange:", placeholder="CME, CBOT, NYMEX, COMEX")
-        cur = self._make_field_row(vbox, "Currency:", default="USD")
+        # Stacked Widget for Inputs
+        self._stack = QStackedWidget()
+        self._stack.setStyleSheet(
+            "QStackedWidget { background: transparent; border: none; }")
 
-        # Auto-fill exchange when a known symbol is typed
-        sym.textChanged.connect(lambda text: self._on_fut_symbol_changed(text, exch))
+        # Page 0: STK
+        stk_page = QWidget()
+        stk_layout = QHBoxLayout(stk_page)
+        stk_layout.setContentsMargins(0, 0, 0, 0)
+        self._stk = {}
+        self._stk['symbol'] = self._make_inline_field(
+            stk_layout, "Symbol", "e.g. AAPL")
+        self._stk['exchange'] = self._make_inline_field(
+            stk_layout, "Exchange", "SMART")
+        self._stk['currency'] = self._make_inline_field(
+            stk_layout, "Currency", "USD")
+        self._stk['symbol'].returnPressed.connect(self._on_find_stk)
+        stk_layout.addStretch()
+        self._stack.addWidget(stk_page)
 
-        vbox.addStretch()
+        # Page 1: FUT
+        fut_page = QWidget()
+        fut_layout = QHBoxLayout(fut_page)
+        fut_layout.setContentsMargins(0, 0, 0, 0)
+        self._fut = {}
+        self._fut['symbol'] = self._make_inline_field(
+            fut_layout, "Symbol", "e.g. NQ")
+        self._fut['exchange'] = self._make_inline_field(
+            fut_layout, "Exchange", "CME")
+        self._fut['currency'] = self._make_inline_field(
+            fut_layout, "Currency", "USD")
+        self._fut['symbol'].returnPressed.connect(self._on_find_fut)
+        self._fut['symbol'].textChanged.connect(
+            lambda text: self._on_fut_symbol_changed(text, self._fut["exchange"]))
+        fut_layout.addStretch()
+        self._stack.addWidget(fut_page)
 
-        btn = QPushButton("Find Future")
-        btn.setStyleSheet(_BTN_GREEN)
-        btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn.clicked.connect(self._on_find_fut)
-        vbox.addWidget(btn)
+        # Page 2: OPT
+        opt_page = QWidget()
+        opt_layout = QHBoxLayout(opt_page)
+        opt_layout.setContentsMargins(0, 0, 0, 0)
+        self._opt = {}
+        self._opt['symbol'] = self._make_inline_field(
+            opt_layout, "Symbol", "e.g. AAPL")
+        self._opt['exchange'] = self._make_inline_field(
+            opt_layout, "Exchange", "SMART")
+        self._opt['currency'] = self._make_inline_field(
+            opt_layout, "Currency", "USD")
+        self._opt['expiry'] = self._make_inline_field(
+            opt_layout, "Expiry", f"{date.today().year}{date.today().month:02d}")
+        self._opt['strike'] = self._make_inline_field(
+            opt_layout, "Strike", "0.00")
 
-        return card, {"symbol": sym, "exchange": exch, "currency": cur, "btn": btn}
+        opt_right_layout = QVBoxLayout()
+        lbl = QLabel("Right")
+        lbl.setStyleSheet(
+            f"QLabel {{ color: {TEXT_DIM}; font-size: 11px; background: transparent; border: none; font-weight: bold; text-transform: uppercase; }}")
+        combo = QComboBox()
+        combo.addItems(["", "C", "P"])
+        combo.setStyleSheet(_COMBO_SS)
+        opt_right_layout.addWidget(lbl)
+        opt_right_layout.addWidget(combo)
+        opt_layout.addLayout(opt_right_layout)
+
+        self._opt['right'] = combo
+        self._opt['symbol'].returnPressed.connect(self._on_find_opt)
+        opt_layout.addStretch()
+        self._stack.addWidget(opt_page)
+
+        vbox.addWidget(self._stack)
+
+        # Search Button Bar
+        btn_bar = QHBoxLayout()
+        btn_bar.addStretch()
+
+        self._btn_search = QPushButton("Search Contracts")
+        self._btn_search.setStyleSheet(_ACTION_BTN)
+        self._btn_search.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_search.setMinimumWidth(150)
+        self._btn_search.clicked.connect(self._on_search_clicked)
+        btn_bar.addWidget(self._btn_search)
+
+        vbox.addLayout(btn_bar)
+
+        # Hook up button group
+        self._btn_grp.idClicked.connect(self._stack.setCurrentIndex)
+
+        # Expose active buttons for logic reuse
+        self._stk['btn'] = self._btn_search
+        self._fut['btn'] = self._btn_search
+        self._opt['btn'] = self._btn_search
+
+        return card
+
+    def _make_inline_field(self, layout: QHBoxLayout, label: str, default: str = "") -> QLineEdit:
+        col = QVBoxLayout()
+        col.setSpacing(4)
+        lbl = QLabel(label)
+        lbl.setStyleSheet(
+            f"QLabel {{ color: {TEXT_DIM}; font-size: 11px; background: transparent; border: none; font-weight: bold; text-transform: uppercase; }}")
+        inp = QLineEdit()
+        inp.setStyleSheet(_INPUT_SS)
+        if default:
+            if "e.g." in default:
+                inp.setPlaceholderText(default)
+            else:
+                inp.setText(default)
+        col.addWidget(lbl)
+        col.addWidget(inp)
+        layout.addLayout(col)
+        return inp
+
+    def _on_search_clicked(self):
+        idx = self._stack.currentIndex()
+        if idx == 0:
+            self._on_find_stk()
+        elif idx == 1:
+            self._on_find_fut()
+        elif idx == 2:
+            self._on_find_opt()
 
     @staticmethod
     def _on_fut_symbol_changed(text: str, exch_input: QLineEdit) -> None:
@@ -391,90 +479,23 @@ class ContractsView(QWidget):
         elif not exch_input.text().strip():
             exch_input.setText("")
 
-    def _build_opt_card(self) -> tuple[QFrame, dict]:
-        card = QFrame()
-        card.setObjectName("searchCard")
-        card.setStyleSheet(_card_ss(ORANGE))
-        vbox = QVBoxLayout(card)
-        vbox.setContentsMargins(10, 8, 10, 10)
-        vbox.setSpacing(6)
-
-        title = QLabel("Option")
-        title.setFont(QFont("Helvetica Neue, Arial", 12, QFont.Weight.DemiBold))
-        title.setStyleSheet(f"QLabel {{ color: {ORANGE}; background: transparent; }}")
-        vbox.addWidget(title)
-
-        sym = self._make_field_row(vbox, "Symbol:", placeholder="e.g. AAPL, TSLA")
-        sym.returnPressed.connect(self._on_find_opt)
-        exch = self._make_field_row(vbox, "Exchange:", default="SMART")
-        cur = self._make_field_row(vbox, "Currency:", default="USD")
-        exp = self._make_field_row(vbox, "Expiry:", default=f"{date.today().year}{date.today().month:02d}")
-        strike = self._make_field_row(vbox, "Strike:", placeholder="0.00")
-
-        right_row = QHBoxLayout()
-        right_row.setSpacing(6)
-        right_lbl = self._make_label("Right:")
-        right_combo = QComboBox()
-        right_combo.addItems(["", "C", "P"])
-        right_combo.setStyleSheet(_COMBO_SS)
-        right_combo.setFixedWidth(70)
-        right_row.addWidget(right_lbl)
-        right_row.addWidget(right_combo)
-        right_row.addStretch()
-        vbox.addLayout(right_row)
-
-        vbox.addStretch()
-
-        btn = QPushButton("Find Option")
-        btn.setStyleSheet(_BTN_ORANGE)
-        btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn.clicked.connect(self._on_find_opt)
-        vbox.addWidget(btn)
-
-        return card, {"symbol": sym, "exchange": exch, "currency": cur,
-                      "expiry": exp, "strike": strike, "right": right_combo,
-                      "btn": btn}
-
-    # ── Helpers ───────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _make_label(text: str) -> QLabel:
-        lbl = QLabel(text)
-        lbl.setFixedWidth(62)
-        lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        lbl.setStyleSheet(f"QLabel {{ color: {TEXT_DIM}; background: transparent; font-size: 11px; }}")
-        return lbl
-
-    def _make_field_row(
-        self, parent_layout: QVBoxLayout, label: str, *,
-        default: str = "", placeholder: str = "",
-    ) -> QLineEdit:
-        row = QHBoxLayout()
-        row.setSpacing(6)
-        lbl = self._make_label(label)
-        inp = QLineEdit(default)
-        if placeholder:
-            inp.setPlaceholderText(placeholder)
-        inp.setStyleSheet(_INPUT_SS)
-        inp.setMinimumWidth(100)
-        row.addWidget(lbl)
-        row.addWidget(inp)
-        parent_layout.addLayout(row)
-        return inp
-
     def _build_saved_table(self) -> QTableWidget:
         table = QTableWidget(0, len(_SAVED_COLS))
         table.setHorizontalHeaderLabels(_SAVED_COLS)
         table.setAlternatingRowColors(True)
-        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        table.verticalHeader().setVisible(True)
+        table.verticalHeader().setVisible(False)
+        table.setShowGrid(True)
         table.horizontalHeader().setStretchLastSection(True)
-        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Interactive)
         table.setStyleSheet(_TABLE_STYLE)
 
-        for col, w in enumerate([120, 70, 60, 80, 70, 90, 60, 50, 280, 70]):
+        for col, w in enumerate([100, 100, 80, 100, 80, 100, 80, 60, 160, 80]):
             table.setColumnWidth(col, w)
 
         return table
@@ -485,7 +506,8 @@ class ContractsView(QWidget):
         w = self._stk
         symbol = w["symbol"].text().strip().upper()
         if not symbol:
-            QMessageBox.warning(self, "Missing Symbol", "Please enter a stock symbol.")
+            QMessageBox.warning(self, "Missing Symbol",
+                                "Please enter a stock symbol.")
             return
         params = {
             "sec_type": "STK",
@@ -499,7 +521,8 @@ class ContractsView(QWidget):
         w = self._fut
         symbol = w["symbol"].text().strip().upper()
         if not symbol:
-            QMessageBox.warning(self, "Missing Symbol", "Please enter a futures symbol.")
+            QMessageBox.warning(self, "Missing Symbol",
+                                "Please enter a futures symbol.")
             return
         params = {
             "sec_type": "FUT",
@@ -513,7 +536,8 @@ class ContractsView(QWidget):
         w = self._opt
         symbol = w["symbol"].text().strip().upper()
         if not symbol:
-            QMessageBox.warning(self, "Missing Symbol", "Please enter an option symbol.")
+            QMessageBox.warning(self, "Missing Symbol",
+                                "Please enter an option symbol.")
             return
         params = {
             "sec_type": "OPT",
@@ -577,11 +601,13 @@ class ContractsView(QWidget):
         # Disconnect previous worker signals
         if self._connected_worker is not None:
             try:
-                self._connected_worker.browse_results.disconnect(self._on_find_results)
+                self._connected_worker.browse_results.disconnect(
+                    self._on_find_results)
             except (RuntimeError, TypeError):
                 pass
             try:
-                self._connected_worker.browse_failed.disconnect(self._on_find_failed)
+                self._connected_worker.browse_failed.disconnect(
+                    self._on_find_failed)
             except (RuntimeError, TypeError):
                 pass
 
@@ -613,7 +639,8 @@ class ContractsView(QWidget):
         self._reset_btn()
 
         if not results:
-            QMessageBox.information(self, "Find Contract", "No contracts found.")
+            QMessageBox.information(
+                self, "Find Contract", "No contracts found.")
             return
 
         existing_conids: set[str] = set()
@@ -651,17 +678,20 @@ class ContractsView(QWidget):
                 if added:
                     self._save_all_contracts()
                     self._reload_saved_table()
-                    log.info("Find: added %d contract(s) from browse dialog", added)
+                    log.info(
+                        "Find: added %d contract(s) from browse dialog", added)
 
     def _on_find_failed(self, error: str) -> None:
         # Disconnect current worker signals
         if self._connected_worker is not None:
             try:
-                self._connected_worker.browse_results.disconnect(self._on_find_results)
+                self._connected_worker.browse_results.disconnect(
+                    self._on_find_results)
             except (RuntimeError, TypeError):
                 pass
             try:
-                self._connected_worker.browse_failed.disconnect(self._on_find_failed)
+                self._connected_worker.browse_failed.disconnect(
+                    self._on_find_failed)
             except (RuntimeError, TypeError):
                 pass
 
@@ -713,7 +743,8 @@ class ContractsView(QWidget):
             self._saved_table.setItem(row, col, item)
 
     def _on_remove_selected(self) -> None:
-        rows = sorted(set(idx.row() for idx in self._saved_table.selectedIndexes()), reverse=True)
+        rows = sorted(set(idx.row()
+                      for idx in self._saved_table.selectedIndexes()), reverse=True)
         if not rows:
             return
         for r in rows:
@@ -753,7 +784,8 @@ class ContractsView(QWidget):
             })
         # Sort by SecType then Symbol for consistent display order
         _SEC_ORDER = {"STK": 0, "FUT": 1, "OPT": 2}
-        contracts.sort(key=lambda c: (_SEC_ORDER.get(c.get("sec_type", ""), 9), c.get("symbol", "")))
+        contracts.sort(key=lambda c: (_SEC_ORDER.get(
+            c.get("sec_type", ""), 9), c.get("symbol", "")))
         config_manager.save_contracts(contracts)
         self.contracts_changed.emit()
 
@@ -764,7 +796,8 @@ class ContractsView(QWidget):
     def _load_saved_contracts(self) -> None:
         contracts = config_manager.load_contracts()
         _SEC_ORDER = {"STK": 0, "FUT": 1, "OPT": 2}
-        contracts.sort(key=lambda c: (_SEC_ORDER.get(c.get("sec_type", ""), 9), c.get("symbol", "")))
+        contracts.sort(key=lambda c: (_SEC_ORDER.get(
+            c.get("sec_type", ""), 9), c.get("symbol", "")))
         log.info("Loading %d saved contract(s)", len(contracts))
         for c in contracts:
             self._add_contract_row(c)
@@ -791,21 +824,21 @@ _BROWSE_COLS = [
 
 _BROWSE_TABLE_STYLE = f"""
     QTableWidget {{
-        background-color: {BG_PRIMARY};
-        alternate-background-color: {BG_SECONDARY};
-        color: {TEXT};
-        gridline-color: {BORDER};
-        border: 1px solid {BORDER};
+        background-color: {Theme.BG_MAIN};
+        alternate-background-color: {Theme.BG_PANEL};
+        color: {Theme.TEXT};
+        gridline-color: {Theme.BORDER};
+        border: 1px solid {Theme.BORDER};
         font-size: 12px;
         selection-background-color: #253545;
-        selection-color: {TEXT};
+        selection-color: {Theme.TEXT};
     }}
     QHeaderView::section {{
-        background-color: {BG_HEADER};
-        color: {TEXT_DIM};
+        background-color: {Theme.BG_INPUT};
+        color: {Theme.TEXT_DIM};
         border: none;
-        border-bottom: 1px solid {BORDER};
-        border-right: 1px solid {BORDER};
+        border-bottom: 1px solid {Theme.BORDER};
+        border-right: 1px solid {Theme.BORDER};
         padding: 5px 8px;
         font-weight: 600;
         font-size: 11px;
@@ -814,7 +847,7 @@ _BROWSE_TABLE_STYLE = f"""
         padding: 4px 8px;
     }}
     QScrollBar:vertical {{
-        background: {BG_PRIMARY};
+        background: {Theme.BG_MAIN};
         width: 8px;
     }}
     QScrollBar::handle:vertical {{
@@ -823,7 +856,7 @@ _BROWSE_TABLE_STYLE = f"""
         min-height: 20px;
     }}
     QScrollBar:horizontal {{
-        background: {BG_PRIMARY};
+        background: {Theme.BG_MAIN};
         height: 8px;
     }}
     QScrollBar::handle:horizontal {{
@@ -836,8 +869,33 @@ _BROWSE_TABLE_STYLE = f"""
     }}
 """
 
-_BROWSE_ADD_SS = _TOOLBAR_BTN.format(bg="#1A3A2A", fg=GREEN, border="#2A4A3A", hover="#244A34", pressed="#1A3A2A")
-_BROWSE_CANCEL_SS = _TOOLBAR_BTN.format(bg="#22262E", fg=TEXT, border=BORDER, hover="#2A2E38", pressed="#22262E")
+_BROWSE_ADD_SS = f"""
+    QPushButton {{
+        background-color: #1A3A2A;
+        color: {Theme.ACCENT};
+        border: 1px solid #2A4A3A;
+        border-radius: 4px;
+        padding: 6px 14px;
+        font-weight: 500;
+        font-size: 13px;
+    }}
+    QPushButton:hover {{ background-color: #244A34; }}
+    QPushButton:pressed {{ background-color: #1A3A2A; }}
+"""
+
+_BROWSE_CANCEL_SS = f"""
+    QPushButton {{
+        background-color: #22262E;
+        color: {Theme.TEXT};
+        border: 1px solid {Theme.BORDER};
+        border-radius: 4px;
+        padding: 6px 14px;
+        font-weight: 500;
+        font-size: 13px;
+    }}
+    QPushButton:hover {{ background-color: #2A2E38; }}
+    QPushButton:pressed {{ background-color: #22262E; }}
+"""
 
 
 class BrowseDialog(QDialog):
@@ -850,13 +908,14 @@ class BrowseDialog(QDialog):
         parent=None,
     ):
         super().__init__(parent)
-        self.setWindowTitle(f"Browse Results — {len(contracts)} contract(s) found")
+        self.setWindowTitle(
+            f"Browse Results — {len(contracts)} contract(s) found")
         self.setMinimumSize(900, 500)
         self.resize(1050, 600)
         self.setStyleSheet(f"""
             QDialog {{
-                background-color: {BG_PRIMARY};
-                color: {TEXT};
+                background-color: {Theme.BG_MAIN};
+                color: {Theme.TEXT};
             }}
         """)
 
@@ -867,18 +926,23 @@ class BrowseDialog(QDialog):
         layout.setContentsMargins(12, 10, 12, 10)
         layout.setSpacing(8)
 
-        info = QLabel(f"Found {len(contracts)} contract(s). Check the ones you want to add:")
-        info.setStyleSheet(f"QLabel {{ color: {TEXT_DIM}; font-size: 12px; background: transparent; }}")
+        info = QLabel(
+            f"Found {len(contracts)} contract(s). Check the ones you want to add:")
+        info.setStyleSheet(
+            f"QLabel {{ color: {Theme.TEXT_DIM}; font-size: 12px; background: transparent; }}")
         layout.addWidget(info)
 
         self._table = QTableWidget(len(contracts), len(_BROWSE_COLS))
         self._table.setHorizontalHeaderLabels(_BROWSE_COLS)
         self._table.setAlternatingRowColors(True)
-        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers)
         self._table.verticalHeader().setVisible(False)
         self._table.horizontalHeader().setStretchLastSection(True)
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self._table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Interactive)
         self._table.setStyleSheet(_BROWSE_TABLE_STYLE)
 
         for col, w in enumerate([32, 120, 70, 60, 80, 70, 90, 70, 50, 280, 70]):
@@ -889,7 +953,8 @@ class BrowseDialog(QDialog):
             conid_str = str(c.get("conid", ""))
             if conid_str in existing_conids:
                 chk_item.setCheckState(Qt.CheckState.Unchecked)
-                chk_item.setFlags(chk_item.flags() & ~Qt.ItemFlag.ItemIsEnabled)
+                chk_item.setFlags(chk_item.flags() & ~
+                                  Qt.ItemFlag.ItemIsEnabled)
                 chk_item.setToolTip("Already saved")
             else:
                 chk_item.setCheckState(Qt.CheckState.Unchecked)
@@ -971,12 +1036,3 @@ class BrowseDialog(QDialog):
             if chk and chk.checkState() == Qt.CheckState.Checked:
                 selected.append(self._contracts[row])
         return selected
-
-
-
-
-
-
-
-
-

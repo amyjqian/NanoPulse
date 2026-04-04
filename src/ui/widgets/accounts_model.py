@@ -12,20 +12,19 @@ Design principles
 * **Editable Alias** column – users can type a friendly name per account.
 """
 from __future__ import annotations
+from src.core import config_manager
+from PySide6.QtGui import QColor
+from PySide6.QtCore import (
+    QAbstractTableModel,
+    QModelIndex,
+    Qt,
+)
 
 import logging
 from typing import Any
 
 log = logging.getLogger(__name__)
 
-from PySide6.QtCore import (
-    QAbstractTableModel,
-    QModelIndex,
-    Qt,
-)
-from PySide6.QtGui import QColor
-
-from src.core import config_manager
 
 # Column indices
 COL_CONNECTION = 0
@@ -210,7 +209,8 @@ class AccountsTableModel(QAbstractTableModel):
         log.info("New account row: label=%r account=%r type=%s alias=%r (row %d)",
                  label, account, acct_type, alias, row_idx)
         self.beginInsertRows(QModelIndex(), row_idx, row_idx)
-        self._table_data.append([label, account, acct_type, alias, "", "", "", "", ""])
+        self._table_data.append(
+            [label, account, acct_type, alias, "", "", "", "", ""])
         self._row_map[(label, account)] = row_idx
         self._acct_to_label[account] = label  # Update reverse index
         self.endInsertRows()
@@ -220,9 +220,11 @@ class AccountsTableModel(QAbstractTableModel):
         keys_to_remove = [k for k in self._row_map if k[0] == label]
         if not keys_to_remove:
             return
-        log.info("Removing %d account row(s) for label=%r", len(keys_to_remove), label)
+        log.info("Removing %d account row(s) for label=%r",
+                 len(keys_to_remove), label)
         # Remove from bottom to top to keep indices valid.
-        indices = sorted((self._row_map[k] for k in keys_to_remove), reverse=True)
+        indices = sorted((self._row_map[k]
+                         for k in keys_to_remove), reverse=True)
         for idx in indices:
             self.beginRemoveRows(QModelIndex(), idx, idx)
             self._table_data.pop(idx)

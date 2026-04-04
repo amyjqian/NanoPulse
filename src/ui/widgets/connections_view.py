@@ -28,38 +28,86 @@ from .accounts_model import AccountsTableModel
 log = logging.getLogger(__name__)
 
 # ── Theme tokens ──────────────────────────────────────────────────────────────
+from src.ui.theme import Theme
+
 BG_PRIMARY = "#1A1D24"
 BG_SECONDARY = "#1E222A"
 BG_HEADER = "#14171D"
 BORDER = "#2A2E37"
 TEXT = "#C9D1D9"
 TEXT_DIM = "#8B949E"
-GREEN = "#3FB950"
-RED = "#F85149"
+GREEN = Theme.ACCENT
+RED = Theme.CLR_SELL
 BLUE = "#58A6FF"
 
-_TOOLBAR_BTN = """
+_TOOLBAR_BTN = f"""
     QPushButton {{
-        background-color: {bg};
-        color: {fg};
-        border: 1px solid {border};
+        background-color: transparent;
+        color: {TEXT};
+        border: 1px solid #30363D;
         border-radius: 4px;
-        padding: 4px 14px;
+        padding: 4px 12px;
         font-weight: 500;
-        font-size: 12px;
+        font-size: 13px;
     }}
-    QPushButton:hover {{ background-color: {hover}; }}
-    QPushButton:pressed {{ background-color: {pressed}; }}
+    QPushButton:hover {{ background-color: #2A2E38; }}
+    QPushButton:pressed {{ background-color: {BG_PRIMARY}; }}
+    QPushButton:disabled {{ background-color: transparent; color: #484F58; border-color: {BORDER}; }}
 """
 
-_CONNECT_SS = _TOOLBAR_BTN.format(bg="#1A3A2A", fg=GREEN, border="#2A4A3A", hover="#244A34", pressed="#1A3A2A")
-_DISCONNECT_SS = _TOOLBAR_BTN.format(bg="#3A1A1A", fg=RED, border="#4A2A2A", hover="#4A2424", pressed="#3A1A1A")
-_ADD_SS = _TOOLBAR_BTN.format(bg="#1A2440", fg=BLUE, border="#2A3450", hover="#24304A", pressed="#1A2440")
-_DELETE_SS = _TOOLBAR_BTN.format(bg="#2A1A1A", fg=RED, border="#3A2A2A", hover="#3A2424", pressed="#2A1A1A")
-_NEUTRAL_SS = _TOOLBAR_BTN.format(bg="#22262E", fg=TEXT, border=BORDER, hover="#2A2E38", pressed="#22262E")
+_CONNECT_SS = f"""
+    QPushButton {{
+        background-color: {GREEN};
+        color: #ffffff;
+        border: none;
+        border-radius: 4px;
+        padding: 4px 10px;
+        min-width: 90px;
+        font-weight: bold;
+        font-size: 13px;
+    }}
+    QPushButton:hover {{ background-color: #4cd860; }}
+    QPushButton:pressed {{ background-color: #35a145; }}
+    QPushButton:disabled {{ background-color: #1A3A2A; color: #484F58; }}
+"""
+
+_DISCONNECT_SS = f"""
+    QPushButton {{
+        background-color: {RED};
+        color: #ffffff;
+        border: none;
+        border-radius: 4px;
+        padding: 4px 10px;
+        min-width: 90px;
+        font-weight: bold;
+        font-size: 13px;
+    }}
+    QPushButton:hover {{ background-color: #fc746d; }}
+    QPushButton:pressed {{ background-color: #c83c34; }}
+"""
+
+_ADD_SS = f"""
+    QPushButton {{
+        background-color: #5C626E;
+        color: #ffffff;
+        border: none;
+        border-radius: 3px;
+        padding: 4px 10px;
+        min-width: 90px;
+        font-weight: bold;
+        font-size: 13px;
+    }}
+    QPushButton:hover {{ background-color: #798190; }}
+    QPushButton:pressed {{ background-color: #464B54; }}
+"""
+
+_DELETE_SS = _ADD_SS
+
+_NEUTRAL_SS = _TOOLBAR_BTN
 
 # Connection config table columns
-_CFG_COLS = ["Label", "Host", "Port", "Client ID", "Type", "Priority", "Auto Connect", "Status", "Action"]
+_CFG_COLS = ["Label", "Host", "Port", "Client ID", "Type",
+             "Priority", "Auto Start", "Auto Reconnect", "Status", "Action"]
 _COL_LABEL = 0
 _COL_HOST = 1
 _COL_PORT = 2
@@ -67,8 +115,9 @@ _COL_CID = 3
 _COL_TYPE = 4
 _COL_PRIORITY = 5
 _COL_AUTO = 6
-_COL_STATUS = 7
-_COL_ACTION = 8
+_COL_AUTO_RECONNECT = 7
+_COL_STATUS = 8
+_COL_ACTION = 9
 
 
 # ── Shared dark stylesheet for QTableWidget / QTableView ──────────────────────
@@ -99,33 +148,17 @@ _TABLE_STYLE = f"""
     QTableWidget QLineEdit {{
         background-color: {BG_SECONDARY};
         color: {TEXT};
-        border: 1px solid {BLUE};
+        border: 1px solid {Theme.ACCENT};
         border-radius: 2px;
-        padding: 2px 6px;
+        padding: 4px 8px;
         selection-background-color: #253545;
         selection-color: {TEXT};
     }}
-    QScrollBar:vertical {{
-        background: {BG_PRIMARY};
-        width: 8px;
-    }}
-    QScrollBar::handle:vertical {{
-        background: #3A3E48;
-        border-radius: 4px;
-        min-height: 20px;
-    }}
-    QScrollBar:horizontal {{
-        background: {BG_PRIMARY};
-        height: 8px;
-    }}
-    QScrollBar::handle:horizontal {{
-        background: #3A3E48;
-        border-radius: 4px;
-        min-width: 20px;
-    }}
-    QScrollBar::add-line, QScrollBar::sub-line {{
-        height: 0; width: 0;
-    }}
+    QScrollBar:vertical {{ background: {BG_PRIMARY}; width: 8px; }}
+    QScrollBar::handle:vertical {{ background: #3A3E48; border-radius: 4px; min-height: 20px; }}
+    QScrollBar:horizontal {{ background: {BG_PRIMARY}; height: 8px; }}
+    QScrollBar::handle:horizontal {{ background: #3A3E48; border-radius: 4px; min-width: 20px; }}
+    QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
 """
 
 
@@ -196,7 +229,8 @@ class _ToggleSwitch(QWidget):
         p.drawRoundedRect(track_x, 0, tw, h, r, r)
 
         # ── Knob ──────────────────────────────────────────────────────────
-        knob_x = (track_x + tw - knob_d - m) if self._checked else (track_x + m)
+        knob_x = (track_x + tw - knob_d -
+                  m) if self._checked else (track_x + m)
         knob_y = m
         p.setBrush(QBrush(QColor("#FFFFFF")))
         p.drawEllipse(knob_x, knob_y, knob_d, knob_d)
@@ -246,7 +280,8 @@ class ConnectionsView(QWidget):
 
     def _setup_ui(self) -> None:
         # Explicit background so the global QWidget rule doesn't bleed through
-        self.setStyleSheet(f"ConnectionsView {{ background-color: {BG_PRIMARY}; }}")
+        self.setStyleSheet(
+            f"ConnectionsView {{ background-color: {BG_PRIMARY}; }}")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -267,43 +302,54 @@ class ConnectionsView(QWidget):
         # ── Top pane: config table ────────────────────────────────────────────
         top_pane = QWidget()
         top_pane.setMinimumHeight(120)
-        top_pane.setStyleSheet(f"QWidget {{ background-color: {BG_PRIMARY}; }}")
+        top_pane.setStyleSheet(
+            f"QWidget {{ background-color: {BG_PRIMARY}; }}")
         top_layout = QVBoxLayout(top_pane)
         top_layout.setContentsMargins(12, 10, 12, 4)
         top_layout.setSpacing(6)
 
         # Section label
         lbl_conn = QLabel("Connections")
-        lbl_conn.setFont(QFont("SF Pro Display, Helvetica Neue, Arial", 13, QFont.Weight.DemiBold))
-        lbl_conn.setStyleSheet(f"QLabel {{ color: {TEXT}; background: transparent; padding: 0 0 2px 0; }}")
+        lbl_conn.setFont(
+            QFont("SF Pro Display, Helvetica Neue, Arial", 13, QFont.Weight.DemiBold))
+        lbl_conn.setStyleSheet(
+            f"QLabel {{ color: {TEXT}; background: transparent; padding: 0 0 2px 0; }}")
         top_layout.addWidget(lbl_conn)
 
-        top_layout.addLayout(self._build_toolbar())
         self._cfg_table = self._build_config_table()
         top_layout.addWidget(self._cfg_table)
+        
+        # Toolbar actions below table
+        top_layout.addLayout(self._build_toolbar())
 
         # ── Bottom pane: accounts table view ──────────────────────────────────
         bottom_pane = QWidget()
         bottom_pane.setMinimumHeight(100)
-        bottom_pane.setStyleSheet(f"QWidget {{ background-color: {BG_PRIMARY}; }}")
+        bottom_pane.setStyleSheet(
+            f"QWidget {{ background-color: {BG_PRIMARY}; }}")
         bottom_layout = QVBoxLayout(bottom_pane)
         bottom_layout.setContentsMargins(12, 8, 12, 10)
         bottom_layout.setSpacing(6)
 
         # Section label
         lbl_acct = QLabel("Accounts")
-        lbl_acct.setFont(QFont("SF Pro Display, Helvetica Neue, Arial", 13, QFont.Weight.DemiBold))
-        lbl_acct.setStyleSheet(f"QLabel {{ color: {TEXT}; background: transparent; padding: 0 0 2px 0; }}")
+        lbl_acct.setFont(
+            QFont("SF Pro Display, Helvetica Neue, Arial", 13, QFont.Weight.DemiBold))
+        lbl_acct.setStyleSheet(
+            f"QLabel {{ color: {TEXT}; background: transparent; padding: 0 0 2px 0; }}")
         bottom_layout.addWidget(lbl_acct)
 
         self._accounts_view = QTableView(self)
         self._accounts_view.setModel(self._model)
         self._accounts_view.setAlternatingRowColors(True)
-        self._accounts_view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._accounts_view.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        self._accounts_view.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self._accounts_view.setSelectionMode(
+            QAbstractItemView.SelectionMode.MultiSelection)
         self._accounts_view.verticalHeader().setVisible(False)
         self._accounts_view.horizontalHeader().setStretchLastSection(True)
-        self._accounts_view.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self._accounts_view.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch)
         self._accounts_view.setStyleSheet(_TABLE_STYLE)
         bottom_layout.addWidget(self._accounts_view)
 
@@ -315,7 +361,8 @@ class ConnectionsView(QWidget):
         layout.addWidget(splitter)
 
         # When a connection row is selected, highlight its accounts below.
-        self._cfg_table.itemSelectionChanged.connect(self._on_connection_selected)
+        self._cfg_table.itemSelectionChanged.connect(
+            self._on_connection_selected)
 
     # ── Toolbar ───────────────────────────────────────────────────────────────
 
@@ -323,13 +370,13 @@ class ConnectionsView(QWidget):
         tb = QHBoxLayout()
         tb.setSpacing(6)
 
-        btn_add = QPushButton("+ Add")
+        btn_add = QPushButton("Add")
         btn_add.setStyleSheet(_ADD_SS)
         btn_add.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_add.clicked.connect(self._on_add_row)
         tb.addWidget(btn_add)
 
-        btn_del = QPushButton("× Delete")
+        btn_del = QPushButton("Delete")
         btn_del.setStyleSheet(_DELETE_SS)
         btn_del.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_del.clicked.connect(self._on_delete_row)
@@ -359,6 +406,7 @@ class ConnectionsView(QWidget):
         t.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         t.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         t.verticalHeader().setVisible(False)
+        t.verticalHeader().setDefaultSectionSize(42)  # Increase height to accommodate widgets
         t.horizontalHeader().setStretchLastSection(True)
 
         # Column widths
@@ -368,7 +416,8 @@ class ConnectionsView(QWidget):
         t.setColumnWidth(_COL_CID, 70)
         t.setColumnWidth(_COL_TYPE, 90)
         t.setColumnWidth(_COL_PRIORITY, 70)
-        t.setColumnWidth(_COL_AUTO, 100)
+        t.setColumnWidth(_COL_AUTO, 80)
+        t.setColumnWidth(_COL_AUTO_RECONNECT, 110)
         t.setColumnWidth(_COL_STATUS, 120)
         t.setColumnWidth(_COL_ACTION, 120)
         # Action column stretches (last)
@@ -390,12 +439,14 @@ class ConnectionsView(QWidget):
         conn_type: str = "Paper",
         priority: int = 1,
         auto: bool = False,
+        auto_reconnect: bool = True,
     ) -> int:
         """Insert a new row into the config table and return its index."""
         if client_id is None:
             client_id = config_manager.get_next_client_id()
 
-        self._cfg_table.blockSignals(True)  # prevent cellChanged during bulk set
+        # prevent cellChanged during bulk set
+        self._cfg_table.blockSignals(True)
 
         row = self._cfg_table.rowCount()
         self._cfg_table.insertRow(row)
@@ -415,7 +466,8 @@ class ConnectionsView(QWidget):
         # Type dropdown (Paper / Live)
         type_combo = _CellComboBox()
         type_combo.addItems(["Paper", "Live"])
-        type_combo.setCurrentText(conn_type if conn_type in ("Paper", "Live") else "Paper")
+        type_combo.setCurrentText(
+            conn_type if conn_type in ("Paper", "Live") else "Paper")
 
         # Force Qt-drawn items instead of native macOS rendering.
         type_combo.setItemDelegate(QStyledItemDelegate(type_combo))
@@ -477,7 +529,8 @@ class ConnectionsView(QWidget):
         popup_container.setWindowFlags(
             Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint | Qt.WindowType.NoDropShadowWindowHint
         )
-        popup_container.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        popup_container.setAttribute(
+            Qt.WidgetAttribute.WA_TranslucentBackground, False)
         popup_container.setStyleSheet(f"""
             QWidget {{
                 background-color: {BG_SECONDARY};
@@ -491,7 +544,8 @@ class ConnectionsView(QWidget):
         # Priority dropdown (1–4)
         pri_combo = _CellComboBox()
         pri_combo.addItems(["1", "2", "3", "4"])
-        pri_combo.setCurrentText(str(priority) if priority in (1, 2, 3, 4) else "1")
+        pri_combo.setCurrentText(
+            str(priority) if priority in (1, 2, 3, 4) else "1")
         pri_combo.setItemDelegate(QStyledItemDelegate(pri_combo))
         pri_combo.setStyleSheet(f"""
             QComboBox {{
@@ -545,7 +599,8 @@ class ConnectionsView(QWidget):
         pri_popup_container.setWindowFlags(
             Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint | Qt.WindowType.NoDropShadowWindowHint
         )
-        pri_popup_container.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        pri_popup_container.setAttribute(
+            Qt.WidgetAttribute.WA_TranslucentBackground, False)
         pri_popup_container.setStyleSheet(f"""
             QWidget {{
                 background-color: {BG_SECONDARY};
@@ -565,6 +620,16 @@ class ConnectionsView(QWidget):
         tgl_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         tgl_layout.setContentsMargins(0, 0, 0, 0)
         self._cfg_table.setCellWidget(row, _COL_AUTO, container)
+
+        # Auto Reconnect toggle switch (centered)
+        recon_toggle = _ToggleSwitch(checked=auto_reconnect)
+        recon_toggle.toggled.connect(self._auto_save)
+        recon_container = QWidget()
+        recon_layout = QHBoxLayout(recon_container)
+        recon_layout.addWidget(recon_toggle)
+        recon_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        recon_layout.setContentsMargins(0, 0, 0, 0)
+        self._cfg_table.setCellWidget(row, _COL_AUTO_RECONNECT, recon_container)
 
         # Action button (centered, same width as toolbar "Connect All")
         btn = QPushButton("Connect")
@@ -593,7 +658,8 @@ class ConnectionsView(QWidget):
     def _on_add_row(self) -> None:
         self._add_config_row()
         self._auto_save()
-        log.info("Added new connection row (total=%d", self._cfg_table.rowCount())
+        log.info("Added new connection row (total=%d",
+                 self._cfg_table.rowCount())
 
     def _on_delete_row(self) -> None:
         row = self._cfg_table.currentRow()
@@ -625,7 +691,8 @@ class ConnectionsView(QWidget):
                 self._connect_row(row)
 
     def _on_disconnect_all(self) -> None:
-        log.info("Disconnect All requested (%d active)", len(self._active_threads))
+        log.info("Disconnect All requested (%d active)",
+                 len(self._active_threads))
         for row in range(self._cfg_table.rowCount()):
             label = self._row_label(row)
             if label and label in self._active_threads:
@@ -637,7 +704,8 @@ class ConnectionsView(QWidget):
     def _on_action_clicked(self, row: int) -> None:
         label = self._row_label(row)
         if not label:
-            log.warning("Action clicked on row %d but label is empty – ignoring", row)
+            log.warning(
+                "Action clicked on row %d but label is empty – ignoring", row)
             return
 
         if label in self._active_threads:
@@ -677,7 +745,8 @@ class ConnectionsView(QWidget):
         # Show a "Connecting…" state; the real Connected / Disconnected
         # will arrive via connection_status_changed signal.
         self._set_row_state(row, connected=False, connecting=True)
-        log.info("Started worker for %s (%s:%d cid=%d)", label, host, port, client_id)
+        log.info("Started worker for %s (%s:%d cid=%d)",
+                 label, host, port, client_id)
 
     def _disconnect_label(self, label: str) -> None:
         worker = self._active_threads.pop(label, None)
@@ -690,7 +759,8 @@ class ConnectionsView(QWidget):
         except RuntimeError:
             pass
         try:
-            worker.connection_status_changed.disconnect(self._on_connection_status)
+            worker.connection_status_changed.disconnect(
+                self._on_connection_status)
         except RuntimeError:
             pass
 
@@ -706,7 +776,8 @@ class ConnectionsView(QWidget):
 
     def _on_connection_status(self, label: str, connected: bool) -> None:
         """Update both Action button and Status cell for the matching row."""
-        log.info("Connection status: %s → %s", label, "Connected" if connected else "Disconnected")
+        log.info("Connection status: %s → %s", label,
+                 "Connected" if connected else "Disconnected")
         for row in range(self._cfg_table.rowCount()):
             if self._row_label(row) == label:
                 self._set_row_state(row, connected=connected)
@@ -775,7 +846,8 @@ class ConnectionsView(QWidget):
                     btn.clicked.disconnect()
                 except RuntimeError:
                     pass
-                btn.clicked.connect(lambda checked, r=row: self._on_action_clicked(r))
+                btn.clicked.connect(
+                    lambda checked, r=row: self._on_action_clicked(r))
 
     def _get_action_button(self, row: int) -> QPushButton | None:
         """Return the QPushButton inside the Action column's container widget."""
@@ -792,6 +864,12 @@ class ConnectionsView(QWidget):
     def _auto_save(self, *_args: Any) -> None:
         rows = self._collect_config_rows()
         config_manager.save_connections(rows)
+        
+        # Real-time sync: if auto_reconnect was toggled, update running thread
+        for r in rows:
+            label = r.get("label")
+            if label and label in self._active_threads:
+                self._active_threads[label].set_auto_reconnect(r.get("auto_reconnect", True))
 
     def _load_config(self) -> None:
         rows = config_manager.load_connections()
@@ -804,7 +882,8 @@ class ConnectionsView(QWidget):
             except (ValueError, TypeError):
                 port = 7497
             try:
-                client_id = int(raw_cid) if str(raw_cid).strip() else config_manager.get_next_client_id()
+                client_id = int(raw_cid) if str(raw_cid).strip(
+                ) else config_manager.get_next_client_id()
             except (ValueError, TypeError):
                 client_id = config_manager.get_next_client_id()
             self._add_config_row(
@@ -815,12 +894,14 @@ class ConnectionsView(QWidget):
                 conn_type=r.get("type", "Paper"),
                 priority=int(r.get("priority", 1)),
                 auto=bool(r.get("auto", False)),
+                auto_reconnect=bool(r.get("auto_reconnect", True)),
             )
 
     def _collect_config_rows(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for row in range(self._cfg_table.rowCount()):
             auto_cb = self._get_auto_checkbox(row)
+            recon_cb = self._get_reconnect_checkbox(row)
             type_combo = self._get_type_combo(row)
             pri_combo = self._get_priority_combo(row)
             rows.append({
@@ -831,6 +912,7 @@ class ConnectionsView(QWidget):
                 "type": type_combo.currentText() if type_combo else "Paper",
                 "priority": int(pri_combo.currentText()) if pri_combo else 1,
                 "auto": auto_cb.isChecked() if auto_cb else False,
+                "auto_reconnect": recon_cb.isChecked() if recon_cb else True,
             })
         return rows
 
@@ -860,6 +942,15 @@ class ConnectionsView(QWidget):
                 return child
         return None
 
+    def _get_reconnect_checkbox(self, row: int) -> _ToggleSwitch | None:
+        container = self._cfg_table.cellWidget(row, _COL_AUTO_RECONNECT)
+        if container is None:
+            return None
+        for child in container.children():
+            if isinstance(child, _ToggleSwitch):
+                return child
+        return None
+
     # ── Auto-connect on show ──────────────────────────────────────────────────
 
     def showEvent(self, event) -> None:
@@ -873,4 +964,3 @@ class ConnectionsView(QWidget):
                 if cb and cb.isChecked() and label and label not in self._active_threads:
                     log.info("Auto-connecting %r on first show", label)
                     self._connect_row(row)
-

@@ -1,4 +1,6 @@
 from __future__ import annotations
+from src.core.enums import OrderAction, OrderType
+from src.ui.theme import Theme
 
 import logging
 import math
@@ -24,23 +26,6 @@ from src.core import config_manager
 
 log = logging.getLogger(__name__)
 
-# ── Colours ───────────────────────────────────────────────────────────────────
-BG_PANEL = "#1e2230"
-BG_INPUT = "#272b3a"
-BG_MAIN = "#161a25"
-TEXT = "#C9D1D9"
-TEXT_DIM = "#8B949E"
-BORDER = "#30363D"
-ACCENT = "#3FB950"
-
-CLR_BUY = "#2e7d32"
-CLR_SELL = "#c62828"
-CLR_BUY_LMT = "#1b5e20"
-CLR_SELL_LMT = "#8b0000"
-CLR_FLATTEN = "#cc6600"
-CLR_REVERSE = "#8E44AD"
-CLR_CLOSE = "#8E8E93"
-CLR_CANCEL = "#3A3A3C"
 
 # Qty presets per asset class
 _FUT_QTYS = [1, 2, 3, 5]
@@ -125,26 +110,24 @@ def _apply_chip_style(btn: QPushButton, selected: bool) -> None:
             "QPushButton:hover{background:#4a4a5a}")
 
 
-
 # ═══════════════════════════════════════════════════════════════════════════════
 #  OrderEntryPanel
 # ═══════════════════════════════════════════════════════════════════════════════
-
 _COMBO_SS = f"""
     QComboBox {{
-        background: {BG_INPUT}; color: {TEXT};
-        border: 1px solid {BORDER}; border-radius: 4px;
+        background: {Theme.BG_INPUT}; color: {Theme.TEXT};
+        border: 1px solid {Theme.BORDER}; border-radius: 4px;
         padding: 3px 8px; font-size: 11px;
     }}
-    QComboBox:hover {{ border-color: {ACCENT}; }}
-    QComboBox:focus {{ border-color: {ACCENT}; }}
+    QComboBox:hover {{ border-color: {Theme.ACCENT}; }}
+    QComboBox:focus {{ border-color: {Theme.ACCENT}; }}
     QComboBox::drop-down {{ border: none; width: 18px; }}
     QComboBox::down-arrow {{ image: none; border: none; width: 0; }}
     QComboBox QAbstractItemView {{
-        background: {BG_INPUT}; color: {TEXT};
-        border: 1px solid {BORDER}; border-radius: 4px;
+        background: {Theme.BG_INPUT}; color: {Theme.TEXT};
+        border: 1px solid {Theme.BORDER}; border-radius: 4px;
         selection-background-color: #3a3f50;
-        selection-color: {TEXT};
+        selection-color: {Theme.TEXT};
         padding: 2px; outline: none;
     }}
 """
@@ -154,7 +137,7 @@ class OrderEntryPanel(QWidget):
     """Full Order Entry widget – drop-in replacement for _titled_panel."""
 
     # Emitted when user clicks an action button:
-    #   {"action": "BUY"/"SELL", "type": "MKT"/"BID"/"ASK",
+    #   {"action": OrderAction.BUY/OrderAction.SELL, "type": "MKT"/"BID"/"ASK",
     #    "symbol": str, "qty": int}
     order_requested = Signal(dict)
 
@@ -179,7 +162,8 @@ class OrderEntryPanel(QWidget):
         self._active_threads: dict = active_threads if active_threads is not None else {}
         self._connected_worker = None  # track worker for TWS lookup
         self._bg_worker = None         # track worker for background price streams
-        self._price_cache: dict[str, tuple[float, float, float]] = {}  # sym → (last, bid, ask)
+        # sym → (last, bid, ask)
+        self._price_cache: dict[str, tuple[float, float, float]] = {}
         self._last_price: float = 0.0  # latest live price for limit-order calculation
         self._last_bid: float = 0.0    # latest live bid price
         self._last_ask: float = 0.0    # latest live ask price
@@ -199,8 +183,8 @@ class OrderEntryPanel(QWidget):
         self.setObjectName("OrderEntryPanel")
         self.setStyleSheet(f"""
             QWidget#OrderEntryPanel {{
-                background: {BG_PANEL};
-                border: 1px solid {BORDER};
+                background: {Theme.BG_PANEL};
+                border: 1px solid {Theme.BORDER};
                 border-radius: 4px;
             }}
         """)
@@ -212,7 +196,7 @@ class OrderEntryPanel(QWidget):
         # ── Title ─────────────────────────────────────────────────────────────
         title = QLabel("Order Entry")
         title.setFont(_TITLE_FONT)
-        title.setStyleSheet(f"color: {TEXT}; border: none;")
+        title.setStyleSheet(f"color: {Theme.TEXT}; border: none;")
         root.addWidget(title)
 
         # ── Search combo + active symbol / price row ──────────────────────────
@@ -234,28 +218,30 @@ class OrderEntryPanel(QWidget):
         completer = self._combo.completer()
         if completer:
             completer.setFilterMode(Qt.MatchFlag.MatchContains)
-            completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+            completer.setCompletionMode(
+                QCompleter.CompletionMode.PopupCompletion)
             completer.popup().setStyleSheet(f"""
                 QAbstractItemView {{
-                    background: {BG_INPUT}; color: {TEXT};
-                    border: 1px solid {BORDER}; border-radius: 4px;
+                    background: {Theme.BG_INPUT}; color: {Theme.TEXT};
+                    border: 1px solid {Theme.BORDER}; border-radius: 4px;
                     selection-background-color: #3a3f50;
-                    selection-color: {TEXT};
+                    selection-color: {Theme.TEXT};
                     padding: 2px; outline: none;
                 }}
             """)
 
         self._lbl_symbol = QLabel("")
         self._lbl_symbol.setFont(_SYMBOL_FONT)
-        self._lbl_symbol.setStyleSheet(f"color: {TEXT}; border: none;")
+        self._lbl_symbol.setStyleSheet(f"color: {Theme.TEXT}; border: none;")
 
         self._lbl_price = QLabel("")
         self._lbl_price.setFont(_PRICE_FONT)
-        self._lbl_price.setStyleSheet(f"color: {ACCENT}; border: none;")
+        self._lbl_price.setStyleSheet(f"color: {Theme.ACCENT}; border: none;")
 
         self._lbl_bid_ask = QLabel("")
         self._lbl_bid_ask.setFont(QFont("Menlo, Consolas, monospace", 10))
-        self._lbl_bid_ask.setStyleSheet(f"color: {TEXT_DIM}; border: none;")
+        self._lbl_bid_ask.setStyleSheet(
+            f"color: {Theme.TEXT_DIM}; border: none;")
         self._lbl_bid_ask.setAlignment(Qt.AlignmentFlag.AlignRight)
 
         # Right side: symbol + price row, then bid/ask below
@@ -268,7 +254,8 @@ class OrderEntryPanel(QWidget):
         right_side = QVBoxLayout()
         right_side.setSpacing(2)
         right_side.addLayout(sym_price_row)
-        right_side.addWidget(self._lbl_bid_ask, alignment=Qt.AlignmentFlag.AlignRight)
+        right_side.addWidget(
+            self._lbl_bid_ask, alignment=Qt.AlignmentFlag.AlignRight)
 
         top_row.addWidget(self._combo, stretch=1)
         top_row.addLayout(right_side, stretch=1)
@@ -304,14 +291,15 @@ class OrderEntryPanel(QWidget):
         action_grid = QGridLayout()
         action_grid.setSpacing(4)
         action_grid.setContentsMargins(0, 0, 0, 0)
-        self._btn_buy_mkt = _make_btn("Buy @MKT", CLR_BUY, 36)
-        self._btn_sell_mkt = _make_btn("Sell @MKT", CLR_SELL, 36)
-        self._btn_buy_mid = _make_btn("Buy @Mid", CLR_BUY, 36)
-        self._btn_sell_mid = _make_btn("Sell @Mid", CLR_SELL, 36)
-        self._btn_buy_bid = _make_btn("Buy @Bid", CLR_BUY, 36)
-        self._btn_sell_ask = _make_btn("Sell @Ask", CLR_SELL, 36)
-        self._btn_buy_bid_lmt = _make_btn("Buy @Bid Limit", CLR_BUY, 36)
-        self._btn_sell_ask_lmt = _make_btn("Sell @Ask Limit", CLR_SELL, 36)
+        self._btn_buy_mkt = _make_btn("Buy @MKT", Theme.CLR_BUY, 36)
+        self._btn_sell_mkt = _make_btn("Sell @MKT", Theme.CLR_SELL, 36)
+        self._btn_buy_mid = _make_btn("Buy @Mid", Theme.CLR_BUY, 36)
+        self._btn_sell_mid = _make_btn("Sell @Mid", Theme.CLR_SELL, 36)
+        self._btn_buy_bid = _make_btn("Buy @Bid", Theme.CLR_BUY, 36)
+        self._btn_sell_ask = _make_btn("Sell @Ask", Theme.CLR_SELL, 36)
+        self._btn_buy_bid_lmt = _make_btn("Buy @Bid Limit", Theme.CLR_BUY, 36)
+        self._btn_sell_ask_lmt = _make_btn(
+            "Sell @Ask Limit", Theme.CLR_SELL, 36)
         action_grid.addWidget(self._btn_buy_mkt, 0, 0)
         action_grid.addWidget(self._btn_sell_mkt, 0, 1)
         action_grid.addWidget(self._btn_buy_mid, 1, 0)
@@ -321,14 +309,22 @@ class OrderEntryPanel(QWidget):
         action_grid.addWidget(self._btn_buy_bid_lmt, 3, 0)
         action_grid.addWidget(self._btn_sell_ask_lmt, 3, 1)
 
-        self._btn_buy_mkt.clicked.connect(lambda: self._emit_order("BUY", "MKT"))
-        self._btn_sell_mkt.clicked.connect(lambda: self._emit_order("SELL", "MKT"))
-        self._btn_buy_mid.clicked.connect(lambda: self._emit_order("BUY", "MID"))
-        self._btn_sell_mid.clicked.connect(lambda: self._emit_order("SELL", "MID"))
-        self._btn_buy_bid.clicked.connect(lambda: self._emit_order("BUY", "BID"))
-        self._btn_sell_ask.clicked.connect(lambda: self._emit_order("SELL", "ASK"))
-        self._btn_buy_bid_lmt.clicked.connect(lambda: self._emit_bid_ask_lmt_order("BUY"))
-        self._btn_sell_ask_lmt.clicked.connect(lambda: self._emit_bid_ask_lmt_order("SELL"))
+        self._btn_buy_mkt.clicked.connect(
+            lambda: self._emit_order(OrderAction.BUY, "MKT"))
+        self._btn_sell_mkt.clicked.connect(
+            lambda: self._emit_order(OrderAction.SELL, "MKT"))
+        self._btn_buy_mid.clicked.connect(
+            lambda: self._emit_order(OrderAction.BUY, "MID"))
+        self._btn_sell_mid.clicked.connect(
+            lambda: self._emit_order(OrderAction.SELL, "MID"))
+        self._btn_buy_bid.clicked.connect(
+            lambda: self._emit_order(OrderAction.BUY, "BID"))
+        self._btn_sell_ask.clicked.connect(
+            lambda: self._emit_order(OrderAction.SELL, "ASK"))
+        self._btn_buy_bid_lmt.clicked.connect(
+            lambda: self._emit_bid_ask_lmt_order(OrderAction.BUY))
+        self._btn_sell_ask_lmt.clicked.connect(
+            lambda: self._emit_bid_ask_lmt_order(OrderAction.SELL))
 
         action_w = QWidget()
         action_w.setStyleSheet("border: none;")
@@ -340,22 +336,22 @@ class OrderEntryPanel(QWidget):
         pm_grid = QGridLayout()
         pm_grid.setSpacing(4)
         pm_grid.setContentsMargins(0, 0, 0, 0)
-        self._btn_close25 = _make_btn("25%", CLR_CLOSE, 30)
-        self._btn_close50 = _make_btn("50%", CLR_CLOSE, 30)
-        self._btn_close75 = _make_btn("75%", CLR_CLOSE, 30)
+        self._btn_close25 = _make_btn("25%", Theme.CLR_CLOSE, 30)
+        self._btn_close50 = _make_btn("50%", Theme.CLR_CLOSE, 30)
+        self._btn_close75 = _make_btn("75%", Theme.CLR_CLOSE, 30)
         pm_grid.addWidget(self._btn_close25, 0, 0)
         pm_grid.addWidget(self._btn_close50, 0, 1)
         pm_grid.addWidget(self._btn_close75, 1, 0)
         self._btn_close25.clicked.connect(lambda: self._on_close_pct(25))
         self._btn_close50.clicked.connect(lambda: self._on_close_pct(50))
         self._btn_close75.clicked.connect(lambda: self._on_close_pct(75))
-        self._btn_flatten = _make_btn("Flatten", CLR_FLATTEN, 30)
+        self._btn_flatten = _make_btn("Flatten", Theme.CLR_FLATTEN, 30)
         pm_grid.addWidget(self._btn_flatten, 1, 1)
         self._btn_flatten.clicked.connect(self._on_flatten)
-        self._btn_reverse = _make_btn("Reverse", CLR_REVERSE, 30)
+        self._btn_reverse = _make_btn("Reverse", Theme.CLR_REVERSE, 30)
         pm_grid.addWidget(self._btn_reverse, 2, 0)
         self._btn_reverse.clicked.connect(self._on_reverse)
-        self._btn_cancel = _make_btn("Cancel", CLR_CANCEL, 30)
+        self._btn_cancel = _make_btn("Cancel", Theme.CLR_CANCEL, 30)
         pm_grid.addWidget(self._btn_cancel, 2, 1)
         self._btn_cancel.clicked.connect(self._on_cancel_all)
 
@@ -383,7 +379,8 @@ class OrderEntryPanel(QWidget):
         if sym:
             self.flatten_requested.emit(sym)
         else:
-            log.warning("OrderEntryPanel: Flatten clicked but no active symbol")
+            log.warning(
+                "OrderEntryPanel: Flatten clicked but no active symbol")
 
     def _on_reverse(self) -> None:
         """Reverse button clicked → emit reverse_requested for the active symbol."""
@@ -391,7 +388,8 @@ class OrderEntryPanel(QWidget):
         if sym:
             self.reverse_requested.emit(sym)
         else:
-            log.warning("OrderEntryPanel: Reverse clicked but no active symbol")
+            log.warning(
+                "OrderEntryPanel: Reverse clicked but no active symbol")
 
     def _on_close_pct(self, pct: int) -> None:
         """Partial close button clicked → emit close_pct_requested."""
@@ -399,7 +397,8 @@ class OrderEntryPanel(QWidget):
         if sym:
             self.close_pct_requested.emit(sym, pct)
         else:
-            log.warning("OrderEntryPanel: Close %d%% clicked but no active symbol", pct)
+            log.warning(
+                "OrderEntryPanel: Close %d%% clicked but no active symbol", pct)
 
     def _refresh_combo_items(self) -> None:
         """Populate the combo dropdown with saved contracts not already added."""
@@ -730,7 +729,7 @@ class OrderEntryPanel(QWidget):
         if not self._active_symbol:
             return
 
-        if action == "BUY":
+        if action == OrderAction.BUY:
             price = self._last_bid
             label = "bid"
         else:
@@ -756,7 +755,7 @@ class OrderEntryPanel(QWidget):
             return
 
         sec = _sec_type_for(self._active_symbol)
-        order_type = "BID_LMT" if action == "BUY" else "ASK_LMT"
+        order_type = "BID_LMT" if action == OrderAction.BUY else "ASK_LMT"
         payload = {
             "action": action,
             "type": order_type,
@@ -766,7 +765,8 @@ class OrderEntryPanel(QWidget):
             "last_price": self._last_price,
             "limit_price": price,
         }
-        log.info("Order requested (%s): %s @ %.4f", order_type, self._active_symbol, price)
+        log.info("Order requested (%s): %s @ %.4f",
+                 order_type, self._active_symbol, price)
         self.order_requested.emit(payload)
 
     # ── TWS fallback lookup ─────────────────────────────────────────────────────
@@ -790,7 +790,8 @@ class OrderEntryPanel(QWidget):
         """Query TWS to qualify a stock symbol not found locally."""
         workers = self._find_workers_by_priority()
         if not workers:
-            log.warning("OrderEntry: no TWS connection for lookup of '%s'", symbol)
+            log.warning(
+                "OrderEntry: no TWS connection for lookup of '%s'", symbol)
             self._combo.lineEdit().setPlaceholderText("No TWS connection!")
             from PySide6.QtCore import QTimer
             QTimer.singleShot(2000, lambda: self._combo.lineEdit().setPlaceholderText(
@@ -809,18 +810,21 @@ class OrderEntryPanel(QWidget):
         # Disconnect previous signals if any
         if self._connected_worker is not None:
             try:
-                self._connected_worker.browse_results.disconnect(self._on_tws_results)
+                self._connected_worker.browse_results.disconnect(
+                    self._on_tws_results)
             except (RuntimeError, TypeError):
                 pass
             try:
-                self._connected_worker.browse_failed.disconnect(self._on_tws_failed)
+                self._connected_worker.browse_failed.disconnect(
+                    self._on_tws_failed)
             except (RuntimeError, TypeError):
                 pass
 
         self._connected_worker = worker
         worker.browse_results.connect(self._on_tws_results)
         worker.browse_failed.connect(self._on_tws_failed)
-        log.info("OrderEntry: trying worker %s for lookup of '%s'", worker._label, symbol)
+        log.info("OrderEntry: trying worker %s for lookup of '%s'",
+                 worker._label, symbol)
         worker.request_browse({
             "sec_type": "STK",
             "symbol": symbol,
@@ -834,11 +838,13 @@ class OrderEntryPanel(QWidget):
         # Disconnect signals
         if self._connected_worker is not None:
             try:
-                self._connected_worker.browse_results.disconnect(self._on_tws_results)
+                self._connected_worker.browse_results.disconnect(
+                    self._on_tws_results)
             except (RuntimeError, TypeError):
                 pass
             try:
-                self._connected_worker.browse_failed.disconnect(self._on_tws_failed)
+                self._connected_worker.browse_failed.disconnect(
+                    self._on_tws_failed)
             except (RuntimeError, TypeError):
                 pass
             self._connected_worker = None
@@ -874,11 +880,13 @@ class OrderEntryPanel(QWidget):
         # Disconnect signals from current worker
         if self._connected_worker is not None:
             try:
-                self._connected_worker.browse_results.disconnect(self._on_tws_results)
+                self._connected_worker.browse_results.disconnect(
+                    self._on_tws_results)
             except (RuntimeError, TypeError):
                 pass
             try:
-                self._connected_worker.browse_failed.disconnect(self._on_tws_failed)
+                self._connected_worker.browse_failed.disconnect(
+                    self._on_tws_failed)
             except (RuntimeError, TypeError):
                 pass
 
@@ -896,7 +904,8 @@ class OrderEntryPanel(QWidget):
         # All workers exhausted
         self._connected_worker = None
         self._combo.lineEdit().setPlaceholderText("Add symbol (look up)..")
-        log.warning("OrderEntry: TWS lookup failed (all workers exhausted): %s", msg)
+        log.warning(
+            "OrderEntry: TWS lookup failed (all workers exhausted): %s", msg)
 
     # ── Public API for live price feed ────────────────────────────────────────
 
@@ -924,7 +933,8 @@ class OrderEntryPanel(QWidget):
         log.info("OrderEntry: refreshing background price subscriptions")
         if self._bg_worker is not None:
             try:
-                self._bg_worker.bg_price_updated.disconnect(self._on_bg_price_update)
+                self._bg_worker.bg_price_updated.disconnect(
+                    self._on_bg_price_update)
             except (RuntimeError, TypeError):
                 pass
             self._bg_worker = None
@@ -947,7 +957,8 @@ class OrderEntryPanel(QWidget):
         # Disconnect from old worker
         if self._bg_worker is not None:
             try:
-                self._bg_worker.bg_price_updated.disconnect(self._on_bg_price_update)
+                self._bg_worker.bg_price_updated.disconnect(
+                    self._on_bg_price_update)
             except (RuntimeError, TypeError):
                 pass
             self._bg_worker.unsubscribe_all_background()
@@ -1038,16 +1049,3 @@ class OrderEntryPanel(QWidget):
         not on the buttons themselves, so the buttons stay concise.
         """
         self._refresh_action_labels()
-
-
-
-
-
-
-
-
-
-
-
-
-

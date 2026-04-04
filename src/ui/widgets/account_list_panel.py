@@ -174,14 +174,17 @@ class _AccountRow(QFrame):
         # Account name (bold white)
         display_name = alias if alias else account
         self._name_lbl = QLabel(display_name)
-        self._name_lbl.setFont(QFont("Helvetica Neue, Arial", 12, QFont.Weight.Bold))
-        self._name_lbl.setStyleSheet("color: #ffffff; background: transparent;")
+        self._name_lbl.setFont(
+            QFont("Helvetica Neue, Arial", 12, QFont.Weight.Bold))
+        self._name_lbl.setStyleSheet(
+            "color: #ffffff; background: transparent;")
         layout.addWidget(self._name_lbl, stretch=1)
 
         # Balance (right, light grey, monospace)
         self._balance_lbl = QLabel(self._format_balance(balance))
         self._balance_lbl.setFont(QFont("Menlo, Consolas, monospace", 11))
-        self._balance_lbl.setStyleSheet("color: #aaaaaa; background: transparent;")
+        self._balance_lbl.setStyleSheet(
+            "color: #aaaaaa; background: transparent;")
         layout.addWidget(self._balance_lbl)
 
         # Remove (×) — flat, dark grey
@@ -275,7 +278,8 @@ class AccountListPanel(QWidget):
         super().__init__(parent)
         self._model = accounts_model
         self._account_rows: dict[str, _AccountRow] = {}
-        self._unchecked: set[str] = set(config_manager.load_unchecked_accounts())
+        self._unchecked: set[str] = set(
+            config_manager.load_unchecked_accounts())
         self._hidden: set[str] = set(config_manager.load_hidden_accounts())
         self._setup_ui()
 
@@ -330,7 +334,8 @@ class AccountListPanel(QWidget):
 
         # ── Scrollable account rows ───────────────────────────────────────────
         self._rows_container = QWidget()
-        self._rows_container.setStyleSheet("background: transparent; border: none;")
+        self._rows_container.setStyleSheet(
+            "background: transparent; border: none;")
         self._rows_layout = QVBoxLayout(self._rows_container)
         self._rows_layout.setContentsMargins(0, 0, 0, 0)
         self._rows_layout.setSpacing(4)
@@ -339,7 +344,8 @@ class AccountListPanel(QWidget):
         scroll = QScrollArea()
         scroll.setWidget(self._rows_container)
         scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setStyleSheet(f"""
             QScrollArea {{ background: transparent; border: none; }}
             QScrollBar:vertical {{ background: transparent; width: 6px; }}

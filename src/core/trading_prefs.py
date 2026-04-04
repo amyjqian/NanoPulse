@@ -74,7 +74,8 @@ class TradingPreferencesManager:
         if self._loaded:
             return
         prefs = config_manager.load_preferences()
-        self._futures = {**_FUTURES_DEFAULTS, **prefs.get("trading_futures", {})}
+        self._futures = {**_FUTURES_DEFAULTS,
+                         **prefs.get("trading_futures", {})}
         self._stocks = {**_STOCKS_DEFAULTS, **prefs.get("trading_stocks", {})}
         self._loaded = True
         log.info(
@@ -145,4 +146,3 @@ class TradingPreferencesManager:
 
 # ── Module-level singleton ────────────────────────────────────────────────────
 trading_prefs = TradingPreferencesManager()
-

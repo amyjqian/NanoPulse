@@ -205,7 +205,8 @@ class _ToggleGroup(QWidget):
             btn.setCheckable(True)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setFixedHeight(30)
-            btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            btn.setSizePolicy(QSizePolicy.Policy.Expanding,
+                              QSizePolicy.Policy.Fixed)
             btn.clicked.connect(lambda _checked, l=label: self._on_click(l))
             self._buttons[label] = btn
             lay.addWidget(btn)
@@ -335,7 +336,8 @@ class _ThemeCard(QFrame):
         # Label text
         p.setPen(text_clr)
         p.setFont(QFont("Helvetica Neue, Arial", 11, QFont.Weight.Medium))
-        p.drawText(0, h - 18, w, 18, Qt.AlignmentFlag.AlignHCenter, self._label)
+        p.drawText(0, h - 18, w, 18,
+                   Qt.AlignmentFlag.AlignHCenter, self._label)
         p.end()
 
 
@@ -448,7 +450,7 @@ class _AssetSettingsGroup(QWidget):
         root.setContentsMargins(24, 16, 24, 16)
         root.setSpacing(14)
 
-        tp  = self._prefs.get(self._prefs_key, {})
+        tp = self._prefs.get(self._prefs_key, {})
         inc = self._increment_label
         lbl_qss = f"color: {_TEXT}; border: none; font-size: 12px;"
 
@@ -494,7 +496,8 @@ class _AssetSettingsGroup(QWidget):
         qty_lbl.setFixedWidth(160)
         self._qty_spin = _spin(tp.get("quantity", 1), 1, 9999)
         self._qty_unit = QLabel(self._qty_label)
-        self._qty_unit.setStyleSheet(f"color: {_TEXT_DIM}; border: none; font-size: 12px;")
+        self._qty_unit.setStyleSheet(
+            f"color: {_TEXT_DIM}; border: none; font-size: 12px;")
         qty_row.addWidget(qty_lbl)
         qty_row.addWidget(self._qty_spin)
         qty_row.addWidget(self._qty_unit)
@@ -508,7 +511,8 @@ class _AssetSettingsGroup(QWidget):
         lc_lbl.setStyleSheet(lbl_qss)
         lc_lbl.setFixedWidth(160)
         self._lc_spin = _spin(tp.get("limit_cap", 0), 0, 99999)
-        self._lc_unit = _combo(["amt", "%", inc], tp.get("limit_cap_unit", inc))
+        self._lc_unit = _combo(
+            ["amt", "%", inc], tp.get("limit_cap_unit", inc))
         lc_row.addWidget(lc_lbl)
         lc_row.addWidget(self._lc_spin)
         lc_row.addWidget(self._lc_unit)
@@ -537,7 +541,8 @@ class _AssetSettingsGroup(QWidget):
         # ── Buy @Bid ──────────────────────────────────────────────────────────
         bb_row = QHBoxLayout()
         bb_row.setSpacing(10)
-        bb_lbl = QLabel("Buy @Bid Offset" if not self._use_urgency else "Buy @Bid")
+        bb_lbl = QLabel(
+            "Buy @Bid Offset" if not self._use_urgency else "Buy @Bid")
         bb_lbl.setStyleSheet(lbl_qss)
         bb_lbl.setFixedWidth(160)
         bb_row.addWidget(bb_lbl)
@@ -549,8 +554,10 @@ class _AssetSettingsGroup(QWidget):
             )
             bb_row.addWidget(self._bb_toggle)
         else:
-            self._bb_spin = _text_input(str(tp.get("buy_bid_offset", 0)), "+/- amt")
-            self._bb_unit = _combo(["amt", "%", inc], tp.get("buy_bid_unit", inc))
+            self._bb_spin = _text_input(
+                str(tp.get("buy_bid_offset", 0)), "+/- amt")
+            self._bb_unit = _combo(
+                ["amt", "%", inc], tp.get("buy_bid_unit", inc))
             bb_row.addWidget(self._bb_spin)
             bb_row.addWidget(self._bb_unit)
 
@@ -560,7 +567,8 @@ class _AssetSettingsGroup(QWidget):
         # ── Sell @Ask ─────────────────────────────────────────────────────────
         sa_row = QHBoxLayout()
         sa_row.setSpacing(10)
-        sa_lbl = QLabel("Sell @Ask Offset" if not self._use_urgency else "Sell @Ask")
+        sa_lbl = QLabel(
+            "Sell @Ask Offset" if not self._use_urgency else "Sell @Ask")
         sa_lbl.setStyleSheet(lbl_qss)
         sa_lbl.setFixedWidth(160)
         sa_row.addWidget(sa_lbl)
@@ -572,8 +580,10 @@ class _AssetSettingsGroup(QWidget):
             )
             sa_row.addWidget(self._sa_toggle)
         else:
-            self._sa_spin = _text_input(str(tp.get("sell_ask_offset", 0)), "+/- amt")
-            self._sa_unit = _combo(["amt", "%", inc], tp.get("sell_ask_unit", inc))
+            self._sa_spin = _text_input(
+                str(tp.get("sell_ask_offset", 0)), "+/- amt")
+            self._sa_unit = _combo(
+                ["amt", "%", inc], tp.get("sell_ask_unit", inc))
             sa_row.addWidget(self._sa_spin)
             sa_row.addWidget(self._sa_unit)
 
@@ -607,8 +617,10 @@ class _AssetSettingsGroup(QWidget):
             self._sa_unit.currentTextChanged.connect(
                 lambda unit: self._apply_unit_validator(self._sa_spin, unit)
             )
-            self._apply_unit_validator(self._bb_spin, self._bb_unit.currentText())
-            self._apply_unit_validator(self._sa_spin, self._sa_unit.currentText())
+            self._apply_unit_validator(
+                self._bb_spin, self._bb_unit.currentText())
+            self._apply_unit_validator(
+                self._sa_spin, self._sa_unit.currentText())
 
     # ── Event filter ──────────────────────────────────────────────────────────
 
@@ -687,7 +699,8 @@ class _AssetSettingsGroup(QWidget):
         else:
             result["buy_bid_offset"] = self._parse_offset(self._bb_spin.text())
             result["buy_bid_unit"] = self._bb_unit.currentText()
-            result["sell_ask_offset"] = self._parse_offset(self._sa_spin.text())
+            result["sell_ask_offset"] = self._parse_offset(
+                self._sa_spin.text())
             result["sell_ask_unit"] = self._sa_unit.currentText()
         return result
 
@@ -715,7 +728,8 @@ class _TradingPage(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }")
 
         container = QWidget()
         container.setStyleSheet(f"background: {_BG_PANEL};")
@@ -874,13 +888,13 @@ class PreferencesDialog(QDialog):
               2. frameGeometry / geometry delta → frame insets (title-bar, borders)
               3. Subtract insets to reach the true frame top-left
             """
-            client_tl   = widget.mapToGlobal(QPoint(0, 0))
-            frame_geo   = widget.frameGeometry()   # screen-absolute on top-levels,
-            client_geo  = widget.geometry()         # but we derive it ourselves to
-                                                    # be explicit about the mapping.
+            client_tl = widget.mapToGlobal(QPoint(0, 0))
+            frame_geo = widget.frameGeometry()   # screen-absolute on top-levels,
+            client_geo = widget.geometry()         # but we derive it ourselves to
+            # be explicit about the mapping.
             # How far the OS frame extends beyond the client area on each side
             frame_dx = client_geo.left() - frame_geo.left()   # left border width
-            frame_dy = client_geo.top()  - frame_geo.top()    # title-bar height
+            frame_dy = client_geo.top() - frame_geo.top()    # title-bar height
             return QRect(
                 client_tl.x() - frame_dx,
                 client_tl.y() - frame_dy,
@@ -890,7 +904,7 @@ class PreferencesDialog(QDialog):
 
         dialog_rect = _abs_frame_rect(self)
         parent_rect = _abs_frame_rect(parent)
-        contained   = parent_rect.contains(dialog_rect)
+        contained = parent_rect.contains(dialog_rect)
 
         print(f"[AutoClose] dialog  rect (screen px): {dialog_rect}  "
               f"tl=({dialog_rect.left()}, {dialog_rect.top()})  "

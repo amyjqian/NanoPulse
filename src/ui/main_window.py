@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from PySide6.QtCore import QEvent, Qt
+from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtGui import QPainter, QColor
 
 from .widgets.top_tab_bar import TopTabBar
@@ -55,7 +55,18 @@ class MainWindow(QWidget):
 
         self._setup_ui()
         self._restore_geometry()
+
+        self._status_timer = QTimer(self)
+        self._status_timer.timeout.connect(self._update_status)
+        self._status_timer.start(1000)
+        self._update_status()
+
         log.info("MainWindow initialised (%dx%d)", self.width(), self.height())
+
+    def _update_status(self) -> None:
+        conn_count = sum(1 for w in self.active_threads.values() if w._ib and w._ib.isConnected())
+        acct_count = self._accounts_model.rowCount()
+        self._tab_bar.set_status(conn_count, acct_count)
 
     # ── Window geometry persistence ───────────────────────────────────────────
 
@@ -88,7 +99,8 @@ class MainWindow(QWidget):
         # ── Top tab bar ───────────────────────────────────────────────────────
         self._tab_bar = TopTabBar(self)
         self._tab_bar.nav_changed.connect(self._on_nav_changed)
-        self._tab_bar.tabBarClicked.connect(self._on_tab_clicked)  # Handle all tab clicks
+        self._tab_bar.tabBarClicked.connect(
+            self._on_tab_clicked)  # Handle all tab clicks
         root_layout.addWidget(self._tab_bar)
 
         # ── Stacked pages ─────────────────────────────────────────────────────
@@ -111,7 +123,8 @@ class MainWindow(QWidget):
             accounts_model=self._accounts_model,
             parent=self,
         )                                                  # index 2 – FlashTrade
-        self._exec_placeholder = Canvas(self)              # index 3 – Executions
+        self._exec_placeholder = Canvas(
+            self)              # index 3 – Executions
 
         # When contracts are added/removed, refresh the order entry dropdown
         self._contracts_view.contracts_changed.connect(
@@ -128,7 +141,8 @@ class MainWindow(QWidget):
 
         # ── Status bar ────────────────────────────────────────────────────────
         self._status_bar = StatusBar(self)
-        self._status_bar.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self._status_bar.setAttribute(
+            Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         root_layout.addWidget(self._status_bar)
 
     # ── Navigation ────────────────────────────────────────────────────────────
@@ -182,30 +196,31 @@ class MainWindow(QWidget):
         # Persist order-status column widths
         self._flash_trade._order_status.save_table_state()
 
-        log.info("closeEvent – shutting down %d worker(s)", len(self.active_threads))
-        
+        log.info("closeEvent – shutting down %d worker(s)",
+                 len(self.active_threads))
+
         # Signal all workers to stop
         for label, worker in list(self.active_threads.items()):
             log.info("Requesting worker shutdown: %s", label)
             worker.stop()
-        
+
         # Wait for all workers to finish with a longer timeout (10 seconds per worker)
         all_stopped = True
         for label, worker in list(self.active_threads.items()):
             log.debug("Waiting for worker %s to finish...", label)
             if not worker.wait(3000):  # 3 second timeout – tasks are cancelled immediately
-                log.warning("Worker %s did not stop gracefully after 3s", label)
+                log.warning(
+                    "Worker %s did not stop gracefully after 3s", label)
                 all_stopped = False
             else:
                 log.debug("Worker %s stopped successfully", label)
-        
+
         # Clear the threads dict
         self.active_threads.clear()
-        
+
         if all_stopped:
             log.info("All workers stopped gracefully")
         else:
             log.warning("Some workers did not stop gracefully – forcing exit")
-        
-        super().closeEvent(event)
 
+        super().closeEvent(event)

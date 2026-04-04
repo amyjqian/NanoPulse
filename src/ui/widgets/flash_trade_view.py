@@ -57,7 +57,8 @@ def _titled_panel(title: str) -> QWidget:
     lbl = QLabel(title)
     lbl.setFont(_TITLE_FONT)
     lbl.setStyleSheet(f"color: {TEXT}; border: none;")
-    layout.addWidget(lbl, alignment=Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+    layout.addWidget(lbl, alignment=Qt.AlignmentFlag.AlignTop |
+                     Qt.AlignmentFlag.AlignLeft)
     layout.addStretch(1)
     return panel
 
@@ -69,10 +70,13 @@ class FlashTradeView(QWidget):
                  accounts_model: AccountsTableModel | None = None, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
-        self._active_threads: dict[str, IBWorkerThread] = active_threads if active_threads is not None else {}
+        self._active_threads: dict[str,
+                                   IBWorkerThread] = active_threads if active_threads is not None else {}
         self._accounts_model = accounts_model
-        self._connected_order_workers: dict[str, IBWorkerThread] = {}  # label → worker instance wired
-        self._connected_portfolio_workers: dict[str, IBWorkerThread] = {}  # label → worker for portfolio
+        # label → worker instance wired
+        self._connected_order_workers: dict[str, IBWorkerThread] = {}
+        # label → worker for portfolio
+        self._connected_portfolio_workers: dict[str, IBWorkerThread] = {}
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(300)          # debounce 300 ms
@@ -153,17 +157,21 @@ class FlashTradeView(QWidget):
 
         # ── Wire order entry → order placement ───────────────────────────────
         self._order_entry.order_requested.connect(self._on_order_requested)
-        self._order_entry.cancel_all_requested.connect(self._on_cancel_all_for_symbol)
+        self._order_entry.cancel_all_requested.connect(
+            self._on_cancel_all_for_symbol)
         self._order_entry.flatten_requested.connect(self._on_flatten_requested)
         self._order_entry.reverse_requested.connect(self._on_reverse_requested)
-        self._order_entry.close_pct_requested.connect(self._on_close_pct_requested)
+        self._order_entry.close_pct_requested.connect(
+            self._on_close_pct_requested)
 
         # ── Wire order status cancel button → cancel logic ───────────────────
         self._order_status.cancel_requested.connect(self._on_cancel_requested)
-        self._order_status.refresh_requested.connect(self._on_refresh_requested)
+        self._order_status.refresh_requested.connect(
+            self._on_refresh_requested)
 
         # ── Wire account position refresh button → portfolio refresh ─────────
-        self._account_position.refresh_requested.connect(self._on_position_refresh_requested)
+        self._account_position.refresh_requested.connect(
+            self._on_position_refresh_requested)
 
     # ── Order placement ───────────────────────────────────────────────────────
 
@@ -190,7 +198,8 @@ class FlashTradeView(QWidget):
             accounts = [flatten_account]
         else:
             if not isinstance(self._account_list, AccountListPanel):
-                log.warning("FlashTrade: AccountListPanel not available – aborting order")
+                log.warning(
+                    "FlashTrade: AccountListPanel not available – aborting order")
                 return
 
             accounts = self._account_list.get_selected_accounts()
@@ -214,12 +223,14 @@ class FlashTradeView(QWidget):
                 break
 
         if not contract:
-            log.warning("FlashTrade: no saved contract for '%s' – aborting", symbol)
+            log.warning(
+                "FlashTrade: no saved contract for '%s' – aborting", symbol)
             return
 
         conid = contract.get("conid")
         if not conid:
-            log.warning("FlashTrade: saved contract for '%s' has no conid – aborting", symbol)
+            log.warning(
+                "FlashTrade: saved contract for '%s' has no conid – aborting", symbol)
             return
 
         action = payload.get("action", "BUY")
@@ -333,7 +344,8 @@ class FlashTradeView(QWidget):
         for account in accounts:
             worker = self._find_worker_for_account(account)
             if not worker:
-                log.warning("FlashTrade: no connected worker for account %s – skipping", account)
+                log.warning(
+                    "FlashTrade: no connected worker for account %s – skipping", account)
                 continue
 
             # Ensure order_status_updated signal is wired for this worker
@@ -393,7 +405,8 @@ class FlashTradeView(QWidget):
         # Disconnect stale worker if any
         if prev is not None:
             try:
-                prev.order_status_updated.disconnect(self._on_order_status_updated)
+                prev.order_status_updated.disconnect(
+                    self._on_order_status_updated)
             except RuntimeError:
                 pass
             try:
@@ -401,11 +414,13 @@ class FlashTradeView(QWidget):
             except RuntimeError:
                 pass
             try:
-                prev.flatten_close_needed.disconnect(self._on_flatten_close_needed)
+                prev.flatten_close_needed.disconnect(
+                    self._on_flatten_close_needed)
             except RuntimeError:
                 pass
             try:
-                prev.reverse_close_needed.disconnect(self._on_reverse_close_needed)
+                prev.reverse_close_needed.disconnect(
+                    self._on_reverse_close_needed)
             except RuntimeError:
                 pass
             log.debug("FlashTrade: unwired stale signals for worker %s", label)
@@ -416,7 +431,8 @@ class FlashTradeView(QWidget):
         worker.reverse_close_needed.connect(self._on_reverse_close_needed)
         self._connected_order_workers[label] = worker
         self._connected_portfolio_workers[label] = worker
-        log.debug("FlashTrade: wired order_status_updated + portfolio_updated + flatten_close_needed for worker %s", label)
+        log.debug(
+            "FlashTrade: wired order_status_updated + portfolio_updated + flatten_close_needed for worker %s", label)
 
         # Re-snapshot: the worker's initial snapshot may have fired before
         # this signal was connected.  Ask it to emit all known orders again.
@@ -486,10 +502,12 @@ class FlashTradeView(QWidget):
                     row_data = self._accounts_model._table_data[row_idx]
                     if row_data[COL_ACCOUNT] == account:
                         try:
-                            bal = float(row_data[COL_NET_LIQ]) if row_data[COL_NET_LIQ] else 0
+                            bal = float(row_data[COL_NET_LIQ]
+                                        ) if row_data[COL_NET_LIQ] else 0
                         except (ValueError, TypeError):
                             bal = 0
-                        self._account_position.set_account_data(account, bal, 0)
+                        self._account_position.set_account_data(
+                            account, bal, 0)
                         break
 
     def _refresh_portfolio(self) -> None:
@@ -509,7 +527,8 @@ class FlashTradeView(QWidget):
         """
         parts = order_id.split("_", 1)
         if len(parts) < 2:
-            log.warning("FlashTrade: malformed order_id for cancel: %s", order_id)
+            log.warning(
+                "FlashTrade: malformed order_id for cancel: %s", order_id)
             return
 
         account = parts[0]
@@ -540,9 +559,11 @@ class FlashTradeView(QWidget):
         worker = self._active_threads.get(label)
         if worker and worker.isRunning() and worker.is_ib_connected:
             worker.cancel_order(order_id)
-            log.info("FlashTrade: cancel forwarded to worker %s for order %s", label, order_id)
+            log.info(
+                "FlashTrade: cancel forwarded to worker %s for order %s", label, order_id)
         else:
-            log.warning("FlashTrade: worker %s not available for cancel of %s", label, order_id)
+            log.warning(
+                "FlashTrade: worker %s not available for cancel of %s", label, order_id)
 
     def _on_cancel_all_for_symbol(self, symbol: str) -> None:
         """Cancel button clicked in OrderEntryPanel → cancel all open orders
@@ -552,12 +573,14 @@ class FlashTradeView(QWidget):
         affected.  If no accounts are checked nothing is cancelled.
         """
         if not isinstance(self._account_list, AccountListPanel):
-            log.warning("FlashTrade: cancel-all blocked — AccountListPanel not available")
+            log.warning(
+                "FlashTrade: cancel-all blocked — AccountListPanel not available")
             return
 
         checked: set[str] = set(self._account_list.get_selected_accounts())
         if not checked:
-            log.warning("FlashTrade: cancel-all blocked for '%s' — no accounts checked", symbol)
+            log.warning(
+                "FlashTrade: cancel-all blocked for '%s' — no accounts checked", symbol)
             return
 
         count = 0
@@ -577,12 +600,14 @@ class FlashTradeView(QWidget):
         read the per-account position and send the correct offsetting order.
         """
         if not isinstance(self._account_list, AccountListPanel):
-            log.warning("FlashTrade: flatten blocked — AccountListPanel not available")
+            log.warning(
+                "FlashTrade: flatten blocked — AccountListPanel not available")
             return
 
         checked: set[str] = set(self._account_list.get_selected_accounts())
         if not checked:
-            log.warning("FlashTrade: flatten blocked for '%s' — no accounts checked", symbol)
+            log.warning(
+                "FlashTrade: flatten blocked for '%s' — no accounts checked", symbol)
             return
 
         count = 0
@@ -607,7 +632,8 @@ class FlashTradeView(QWidget):
         account = data.get("account", "")
 
         if not symbol or qty <= 0 or not account:
-            log.warning("FlashTrade: flatten_close_needed invalid data: %s", data)
+            log.warning(
+                "FlashTrade: flatten_close_needed invalid data: %s", data)
             return
 
         # Read current last price from the order entry cache so the limit
@@ -639,12 +665,14 @@ class FlashTradeView(QWidget):
         for *symbol* on every checked account across all connected workers.
         """
         if not isinstance(self._account_list, AccountListPanel):
-            log.warning("FlashTrade: reverse blocked — AccountListPanel not available")
+            log.warning(
+                "FlashTrade: reverse blocked — AccountListPanel not available")
             return
 
         checked: set[str] = set(self._account_list.get_selected_accounts())
         if not checked:
-            log.warning("FlashTrade: reverse blocked for '%s' — no accounts checked", symbol)
+            log.warning(
+                "FlashTrade: reverse blocked for '%s' — no accounts checked", symbol)
             return
 
         count = 0
@@ -669,7 +697,8 @@ class FlashTradeView(QWidget):
         account = data.get("account", "")
 
         if not symbol or qty <= 0 or not account:
-            log.warning("FlashTrade: reverse_close_needed invalid data: %s", data)
+            log.warning(
+                "FlashTrade: reverse_close_needed invalid data: %s", data)
             return
 
         # Read current last price from the order entry cache so the limit
@@ -703,12 +732,14 @@ class FlashTradeView(QWidget):
         order-placement path (limit cap, RTH, prefs, etc.).
         """
         if not isinstance(self._account_list, AccountListPanel):
-            log.warning("FlashTrade: close_%d%% blocked — AccountListPanel not available", pct)
+            log.warning(
+                "FlashTrade: close_%d%% blocked — AccountListPanel not available", pct)
             return
 
         checked: set[str] = set(self._account_list.get_selected_accounts())
         if not checked:
-            log.warning("FlashTrade: close_%d%% blocked for '%s' — no accounts checked", pct, symbol)
+            log.warning(
+                "FlashTrade: close_%d%% blocked for '%s' — no accounts checked", pct, symbol)
             return
 
         count = 0
@@ -741,7 +772,8 @@ class FlashTradeView(QWidget):
             if worker.isRunning() and worker.is_ib_connected:
                 worker.request_portfolio_snapshot()
                 worker.request_portfolio_refresh()
-                log.info("FlashTrade: portfolio snapshot + refresh for worker %s", label)
+                log.info(
+                    "FlashTrade: portfolio snapshot + refresh for worker %s", label)
 
     # ── Layout persistence ────────────────────────────────────────────────────
 

@@ -66,11 +66,13 @@ _COLUMNS = [
 
 # ── Filter categories ────────────────────────────────────────────────────────
 _FILTER_ALL = "All"
-_FILTER_ACTIVE = "Active"       # Open + Completed combined (excludes Cancelled)
+# Open + Completed combined (excludes Cancelled)
+_FILTER_ACTIVE = "Active"
 _FILTER_OPEN = "Open"
 _FILTER_CANCELLED = "Cancelled"
 _FILTER_COMPLETED = "Completed"
-_FILTERS = [_FILTER_ALL, _FILTER_ACTIVE, _FILTER_OPEN, _FILTER_COMPLETED, _FILTER_CANCELLED]
+_FILTERS = [_FILTER_ALL, _FILTER_ACTIVE, _FILTER_OPEN,
+            _FILTER_COMPLETED, _FILTER_CANCELLED]
 
 # Map raw status strings to our categories
 _STATUS_CATEGORY: dict[str, str] = {
@@ -228,7 +230,8 @@ class OrderStatusPanel(QWidget):
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setCheckable(True)
             btn.setChecked(label == _FILTER_ALL)
-            btn.clicked.connect(lambda checked, lbl=label: self._on_filter_clicked(lbl))
+            btn.clicked.connect(
+                lambda checked, lbl=label: self._on_filter_clicked(lbl))
             self._filter_btns[label] = btn
             header.addWidget(btn)
 
@@ -239,16 +242,20 @@ class OrderStatusPanel(QWidget):
         self._table = QTableWidget(0, len(_COLUMNS))
         self._table.setHorizontalHeaderLabels(_COLUMNS)
         self._table.setAlternatingRowColors(True)
-        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection)
+        self._table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers)
         self._table.verticalHeader().setVisible(False)
         self._table.setShowGrid(True)
         self._table.setFont(_TABLE_FONT)
         self._table.setStyleSheet(_TABLE_STYLE)
 
         hdr = self._table.horizontalHeader()
-        hdr.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        hdr.setDefaultAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         hdr.setStretchLastSection(True)
         # All columns are user-resizable via drag
         hdr.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
@@ -362,7 +369,8 @@ class OrderStatusPanel(QWidget):
             # UserRole stores the raw status string when the display text
             # has been decorated (e.g. "Inactive ⚠"). Fall back to .text().
             raw_status = status_item.data(Qt.ItemDataRole.UserRole)
-            status = raw_status if isinstance(raw_status, str) else status_item.text()
+            status = raw_status if isinstance(
+                raw_status, str) else status_item.text()
             category = _STATUS_CATEGORY.get(status, _FILTER_OPEN)
             if self._active_filter == _FILTER_ALL:
                 visible = True
@@ -400,7 +408,8 @@ class OrderStatusPanel(QWidget):
 
         self._populate_row(insert_row, order_id, data)
         self._apply_row_visibility()
-        log.debug("OrderStatus: added order %s at row %d", order_id, insert_row)
+        log.debug("OrderStatus: added order %s at row %d",
+                  order_id, insert_row)
 
     def _find_sorted_row(self, new_sort: str) -> int:
         """Return the row index at which to insert so that time_sort is descending."""
@@ -487,10 +496,12 @@ class OrderStatusPanel(QWidget):
                     CLR_BUY if text.upper() == "BUY" else
                     CLR_SELL if text.upper() == "SELL" else TEXT
                 ))
-                item.setFont(QFont("Helvetica Neue, Arial", 11, QFont.Weight.Bold))
+                item.setFont(
+                    QFont("Helvetica Neue, Arial", 11, QFont.Weight.Bold))
             elif col == COL_STATUS:
                 item.setForeground(QColor(self._status_colour(text)))
-                item.setFont(QFont("Helvetica Neue, Arial", 11, QFont.Weight.Bold))
+                item.setFont(
+                    QFont("Helvetica Neue, Arial", 11, QFont.Weight.Bold))
                 if error_message:
                     # Show ⚠ so the user knows there is more info on hover.
                     # Store the raw status in UserRole so _apply_row_visibility
@@ -552,7 +563,8 @@ class OrderStatusPanel(QWidget):
                     background: #5A2A2A;
                 }}
             """)
-            btn.clicked.connect(lambda _, oid=order_id: self._on_cancel_clicked(oid))
+            btn.clicked.connect(
+                lambda _, oid=order_id: self._on_cancel_clicked(oid))
             self._table.setCellWidget(row, COL_CANCEL, btn)
         else:
             # Remove any existing button for non-open or external orders
@@ -581,4 +593,3 @@ class OrderStatusPanel(QWidget):
         if cat == _FILTER_COMPLETED:
             return CLR_FILLED
         return CLR_CANCELLED
-

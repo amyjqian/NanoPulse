@@ -15,7 +15,8 @@ class Canvas(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding,
+                           QSizePolicy.Policy.Expanding)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
 
     def paintEvent(self, event):
@@ -62,5 +63,3 @@ class Canvas(QWidget):
         )
 
         p.end()
-
-

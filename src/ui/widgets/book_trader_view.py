@@ -47,33 +47,33 @@ from src.core import config_manager
 log = logging.getLogger(__name__)
 
 # -- Theme tokens -------------------------------------------------------------
-BG_MAIN     = "#161a25"
-BG_PANEL    = "#1e2230"
-BG_HEADER   = "#14171D"
-BORDER      = "#2A2E37"
-TEXT        = "#C9D1D9"
-TEXT_DIM    = "#8B949E"
+BG_MAIN = "#161a25"
+BG_PANEL = "#1e2230"
+BG_HEADER = "#14171D"
+BORDER = "#2A2E37"
+TEXT = "#C9D1D9"
+TEXT_DIM = "#8B949E"
 TEXT_BRIGHT = "#E6EDF3"
-GREEN       = "#2e7d32"
-RED         = "#c62828"
-BLUE        = "#58A6FF"
+GREEN = "#2e7d32"
+RED = "#c62828"
+BLUE = "#58A6FF"
 
-BID_BAR      = "#4A3C10"
+BID_BAR = "#4A3C10"
 BID_BAR_FILL = "#6B5A1A"
-ASK_BAR      = "#0E3E30"
+ASK_BAR = "#0E3E30"
 ASK_BAR_FILL = "#186050"
 
-LAST_ROW_BG   = "#0E3460"
+LAST_ROW_BG = "#0E3460"
 LAST_ROW_EDGE = "#1A4E80"
 
 # -- Column indices ------------------------------------------------------------
 COL_BID_ORD = 0
-COL_BID_SZ  = 1
-COL_PRICE   = 2
-COL_ASK_SZ  = 3
+COL_BID_SZ = 1
+COL_PRICE = 2
+COL_ASK_SZ = 3
 COL_ASK_ORD = 4
 
-_HEADERS  = ["Bid #", "Bid Qty", "Price", "Ask Qty", "Ask #"]
+_HEADERS = ["Bid #", "Bid Qty", "Price", "Ask Qty", "Ask #"]
 _NUM_ROWS = 400
 
 
@@ -315,26 +315,33 @@ class PriceLadderDelegate(QStyledItemDelegate):
             if is_last:
                 painter.fillRect(rect, QColor(LAST_ROW_BG))
                 painter.setPen(QPen(QColor(LAST_ROW_EDGE), 1))
-                painter.drawLine(rect.left(), rect.top(), rect.left(), rect.bottom())
-                painter.drawLine(rect.right(), rect.top(), rect.right(), rect.bottom())
+                painter.drawLine(rect.left(), rect.top(),
+                                 rect.left(), rect.bottom())
+                painter.drawLine(rect.right(), rect.top(),
+                                 rect.right(), rect.bottom())
             elif bid > 0:
-                c = QColor(BID_BAR); c.setAlpha(80)
+                c = QColor(BID_BAR)
+                c.setAlpha(80)
                 painter.fillRect(rect, c)
             elif ask > 0:
-                c = QColor(ASK_BAR); c.setAlpha(80)
+                c = QColor(ASK_BAR)
+                c.setAlpha(80)
                 painter.fillRect(rect, c)
 
         # 4. subtle row tint for last-traded on non-price cols
         if is_last and col != COL_PRICE:
-            c = QColor(LAST_ROW_BG); c.setAlpha(40)
+            c = QColor(LAST_ROW_BG)
+            c.setAlpha(40)
             painter.fillRect(rect, c)
 
         # 5. working order highlights
         if col == COL_BID_ORD and bid_ord > 0:
-            c = QColor(GREEN); c.setAlpha(50)
+            c = QColor(GREEN)
+            c.setAlpha(50)
             painter.fillRect(rect, c)
         elif col == COL_ASK_ORD and ask_ord > 0:
-            c = QColor(RED); c.setAlpha(50)
+            c = QColor(RED)
+            c.setAlpha(50)
             painter.fillRect(rect, c)
 
         # 6. grid lines
@@ -376,9 +383,11 @@ class PriceLadderDelegate(QStyledItemDelegate):
             else:
                 painter.setPen(QColor(TEXT))
         elif col == COL_BID_ORD:
-            painter.setPen(QColor("#66BB6A") if bid_ord > 0 else QColor(TEXT_DIM))
+            painter.setPen(QColor("#66BB6A") if bid_ord >
+                           0 else QColor(TEXT_DIM))
         elif col == COL_ASK_ORD:
-            painter.setPen(QColor("#EF5350") if ask_ord > 0 else QColor(TEXT_DIM))
+            painter.setPen(QColor("#EF5350") if ask_ord >
+                           0 else QColor(TEXT_DIM))
         else:
             painter.setPen(QColor(TEXT_DIM))
 
@@ -568,7 +577,8 @@ class BookTraderView(QWidget):
         self._completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         self._completer.setFilterMode(Qt.MatchFlag.MatchContains)
         self._completer.setMaxVisibleItems(12)
-        self._completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        self._completer.setCompletionMode(
+            QCompleter.CompletionMode.PopupCompletion)
         self._completer.activated.connect(self._on_completer_activated)
         self._sym_input.setCompleter(self._completer)
 
@@ -583,7 +593,8 @@ class BookTraderView(QWidget):
 
         tb.addWidget(_toolbar_label("Tick", TEXT_DIM, 11))
         self._tick_combo = QComboBox()
-        self._tick_combo.addItems(["0.25", "0.50", "0.01", "0.05", "0.10", "1.00"])
+        self._tick_combo.addItems(
+            ["0.25", "0.50", "0.01", "0.05", "0.10", "1.00"])
         self._tick_combo.setStyleSheet(_COMBO_QSS)
         self._tick_combo.currentTextChanged.connect(self._on_tick_changed)
         tb.addWidget(self._tick_combo)
@@ -600,7 +611,8 @@ class BookTraderView(QWidget):
 
         tb.addStretch()
 
-        self._centre_btn = _make_btn("Centre", "#1A2440", BLUE, "#24304A", min_w=72)
+        self._centre_btn = _make_btn(
+            "Centre", "#1A2440", BLUE, "#24304A", min_w=72)
         self._centre_btn.setStyleSheet(
             self._centre_btn.styleSheet().replace(
                 "border:1px solid #1A2440", "border:1px solid #2A3450"))
@@ -626,9 +638,12 @@ class BookTraderView(QWidget):
         self._table.setItemDelegate(self._delegate)
         self._table.setStyleSheet(_TABLE_QSS)
         self._table.setShowGrid(False)
-        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self._table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self._table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection)
+        self._table.setVerticalScrollMode(
+            QAbstractItemView.ScrollMode.ScrollPerPixel)
         self._table.verticalHeader().setVisible(False)
         self._table.verticalHeader().setDefaultSectionSize(PriceLadderDelegate.ROW_H)
 
@@ -655,11 +670,11 @@ class BookTraderView(QWidget):
         bl.setContentsMargins(8, 2, 8, 2)
         bl.setSpacing(16)
 
-        self._lbl_last   = _toolbar_label("Last: ---", TEXT, 10, bold=True)
-        self._lbl_bid    = _toolbar_label("Bid: ---", "#D4A82A", 10)
-        self._lbl_ask    = _toolbar_label("Ask: ---", "#4AD080", 10)
+        self._lbl_last = _toolbar_label("Last: ---", TEXT, 10, bold=True)
+        self._lbl_bid = _toolbar_label("Bid: ---", "#D4A82A", 10)
+        self._lbl_ask = _toolbar_label("Ask: ---", "#4AD080", 10)
         self._lbl_spread = _toolbar_label("Spread: ---", TEXT_DIM, 10)
-        self._lbl_pos    = _toolbar_label("Pos: flat", TEXT_DIM, 10)
+        self._lbl_pos = _toolbar_label("Pos: flat", TEXT_DIM, 10)
 
         bl.addWidget(self._lbl_last)
         bl.addWidget(self._lbl_bid)
@@ -716,7 +731,8 @@ class BookTraderView(QWidget):
         from PySide6.QtCore import QStringListModel
         model = QStringListModel(completions, self._completer)
         self._completer.setModel(model)
-        log.info("BookTrader: loaded %d saved contracts for completer", len(completions))
+        log.info("BookTrader: loaded %d saved contracts for completer",
+                 len(completions))
 
     def _find_contract_by_text(self, text: str) -> dict | None:
         """Match user text against saved contracts.
@@ -761,7 +777,8 @@ class BookTraderView(QWidget):
         worker = self._find_connected_worker()
         if worker is None:
             self._info_lbl.setText("No TWS connected")
-            log.warning("BookTrader: no connected worker for depth subscription")
+            log.warning(
+                "BookTrader: no connected worker for depth subscription")
             return
 
         self._current_worker = worker
@@ -783,8 +800,10 @@ class BookTraderView(QWidget):
         """Cancel the current depth subscription and disconnect signals."""
         if self._current_worker is not None:
             try:
-                self._current_worker.depth_updated.disconnect(self._on_depth_data)
-                self._current_worker.ticker_updated.disconnect(self._on_ticker_data)
+                self._current_worker.depth_updated.disconnect(
+                    self._on_depth_data)
+                self._current_worker.ticker_updated.disconnect(
+                    self._on_ticker_data)
             except (RuntimeError, TypeError):
                 pass
             self._current_worker.cancel_mkt_depth()
@@ -794,7 +813,8 @@ class BookTraderView(QWidget):
     def _on_depth_data(self, bids, asks) -> None:
         """Slot: receive live depth from the worker."""
         bb = max(bids, default=0)          # best bid – always on a tick boundary
-        ba = min(asks, default=0)          # best ask – always on a tick boundary
+        # best ask – always on a tick boundary
+        ba = min(asks, default=0)
 
         # Use best-bid as the rebuild anchor (it's always tick-aligned)
         anchor = float(bb or ba or 0)
@@ -957,7 +977,8 @@ class BookTraderView(QWidget):
         row = self._model.row_of(self._model._last)
         if row >= 0:
             idx = self._model.index(row, COL_PRICE)
-            self._table.scrollTo(idx, QAbstractItemView.ScrollHint.PositionAtCenter)
+            self._table.scrollTo(
+                idx, QAbstractItemView.ScrollHint.PositionAtCenter)
 
     # -- public live-data API --------------------------------------------------
 
