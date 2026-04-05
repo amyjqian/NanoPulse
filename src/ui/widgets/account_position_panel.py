@@ -16,12 +16,10 @@ flatten_requested(str)        – user clicked Flatten (account id)
 """
 from __future__ import annotations
 
-import json
 import logging
 import math
-import os
 
-from PySide6.QtCore import QEvent, QRect, QSize, Qt, Signal
+from PySide6.QtCore import QEvent, QRect, QSettings, QSize, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -126,11 +124,6 @@ _TABLE_STYLE = f"""
 """
 
 # ── Column-width persistence ───────────────────────────────────────────────────
-_COL_WIDTHS_FILE = os.path.normpath(os.path.join(
-    os.path.dirname(__file__), "..", "..", "..",
-    "data", "portfolio_col_widths.json"
-))
-
 _BG_HEADER_ROW_BRUSH = QBrush(QColor(BG_HEADER_ROW))
 
 
@@ -598,25 +591,23 @@ class AccountPositionPanel(QWidget):
         for col, sample in self._COL_SAMPLES.items():
             self._table.setColumnWidth(col, fm.horizontalAdvance(sample) + pad)
 
+    _SETTINGS_KEY = "AccountPositionPanel/headerState"
+
     def _restore_col_widths(self) -> None:
-        try:
-            with open(_COL_WIDTHS_FILE, "r", encoding="utf-8") as f:
-                widths: dict = json.load(f)
-            for col in range(NUM_COLS):
-                w = widths.get(str(col))
-                if w:
-                    self._table.setColumnWidth(col, int(w))
-        except (FileNotFoundError, json.JSONDecodeError, ValueError):
-            self._apply_default_col_widths()
+        settings = QSettings("NanoPulse", "Dashboard")
+        state = settings.value(self._SETTINGS_KEY)
+        if state is not None:
+            if self._table.horizontalHeader().restoreState(state):
+                log.debug("Position: restored header state from QSettings")
+                return
+        self._apply_default_col_widths()
+        log.debug("Position: applied default column widths")
 
     def save_col_widths(self) -> None:
-        widths = {str(col): self._table.columnWidth(col) for col in range(NUM_COLS)}
-        try:
-            os.makedirs(os.path.dirname(_COL_WIDTHS_FILE), exist_ok=True)
-            with open(_COL_WIDTHS_FILE, "w", encoding="utf-8") as f:
-                json.dump(widths, f, indent=2)
-        except OSError as exc:
-            log.warning("Portfolio: could not save column widths: %s", exc)
+        settings = QSettings("NanoPulse", "Dashboard")
+        state = self._table.horizontalHeader().saveState()
+        settings.setValue(self._SETTINGS_KEY, state)
+        log.debug("Position: saved header state to QSettings")
 
     def _on_section_resized(self, _logical: int, _old: int, _new: int) -> None:
         self.save_col_widths()
