@@ -7,7 +7,7 @@ import math
 from typing import Any
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QColor, QFont, QPainter
 from PySide6.QtWidgets import (
     QComboBox,
     QCompleter,
@@ -108,6 +108,245 @@ def _apply_chip_style(btn: QPushButton, selected: bool) -> None:
             "QPushButton{background:#3a3a4a;color:#ccc;border:none;"
             "border-radius:6px;padding:4px 12px;font-weight:600;font-size:12px}"
             "QPushButton:hover{background:#4a4a5a}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Toggle switch
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class _ToggleSwitch(QWidget):
+    """Compact iOS-style on/off toggle (custom-painted, no images needed)."""
+
+    toggled = Signal(bool)
+    _W, _H = 40, 22
+
+    def __init__(self, on: bool = False, parent=None):
+        super().__init__(parent)
+        self._on = on
+        self.setFixedSize(self._W, self._H)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mousePressEvent(self, event) -> None:
+        self._on = not self._on
+        self.update()
+        self.toggled.emit(self._on)
+
+    def paintEvent(self, event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = self._H // 2
+        # Track
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#0071e3") if self._on else QColor("#4a4a5a"))
+        p.drawRoundedRect(0, 1, self._W, self._H - 2, r, r)
+        # Thumb
+        thumb_d = self._H - 6
+        thumb_x = self._W - thumb_d - 4 if self._on else 4
+        p.setBrush(QColor("white"))
+        p.drawEllipse(thumb_x, 3, thumb_d, thumb_d)
+        p.end()
+
+    @property
+    def is_on(self) -> bool:
+        return self._on
+
+    def set_on(self, value: bool) -> None:
+        if self._on != value:
+            self._on = value
+            self.update()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Tier section  (Take Profit / Stop Loss)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class _TierSection(QWidget):
+    """Header (label + toggle) + a row of tier chip buttons + custom input field.
+
+    Chip labels come from the ``tiers`` list loaded from preferences.
+    The last element in the row is always a free-text input (custom value).
+    """
+
+    changed = Signal()
+
+    _CHIP_H = 28
+    _SS_SEL = (
+        "QPushButton{background:#0071e3;color:white;border:none;"
+        "border-radius:6px;padding:4px 12px;font-weight:bold;font-size:12px}"
+        "QPushButton:hover{background:#0077ed}"
+    )
+    _SS_NORM = (
+        "QPushButton{background:#3a3a4a;color:#ccc;border:none;"
+        "border-radius:6px;padding:4px 12px;font-weight:600;font-size:12px}"
+        "QPushButton:hover{background:#4a4a5a}"
+    )
+    _SS_DIS = (
+        "QPushButton{background:#252535;color:#444;border:none;"
+        "border-radius:6px;padding:4px 12px;font-size:12px}"
+    )
+    _SS_INPUT = (
+        "QLineEdit{background:#3a3a4a;color:#ccc;border:none;"
+        "border-radius:4px;padding:2px 6px;font-size:11px}"
+        "QLineEdit:focus{background:#4a4a5a;color:white}"
+        "QLineEdit:disabled{background:#252535;color:#444;border:none}"
+    )
+
+    def __init__(self, title: str, tiers: list[dict],
+                 enabled: bool = False, parent=None):
+        super().__init__(parent)
+        self._tiers: list[dict] = tiers
+        self._selected_idx: int | None = None
+        self._chip_buttons: list[QPushButton] = []
+        self._input: QLineEdit | None = None
+        self._toggle: _ToggleSwitch | None = None
+        self._state_lbl: QLabel | None = None
+        self._chips_layout: QHBoxLayout | None = None
+        self._build_ui(title, enabled)
+
+    # ── Build ─────────────────────────────────────────────────────────────────
+
+    def _build_ui(self, title: str, enabled: bool) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 4)
+        root.setSpacing(4)
+
+        # Header row
+        hdr = QHBoxLayout()
+        hdr.setSpacing(6)
+        hdr.setContentsMargins(0, 0, 0, 0)
+        lbl = QLabel(title)
+        lbl.setStyleSheet(
+            f"color: {Theme.TEXT}; font-size: 11px; font-weight: bold; border: none;")
+        hdr.addWidget(lbl)
+        hdr.addStretch()
+        self._state_lbl = QLabel("On" if enabled else "Off")
+        self._state_lbl.setStyleSheet(
+            f"color: {Theme.TEXT_DIM}; font-size: 11px; border: none;")
+        hdr.addWidget(self._state_lbl)
+        self._toggle = _ToggleSwitch(enabled)
+        self._toggle.toggled.connect(self._on_toggled)
+        hdr.addWidget(self._toggle)
+        root.addLayout(hdr)
+
+        # Chips container (rebuilt on reload_tiers)
+        chips_w = QWidget()
+        chips_w.setStyleSheet("border: none;")
+        self._chips_layout = QHBoxLayout(chips_w)
+        self._chips_layout.setContentsMargins(0, 0, 0, 0)
+        self._chips_layout.setSpacing(4)
+        root.addWidget(chips_w)
+
+        self._build_chips(enabled)
+
+    def _build_chips(self, enabled: bool) -> None:
+        """(Re)populate the chips row from self._tiers."""
+        lay = self._chips_layout
+        while lay.count():
+            item = lay.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._chip_buttons.clear()
+        self._selected_idx = None
+
+        for i, tier in enumerate(self._tiers):
+            label = tier.get("label", f"Tier {i + 1}")
+            btn = QPushButton(label)
+            btn.setFixedHeight(self._CHIP_H)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setSizePolicy(
+                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            btn.clicked.connect(lambda chk, idx=i: self._on_chip_clicked(idx))
+            self._chip_buttons.append(btn)
+            lay.addWidget(btn)
+
+        # Custom input (always last, always enabled, expands with the rest)
+        self._input = QLineEdit()
+        self._input.setFixedHeight(self._CHIP_H)
+        self._input.setMinimumWidth(48)
+        self._input.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._input.setStyleSheet(self._SS_INPUT)
+        self._input.textChanged.connect(self._on_input_changed)
+        lay.addWidget(self._input)
+        # No addStretch() — chips fill all available width
+
+        self._update_chip_styles()
+
+    # ── Slots ─────────────────────────────────────────────────────────────────
+
+    def _on_toggled(self, on: bool) -> None:
+        self._state_lbl.setText("On" if on else "Off")
+        if not on:
+            # Unselect all chips and clear input when toggled OFF
+            self._selected_idx = None
+            if self._input:
+                self._input.blockSignals(True)
+                self._input.clear()
+                self._input.blockSignals(False)
+        self._update_chip_styles()
+        self.changed.emit()
+
+    def _on_chip_clicked(self, idx: int) -> None:
+        # Auto-switch toggle ON if currently OFF
+        if self._toggle and not self._toggle.is_on:
+            self._toggle.set_on(True)
+            self._state_lbl.setText("On")
+        self._selected_idx = idx
+        if self._input:
+            self._input.blockSignals(True)
+            self._input.clear()
+            self._input.blockSignals(False)
+        self._update_chip_styles()
+        self.changed.emit()
+
+    def _on_input_changed(self, text: str) -> None:
+        stripped = text.strip()
+        if stripped:
+            # Auto-switch toggle ON if value > 0 and toggle is currently OFF
+            try:
+                if float(stripped) > 0 and self._toggle and not self._toggle.is_on:
+                    self._toggle.set_on(True)
+                    self._state_lbl.setText("On")
+            except ValueError:
+                pass
+            self._selected_idx = None
+            self._update_chip_styles()
+        self.changed.emit()
+
+    def _update_chip_styles(self) -> None:
+        # Delegate to the same helper used by symbol chips for identical styling.
+        for i, btn in enumerate(self._chip_buttons):
+            _apply_chip_style(btn, i == self._selected_idx)
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def reload_tiers(self, tiers: list[dict]) -> None:
+        """Reload chip buttons when preferences change."""
+        self._tiers = tiers
+        self._build_chips(enabled=True)  # chips are always interactive
+
+    @property
+    def is_enabled(self) -> bool:
+        return self._toggle.is_on if self._toggle else False
+
+    def get_value(self) -> dict | None:
+        """Return selected tier value dict, or None if disabled/nothing chosen."""
+        if not self.is_enabled:
+            return None
+        custom = self._input.text().strip() if self._input else ""
+        if custom:
+            try:
+                return {"value": float(custom), "unit": "ticks", "label": "Custom"}
+            except ValueError:
+                return None
+        if self._selected_idx is not None and self._selected_idx < len(self._tiers):
+            t = self._tiers[self._selected_idx]
+            return {
+                "value": t.get("value", 0),
+                "unit":  t.get("unit", "ticks"),
+                "label": t.get("label", ""),
+            }
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -366,6 +605,17 @@ class OrderEntryPanel(QWidget):
         pm_w.setLayout(pm_grid)
         root.addWidget(pm_w)
 
+        root.addSpacing(8)
+
+        # ── Take Profit ───────────────────────────────────────────────────────
+        pt_tiers, sl_tiers = self._load_tiers_for_active()
+        self._pt_section = _TierSection("Take profit", pt_tiers, enabled=False)
+        root.addWidget(self._pt_section)
+
+        # ── Stop Loss ─────────────────────────────────────────────────────────
+        self._sl_section = _TierSection("Stop loss", sl_tiers, enabled=False)
+        root.addWidget(self._sl_section)
+
         root.addStretch(1)
 
     # ── Combo / symbol search ─────────────────────────────────────────────────
@@ -508,6 +758,7 @@ class OrderEntryPanel(QWidget):
         self._rebuild_symbol_buttons()
         self._rebuild_qty_buttons()
         self._refresh_action_labels()
+        self._reload_tier_sections()
 
     # ── Symbol buttons ────────────────────────────────────────────────────────
 
@@ -578,6 +829,7 @@ class OrderEntryPanel(QWidget):
         self._update_symbol_display()
         self._rebuild_qty_buttons()
         self._refresh_action_labels()
+        self._reload_tier_sections()
 
     def _update_symbol_display(self) -> None:
         if self._active_symbol:
@@ -626,6 +878,7 @@ class OrderEntryPanel(QWidget):
         self._rebuild_symbol_buttons()
         self._rebuild_qty_buttons()
         self._refresh_action_labels()
+        self._reload_tier_sections()
 
     # ── Quantity buttons ──────────────────────────────────────────────────────
 
@@ -705,6 +958,33 @@ class OrderEntryPanel(QWidget):
         self._btn_buy_bid_lmt.setText(f"Buy {q} @Bid Limit")
         self._btn_sell_ask_lmt.setText(f"Sell {q} @Ask Limit")
 
+    # ── Tier helpers ──────────────────────────────────────────────────────────
+
+    _TIER_FALLBACK = [
+        {"label": "Tier 1", "value": 20,  "unit": "ticks"},
+        {"label": "Tier 2", "value": 40,  "unit": "ticks"},
+        {"label": "Tier 3", "value": 80,  "unit": "ticks"},
+        {"label": "Tier 4", "value": 160, "unit": "ticks"},
+    ]
+
+    def _load_tiers_for_active(self) -> tuple[list[dict], list[dict]]:
+        """Return (profit_take_tiers, stop_loss_tiers) for the active symbol's asset class."""
+        sec = _sec_type_for(self._active_symbol or "")
+        key = "trading_futures" if sec == "FUT" else "trading_stocks"
+        prefs = config_manager.load_preferences()
+        section = prefs.get(key, {})
+        pt = section.get("profit_take", self._TIER_FALLBACK)
+        sl = section.get("stop_loss",   self._TIER_FALLBACK)
+        return pt, sl
+
+    def _reload_tier_sections(self) -> None:
+        """Reload PT/SL tier chips when the active symbol or preferences change."""
+        if not hasattr(self, "_pt_section"):
+            return
+        pt_tiers, sl_tiers = self._load_tiers_for_active()
+        self._pt_section.reload_tiers(pt_tiers)
+        self._sl_section.reload_tiers(sl_tiers)
+
     # ── Order signal ──────────────────────────────────────────────────────────
 
     def _emit_order(self, action: str, order_type: str) -> None:
@@ -718,6 +998,8 @@ class OrderEntryPanel(QWidget):
             "qty": self._active_qty,
             "sec_type": sec,
             "last_price": self._last_price,
+            "profit_take": self._pt_section.get_value() if hasattr(self, "_pt_section") else None,
+            "stop_loss":   self._sl_section.get_value() if hasattr(self, "_sl_section") else None,
         }
         log.info("Order requested: %s", payload)
         self.order_requested.emit(payload)
