@@ -95,6 +95,21 @@ def _parse_ib_time(s: str) -> datetime | None:
     return None
 
 
+# IB uses DBL_MAX (≈1.7976931348623157e+308) as a sentinel for "no data".
+# This is a valid finite float, so math.isnan / math.isinf won't catch it.
+_IB_DBL_MAX = 1.7e308
+
+
+def _safe_pnl(val) -> float:
+    """Return *val* as a float, or 0.0 if it is None, NaN, or IB's DBL_MAX sentinel."""
+    if val is None:
+        return 0.0
+    v = float(val)
+    if math.isnan(v) or abs(v) >= _IB_DBL_MAX:
+        return 0.0
+    return v
+
+
 try:
     from ib_async import IB, AccountValue
 except ImportError:  # allow UI dev without TWS dependency installed
@@ -141,6 +156,12 @@ class IBWorkerThread(QThread):
     flatten_close_needed = Signal(dict)
     # {symbol, account, action, qty} → UI places the reverse order
     reverse_close_needed = Signal(dict)
+    # per-position P&L from pnlSingleEvent
+    # (account, con_id, daily_pnl, realized_pnl, unrealized_pnl)
+    pnl_single_updated = Signal(str, int, float, float, float)
+    # account-level P&L from pnlEvent
+    # (account, daily_pnl, realized_pnl, unrealized_pnl)
+    account_pnl_updated = Signal(str, float, float, float)
 
     def __init__(
         self,
@@ -207,6 +228,9 @@ class IBWorkerThread(QThread):
         # refresh instead of falling back to 00:00:00.
         # NOT cleared on reconnect.
         self._order_times: dict[str, str] = {}
+
+        # Track per-position PnL subscriptions: set of (account, conId)
+        self._pnl_single_subs: set[tuple[str, int]] = set()
 
     def set_auto_reconnect(self, auto_reconnect: bool) -> None:
         """Update the auto-reconnect flag natively while running."""
@@ -422,6 +446,7 @@ class IBWorkerThread(QThread):
         self._ib = IB()
         self._ib.accountSummaryEvent += self._on_account_summary
         self._ib.pnlEvent += self._on_pnl
+        self._ib.pnlSingleEvent += self._on_pnl_single
         self._ib.errorEvent += self._on_ib_error
         self._ib.pendingTickersEvent += self._on_pending_tickers
         # Global order-status listener – catches ALL order updates
@@ -431,7 +456,7 @@ class IBWorkerThread(QThread):
         self._ib.updatePortfolioEvent += self._on_portfolio_update
 
         tws_log.info("[%s] IB instance created – event subscriptions: "
-                     "accountSummaryEvent, pnlEvent, errorEvent, "
+                     "accountSummaryEvent, pnlEvent, pnlSingleEvent, errorEvent, "
                      "pendingTickersEvent, orderStatusEvent, updatePortfolioEvent",
                      self._label)
 
@@ -1658,7 +1683,7 @@ class IBWorkerThread(QThread):
         """Handle pnlEvent – provides dailyPnL, realizedPnL, unrealizedPnL.
 
         ``pnlEvent`` emits a single :class:`PnL` object per call.
-        Fields may be ``float('nan')`` when unavailable.
+        Fields may be ``float('nan')`` or ``DBL_MAX`` when unavailable.
         """
         try:
             acct = entry.account
@@ -1666,11 +1691,36 @@ class IBWorkerThread(QThread):
                           "realizedPnL=%s unrealizedPnL=%s",
                           self._label, acct,
                           entry.dailyPnL, entry.realizedPnL, entry.unrealizedPnL)
-            if entry.dailyPnL is not None and not math.isnan(entry.dailyPnL):
-                self._buffer[(acct, "DailyPnL")] = (
-                    str(entry.dailyPnL), "BASE")
+            daily = _safe_pnl(entry.dailyPnL)
+            if daily != 0.0:
+                self._buffer[(acct, "DailyPnL")] = (str(daily), "BASE")
+            # Emit account-level P&L signal for the UI position panel
+            realized = _safe_pnl(entry.realizedPnL)
+            unrealized = _safe_pnl(entry.unrealizedPnL)
+            self.account_pnl_updated.emit(acct, daily, realized, unrealized)
         except Exception:
             log.debug("Worker %s: bad PnL entry: %s", self._label, entry)
+
+    def _on_pnl_single(self, entry) -> None:
+        """Handle pnlSingleEvent – per-position P&L updates.
+
+        ``pnlSingleEvent`` emits a :class:`PnLSingle` object per call.
+        Fields may be ``float('nan')`` or ``DBL_MAX`` (1.7976e+308) when
+        unavailable.
+        """
+        try:
+            acct = entry.account
+            con_id = entry.conId
+            tws_log.debug("[%s] EVENT     pnlSingleEvent → account=%s conId=%s "
+                          "dailyPnL=%s unrealizedPnL=%s realizedPnL=%s",
+                          self._label, acct, con_id,
+                          entry.dailyPnL, entry.unrealizedPnL, entry.realizedPnL)
+            daily = _safe_pnl(entry.dailyPnL)
+            realized = _safe_pnl(entry.realizedPnL)
+            unrealized = _safe_pnl(entry.unrealizedPnL)
+            self.pnl_single_updated.emit(acct, con_id, daily, realized, unrealized)
+        except Exception:
+            log.debug("Worker %s: bad PnLSingle entry: %s", self._label, entry)
 
     def _on_portfolio_update(self, item) -> None:
         """Buffer a PortfolioItem update for throttled emission.
@@ -1698,7 +1748,7 @@ class IBWorkerThread(QThread):
                           float(getattr(item, "marketPrice", 0)),
                           float(getattr(item, "marketValue", 0)),
                           float(getattr(item, "unrealizedPNL", 0)),
-                          float(getattr(item, "realizedPnL", 0)))
+                          float(getattr(item, "realizedPNL", 0)))
             self._portfolio_buffer[(acct, con_id)] = {
                 "label": self._label,
                 "account": acct,
@@ -1713,11 +1763,34 @@ class IBWorkerThread(QThread):
                 "market_price": float(getattr(item, "marketPrice", 0)),
                 "market_value": float(getattr(item, "marketValue", 0)),
                 "unrealized_pnl": float(getattr(item, "unrealizedPNL", 0)),
-                "realized_pnl": float(getattr(item, "realizedPnL", 0)),
+                "realized_pnl": float(getattr(item, "realizedPNL", 0)),
             }
             # Also persist into the long-lived cache for late subscribers
             self._portfolio_cache[(acct, con_id)
                                   ] = self._portfolio_buffer[(acct, con_id)]
+
+            # Subscribe to per-position PnL if not already subscribed
+            pnl_key = (acct, con_id)
+            if pos != 0 and pnl_key not in self._pnl_single_subs:
+                try:
+                    self._ib.reqPnLSingle(acct, "", con_id)
+                    self._pnl_single_subs.add(pnl_key)
+                    tws_log.info("[%s] API-CALL  reqPnLSingle(account=%s, conId=%s)",
+                                 self._label, acct, con_id)
+                except Exception as exc:
+                    log.debug("Worker %s: reqPnLSingle failed for %s/%s: %s",
+                              self._label, acct, con_id, exc)
+            elif pos == 0 and pnl_key in self._pnl_single_subs:
+                # Position closed → cancel the subscription
+                try:
+                    self._ib.cancelPnLSingle(acct, "", con_id)
+                    self._pnl_single_subs.discard(pnl_key)
+                    tws_log.info("[%s] API-CALL  cancelPnLSingle(account=%s, conId=%s)",
+                                 self._label, acct, con_id)
+                except Exception as exc:
+                    log.debug("Worker %s: cancelPnLSingle failed for %s/%s: %s",
+                              self._label, acct, con_id, exc)
+
         except Exception:
             log.debug("Worker %s: bad portfolio item: %s", self._label, item)
 

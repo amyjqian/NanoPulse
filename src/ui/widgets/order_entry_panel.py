@@ -336,23 +336,28 @@ class OrderEntryPanel(QWidget):
         pm_grid = QGridLayout()
         pm_grid.setSpacing(4)
         pm_grid.setContentsMargins(0, 0, 0, 0)
+
+
         self._btn_close25 = _make_btn("25%", Theme.CLR_CLOSE, 30)
         self._btn_close50 = _make_btn("50%", Theme.CLR_CLOSE, 30)
         self._btn_close75 = _make_btn("75%", Theme.CLR_CLOSE, 30)
-        pm_grid.addWidget(self._btn_close25, 0, 0)
-        pm_grid.addWidget(self._btn_close50, 0, 1)
-        pm_grid.addWidget(self._btn_close75, 1, 0)
+        pm_grid.addWidget(self._btn_close25, 1, 0)
+        pm_grid.addWidget(self._btn_close50, 1, 1)
+        pm_grid.addWidget(self._btn_close75, 2, 1)
         self._btn_close25.clicked.connect(lambda: self._on_close_pct(25))
         self._btn_close50.clicked.connect(lambda: self._on_close_pct(50))
         self._btn_close75.clicked.connect(lambda: self._on_close_pct(75))
+
         self._btn_flatten = _make_btn("Flatten", Theme.CLR_FLATTEN, 30)
-        pm_grid.addWidget(self._btn_flatten, 1, 1)
+        pm_grid.addWidget(self._btn_flatten, 0, 0)
         self._btn_flatten.clicked.connect(self._on_flatten)
+
         self._btn_reverse = _make_btn("Reverse", Theme.CLR_REVERSE, 30)
         pm_grid.addWidget(self._btn_reverse, 2, 0)
         self._btn_reverse.clicked.connect(self._on_reverse)
+
         self._btn_cancel = _make_btn("Cancel", Theme.CLR_CANCEL, 30)
-        pm_grid.addWidget(self._btn_cancel, 2, 1)
+        pm_grid.addWidget(self._btn_cancel, 0, 1)
         self._btn_cancel.clicked.connect(self._on_cancel_all)
 
         pm_w = QWidget()

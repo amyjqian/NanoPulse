@@ -44,16 +44,14 @@ from .order_status_model import (
     # Column constants
     COL_SYMBOL, COL_ACCOUNT, COL_ACTION, COL_TYPE, COL_QTY,
     COL_FILL, COL_STATUS, COL_CANCEL, COL_TIME, COL_LMT, COL_STP, COL_TIF,
-    HEADERS,
     # Roles
-    OrderIdRole, IsInternalRole, StatusCategoryRole, RawStatusRole,
+    OrderIdRole, IsInternalRole, StatusCategoryRole,
     # Filter constants
-    FILTER_ALL, FILTER_ACTIVE, FILTER_OPEN, FILTER_COMPLETED, FILTER_CANCELLED,
-    FILTERS, STATUS_CATEGORY,
+    FILTER_ALL, FILTER_OPEN,
+    FILTERS,
     # Model + Proxy
     OrderStatusModel, OrderStatusFilterProxy,
-    # Helpers / colours
-    is_internal_order, status_colour,
+    # Colours
     CLR_SELL,
 )
 
@@ -297,7 +295,7 @@ class OrderStatusPanel(QWidget):
         header = QHBoxLayout()
         header.setSpacing(0)
 
-        title = QLabel("Order Status")
+        title = QLabel("Orders")
         title.setFont(_TITLE_FONT)
         title.setStyleSheet("color: #ffffff; border: none;")
         header.addWidget(title)
