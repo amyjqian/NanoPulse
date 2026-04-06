@@ -92,7 +92,10 @@ def _fmt_money(val: float) -> str:
 def _fmt_pnl(val: float) -> str:
     if not math.isfinite(val):
         return "–"
-    return f"+${val:,.2f}" if val >= 0 else f"-${abs(val):,.2f}"
+    v = int(round(val))
+    if v == 0:
+        return ""
+    return f"+${v:,}" if v > 0 else f"-${abs(v):,}"
 
 
 def _fmt_qty(val: float) -> str:
@@ -223,7 +226,7 @@ class AccountPositionModel(QAbstractTableModel):
             if col == COL_LAST_PRICE:
                 return _fmt_price(rd.get("market_price", 0))
             if col == COL_DAILY_PNL:
-                v = pnl_s.get("daily_pnl", float("nan"))
+                v = pnl_s.get("daily_pnl", rd.get("daily_pnl", float("nan")))
                 return _fmt_pnl(v) if math.isfinite(v) else "–"
             if col == COL_REALIZED_PNL:
                 v = pnl_s.get("realized_pnl", rd.get("realized_pnl", float("nan")))
@@ -240,7 +243,7 @@ class AccountPositionModel(QAbstractTableModel):
 
         if role == Qt.ItemDataRole.ForegroundRole:
             if col == COL_DAILY_PNL:
-                return _pnl_color(pnl_s.get("daily_pnl", float("nan")))
+                return _pnl_color(pnl_s.get("daily_pnl", rd.get("daily_pnl", float("nan"))))
             if col == COL_REALIZED_PNL:
                 v = pnl_s.get("realized_pnl", rd.get("realized_pnl", float("nan")))
                 return _pnl_color(v)
@@ -248,8 +251,13 @@ class AccountPositionModel(QAbstractTableModel):
                 v = pnl_s.get("unrealized_pnl", rd.get("unrealized_pnl", float("nan")))
                 return _pnl_color(v)
             if col == COL_POSITION:
-                pos = rd.get("position", 0)
-                return QColor(CLR_LONG) if pos > 0 else QColor(CLR_SHORT)
+                pos_val = rd.get("position", 0)
+                if pos_val > 0:
+                    return QColor(CLR_LONG)
+                elif pos_val < 0:
+                    return QColor(CLR_SHORT)
+                else:
+                    return QColor(TEXT_DIM)  # zero position – neutral
             return QColor(TEXT)
 
         if role == Qt.ItemDataRole.FontRole:
@@ -285,15 +293,10 @@ class AccountPositionModel(QAbstractTableModel):
             self._positions[key] = pos
 
             if key in self._row_map and old is not None:
-                new_pos = pos.get("position", 0)
-                old_pos = old.get("position", 0)
-                if (new_pos == 0) != (old_pos == 0):
-                    needs_rebuild = True
-                else:
-                    self._update_row_in_place(key, pos)
+                # Always update in-place; zero positions are now shown
+                self._update_row_in_place(key, pos)
             else:
-                if pos.get("position", 0) != 0:
-                    needs_rebuild = True
+                needs_rebuild = True  # new key – always add to view
 
         if needs_rebuild:
             self.rebuild()
@@ -302,13 +305,20 @@ class AccountPositionModel(QAbstractTableModel):
                           daily_pnl: float, realized_pnl: float,
                           unrealized_pnl: float) -> None:
         key = (account, con_id)
-        self._pnl_single[key] = {
-            "daily_pnl":     daily_pnl,
-            "realized_pnl":  realized_pnl,
+        pnl_data = {
+            "daily_pnl":      daily_pnl,
+            "realized_pnl":   realized_pnl,
             "unrealized_pnl": unrealized_pnl,
         }
+        self._pnl_single[key] = pnl_data
         row = self._row_map.get(key)
         if row is not None:
+            # Write finite values back into the row dict so the data persists
+            # even if the broker stops sending pnlSingle for zero-position rows.
+            rd = self._rows[row]
+            for field, val in pnl_data.items():
+                if math.isfinite(val):
+                    rd[field] = val
             left  = self.index(row, COL_DAILY_PNL)
             right = self.index(row, COL_UNREALIZED_PNL)
             self.dataChanged.emit(left, right, [
@@ -352,7 +362,8 @@ class AccountPositionModel(QAbstractTableModel):
             self.endResetModel()
         self._positions.clear()
         self._acct_data.clear()
-        self._pnl_single.clear()
+        # _pnl_single is intentionally NOT cleared here so cached P&L values
+        # survive a Refresh and are immediately visible when rows are rebuilt.
 
     def get_position_keys(self) -> list[tuple[str, int]]:
         return [k for k, v in self._positions.items()
@@ -366,14 +377,12 @@ class AccountPositionModel(QAbstractTableModel):
         self._row_map.clear()
         self._acct_row_map.clear()
 
-        # Collect active positions grouped by account
+        # Collect all positions grouped by account (including zero positions)
         acct_pos: dict[str, list] = {}
         for key, pos in sorted(
             self._positions.items(),
             key=lambda kv: (kv[0][0], kv[1].get("symbol", "")),
         ):
-            if pos.get("position", 0) == 0:
-                continue
             acct_pos.setdefault(key[0], []).append((key, pos))
 
         for account in sorted(acct_pos):
@@ -386,6 +395,13 @@ class AccountPositionModel(QAbstractTableModel):
                 self._row_map[key] = len(self._rows)
                 p = dict(pos)
                 p["_row_type"] = ROW_TYPE_POSITION
+                # Merge cached pnl_single data into the row so Daily P&L is
+                # visible immediately, even for zero-position rows where the
+                # broker has stopped sending pnlSingle updates.
+                pnl_s = self._pnl_single.get(key, {})
+                for field in ("daily_pnl", "realized_pnl", "unrealized_pnl"):
+                    if field in pnl_s and math.isfinite(pnl_s[field]):
+                        p.setdefault(field, pnl_s[field])
                 self._rows.append(p)
 
         self.endResetModel()
@@ -403,6 +419,13 @@ class AccountPositionModel(QAbstractTableModel):
         rd = self._rows[row]
         for k, v in pos.items():
             rd[k] = v
+        # When position hits zero, snapshot the last known pnl_single data
+        # into rd — the broker may stop sending updates for flat positions.
+        if pos.get("position", 0) == 0:
+            pnl_s = self._pnl_single.get(key, {})
+            for field in ("daily_pnl", "realized_pnl", "unrealized_pnl"):
+                if field in pnl_s and math.isfinite(pnl_s[field]):
+                    rd.setdefault(field, pnl_s[field])
         left  = self.index(row, 0)
         right = self.index(row, NUM_COLS - 1)
         self.dataChanged.emit(left, right, [

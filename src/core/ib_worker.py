@@ -562,6 +562,9 @@ class IBWorkerThread(QThread):
                 self._trades.clear()
                 self._has_status_handler.clear()
                 self._bg_tickers.clear()
+                # Clear pnlSingle subscriptions so they are re-established
+                # after reconnect (IB drops all subscriptions on disconnect).
+                self._pnl_single_subs.clear()
 
                 # Post-connect setup: errors here should NOT reset the
                 # connection status — the IB link is alive; only the
@@ -1769,9 +1772,12 @@ class IBWorkerThread(QThread):
             self._portfolio_cache[(acct, con_id)
                                   ] = self._portfolio_buffer[(acct, con_id)]
 
-            # Subscribe to per-position PnL if not already subscribed
+            # Subscribe to per-position PnL for ALL positions (including zero).
+            # Keeping the subscription active after a position closes ensures
+            # the daily P&L (realized gain/loss from the trade that day) is
+            # still delivered and visible in the Positions view.
             pnl_key = (acct, con_id)
-            if pos != 0 and pnl_key not in self._pnl_single_subs:
+            if pnl_key not in self._pnl_single_subs:
                 try:
                     self._ib.reqPnLSingle(acct, "", con_id)
                     self._pnl_single_subs.add(pnl_key)
@@ -1779,16 +1785,6 @@ class IBWorkerThread(QThread):
                                  self._label, acct, con_id)
                 except Exception as exc:
                     log.debug("Worker %s: reqPnLSingle failed for %s/%s: %s",
-                              self._label, acct, con_id, exc)
-            elif pos == 0 and pnl_key in self._pnl_single_subs:
-                # Position closed → cancel the subscription
-                try:
-                    self._ib.cancelPnLSingle(acct, "", con_id)
-                    self._pnl_single_subs.discard(pnl_key)
-                    tws_log.info("[%s] API-CALL  cancelPnLSingle(account=%s, conId=%s)",
-                                 self._label, acct, con_id)
-                except Exception as exc:
-                    log.debug("Worker %s: cancelPnLSingle failed for %s/%s: %s",
                               self._label, acct, con_id, exc)
 
         except Exception:
