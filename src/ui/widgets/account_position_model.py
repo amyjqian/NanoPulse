@@ -137,6 +137,13 @@ class AccountPositionModel(QAbstractTableModel):
         self._pnl_single: dict[tuple[str, int], dict] = {}
         self._acct_data: dict[str, dict] = {}
         self._get_alias = get_alias
+        self._show_zero: bool = True   # default ON – show zero-qty rows
+
+    def set_show_zero(self, show: bool) -> None:
+        """Show or hide rows where position qty == 0, then rebuild."""
+        if self._show_zero != show:
+            self._show_zero = show
+            self.rebuild()
 
     # ── Qt table interface ────────────────────────────────────────────────────
 
@@ -243,7 +250,8 @@ class AccountPositionModel(QAbstractTableModel):
             if col == COL_POSITION:
                 return _fmt_qty(rd.get("position", 0))
             if col == COL_AVG_PRICE:
-                return _fmt_price(rd.get("display_avg", rd.get("avg_cost", 0)))
+                v = rd.get("display_avg", rd.get("avg_cost", 0))
+                return f"{v:,.2f}" if (v and math.isfinite(v)) else ""
             if col == COL_LAST_PRICE:
                 return _fmt_price(rd.get("market_price", 0))
             if col == COL_REALIZED_PNL:
@@ -388,9 +396,10 @@ class AccountPositionModel(QAbstractTableModel):
             self._acct_row_map.clear()
             self.endResetModel()
         self._positions.clear()
-        self._acct_data.clear()
-        # _pnl_single is intentionally NOT cleared here so cached P&L values
-        # survive a Refresh and are immediately visible when rows are rebuilt.
+        # _acct_data and _pnl_single are intentionally NOT cleared here so
+        # cached account-level P&L (Daily P&L, Net Liq, Excess Liq) and
+        # per-position P&L survive a Refresh and are immediately visible
+        # when rows are rebuilt, before the next pnlEvent/pnlSingleEvent fires.
 
     def get_position_keys(self) -> list[tuple[str, int]]:
         return [k for k, v in self._positions.items()
@@ -407,6 +416,8 @@ class AccountPositionModel(QAbstractTableModel):
         # Collect all positions grouped by account (including zero positions)
         acct_pos: dict[str, list] = {}
         for key, pos in self._positions.items():
+            if not self._show_zero and pos.get("position", 0) == 0:
+                continue
             acct_pos.setdefault(key[0], []).append((key, pos))
 
         for account in sorted(acct_pos):

@@ -34,7 +34,6 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-
 from .account_position_model import (
     AccountPositionModel,
     IsFirstInGroupRole,
@@ -49,6 +48,7 @@ from .account_position_model import (
     BG_HEADER_ROW,
     _fmt_pnl, _fmt_money, _pnl_color,
 )
+from .connections_view import _ToggleSwitch
 
 log = logging.getLogger(__name__)
 
@@ -154,8 +154,9 @@ class AccountHeaderInfoDelegate(QStyledItemDelegate):
     """For HEADER rows: paints "Daily P&L · Net Liq · Excess Liq" inline
     across the spanned cell.  For POSITION rows: normal symbol rendering."""
 
-    _LABEL_COLOR = QColor(TEXT_DIM)
-    _LABEL_SEP   = "     "   # gap between segments
+    _LABEL_COLOR  = QColor(TEXT_DIM)
+    _GAP_LBL_VAL  = 4    # px between "Label:" and value
+    _GAP_SEGMENTS = 20    # px between categories
 
     def initStyleOption(self, option: QStyleOptionViewItem, index) -> None:
         super().initStyleOption(option, index)
@@ -180,61 +181,46 @@ class AccountHeaderInfoDelegate(QStyledItemDelegate):
         net_liq    = ad.get("net_liq",    0.0)
         excess_liq = ad.get("excess_liq", 0.0)
 
-        daily_str  = _fmt_pnl(daily_pnl)  if math.isfinite(daily_pnl) else "–"
+        # Header-specific format: always show a value (including +$0)
+        if math.isfinite(daily_pnl):
+            v = int(round(daily_pnl))
+            daily_str = f"+${v:,}" if v >= 0 else f"-${abs(v):,}"
+        else:
+            daily_str = "–"
         net_str    = _fmt_money(net_liq)
         excess_str = _fmt_money(excess_liq)
 
         # (label, value, value_color)
         segments = [
-            ("Daily P&L",  daily_str,  _pnl_color(daily_pnl)),
-            ("Net Liq",    net_str,    QColor(TEXT)),
-            ("Excess Liq", excess_str, QColor(TEXT)),
+            ("Daily P&L", daily_str,  _pnl_color(daily_pnl)),
+            ("Net",       net_str,    QColor(TEXT)),
+            ("Excess",    excess_str, QColor(TEXT)),
         ]
 
-        fm_lbl = QFontMetrics(_INFO_LABEL_FONT)
-        fm_val = QFontMetrics(_INFO_VALUE_FONT)
-        sep_w  = fm_lbl.horizontalAdvance(self._LABEL_SEP)
-
-        # Measure total width so we can right-align inside the cell
-        total_w = 0
-        for i, (lbl, val, _) in enumerate(segments):
-            total_w += fm_lbl.horizontalAdvance(lbl + " ")
-            total_w += fm_val.horizontalAdvance(val)
-            if i < len(segments) - 1:
-                total_w += sep_w
-
         rect = option.rect
-        x = rect.right() - total_w - 12   # right-align with small margin
+        x = rect.left() + 8
         y, h = rect.top(), rect.height()
 
         for i, (lbl, val, v_color) in enumerate(segments):
-            # Label
+            # "Label:" — use painter.fontMetrics() for accurate device metrics
             painter.setFont(_INFO_LABEL_FONT)
             painter.setPen(self._LABEL_COLOR)
-            lbl_text = lbl + " "
-            lw = fm_lbl.horizontalAdvance(lbl_text)
-            painter.drawText(QRect(x, y, lw, h),
-                             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                             lbl_text)
-            x += lw
+            fm = painter.fontMetrics()
+            baseline = y + (h + fm.ascent() - fm.descent()) // 2
+            lbl_text = lbl + ":"
+            painter.drawText(x, baseline, lbl_text)
+            x += fm.horizontalAdvance(lbl_text) + self._GAP_LBL_VAL
 
             # Value
             painter.setFont(_INFO_VALUE_FONT)
             painter.setPen(v_color)
-            vw = fm_val.horizontalAdvance(val)
-            painter.drawText(QRect(x, y, vw, h),
-                             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                             val)
-            x += vw
+            fm = painter.fontMetrics()
+            baseline = y + (h + fm.ascent() - fm.descent()) // 2
+            painter.drawText(x, baseline, val)
+            x += fm.horizontalAdvance(val)
 
-            # Separator
             if i < len(segments) - 1:
-                painter.setFont(_INFO_LABEL_FONT)
-                painter.setPen(self._LABEL_COLOR)
-                painter.drawText(QRect(x, y, sep_w, h),
-                                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                                 self._LABEL_SEP)
-                x += sep_w
+                x += self._GAP_SEGMENTS
 
         painter.restore()
 
@@ -520,7 +506,7 @@ class AccountPositionPanel(QWidget):
         btn.setFixedSize(26, 26)
         btn.setStyleSheet(f"""
             QPushButton {{
-                background: transparent; color: {TEXT_DIM};
+                background: transparent; color: {TEXT_DIM_PNL};
                 border: 1px solid {BORDER}; border-radius: 4px;
                 font-size: 14px; font-weight: bold;
             }}
@@ -529,7 +515,20 @@ class AccountPositionPanel(QWidget):
         """)
         btn.clicked.connect(self._on_refresh_clicked)
         hdr.addWidget(btn)
+
         hdr.addStretch(1)
+
+        # Zero-position toggle  (right corner, default ON)
+        zero_lbl = QLabel("Zero Pos")
+        zero_lbl.setStyleSheet(
+            f"color: {TEXT_DIM_PNL}; font-size: 10px; border: none;")
+        hdr.addWidget(zero_lbl)
+        hdr.addSpacing(4)
+
+        self._zero_pos_toggle = _ToggleSwitch(checked=True)
+        self._zero_pos_toggle.toggled.connect(self._on_zero_pos_toggled)
+        hdr.addWidget(self._zero_pos_toggle)
+
         root.addLayout(hdr)
 
         # ── Table ────────────────────────────────────────────────────────
@@ -662,6 +661,9 @@ class AccountPositionPanel(QWidget):
         log.info("Portfolio: refresh requested")
         self.clear_positions()
         self.refresh_requested.emit()
+
+    def _on_zero_pos_toggled(self, checked: bool) -> None:
+        self._model.set_show_zero(checked)
 
     def _on_flatten_clicked(self, account: str) -> None:
         log.info("Portfolio: flatten requested for %s", account)
