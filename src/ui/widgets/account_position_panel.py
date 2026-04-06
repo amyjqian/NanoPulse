@@ -289,7 +289,7 @@ class FlattenButtonDelegate(QStyledItemDelegate):
 
     def _hdr_button_rect(self, cell_rect: QRect, fm: QFontMetrics) -> QRect:
         tw = fm.horizontalAdvance(self._HDR_TEXT) + 2 * self._HDR_H_PAD
-        th = fm.height() + 2 * self._HDR_V_PAD
+        th = int((fm.height() + 2 * self._HDR_V_PAD) * 1.4)
         x  = cell_rect.x() + 6
         y  = cell_rect.y() + (cell_rect.height() - th) // 2
         return QRect(x, y, tw, th)
@@ -302,7 +302,7 @@ class FlattenButtonDelegate(QStyledItemDelegate):
                       for lbl, *_ in _POS_BTNS)
         n       = len(_POS_BTNS)
         total_w = btn_w * n + _POS_BTN_GAP * (n - 1)
-        btn_h   = min(fm.height() + 2 * _POS_BTN_V_PAD,
+        btn_h   = min(int((fm.height() + 2 * _POS_BTN_V_PAD) * 1.4),
                       cell_rect.height() - 4)
 
         x = cell_rect.x() + 6
@@ -447,10 +447,11 @@ class FlattenButtonDelegate(QStyledItemDelegate):
             btn_w   = max(fm.horizontalAdvance(lbl) + 2 * _POS_BTN_H_PAD
                           for lbl, *_ in _POS_BTNS)
             total_w = btn_w * len(_POS_BTNS) + _POS_BTN_GAP * (len(_POS_BTNS) - 1) + 16
-            return QSize(total_w, fm.height() + 2 * _POS_BTN_V_PAD + 4)
+            btn_h   = int((fm.height() + 2 * _POS_BTN_V_PAD) * 1.5)
+            return QSize(total_w, btn_h + 4)
         # header row
         tw = fm.horizontalAdvance(self._HDR_TEXT) + 2 * self._HDR_H_PAD + 8
-        th = fm.height() + 2 * self._HDR_V_PAD + 4
+        th = int((fm.height() + 2 * self._HDR_V_PAD) * 1.4) + 4
         return QSize(tw, th)
 
 
