@@ -521,9 +521,11 @@ class FlashTradeView(QWidget):
                                            ) if row_data[COL_EXCESS_LIQ] else 0
                         except (ValueError, TypeError):
                             excess = 0
+                        bp = self._accounts_model.get_buying_power(account)
                         self._account_position.set_account_data(
                             account, balance=bal,
-                            net_liq=bal, excess_liq=excess)
+                            net_liq=bal, excess_liq=excess,
+                            buying_power=bp)
                         break
 
     def _on_pnl_single_updated(self, account: str, con_id: int,

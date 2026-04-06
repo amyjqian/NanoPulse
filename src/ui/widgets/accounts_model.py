@@ -34,8 +34,7 @@ COL_ALIAS = 3
 COL_NET_LIQ = 4
 COL_TOTAL_CASH = 5
 COL_EXCESS_LIQ = 6
-COL_BUYING_POWER = 7
-COL_DAILY_PNL = 8
+COL_DAILY_PNL = 7
 
 HEADERS = [
     "Connection",
@@ -45,7 +44,6 @@ HEADERS = [
     "Net Liquidation",
     "Total Cash",
     "Excess Liq",
-    "Buying Power",
     "Daily P&L",
 ]
 
@@ -54,12 +52,11 @@ _TAG_COL_MAP: dict[str, int] = {
     "NetLiquidation": COL_NET_LIQ,
     "TotalCashValue": COL_TOTAL_CASH,
     "ExcessLiquidity": COL_EXCESS_LIQ,
-    "BuyingPower": COL_BUYING_POWER,
     "DailyPnL": COL_DAILY_PNL,
 }
 
 _FINANCIAL_COLS = {
-    COL_NET_LIQ, COL_TOTAL_CASH, COL_EXCESS_LIQ, COL_BUYING_POWER,
+    COL_NET_LIQ, COL_TOTAL_CASH, COL_EXCESS_LIQ,
     COL_DAILY_PNL,
 }
 
@@ -88,14 +85,12 @@ class AccountsTableModel(QAbstractTableModel):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        # Ordered list of row data – each row is a list[str] of len(HEADERS).
         self._table_data: list[list[str]] = []
-        # (connection_label, account) → row index
         self._row_map: dict[tuple[str, str], int] = {}
-        # Reverse index: account → connection_label  (O(1) cancel routing)
         self._acct_to_label: dict[str, str] = {}
-        # account_number → alias  (persisted in app_config.json)
         self._aliases: dict[str, str] = config_manager.load_aliases()
+        # Buying power tracked separately (not shown as a column in Connections view)
+        self._buying_power: dict[str, float] = {}   # account → buying power
 
     # ── Qt model interface ────────────────────────────────────────────────────
 
@@ -186,9 +181,17 @@ class AccountsTableModel(QAbstractTableModel):
         from any worker thread and surgically update the table.
         """
         for label, account, tag, value, currency in batch:
+            # Buying power is cached but not shown as a column in Connections view
+            if tag == "BuyingPower":
+                try:
+                    self._buying_power[account] = float(value)
+                except (ValueError, TypeError):
+                    pass
+                continue
+
             col = _TAG_COL_MAP.get(tag)
             if col is None:
-                continue  # we only display a subset of IBKR tags
+                continue
 
             key = (label, account)
             if key not in self._row_map:
@@ -210,10 +213,14 @@ class AccountsTableModel(QAbstractTableModel):
                  label, account, acct_type, alias, row_idx)
         self.beginInsertRows(QModelIndex(), row_idx, row_idx)
         self._table_data.append(
-            [label, account, acct_type, alias, "", "", "", "", ""])
+            [label, account, acct_type, alias, "", "", "", ""])   # 8 cols
         self._row_map[(label, account)] = row_idx
-        self._acct_to_label[account] = label  # Update reverse index
+        self._acct_to_label[account] = label
         self.endInsertRows()
+
+    def get_buying_power(self, account: str) -> float:
+        """Return the last-known buying power for *account*, or 0.0."""
+        return self._buying_power.get(account, 0.0)
 
     def remove_rows_by_label(self, label: str) -> None:
         """Remove every row whose Connection column matches *label*."""

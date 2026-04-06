@@ -192,9 +192,10 @@ class AccountPositionModel(QAbstractTableModel):
             # AccountHeaderInfoDelegate reads this role to paint the summary.
             if role == HeaderInfoRole:
                 return {
-                    "daily_pnl":  ad.get("daily_pnl",  float("nan")),
-                    "net_liq":    ad.get("net_liq",    0.0),
-                    "excess_liq": ad.get("excess_liq", 0.0),
+                    "daily_pnl":    ad.get("daily_pnl",    float("nan")),
+                    "net_liq":      ad.get("net_liq",      0.0),
+                    "excess_liq":   ad.get("excess_liq",   0.0),
+                    "buying_power": ad.get("buying_power", 0.0),
                 }
 
             if role == Qt.ItemDataRole.DisplayRole:
@@ -363,6 +364,7 @@ class AccountPositionModel(QAbstractTableModel):
 
     def set_account_data(self, account: str, *,
                          net_liq: float = 0, excess_liq: float = 0,
+                         buying_power: float = 0,
                          daily_pnl: float = float("nan"),
                          realized_pnl: float = float("nan"),
                          unrealized_pnl: float = float("nan")) -> None:
@@ -371,6 +373,8 @@ class AccountPositionModel(QAbstractTableModel):
             ad["net_liq"] = net_liq
         if excess_liq:
             ad["excess_liq"] = excess_liq
+        if buying_power:
+            ad["buying_power"] = buying_power
         if math.isfinite(daily_pnl):
             ad["daily_pnl"] = daily_pnl
         if math.isfinite(realized_pnl):

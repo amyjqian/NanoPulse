@@ -176,10 +176,11 @@ class AccountHeaderInfoDelegate(QStyledItemDelegate):
         painter.save()
         painter.fillRect(option.rect, QColor(BG_HEADER_ROW))
 
-        ad         = index.data(HeaderInfoRole) or {}
-        daily_pnl  = ad.get("daily_pnl",  float("nan"))
-        net_liq    = ad.get("net_liq",    0.0)
-        excess_liq = ad.get("excess_liq", 0.0)
+        ad           = index.data(HeaderInfoRole) or {}
+        daily_pnl    = ad.get("daily_pnl",    float("nan"))
+        net_liq      = ad.get("net_liq",      0.0)
+        excess_liq   = ad.get("excess_liq",   0.0)
+        buying_power = ad.get("buying_power", 0.0)
 
         # Header-specific format: always show a value (including +$0)
         if math.isfinite(daily_pnl):
@@ -189,12 +190,14 @@ class AccountHeaderInfoDelegate(QStyledItemDelegate):
             daily_str = "–"
         net_str    = _fmt_money(net_liq)
         excess_str = _fmt_money(excess_liq)
+        bp_str     = _fmt_money(buying_power)
 
         # (label, value, value_color)
         segments = [
             ("Daily P&L", daily_str,  _pnl_color(daily_pnl)),
             ("Net",       net_str,    QColor(TEXT)),
             ("Excess",    excess_str, QColor(TEXT)),
+            ("BP",        bp_str,     QColor(TEXT)),
         ]
 
         rect = option.rect
@@ -644,6 +647,7 @@ class AccountPositionPanel(QWidget):
             account,
             net_liq=kwargs.get("net_liq", balance),
             excess_liq=kwargs.get("excess_liq", 0),
+            buying_power=kwargs.get("buying_power", 0),
             daily_pnl=kwargs.get("daily_pnl", float("nan")),
             realized_pnl=kwargs.get("realized_pnl", float("nan")),
             unrealized_pnl=kwargs.get("unrealized_pnl", float("nan")),
