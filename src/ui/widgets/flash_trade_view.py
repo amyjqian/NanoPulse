@@ -450,6 +450,7 @@ class FlashTradeView(QWidget):
         if worker.is_ib_connected:
             worker.request_order_snapshot()
             worker.request_portfolio_snapshot()
+            worker.request_pnl_snapshot()
 
     def _on_order_status_updated(self, data: dict) -> None:
         """Receive order status from worker thread → update OrderStatusPanel."""

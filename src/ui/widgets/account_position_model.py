@@ -216,7 +216,9 @@ class AccountPositionModel(QAbstractTableModel):
 
         if role == Qt.ItemDataRole.DisplayRole:
             if col == COL_ACCOUNT:
-                return None  # shown in header row
+                # Show daily P&L in the first column for position rows
+                v = pnl_s.get("daily_pnl", rd.get("daily_pnl", float("nan")))
+                return _fmt_pnl(v) if math.isfinite(v) else "–"
             if col == COL_SYMBOL:
                 return rd.get("local_symbol") or rd.get("symbol", "")
             if col == COL_POSITION:
@@ -237,11 +239,14 @@ class AccountPositionModel(QAbstractTableModel):
             return None  # COL_NET_LIQ, COL_EXCESS_LIQ, COL_FLATTEN → blank
 
         if role == Qt.ItemDataRole.TextAlignmentRole:
-            if col in (COL_ACCOUNT, COL_SYMBOL):
+            if col == COL_SYMBOL:
                 return int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         if role == Qt.ItemDataRole.ForegroundRole:
+            if col == COL_ACCOUNT:
+                v = pnl_s.get("daily_pnl", rd.get("daily_pnl", float("nan")))
+                return _pnl_color(v)
             if col == COL_DAILY_PNL:
                 return _pnl_color(pnl_s.get("daily_pnl", rd.get("daily_pnl", float("nan"))))
             if col == COL_REALIZED_PNL:
@@ -261,7 +266,7 @@ class AccountPositionModel(QAbstractTableModel):
             return QColor(TEXT)
 
         if role == Qt.ItemDataRole.FontRole:
-            if col == COL_SYMBOL:
+            if col in (COL_ACCOUNT, COL_SYMBOL):
                 return _MONO_BOLD
             if col in (COL_DAILY_PNL, COL_REALIZED_PNL, COL_UNREALIZED_PNL):
                 return _MONO_BOLD
@@ -319,7 +324,7 @@ class AccountPositionModel(QAbstractTableModel):
             for field, val in pnl_data.items():
                 if math.isfinite(val):
                     rd[field] = val
-            left  = self.index(row, COL_DAILY_PNL)
+            left  = self.index(row, COL_ACCOUNT)
             right = self.index(row, COL_UNREALIZED_PNL)
             self.dataChanged.emit(left, right, [
                 Qt.ItemDataRole.DisplayRole,

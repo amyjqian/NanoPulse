@@ -232,6 +232,10 @@ class IBWorkerThread(QThread):
         # Track per-position PnL subscriptions: set of (account, conId)
         self._pnl_single_subs: set[tuple[str, int]] = set()
 
+        # Last-known pnlSingle values per (account, conId).
+        # Persists across reconnects so the UI can re-snapshot missed events.
+        self._pnl_single_cache: dict[tuple[str, int], tuple[float, float, float]] = {}
+
     def set_auto_reconnect(self, auto_reconnect: bool) -> None:
         """Update the auto-reconnect flag natively while running."""
         self._auto_reconnect = auto_reconnect
@@ -282,6 +286,25 @@ class IBWorkerThread(QThread):
                       self._label, len(batch))
         else:
             log.debug("Worker %s: request_portfolio_snapshot but cache is empty",
+                      self._label)
+
+    def request_pnl_snapshot(self) -> None:
+        """Thread-safe: re-emit all cached pnlSingle values.
+
+        Called by the UI when pnl_single_updated is connected *after* the
+        initial pnlSingleEvents were already fired — prevents the
+        'missed first event' race where one worker's pnlSingle fires before
+        the slot is wired up.
+        """
+        if self._pnl_single_cache:
+            for (acct, con_id), (daily, realized, unrealized) in \
+                    list(self._pnl_single_cache.items()):
+                self.pnl_single_updated.emit(
+                    acct, con_id, daily, realized, unrealized)
+            log.debug("Worker %s: pnl snapshot emitted (%d entries)",
+                      self._label, len(self._pnl_single_cache))
+        else:
+            log.debug("Worker %s: request_pnl_snapshot but cache is empty",
                       self._label)
 
     def request_portfolio_refresh(self) -> None:
@@ -1721,6 +1744,7 @@ class IBWorkerThread(QThread):
             daily = _safe_pnl(entry.dailyPnL)
             realized = _safe_pnl(entry.realizedPnL)
             unrealized = _safe_pnl(entry.unrealizedPnL)
+            self._pnl_single_cache[(acct, con_id)] = (daily, realized, unrealized)
             self.pnl_single_updated.emit(acct, con_id, daily, realized, unrealized)
         except Exception:
             log.debug("Worker %s: bad PnLSingle entry: %s", self._label, entry)
