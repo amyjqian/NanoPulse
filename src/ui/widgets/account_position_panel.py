@@ -43,7 +43,7 @@ from .account_position_model import (
     ROW_TYPE_HEADER, ROW_TYPE_POSITION,
     COL_ACCOUNT, COL_SYMBOL, COL_POSITION,
     COL_AVG_PRICE, COL_LAST_PRICE,
-    COL_REALIZED_PNL, COL_UNREALIZED_PNL,
+    COL_REALIZED_PNL, COL_UNREALIZED_PNL, COL_MARKET_VALUE,
     COL_FLATTEN,
     NUM_COLS, TEXT_DIM,
     BG_HEADER_ROW,
@@ -593,10 +593,11 @@ class AccountPositionPanel(QWidget):
         COL_ACCOUNT:        "WWWWWWWWW",
         COL_SYMBOL:         "WWWWWWW",
         COL_POSITION:       "999999",
+        COL_UNREALIZED_PNL: "-9999.99",
         COL_AVG_PRICE:      "99999.99",
         COL_LAST_PRICE:     "99999.99",
         COL_REALIZED_PNL:   "-9999.99",
-        COL_UNREALIZED_PNL: "-9999.99",
+        COL_MARKET_VALUE:   "$999,999",
         COL_FLATTEN:        "Flatten  25%  50%  75% __",
     }
 

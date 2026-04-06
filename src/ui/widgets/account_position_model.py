@@ -46,15 +46,16 @@ log = logging.getLogger(__name__)
 COL_ACCOUNT        = 0
 COL_SYMBOL         = 1
 COL_POSITION       = 2
-COL_AVG_PRICE      = 3
-COL_LAST_PRICE     = 4
-COL_REALIZED_PNL   = 5
-COL_UNREALIZED_PNL = 6
-COL_FLATTEN        = 7   # header rows: Flatten button; position rows: blank
+COL_UNREALIZED_PNL = 3
+COL_AVG_PRICE      = 4
+COL_LAST_PRICE     = 5
+COL_REALIZED_PNL   = 6
+COL_MARKET_VALUE   = 7
+COL_FLATTEN        = 8   # header rows: Flatten button; position rows: blank
 
 HEADERS = [
-    "Account", "Symbol", "Position", "Avg Price", "Last Price",
-    "Realized P&L", "Unrealized P&L", "",
+    "Account", "Symbol", "Qty", "Unrealized", "Avg Price", "Last Price",
+    "Realized", "Mkt Value", "",
 ]
 
 NUM_COLS = len(HEADERS)
@@ -102,6 +103,16 @@ def _fmt_pnl(val: float) -> str:
 def _fmt_qty(val: float) -> str:
     v = int(val)
     return f"+{v}" if v > 0 else str(v)
+
+
+def _fmt_mktval(val: float) -> str:
+    """Format market value: rounded to integer, empty for zero, signed."""
+    if not math.isfinite(val):
+        return "–"
+    v = int(round(val))
+    if v == 0:
+        return ""
+    return f"${v:,}" if v > 0 else f"-${abs(v):,}"
 
 
 def _pnl_color(val: float) -> QColor:
@@ -241,6 +252,8 @@ class AccountPositionModel(QAbstractTableModel):
             if col == COL_UNREALIZED_PNL:
                 v = pnl_s.get("unrealized_pnl", rd.get("unrealized_pnl", float("nan")))
                 return _fmt_pnl(v) if math.isfinite(v) else "–"
+            if col == COL_MARKET_VALUE:
+                return _fmt_mktval(rd.get("market_value", float("nan")))
             return None  # COL_NET_LIQ, COL_EXCESS_LIQ, COL_FLATTEN → blank
 
         if role == Qt.ItemDataRole.TextAlignmentRole:
@@ -304,8 +317,11 @@ class AccountPositionModel(QAbstractTableModel):
             self._positions[key] = pos
 
             if key in self._row_map and old is not None:
-                # Always update in-place; zero positions are now shown
-                self._update_row_in_place(key, pos)
+                # Re-sort whenever market_value changes — it drives the sort order
+                if pos.get("market_value", 0) != old.get("market_value", 0):
+                    needs_rebuild = True
+                else:
+                    self._update_row_in_place(key, pos)
             else:
                 needs_rebuild = True  # new key – always add to view
 
@@ -390,13 +406,16 @@ class AccountPositionModel(QAbstractTableModel):
 
         # Collect all positions grouped by account (including zero positions)
         acct_pos: dict[str, list] = {}
-        for key, pos in sorted(
-            self._positions.items(),
-            key=lambda kv: (kv[0][0], kv[1].get("symbol", "")),
-        ):
+        for key, pos in self._positions.items():
             acct_pos.setdefault(key[0], []).append((key, pos))
 
         for account in sorted(acct_pos):
+            # Sort positions within the account by abs(market_value) desc
+            acct_pos[account].sort(
+                key=lambda kv: abs(kv[1].get("market_value", 0)),
+                reverse=True,
+            )
+
             # Account header row
             self._acct_row_map[account] = len(self._rows)
             self._rows.append({"_row_type": ROW_TYPE_HEADER, "account": account})
