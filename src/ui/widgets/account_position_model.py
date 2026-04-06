@@ -28,11 +28,13 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QBrush, QColor, QFont
 
 # ── Custom roles ──────────────────────────────────────────────────────────────
-IsFirstInGroupRole = Qt.ItemDataRole.UserRole + 100  # kept for compat (unused now)
-RowTypeRole        = Qt.ItemDataRole.UserRole + 101  # str: ROW_TYPE_*
-FlattenRole        = Qt.ItemDataRole.UserRole + 102  # str: account id (header rows)
-HeaderInfoRole     = Qt.ItemDataRole.UserRole + 103  # dict: daily_pnl/net_liq/excess_liq
-PositionKeyRole    = Qt.ItemDataRole.UserRole + 104  # tuple(account, con_id) for position rows
+IsFirstInGroupRole      = Qt.ItemDataRole.UserRole + 100  # kept for compat (unused now)
+RowTypeRole             = Qt.ItemDataRole.UserRole + 101  # str: ROW_TYPE_*
+FlattenRole             = Qt.ItemDataRole.UserRole + 102  # str: account id (header rows)
+HeaderInfoRole          = Qt.ItemDataRole.UserRole + 103  # dict: daily_pnl/net_liq/excess_liq
+PositionKeyRole         = Qt.ItemDataRole.UserRole + 104  # tuple(account, con_id) for position rows
+PositionRole            = Qt.ItemDataRole.UserRole + 105  # float: raw position qty (position rows)
+AccountHasPositionsRole = Qt.ItemDataRole.UserRole + 106  # bool: account has any non-zero position (header rows)
 
 # ── Row type constants ────────────────────────────────────────────────────────
 ROW_TYPE_HEADER   = "header"
@@ -46,14 +48,13 @@ COL_SYMBOL         = 1
 COL_POSITION       = 2
 COL_AVG_PRICE      = 3
 COL_LAST_PRICE     = 4
-COL_DAILY_PNL      = 5
-COL_REALIZED_PNL   = 6
-COL_UNREALIZED_PNL = 7
-COL_FLATTEN        = 8   # header rows: Flatten button; position rows: blank
+COL_REALIZED_PNL   = 5
+COL_UNREALIZED_PNL = 6
+COL_FLATTEN        = 7   # header rows: Flatten button; position rows: blank
 
 HEADERS = [
     "Account", "Symbol", "Position", "Avg Price", "Last Price",
-    "Daily P&L", "Realized P&L", "Unrealized P&L", "",
+    "Realized P&L", "Unrealized P&L", "",
 ]
 
 NUM_COLS = len(HEADERS)
@@ -203,6 +204,13 @@ class AccountPositionModel(QAbstractTableModel):
             if role == FlattenRole:
                 return account
 
+            if role == AccountHasPositionsRole:
+                return any(
+                    pos.get("position", 0) != 0
+                    for key, pos in self._positions.items()
+                    if key[0] == account
+                )
+
             if role == IsFirstInGroupRole:
                 return False
 
@@ -227,9 +235,6 @@ class AccountPositionModel(QAbstractTableModel):
                 return _fmt_price(rd.get("display_avg", rd.get("avg_cost", 0)))
             if col == COL_LAST_PRICE:
                 return _fmt_price(rd.get("market_price", 0))
-            if col == COL_DAILY_PNL:
-                v = pnl_s.get("daily_pnl", rd.get("daily_pnl", float("nan")))
-                return _fmt_pnl(v) if math.isfinite(v) else "–"
             if col == COL_REALIZED_PNL:
                 v = pnl_s.get("realized_pnl", rd.get("realized_pnl", float("nan")))
                 return _fmt_pnl(v) if math.isfinite(v) else "–"
@@ -247,8 +252,6 @@ class AccountPositionModel(QAbstractTableModel):
             if col == COL_ACCOUNT:
                 v = pnl_s.get("daily_pnl", rd.get("daily_pnl", float("nan")))
                 return _pnl_color(v)
-            if col == COL_DAILY_PNL:
-                return _pnl_color(pnl_s.get("daily_pnl", rd.get("daily_pnl", float("nan"))))
             if col == COL_REALIZED_PNL:
                 v = pnl_s.get("realized_pnl", rd.get("realized_pnl", float("nan")))
                 return _pnl_color(v)
@@ -268,7 +271,7 @@ class AccountPositionModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.FontRole:
             if col in (COL_ACCOUNT, COL_SYMBOL):
                 return _MONO_BOLD
-            if col in (COL_DAILY_PNL, COL_REALIZED_PNL, COL_UNREALIZED_PNL):
+            if col in (COL_REALIZED_PNL, COL_UNREALIZED_PNL):
                 return _MONO_BOLD
             return _MONO
 
@@ -277,6 +280,9 @@ class AccountPositionModel(QAbstractTableModel):
 
         if role == PositionKeyRole:
             return (account, con_id)   # delegate reads this to identify the position
+
+        if role == PositionRole:
+            return rd.get("position", 0)   # raw float qty – 0 means flat
 
         return None
 

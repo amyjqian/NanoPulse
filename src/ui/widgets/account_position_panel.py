@@ -39,10 +39,11 @@ from .account_position_model import (
     AccountPositionModel,
     IsFirstInGroupRole,
     RowTypeRole, FlattenRole, HeaderInfoRole, PositionKeyRole,
+    PositionRole, AccountHasPositionsRole,
     ROW_TYPE_HEADER, ROW_TYPE_POSITION,
     COL_ACCOUNT, COL_SYMBOL, COL_POSITION,
     COL_AVG_PRICE, COL_LAST_PRICE,
-    COL_DAILY_PNL, COL_REALIZED_PNL, COL_UNREALIZED_PNL,
+    COL_REALIZED_PNL, COL_UNREALIZED_PNL,
     COL_FLATTEN,
     NUM_COLS, TEXT_DIM,
     BG_HEADER_ROW,
@@ -335,6 +336,11 @@ class FlattenButtonDelegate(QStyledItemDelegate):
 
         # ── HEADER ROW: single Flatten button ────────────────────────────
         if self._is_header(index):
+            # Don't show Flatten when the account has no open positions
+            if not index.data(AccountHasPositionsRole):
+                painter.restore()
+                return
+
             btn_rect = self._hdr_button_rect(option.rect, fm)
             hovered  = bool(option.state & QStyle.StateFlag.State_MouseOver)
             pressed  = (self._pressed_row == index.row()
@@ -360,6 +366,11 @@ class FlattenButtonDelegate(QStyledItemDelegate):
 
         # ── POSITION ROW: Flatten · 25% · 50% · 75% ─────────────────────
         if self._is_position(index):
+            # Don't show action buttons when position is flat
+            if index.data(PositionRole) == 0:
+                painter.restore()
+                return
+
             rects   = self._pos_button_rects(option.rect, fm)
             hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
             btn_font = QFont("Helvetica Neue, Arial", 10, QFont.Weight.Bold)
@@ -390,6 +401,8 @@ class FlattenButtonDelegate(QStyledItemDelegate):
 
         # ── header row ────────────────────────────────────────────────────
         if self._is_header(index):
+            if not index.data(AccountHasPositionsRole):
+                return False
             if etype == QEvent.Type.MouseButtonPress:
                 self._pressed_row = index.row()
                 self._pressed_btn = -1
@@ -407,6 +420,8 @@ class FlattenButtonDelegate(QStyledItemDelegate):
 
         # ── position row ──────────────────────────────────────────────────
         if self._is_position(index):
+            if index.data(PositionRole) == 0:
+                return False
             fm    = QFontMetrics(option.font)
             rects = self._pos_button_rects(option.rect, fm)
             pos   = event.position().toPoint() if hasattr(event, "position") \
@@ -580,7 +595,6 @@ class AccountPositionPanel(QWidget):
         COL_POSITION:       "999999",
         COL_AVG_PRICE:      "99999.99",
         COL_LAST_PRICE:     "99999.99",
-        COL_DAILY_PNL:      "-9999.99",
         COL_REALIZED_PNL:   "-9999.99",
         COL_UNREALIZED_PNL: "-9999.99",
         COL_FLATTEN:        "Flatten  25%  50%  75% __",
