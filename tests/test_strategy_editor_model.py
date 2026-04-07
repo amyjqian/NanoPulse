@@ -56,9 +56,9 @@ m4.add_symbol("MNQ")
 idx_off = m4.index(0, 1)          # NQ, TP T1 Off
 m4.setData(idx_off, 10.0, Qt.ItemDataRole.EditRole)
 
-# Without multiplier: display should be "—"
+# Without multiplier: fallback 1.0 → Val = Offset × 1.0
 disp = m4.data(m4.index(0, 2), Qt.ItemDataRole.DisplayRole)  # TP T1 Val
-assert disp == "—", f"Expected '—' without multiplier, got {disp!r}"
+assert disp == "10.00", f"Expected '10.00' with fallback 1.0, got {disp!r}"
 
 # Set multipliers
 m4.set_multipliers({"NQ": 20.0, "MNQ": 2.0})

@@ -146,9 +146,9 @@ class StrategyPivotModel(QAbstractTableModel):
             self.dataChanged.emit(tl, br, [Qt.ItemDataRole.DisplayRole,
                                            Qt.ItemDataRole.ForegroundRole])
 
-    def _multiplier(self, symbol: str) -> float | None:
-        """Return the float multiplier for *symbol*, or None if unknown."""
-        return self._multipliers.get(symbol)
+    def _multiplier(self, symbol: str) -> float:
+        """Return the float multiplier for *symbol*, falling back to 1.0."""
+        return self._multipliers.get(symbol, 1.0)
 
     # ------------------------------------------------------------------
     def _empty_row(self) -> dict:
@@ -211,14 +211,12 @@ class StrategyPivotModel(QAbstractTableModel):
                     return ""
                 return f"{val:.4f}".rstrip("0").rstrip(".")
 
-            # Val column – always computed
+            # Val column – always computed (multiplier falls back to 1.0)
             if role == Qt.ItemDataRole.EditRole:
                 return None   # not editable
             offset_key = (key[0], key[1], "offset")
             offset = self._data[symbol].get(offset_key, 0.0)
             mult = self._multiplier(symbol)
-            if mult is None:
-                return "—"
             val = offset * mult
             if val == 0.0:
                 return ""
@@ -235,9 +233,9 @@ class StrategyPivotModel(QAbstractTableModel):
             if col == 0:
                 return QColor(TEXT)
             if key[2] == "value":
-                mult = self._multiplier(symbol)
-                # teal when computed, red when multiplier unknown
-                return QColor(COMPUTED if mult is not None else RED)
+                # teal = real multiplier; amber = fallback 1.0
+                known = symbol in self._multipliers
+                return QColor(COMPUTED if known else ORANGE)
             return QColor(ORANGE)
 
         # ── Background ───────────────────────────────────────────────
@@ -249,14 +247,15 @@ class StrategyPivotModel(QAbstractTableModel):
         # ── Tooltip ──────────────────────────────────────────────────
         if role == Qt.ItemDataRole.ToolTipRole:
             if col > 0 and key[2] == "value":
-                mult = self._multiplier(symbol)
-                if mult is None:
-                    return (f'No multiplier found for "{symbol}".\n'
-                            f'Add this contract in the Contracts tab.')
                 offset_key = (key[0], key[1], "offset")
                 offset = self._data[symbol].get(offset_key, 0.0)
-                return (f"Offset {offset} × Multiplier {mult:g} "
-                        f"= {offset * mult:,.2f}")
+                if symbol in self._multipliers:
+                    mult = self._multipliers[symbol]
+                    return (f"Offset {offset} × Multiplier {mult:g} "
+                            f"= {offset * mult:,.2f}")
+                return (f'No contract found for "{symbol}" – '
+                        f'using fallback multiplier 1.0\n'
+                        f'Offset {offset} × 1.0 = {offset:,.2f}')
             return None
 
         return None
@@ -348,12 +347,7 @@ class StrategyPivotModel(QAbstractTableModel):
                 for ot in _ORDER_TYPES:
                     for tier in range(1, 5):
                         offset = d.get((ot, tier, "offset"), 0.0)
-                        # Persist computed val; fall back to stored val when
-                        # the multiplier isn't available yet.
-                        if mult is not None:
-                            computed_val = offset * mult
-                        else:
-                            computed_val = d.get((ot, tier, "value"), 0.0)
+                        computed_val = offset * mult   # mult >= 1.0 always
                         conn.execute(
                             "INSERT OR REPLACE INTO strategy_tiers "
                             "(symbol, order_type, tier_level, offset, value) "
@@ -430,8 +424,7 @@ class StrategyPivotModel(QAbstractTableModel):
                     parts.append(str(d.get(k, 0.0)))
                 else:
                     offset = d.get((k[0], k[1], "offset"), 0.0)
-                    computed = offset * mult if mult is not None else d.get(k, 0.0)
-                    parts.append(str(computed))
+                    parts.append(str(offset * mult))
             lines.append("\t".join(parts))
         return "\n".join(lines)
 
@@ -1034,7 +1027,8 @@ class StrategyEditorView(QWidget):
 
         if missing:
             self._set_status(
-                f"⚠  No contract multiplier for: {', '.join(missing)}")
+                f"⚠  Using fallback ×1.0 for: {', '.join(missing)}"
+                f" — add them in the Contracts tab to use their real multiplier")
         elif mults:
             self._set_status(
                 f"Multipliers loaded for {len(mults)} contract(s)")
