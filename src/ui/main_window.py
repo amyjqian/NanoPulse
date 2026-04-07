@@ -21,6 +21,7 @@ from .widgets.accounts_model import AccountsTableModel
 from .widgets.connections_view import ConnectionsView
 from .widgets.contracts_view import ContractsView
 from .widgets.flash_trade_view import FlashTradeView
+from .widgets.strategy_editor import StrategyEditorView
 from .widgets.preferences_dialog import PreferencesDialog
 from src.core.ib_worker import IBWorkerThread
 from src.core import config_manager
@@ -31,10 +32,11 @@ _C_WINDOW_BG = QColor("#30363D")
 
 # Tab label → stacked-widget index
 _PAGE_INDEX: dict[str, int] = {
-    "Connect":    0,
-    "Contracts":  1,
-    "FlashTrade": 2,
-    "Executions": 3,
+    "Connect":        0,
+    "Contracts":      1,
+    "FlashTrade":     2,
+    "StrategyEditor": 3,
+    "Executions":     4,
 }
 
 
@@ -123,8 +125,11 @@ class MainWindow(QWidget):
             accounts_model=self._accounts_model,
             parent=self,
         )                                                  # index 2 – FlashTrade
+        self._strategy_editor = StrategyEditorView(
+            parent=self,
+        )                                                  # index 3 – StrategyEditor
         self._exec_placeholder = Canvas(
-            self)              # index 3 – Executions
+            self)              # index 4 – Executions
 
         # When contracts are added/removed, refresh the order entry dropdown
         self._contracts_view.contracts_changed.connect(
@@ -134,6 +139,7 @@ class MainWindow(QWidget):
         self._pages.addWidget(self._connections_view)
         self._pages.addWidget(self._contracts_view)
         self._pages.addWidget(self._flash_trade)
+        self._pages.addWidget(self._strategy_editor)
         self._pages.addWidget(self._exec_placeholder)
         self._pages.setCurrentIndex(0)
 
