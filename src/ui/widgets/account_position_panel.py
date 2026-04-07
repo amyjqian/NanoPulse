@@ -580,14 +580,18 @@ class AccountPositionPanel(QWidget):
     # ── Column spans ─────────────────────────────────────────────────────────
 
     def _apply_spans(self) -> None:
-        """Merge columns 1-7 into one cell for every account header row."""
+        """Merge columns 1-7 into one cell for every account header row.
+
+        clearSpans() is called first to remove all previous spans in one shot.
+        Resetting individual cells with setSpan(row, col, 1, 1) triggers
+        Qt's "single cell span won't be added" warning for every position row.
+        """
+        self._table.clearSpans()
         span_cols = COL_FLATTEN - COL_SYMBOL  # = 7
         for row in range(self._model.rowCount()):
             idx = self._model.index(row, COL_ACCOUNT)
             if idx.data(RowTypeRole) == ROW_TYPE_HEADER:
                 self._table.setSpan(row, COL_SYMBOL, 1, span_cols)
-            else:
-                self._table.setSpan(row, COL_SYMBOL, 1, 1)  # reset
 
     # ── Column-width persistence ──────────────────────────────────────────────
 
