@@ -1,77 +1,84 @@
 """
-AccountPositionPanel – live portfolio positions in a QTableWidget.
+AccountPositionPanel – grouped portfolio positions table (QTableView).
 
-Uses the same table-based styling as OrderStatusPanel, with per-row
-action buttons (Flatten, Reverse, 25 %, 50 %, 75 %) and colour-coded
-Side / P&L columns.
+Public API
+──────────
+update_positions(batch)                  – ingest position dicts from worker
+update_pnl_single(account, con_id, ...) – per-position P&L
+set_account_data(account, ...)           – account-level data (Net Liq, etc.)
+clear_positions()                        – remove everything
+get_position_keys()                      – active (account, conId) keys
+
+Signals
+───────
+refresh_requested()           – user clicked ⟳
+flatten_requested(str)        – user clicked Flatten (account id)
 """
 from __future__ import annotations
 
 import logging
 import math
 
-from PySide6.QtCore import Qt, Signal, QTimer
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtCore import QEvent, QRect, QSettings, QSize, Qt, Signal
+from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QPushButton,
-    QTableWidget,
-    QTableWidgetItem,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
+    QTableView,
     QVBoxLayout,
     QWidget,
 )
+from .account_position_model import (
+    AccountPositionModel,
+    IsFirstInGroupRole,
+    RowTypeRole, FlattenRole, HeaderInfoRole, PositionKeyRole,
+    PositionRole, AccountHasPositionsRole,
+    ROW_TYPE_HEADER, ROW_TYPE_POSITION,
+    COL_ACCOUNT, COL_SYMBOL, COL_POSITION,
+    COL_AVG_PRICE, COL_LAST_PRICE,
+    COL_REALIZED_PNL, COL_UNREALIZED_PNL, COL_MARKET_VALUE,
+    COL_FLATTEN,
+    NUM_COLS, TEXT_DIM,
+    BG_HEADER_ROW,
+    _fmt_pnl, _fmt_money, _pnl_color,
+)
+from .connections_view import _ToggleSwitch
 
 log = logging.getLogger(__name__)
 
-# ── Theme tokens (shared with OrderStatusPanel) ──────────────────────────────
-BG_PANEL = "#1e2230"
-BG_TABLE = "#1A1D24"
+# ── Theme tokens ──────────────────────────────────────────────────────────────
+BG_PANEL     = "#1e2230"
+BG_TABLE     = "#1A1D24"
 BG_TABLE_ALT = "#1E222A"
-BG_HEADER = "#14171D"
-BORDER = "#30363D"
-TEXT = "#C9D1D9"
-TEXT_DIM = "#8B949E"
+BG_HEADER    = "#14171D"
+BORDER       = "#30363D"
+TEXT         = "#C9D1D9"
+TEXT_DIM_PNL = "#8B949E"
+CLR_OPEN     = "#58A6FF"
 
-CLR_LONG = "#2e7d32"
-CLR_SHORT = "#c62828"
-CLR_FLATTEN = "#cc6600"
-CLR_REVERSE = "#8E44AD"
-CLR_CLOSE = "#8E8E93"
-CLR_PNL_POS = "#3FB950"
-CLR_PNL_NEG = "#F85149"
-CLR_ACCT_ROW = "#181C28"
-CLR_OPEN = "#58A6FF"
+# Flatten button colours
+CLR_FLATTEN_BG      = "#1A2A1A"
+CLR_FLATTEN_HOVER   = "#1F3820"
+CLR_FLATTEN_PRESSED = "#254825"
+CLR_FLATTEN_BORDER  = "#2A4A2A"
+CLR_FLATTEN_TEXT    = "#FF9800"   # orange – caution action
 
-# ── Fonts ─────────────────────────────────────────────────────────────────────
 _TITLE_FONT = QFont("Helvetica Neue, Arial", 11)
 _TITLE_FONT.setWeight(QFont.Weight.Bold)
 
 _TABLE_FONT = QFont("Menlo, Consolas, monospace", 11)
+_INFO_LABEL_FONT  = QFont("Menlo, Consolas, monospace", 10)
+_INFO_VALUE_FONT  = QFont("Menlo, Consolas, monospace", 10, QFont.Weight.Bold)
 
-_BTN_FONT = QFont("Helvetica Neue, Arial", 9)
-_BTN_FONT.setWeight(QFont.Weight.Bold)
-
-_ACCT_FONT = QFont("Helvetica Neue, Arial", 11)
-_ACCT_FONT.setWeight(QFont.Weight.Bold)
-
-# ── Column indices ────────────────────────────────────────────────────────────
-COL_SYMBOL = 0
-COL_ACCOUNT = 1
-COL_SIDE = 2
-COL_QTY = 3
-COL_AVG = 4
-COL_CURRENT = 5
-COL_PNL = 6
-COL_ACTIONS = 7
-
-_COLUMNS = ["Symbol", "Account", "Side", "Qty", "Avg", "Current", "P&L", ""]
-
-# ── Table QSS (mirrors OrderStatusPanel) ─────────────────────────────────────
+# ── QSS ───────────────────────────────────────────────────────────────────────
 _TABLE_STYLE = f"""
-    QTableWidget {{
+    QTableView {{
         background-color: {BG_TABLE};
         alternate-background-color: {BG_TABLE_ALT};
         color: {TEXT};
@@ -87,12 +94,12 @@ _TABLE_STYLE = f"""
         border: none;
         border-bottom: 1px solid {BORDER};
         border-right: 1px solid {BORDER};
-        padding: 5px 8px;
+        padding: 2px 2px;
         font-weight: 600;
         font-size: 11px;
     }}
-    QTableWidget::item {{
-        padding: 4px 8px;
+    QTableView::item {{
+        padding: 0px 2px;
     }}
     QScrollBar:vertical {{
         background: {BG_TABLE};
@@ -117,93 +124,362 @@ _TABLE_STYLE = f"""
     }}
 """
 
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _make_action_btn(text: str, colour: str, min_h: int = 22) -> QPushButton:
-    """Small action button for position rows."""
-    btn = QPushButton(text)
-    btn.setFixedHeight(min_h)
-    btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    btn.setFont(_BTN_FONT)
-    btn.setStyleSheet(f"""
-        QPushButton {{
-            background: {colour};
-            color: #ffffff;
-            border: none;
-            border-radius: 3px;
-            padding: 2px 8px;
-            font-weight: bold;
-            font-size: 9px;
-        }}
-        QPushButton:hover {{ border: 1px solid #ffffff30; }}
-        QPushButton:pressed {{ border: 1px solid #ffffff60; }}
-    """)
-    return btn
+# ── Column-width persistence ───────────────────────────────────────────────────
+_BG_HEADER_ROW_BRUSH = QBrush(QColor(BG_HEADER_ROW))
 
 
-def _fmt_price(val: float) -> str:
-    if val == 0 or math.isnan(val):
-        return "–"
-    return f"${val:,.2f}"
+# ══════════════════════════════════════════════════════════════════════════════
+#  PortfolioRowDelegate  – forces header-row background on all plain columns
+# ══════════════════════════════════════════════════════════════════════════════
+
+class PortfolioRowDelegate(QStyledItemDelegate):
+    """Forces the BG_HEADER_ROW background on account header rows for any
+    column not handled by a specialised per-column delegate."""
+
+    def initStyleOption(self, option: QStyleOptionViewItem, index) -> None:
+        super().initStyleOption(option, index)
+        if index.data(RowTypeRole) == ROW_TYPE_HEADER:
+            option.backgroundBrush = _BG_HEADER_ROW_BRUSH
+            option.features = (
+                option.features
+                & ~QStyleOptionViewItem.ViewItemFeature.Alternate
+            )
 
 
-def _fmt_pnl(val: float) -> str:
-    if math.isnan(val):
-        return "–"
-    sign = "+" if val >= 0 else ""
-    return f"{sign}${val:,.0f}"
+# ══════════════════════════════════════════════════════════════════════════════
+#  AccountHeaderInfoDelegate – merged info cell (cols 1-7 spanned)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class AccountHeaderInfoDelegate(QStyledItemDelegate):
+    """For HEADER rows: paints "Daily P&L · Net Liq · Excess Liq" inline
+    across the spanned cell.  For POSITION rows: normal symbol rendering."""
+
+    _LABEL_COLOR  = QColor(TEXT_DIM)
+    _GAP_LBL_VAL  = 4    # px between "Label:" and value
+    _GAP_SEGMENTS = 20    # px between categories
+
+    def initStyleOption(self, option: QStyleOptionViewItem, index) -> None:
+        super().initStyleOption(option, index)
+        if index.data(RowTypeRole) == ROW_TYPE_HEADER:
+            option.backgroundBrush = _BG_HEADER_ROW_BRUSH
+            option.features = (
+                option.features
+                & ~QStyleOptionViewItem.ViewItemFeature.Alternate
+            )
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem,
+              index) -> None:
+        if index.data(RowTypeRole) != ROW_TYPE_HEADER:
+            super().paint(painter, option, index)
+            return
+
+        painter.save()
+        painter.fillRect(option.rect, QColor(BG_HEADER_ROW))
+
+        ad           = index.data(HeaderInfoRole) or {}
+        daily_pnl    = ad.get("daily_pnl",    float("nan"))
+        net_liq      = ad.get("net_liq",      0.0)
+        excess_liq   = ad.get("excess_liq",   0.0)
+        buying_power = ad.get("buying_power", 0.0)
+
+        # Header-specific format: always show a value (including +$0)
+        if math.isfinite(daily_pnl):
+            v = int(round(daily_pnl))
+            daily_str = f"+${v:,}" if v >= 0 else f"-${abs(v):,}"
+        else:
+            daily_str = "–"
+        net_str    = _fmt_money(net_liq)
+        excess_str = _fmt_money(excess_liq)
+        bp_str     = _fmt_money(buying_power)
+
+        # (label, value, value_color)
+        segments = [
+            ("Daily P&L", daily_str,  _pnl_color(daily_pnl)),
+            ("Net",       net_str,    QColor(TEXT)),
+            ("Excess",    excess_str, QColor(TEXT)),
+            ("BP",        bp_str,     QColor(TEXT)),
+        ]
+
+        rect = option.rect
+        x = rect.left() + 8
+        y, h = rect.top(), rect.height()
+
+        for i, (lbl, val, v_color) in enumerate(segments):
+            # "Label:" — use painter.fontMetrics() for accurate device metrics
+            painter.setFont(_INFO_LABEL_FONT)
+            painter.setPen(self._LABEL_COLOR)
+            fm = painter.fontMetrics()
+            baseline = y + (h + fm.ascent() - fm.descent()) // 2
+            lbl_text = lbl + ":"
+            painter.drawText(x, baseline, lbl_text)
+            x += fm.horizontalAdvance(lbl_text) + self._GAP_LBL_VAL
+
+            # Value
+            painter.setFont(_INFO_VALUE_FONT)
+            painter.setPen(v_color)
+            fm = painter.fontMetrics()
+            baseline = y + (h + fm.ascent() - fm.descent()) // 2
+            painter.drawText(x, baseline, val)
+            x += fm.horizontalAdvance(val)
+
+            if i < len(segments) - 1:
+                x += self._GAP_SEGMENTS
+
+        painter.restore()
 
 
-def _fmt_bal(val: float) -> str:
-    if val == 0 or math.isnan(val):
-        return "–"
-    if abs(val) >= 1_000_000:
-        return f"${val / 1_000_000:.1f}M"
-    if abs(val) >= 1_000:
-        return f"${val / 1_000:.0f}k"
-    return f"${val:,.0f}"
+# ── Position-row action buttons definition ────────────────────────────────────
+# (label, bg_normal, bg_hover, bg_pressed, pct)   pct=100 → full flatten
+_POS_BTNS = [
+    ("Flatten", "#cc6600", "#d97a00", "#b35800", 100),
+    ("25%",     "#5A5A62", "#6E6E76", "#4A4A52",  25),
+    ("50%",     "#5A5A62", "#6E6E76", "#4A4A52",  50),
+    ("75%",     "#5A5A62", "#6E6E76", "#4A4A52",  75),
+]
+_POS_BTN_H_PAD  = 7
+_POS_BTN_V_PAD  = 2
+_POS_BTN_GAP    = 4
+_POS_BTN_RADIUS = 3
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+#  FlattenButtonDelegate
+#    • Header rows  → single orange "Flatten" button
+#    • Position rows → four buttons: Flatten · 25% · 50% · 75%
+# ══════════════════════════════════════════════════════════════════════════════
+
+class FlattenButtonDelegate(QStyledItemDelegate):
+    """Action-button column delegate for the portfolio table."""
+
+    # header-row signal
+    flatten_clicked          = Signal(str)        # account
+    # position-row signal  (account, con_id, pct)  pct=100 → full flatten
+    position_close_clicked   = Signal(str, int, int)
+
+    # ── header-row button geometry ────────────────────────────────────────────
+    _HDR_TEXT    = "Flatten"
+    _HDR_H_PAD   = 8
+    _HDR_V_PAD   = 2
+    _HDR_RADIUS  = 3
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pressed_row: int | None = None
+        self._pressed_btn: int | None = None   # index into _POS_BTNS (position rows)
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _is_header(index) -> bool:
+        return index.data(RowTypeRole) == ROW_TYPE_HEADER
+
+    @staticmethod
+    def _is_position(index) -> bool:
+        return index.data(RowTypeRole) == ROW_TYPE_POSITION
+
+    def _hdr_button_rect(self, cell_rect: QRect, fm: QFontMetrics) -> QRect:
+        tw = fm.horizontalAdvance(self._HDR_TEXT) + 2 * self._HDR_H_PAD
+        th = int((fm.height() + 2 * self._HDR_V_PAD) * 1.4)
+        x  = cell_rect.x() + 6
+        y  = cell_rect.y() + (cell_rect.height() - th) // 2
+        return QRect(x, y, tw, th)
+
+    def _pos_button_rects(self, cell_rect: QRect,
+                          fm: QFontMetrics) -> list[QRect]:
+        """Return a list of QRect for each position-row action button.
+        All buttons share the same width (widest label wins)."""
+        btn_w   = max(fm.horizontalAdvance(lbl) + 2 * _POS_BTN_H_PAD
+                      for lbl, *_ in _POS_BTNS)
+        n       = len(_POS_BTNS)
+        total_w = btn_w * n + _POS_BTN_GAP * (n - 1)
+        btn_h   = min(int((fm.height() + 2 * _POS_BTN_V_PAD) * 1.4),
+                      cell_rect.height() - 4)
+
+        x = cell_rect.x() + 6
+        y = cell_rect.y() + (cell_rect.height() - btn_h)  // 2
+
+        rects = []
+        for _ in _POS_BTNS:
+            rects.append(QRect(x, y, btn_w, btn_h))
+            x += btn_w + _POS_BTN_GAP
+        return rects
+
+    # ── paint ─────────────────────────────────────────────────────────────────
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem,
+              index) -> None:
+        painter.save()
+
+        # ── background ───────────────────────────────────────────────────
+        if self._is_header(index):
+            painter.fillRect(option.rect, QColor(BG_HEADER_ROW))
+        elif option.state & QStyle.StateFlag.State_Selected:
+            painter.fillRect(option.rect, QColor("#253545"))
+        elif option.features & QStyleOptionViewItem.ViewItemFeature.Alternate:
+            painter.fillRect(option.rect, QColor(BG_TABLE_ALT))
+        else:
+            painter.fillRect(option.rect, QColor(BG_TABLE))
+
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        fm = QFontMetrics(option.font)
+
+        # ── HEADER ROW: single Flatten button ────────────────────────────
+        if self._is_header(index):
+            # Don't show Flatten when the account has no open positions
+            if not index.data(AccountHasPositionsRole):
+                painter.restore()
+                return
+
+            btn_rect = self._hdr_button_rect(option.rect, fm)
+            hovered  = bool(option.state & QStyle.StateFlag.State_MouseOver)
+            pressed  = (self._pressed_row == index.row()
+                        and self._pressed_btn == -1)
+
+            # Reuse the same colours as the position-row Flatten button
+            _lbl, bg_n, bg_h, bg_p, _pct = _POS_BTNS[0]
+            bg = (QColor(bg_p) if pressed
+                  else QColor(bg_h) if hovered
+                  else QColor(bg_n))
+
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(bg)
+            painter.drawRoundedRect(btn_rect, self._HDR_RADIUS, self._HDR_RADIUS)
+
+            painter.setPen(QColor("#ffffff"))
+            painter.setFont(QFont("Helvetica Neue, Arial", 10, QFont.Weight.Bold))
+            painter.drawText(btn_rect, Qt.AlignmentFlag.AlignCenter,
+                             self._HDR_TEXT)
+
+            painter.restore()
+            return
+
+        # ── POSITION ROW: Flatten · 25% · 50% · 75% ─────────────────────
+        if self._is_position(index):
+            # Don't show action buttons when position is flat
+            if index.data(PositionRole) == 0:
+                painter.restore()
+                return
+
+            rects   = self._pos_button_rects(option.rect, fm)
+            hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+            btn_font = QFont("Helvetica Neue, Arial", 10, QFont.Weight.Bold)
+
+            for i, ((lbl, bg_n, bg_h, bg_p, _pct), rect) in enumerate(
+                    zip(_POS_BTNS, rects)):
+                pressed_this = (self._pressed_row == index.row()
+                                and self._pressed_btn == i)
+                bg = (QColor(bg_p) if pressed_this
+                      else QColor(bg_h) if hovered
+                      else QColor(bg_n))
+
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(bg)
+                painter.drawRoundedRect(rect, _POS_BTN_RADIUS, _POS_BTN_RADIUS)
+
+                painter.setPen(QColor("#ffffff"))
+                painter.setFont(btn_font)
+                painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, lbl)
+
+        painter.restore()
+
+    # ── interaction ───────────────────────────────────────────────────────────
+
+    def editorEvent(self, event: QEvent, model,
+                    option: QStyleOptionViewItem, index) -> bool:
+        etype = event.type()
+
+        # ── header row ────────────────────────────────────────────────────
+        if self._is_header(index):
+            if not index.data(AccountHasPositionsRole):
+                return False
+            if etype == QEvent.Type.MouseButtonPress:
+                self._pressed_row = index.row()
+                self._pressed_btn = -1
+                return True
+            if etype == QEvent.Type.MouseButtonRelease:
+                was = (self._pressed_row == index.row()
+                       and self._pressed_btn == -1)
+                self._pressed_row = None
+                self._pressed_btn = None
+                if was:
+                    acct = index.data(FlattenRole)
+                    if acct:
+                        self.flatten_clicked.emit(acct)
+                return was
+
+        # ── position row ──────────────────────────────────────────────────
+        if self._is_position(index):
+            if index.data(PositionRole) == 0:
+                return False
+            fm    = QFontMetrics(option.font)
+            rects = self._pos_button_rects(option.rect, fm)
+            pos   = event.position().toPoint() if hasattr(event, "position") \
+                    else event.pos()
+
+            if etype == QEvent.Type.MouseButtonPress:
+                for i, rect in enumerate(rects):
+                    if rect.contains(pos):
+                        self._pressed_row = index.row()
+                        self._pressed_btn = i
+                        return True
+                return False
+
+            if etype == QEvent.Type.MouseButtonRelease:
+                was_row = self._pressed_row == index.row()
+                was_btn = self._pressed_btn
+                self._pressed_row = None
+                self._pressed_btn = None
+                if was_row and was_btn is not None:
+                    for i, rect in enumerate(rects):
+                        if i == was_btn and rect.contains(pos):
+                            key = index.data(PositionKeyRole)
+                            if key:
+                                acct, con_id = key
+                                _, _, _, _, pct = _POS_BTNS[i]
+                                self.position_close_clicked.emit(
+                                    acct, con_id, pct)
+                            return True
+                return False
+
+        return False
+
+    # ── size hint ─────────────────────────────────────────────────────────────
+
+    def sizeHint(self, option: QStyleOptionViewItem, index) -> QSize:
+        fm = QFontMetrics(option.font)
+        if self._is_position(index):
+            btn_w   = max(fm.horizontalAdvance(lbl) + 2 * _POS_BTN_H_PAD
+                          for lbl, *_ in _POS_BTNS)
+            total_w = btn_w * len(_POS_BTNS) + _POS_BTN_GAP * (len(_POS_BTNS) - 1) + 16
+            btn_h   = int((fm.height() + 2 * _POS_BTN_V_PAD) * 1.5)
+            return QSize(total_w, btn_h + 4)
+        # header row
+        tw = fm.horizontalAdvance(self._HDR_TEXT) + 2 * self._HDR_H_PAD + 8
+        th = int((fm.height() + 2 * self._HDR_V_PAD) * 1.4) + 4
+        return QSize(tw, th)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  AccountPositionPanel
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 
 class AccountPositionPanel(QWidget):
-    """Displays live portfolio positions in a QTableWidget grouped by account."""
+    """Grouped portfolio positions table with per-account header rows."""
 
-    # Emitted when user clicks a position action button
     position_action_requested = Signal(dict)
-
-    # Emitted when user clicks account-level Flatten
-    account_action_requested = Signal(dict)
-
-    # Emitted when user clicks Refresh button
-    refresh_requested = Signal()
+    account_action_requested  = Signal(dict)
+    refresh_requested         = Signal()
+    flatten_requested         = Signal(str)          # account id (header row Flatten)
+    position_close_requested  = Signal(str, int, int)  # account, con_id, pct (100=flatten)
 
     def __init__(self, accounts_model=None, parent=None):
         super().__init__(parent)
         self._accounts_model = accounts_model
-        # positions: (account, con_id) → dict with all position fields
-        self._positions: dict[tuple[str, int], dict] = {}
-        # account-level data: account → {"balance": float, "pnl": float}
-        self._account_data: dict[str, dict] = {}
-
-        # ── Row tracking ──
-        # position_rows: (account, con_id) → table row index
-        self._position_rows: dict[tuple[str, int], int] = {}
-        # account_header_rows: account → table row index
-        self._account_header_rows: dict[str, int] = {}
-
-        # ── Coalesced rebuild timer ──
-        self._rebuild_timer = QTimer(self)
-        self._rebuild_timer.setSingleShot(True)
-        self._rebuild_timer.setInterval(0)
-        self._rebuild_timer.timeout.connect(self._rebuild)
-
+        self._model = AccountPositionModel(
+            get_alias=self._get_alias, parent=self)
         self._setup_ui()
 
-    # ── UI construction ───────────────────────────────────────────────────────
+    # ── UI ────────────────────────────────────────────────────────────────────
 
     def _setup_ui(self) -> None:
         self.setObjectName("AccountPositionPanel")
@@ -219,431 +495,193 @@ class AccountPositionPanel(QWidget):
         root.setContentsMargins(10, 8, 10, 8)
         root.setSpacing(6)
 
-        # ── Header row: title + refresh button ──
-        header = QHBoxLayout()
-        header.setSpacing(6)
-
-        title = QLabel("Account Position")
+        # ── Title bar ────────────────────────────────────────────────────
+        hdr = QHBoxLayout()
+        hdr.setSpacing(0)
+        title = QLabel("Positions")
         title.setFont(_TITLE_FONT)
         title.setStyleSheet("color: #ffffff; border: none;")
-        header.addWidget(title)
+        hdr.addWidget(title)
 
-        refresh_btn = QPushButton("⟳")
-        refresh_btn.setToolTip("Refresh positions from TWS")
-        refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        refresh_btn.setFixedSize(26, 26)
-        refresh_btn.setStyleSheet(f"""
+        btn = QPushButton("⟳")
+        btn.setToolTip("Refresh positions")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setFixedSize(26, 26)
+        btn.setStyleSheet(f"""
             QPushButton {{
-                background: transparent;
-                color: {TEXT_DIM};
-                border: 1px solid {BORDER};
-                border-radius: 4px;
-                font-size: 14px;
-                font-weight: bold;
+                background: transparent; color: {TEXT_DIM_PNL};
+                border: 1px solid {BORDER}; border-radius: 4px;
+                font-size: 14px; font-weight: bold;
             }}
-            QPushButton:hover {{
-                color: #ffffff;
-                border-color: {CLR_OPEN};
-                background: #253545;
-            }}
-            QPushButton:pressed {{
-                background: #1a2535;
-            }}
+            QPushButton:hover {{ color: #ffffff; border-color: {CLR_OPEN}; background: #253545; }}
+            QPushButton:pressed {{ background: #1a2535; }}
         """)
-        refresh_btn.clicked.connect(self._on_refresh_clicked)
-        header.addWidget(refresh_btn)
+        btn.clicked.connect(self._on_refresh_clicked)
+        hdr.addWidget(btn)
 
-        header.addStretch(1)
-        root.addLayout(header)
+        hdr.addStretch(1)
 
-        # ── Table ──
-        self._table = QTableWidget(0, len(_COLUMNS))
-        self._table.setHorizontalHeaderLabels(_COLUMNS)
+        # Zero-position toggle  (right corner, default ON)
+        zero_lbl = QLabel("Zero Pos")
+        zero_lbl.setStyleSheet(
+            f"color: {TEXT_DIM_PNL}; font-size: 10px; border: none;")
+        hdr.addWidget(zero_lbl)
+        hdr.addSpacing(4)
+
+        self._zero_pos_toggle = _ToggleSwitch(checked=True)
+        self._zero_pos_toggle.toggled.connect(self._on_zero_pos_toggled)
+        hdr.addWidget(self._zero_pos_toggle)
+
+        root.addLayout(hdr)
+
+        # ── Table ────────────────────────────────────────────────────────
+        self._table = QTableView()
+        self._table.setModel(self._model)
         self._table.setAlternatingRowColors(True)
-        self._table.setSelectionBehavior(
-            QAbstractItemView.SelectionBehavior.SelectRows)
-        self._table.setSelectionMode(
-            QAbstractItemView.SelectionMode.SingleSelection)
-        self._table.setEditTriggers(
-            QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._table.verticalHeader().setVisible(False)
         self._table.setShowGrid(True)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._table.verticalHeader().setVisible(False)
         self._table.setFont(_TABLE_FONT)
         self._table.setStyleSheet(_TABLE_STYLE)
+        self._table.verticalHeader().setDefaultSectionSize(34)
+        self._table.viewport().setMouseTracking(True)
 
-        hdr = self._table.horizontalHeader()
-        hdr.setDefaultAlignment(
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        hdr.setStretchLastSection(True)
-        hdr.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        # Global delegate – forces header-row background on ordinary columns
+        self._row_delegate = PortfolioRowDelegate(self._table)
+        self._table.setItemDelegate(self._row_delegate)
 
-        _default_widths = {
-            COL_SYMBOL: 80, COL_ACCOUNT: 100, COL_SIDE: 60,
-            COL_QTY: 50, COL_AVG: 90, COL_CURRENT: 90,
-            COL_PNL: 75, COL_ACTIONS: 280,
-        }
-        for col, w in _default_widths.items():
-            self._table.setColumnWidth(col, w)
+        # Merged info cell delegate (COL_SYMBOL, spanned 1→7 on header rows)
+        self._info_delegate = AccountHeaderInfoDelegate(self._table)
+        self._table.setItemDelegateForColumn(COL_SYMBOL, self._info_delegate)
 
-        self._table.verticalHeader().setDefaultSectionSize(30)
+        # Flatten button on the last column
+        self._flatten_delegate = FlattenButtonDelegate(self._table)
+        self._flatten_delegate.flatten_clicked.connect(self._on_flatten_clicked)
+        self._flatten_delegate.position_close_clicked.connect(
+            self._on_position_close_clicked)
+        self._table.setItemDelegateForColumn(COL_FLATTEN, self._flatten_delegate)
+
+        # Header
+        h = self._table.horizontalHeader()
+        h.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        h.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        h.setStretchLastSection(True)
+
+        self._restore_col_widths()
+        h.sectionResized.connect(self._on_section_resized)
+
+        # Apply column spans whenever model is rebuilt
+        self._model.modelReset.connect(self._apply_spans)
+
         root.addWidget(self._table, stretch=1)
+
+    # ── Column spans ─────────────────────────────────────────────────────────
+
+    def _apply_spans(self) -> None:
+        """Merge columns 1-7 into one cell for every account header row."""
+        span_cols = COL_FLATTEN - COL_SYMBOL  # = 7
+        for row in range(self._model.rowCount()):
+            idx = self._model.index(row, COL_ACCOUNT)
+            if idx.data(RowTypeRole) == ROW_TYPE_HEADER:
+                self._table.setSpan(row, COL_SYMBOL, 1, span_cols)
+            else:
+                self._table.setSpan(row, COL_SYMBOL, 1, 1)  # reset
+
+    # ── Column-width persistence ──────────────────────────────────────────────
+
+    _COL_SAMPLES = {
+        COL_ACCOUNT:        "WWWWWWWWW",
+        COL_SYMBOL:         "WWWWWWW",
+        COL_POSITION:       "999999",
+        COL_UNREALIZED_PNL: "-9999.99",
+        COL_AVG_PRICE:      "99999.99",
+        COL_LAST_PRICE:     "99999.99",
+        COL_REALIZED_PNL:   "-9999.99",
+        COL_MARKET_VALUE:   "$999,999",
+        COL_FLATTEN:        "Flatten  25%  50%  75% __",
+    }
+
+    def _apply_default_col_widths(self) -> None:
+        fm  = QFontMetrics(self._table.font())
+        pad = fm.horizontalAdvance("W")
+        for col, sample in self._COL_SAMPLES.items():
+            self._table.setColumnWidth(col, fm.horizontalAdvance(sample) + pad)
+
+    _SETTINGS_KEY = "AccountPositionPanel/headerState"
+
+    def _restore_col_widths(self) -> None:
+        settings = QSettings("NanoPulse", "Dashboard")
+        state = settings.value(self._SETTINGS_KEY)
+        if state is not None:
+            if self._table.horizontalHeader().restoreState(state):
+                log.debug("Position: restored header state from QSettings")
+                return
+        self._apply_default_col_widths()
+        log.debug("Position: applied default column widths")
+
+    def save_col_widths(self) -> None:
+        settings = QSettings("NanoPulse", "Dashboard")
+        state = self._table.horizontalHeader().saveState()
+        settings.setValue(self._SETTINGS_KEY, state)
+        log.debug("Position: saved header state to QSettings")
+
+    def _on_section_resized(self, _logical: int, _old: int, _new: int) -> None:
+        self.save_col_widths()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def update_positions(self, batch: list[dict]) -> None:
-        """Receive a batch of position dicts from a worker thread."""
-        needs_rebuild = False
-        for pos in batch:
-            account = pos.get("account", "")
-            con_id = pos.get("con_id", 0)
-            if not account or not con_id:
-                continue
-            key = (account, con_id)
-            old = self._positions.get(key)
-            self._positions[key] = pos
+        self._model.update_positions(batch)
 
-            if key in self._position_rows and old is not None:
-                new_pos = pos.get("position", 0)
-                old_pos = old.get("position", 0)
-                if new_pos == 0 and old_pos != 0:
-                    needs_rebuild = True
-                    log.debug("AcctPos: position closed %s → rebuild",
-                              pos.get("symbol"))
-                elif new_pos != 0 and old_pos == 0:
-                    needs_rebuild = True
-                    log.debug(
-                        "AcctPos: position reopened %s → rebuild", pos.get("symbol"))
-                else:
-                    self._update_row_in_place(key, pos)
-            else:
-                if pos.get("position", 0) != 0:
-                    needs_rebuild = True
-                    log.debug("AcctPos: new position %s qty=%.1f → rebuild",
-                              pos.get("symbol"), pos.get("position", 0))
+    def update_pnl_single(self, account: str, con_id: int,
+                          daily_pnl: float, realized_pnl: float,
+                          unrealized_pnl: float) -> None:
+        self._model.update_pnl_single(
+            account, con_id, daily_pnl, realized_pnl, unrealized_pnl)
 
-        # Update account header P&L in-place when no structural change
-        if not needs_rebuild:
-            self._update_all_account_headers_in_place()
-
-        if needs_rebuild:
-            self._schedule_rebuild()
-
-    def set_account_data(self, account: str, balance: float, pnl: float) -> None:
-        """Update header-level info for an account (balance, pnl)."""
-        self._account_data[account] = {"balance": balance, "pnl": pnl}
-        if account in self._account_header_rows:
-            self._update_account_header_in_place(account)
-        elif any(k[0] == account for k in self._positions):
-            self._schedule_rebuild()
-
-    # ── In-place update helpers ───────────────────────────────────────────────
-
-    def _update_row_in_place(self, key: tuple[str, int], pos: dict) -> None:
-        """Update cell text for an existing position row without rebuild."""
-        row = self._position_rows.get(key)
-        if row is None:
-            return
-
-        position = pos.get("position", 0)
-        avg_cost = pos.get("avg_cost", 0)
-        market_price = pos.get("market_price", 0)
-        unrealized_pnl = pos.get("unrealized_pnl", 0)
-        sec_type = pos.get("sec_type", "")
-
-        display_avg = avg_cost
-        if sec_type == "FUT" and position != 0 and market_price != 0:
-            implied_mult = abs(pos.get("market_value", 0) /
-                               (position * market_price))
-            if implied_mult > 1:
-                display_avg = avg_cost / implied_mult
-
-        qty = abs(int(position))
-
-        item = self._table.item(row, COL_QTY)
-        if item:
-            item.setText(str(qty))
-
-        item = self._table.item(row, COL_AVG)
-        if item:
-            item.setText(_fmt_price(display_avg))
-
-        item = self._table.item(row, COL_CURRENT)
-        if item:
-            item.setText(_fmt_price(market_price))
-
-        item = self._table.item(row, COL_PNL)
-        if item:
-            pnl_clr = CLR_PNL_POS if unrealized_pnl >= 0 else CLR_PNL_NEG
-            item.setText(_fmt_pnl(unrealized_pnl))
-            item.setForeground(QColor(pnl_clr))
-
-    def _update_all_account_headers_in_place(self) -> None:
-        for acct in self._account_header_rows:
-            self._update_account_header_in_place(acct)
-
-    def _update_account_header_in_place(self, account: str) -> None:
-        """Update balance + P&L text in the account header spanning row."""
-        row = self._account_header_rows.get(account)
-        if row is None:
-            return
-
-        total_pnl = sum(
-            p.get("unrealized_pnl", 0)
-            for (acct, _), p in self._positions.items()
-            if acct == account and p.get("position", 0) != 0
+    def set_account_data(self, account: str, balance: float = 0,
+                         pnl: float = 0, **kwargs) -> None:
+        self._model.set_account_data(
+            account,
+            net_liq=kwargs.get("net_liq", balance),
+            excess_liq=kwargs.get("excess_liq", 0),
+            buying_power=kwargs.get("buying_power", 0),
+            daily_pnl=kwargs.get("daily_pnl", float("nan")),
+            realized_pnl=kwargs.get("realized_pnl", float("nan")),
+            unrealized_pnl=kwargs.get("unrealized_pnl", float("nan")),
         )
-
-        acct_info = self._account_data.get(account, {})
-        bal = acct_info.get("balance", 0)
-
-        widget = self._table.cellWidget(row, COL_SYMBOL)
-        if widget is None:
-            return
-
-        bal_lbl = widget.findChild(QLabel, "bal_lbl")
-        pnl_lbl = widget.findChild(QLabel, "pnl_lbl")
-
-        if bal_lbl:
-            if bal:
-                bal_lbl.setText(f"Bal: {_fmt_bal(bal)}")
-                bal_lbl.show()
-            else:
-                bal_lbl.hide()
-
-        if pnl_lbl:
-            pnl_clr = CLR_PNL_POS if total_pnl >= 0 else CLR_PNL_NEG
-            pnl_lbl.setText(f"P&L: {_fmt_pnl(total_pnl)}")
-            pnl_lbl.setStyleSheet(
-                f"color:{pnl_clr};border:none;font-weight:bold;font-size:11px;")
-
-    def _schedule_rebuild(self) -> None:
-        if not self._rebuild_timer.isActive():
-            self._rebuild_timer.start()
-
-    def _on_refresh_clicked(self) -> None:
-        """Ask the workers to re-push positions (from cache + IB refresh)."""
-        log.info("AcctPos: refresh requested by user")
-        self.refresh_requested.emit()
 
     def clear_positions(self) -> None:
-        """Remove every row and reset internal state."""
-        self._table.setRowCount(0)
-        self._position_rows.clear()
-        self._account_header_rows.clear()
-        self._positions.clear()
-        self._account_data.clear()
-        log.debug("AcctPos: cleared all positions")
+        self._model.clear()
 
-    # ── Rebuild ───────────────────────────────────────────────────────────────
+    def get_position_keys(self) -> list[tuple[str, int]]:
+        return self._model.get_position_keys()
 
-    def _rebuild(self) -> None:
-        """Rebuild the entire table from self._positions."""
-        self._position_rows.clear()
-        self._account_header_rows.clear()
-        self._table.setRowCount(0)
+    # ── Slots ─────────────────────────────────────────────────────────────────
 
-        # Group positions by account
-        accounts: dict[str, list[dict]] = {}
-        for (acct, _), pos in self._positions.items():
-            if pos.get("position", 0) == 0:
-                continue
-            accounts.setdefault(acct, []).append(pos)
+    def _on_refresh_clicked(self) -> None:
+        log.info("Portfolio: refresh requested")
+        self.clear_positions()
+        self.refresh_requested.emit()
 
-        if not accounts:
-            return
+    def _on_zero_pos_toggled(self, checked: bool) -> None:
+        self._model.set_show_zero(checked)
 
-        for acct in sorted(accounts.keys()):
-            positions = accounts[acct]
-            self._insert_account_header(acct, positions)
-            for pos in sorted(positions, key=lambda p: p.get("symbol", "")):
-                self._insert_position_row(acct, pos)
+    def _on_flatten_clicked(self, account: str) -> None:
+        log.info("Portfolio: flatten requested for %s", account)
+        self.flatten_requested.emit(account)
 
-    # ── Account header row ────────────────────────────────────────────────────
-
-    def _insert_account_header(self, account: str, positions: list[dict]) -> None:
-        """Insert a spanning header row for one account."""
-        row = self._table.rowCount()
-        self._table.insertRow(row)
-        self._table.setRowHeight(row, 34)
-        self._account_header_rows[account] = row
-
-        # Span all columns
-        self._table.setSpan(row, 0, 1, len(_COLUMNS))
-
-        # Build header widget
-        widget = QWidget()
-        widget.setStyleSheet(f"background:{CLR_ACCT_ROW};border:none;")
-        layout = QHBoxLayout(widget)
-        layout.setContentsMargins(8, 2, 8, 2)
-        layout.setSpacing(10)
-
-        alias = self._get_alias(account)
-        alias_lbl = QLabel(alias if alias else account)
-        alias_lbl.setFont(_ACCT_FONT)
-        alias_lbl.setStyleSheet(
-            "color:#ffffff;border:none;font-weight:bold;font-size:12px;")
-        layout.addWidget(alias_lbl)
-
-        if alias:
-            acct_lbl = QLabel(account)
-            acct_lbl.setStyleSheet(
-                f"color:{TEXT_DIM};border:none;font-size:10px;")
-            layout.addWidget(acct_lbl)
-
-        layout.addStretch()
-
-        acct_info = self._account_data.get(account, {})
-        bal = acct_info.get("balance", 0)
-        bal_lbl = QLabel(f"Bal: {_fmt_bal(bal)}" if bal else "")
-        bal_lbl.setObjectName("bal_lbl")
-        bal_lbl.setStyleSheet(f"color:{TEXT_DIM};border:none;font-size:11px;")
-        bal_lbl.setVisible(bool(bal))
-        layout.addWidget(bal_lbl)
-
-        total_pnl = sum(p.get("unrealized_pnl", 0) for p in positions)
-        pnl_clr = CLR_PNL_POS if total_pnl >= 0 else CLR_PNL_NEG
-        pnl_lbl = QLabel(f"P&L: {_fmt_pnl(total_pnl)}")
-        pnl_lbl.setObjectName("pnl_lbl")
-        pnl_lbl.setStyleSheet(
-            f"color:{pnl_clr};border:none;font-weight:bold;font-size:11px;")
-        layout.addWidget(pnl_lbl)
-
-        flatten_btn = _make_action_btn("× Flatten", CLR_FLATTEN, 24)
-        flatten_btn.clicked.connect(
-            lambda checked, a=account: self.account_action_requested.emit(
-                {"action": "FLATTEN_ALL", "account": a}
-            )
-        )
-        layout.addWidget(flatten_btn)
-
-        self._table.setCellWidget(row, 0, widget)
-
-    # ── Position row ──────────────────────────────────────────────────────────
-
-    def _insert_position_row(self, account: str, pos: dict) -> None:
-        """Insert one position row with data cells and action buttons."""
-        row = self._table.rowCount()
-        self._table.insertRow(row)
-        self._table.setRowHeight(row, 30)
-
-        con_id = pos.get("con_id", 0)
-        key = (account, con_id)
-        self._position_rows[key] = row
-
-        symbol = pos.get("local_symbol") or pos.get("symbol", "")
-        position = pos.get("position", 0)
-        avg_cost = pos.get("avg_cost", 0)
-        market_price = pos.get("market_price", 0)
-        unrealized_pnl = pos.get("unrealized_pnl", 0)
-        sec_type = pos.get("sec_type", "")
-
-        display_avg = avg_cost
-        if sec_type == "FUT" and position != 0 and market_price != 0:
-            implied_mult = abs(pos.get("market_value", 0) /
-                               (position * market_price))
-            if implied_mult > 1:
-                display_avg = avg_cost / implied_mult
-
-        side = "LONG" if position > 0 else "SHORT"
-        qty = abs(int(position))
-
-        alias = self._get_alias(account)
-
-        # Symbol
-        item = QTableWidgetItem(symbol)
-        item.setForeground(QColor(TEXT))
-        item.setFont(
-            QFont("Menlo, Consolas, monospace", 11, QFont.Weight.Bold))
-        self._table.setItem(row, COL_SYMBOL, item)
-
-        # Account
-        item = QTableWidgetItem(alias if alias else account)
-        item.setForeground(QColor(TEXT_DIM))
-        self._table.setItem(row, COL_ACCOUNT, item)
-
-        # Side
-        item = QTableWidgetItem(side)
-        side_clr = CLR_PNL_POS if side == "LONG" else CLR_PNL_NEG
-        item.setForeground(QColor(side_clr))
-        item.setFont(QFont("Helvetica Neue, Arial", 11, QFont.Weight.Bold))
-        self._table.setItem(row, COL_SIDE, item)
-
-        # Qty
-        item = QTableWidgetItem(str(qty))
-        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        item.setForeground(QColor(TEXT))
-        self._table.setItem(row, COL_QTY, item)
-
-        # Avg
-        item = QTableWidgetItem(_fmt_price(display_avg))
-        item.setTextAlignment(Qt.AlignmentFlag.AlignRight |
-                              Qt.AlignmentFlag.AlignVCenter)
-        item.setForeground(QColor(TEXT))
-        self._table.setItem(row, COL_AVG, item)
-
-        # Current
-        item = QTableWidgetItem(_fmt_price(market_price))
-        item.setTextAlignment(Qt.AlignmentFlag.AlignRight |
-                              Qt.AlignmentFlag.AlignVCenter)
-        item.setForeground(QColor(TEXT))
-        self._table.setItem(row, COL_CURRENT, item)
-
-        # P&L
-        pnl_clr = CLR_PNL_POS if unrealized_pnl >= 0 else CLR_PNL_NEG
-        item = QTableWidgetItem(_fmt_pnl(unrealized_pnl))
-        item.setTextAlignment(Qt.AlignmentFlag.AlignRight |
-                              Qt.AlignmentFlag.AlignVCenter)
-        item.setForeground(QColor(pnl_clr))
-        item.setFont(
-            QFont("Menlo, Consolas, monospace", 11, QFont.Weight.Bold))
-        self._table.setItem(row, COL_PNL, item)
-
-        # Action buttons
-        action_info = {
-            "account": account,
-            "con_id": con_id,
-            "symbol": symbol,
-            "position": position,
-            "sec_type": sec_type,
-            "exchange": pos.get("exchange", ""),
-            "currency": pos.get("currency", "USD"),
-        }
-
-        btn_widget = QWidget()
-        btn_widget.setStyleSheet("background:transparent;border:none;")
-        btn_layout = QHBoxLayout(btn_widget)
-        btn_layout.setContentsMargins(4, 2, 4, 2)
-        btn_layout.setSpacing(3)
-
-        flat_btn = _make_action_btn("× Flatten", CLR_FLATTEN, 22)
-        flat_btn.clicked.connect(
-            lambda checked, info=dict(action_info, action="FLATTEN"):
-                self.position_action_requested.emit(info)
-        )
-        btn_layout.addWidget(flat_btn)
-
-        rev_btn = _make_action_btn("↻ Reverse", CLR_REVERSE, 22)
-        rev_btn.clicked.connect(
-            lambda checked, info=dict(action_info, action="REVERSE"):
-                self.position_action_requested.emit(info)
-        )
-        btn_layout.addWidget(rev_btn)
-
-        for pct, label in [(25, "25%"), (50, "50%"), (75, "75%")]:
-            btn = _make_action_btn(label, CLR_CLOSE, 22)
-            btn.clicked.connect(
-                lambda checked, info=dict(action_info, action=f"CLOSE_{pct}"):
-                    self.position_action_requested.emit(info)
-            )
-            btn_layout.addWidget(btn)
-
-        btn_layout.addStretch()
-        self._table.setCellWidget(row, COL_ACTIONS, btn_widget)
+    def _on_position_close_clicked(self, account: str, con_id: int,
+                                   pct: int) -> None:
+        log.info("Portfolio: close %d%% requested – %s conId=%d",
+                 pct, account, con_id)
+        self.position_close_requested.emit(account, con_id, pct)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _get_alias(self, account: str) -> str:
-        """Get account alias from the accounts model."""
         if self._accounts_model is not None:
             return self._accounts_model._aliases.get(account, "")
         return ""

@@ -423,22 +423,34 @@ class FlashTradeView(QWidget):
                     self._on_reverse_close_needed)
             except RuntimeError:
                 pass
+            try:
+                prev.pnl_single_updated.disconnect(self._on_pnl_single_updated)
+            except RuntimeError:
+                pass
+            try:
+                prev.account_pnl_updated.disconnect(self._on_account_pnl_updated)
+            except RuntimeError:
+                pass
             log.debug("FlashTrade: unwired stale signals for worker %s", label)
 
         worker.order_status_updated.connect(self._on_order_status_updated)
         worker.portfolio_updated.connect(self._on_portfolio_updated)
         worker.flatten_close_needed.connect(self._on_flatten_close_needed)
         worker.reverse_close_needed.connect(self._on_reverse_close_needed)
+        worker.pnl_single_updated.connect(self._on_pnl_single_updated)
+        worker.account_pnl_updated.connect(self._on_account_pnl_updated)
         self._connected_order_workers[label] = worker
         self._connected_portfolio_workers[label] = worker
         log.debug(
-            "FlashTrade: wired order_status_updated + portfolio_updated + flatten_close_needed for worker %s", label)
+            "FlashTrade: wired order_status_updated + portfolio_updated + "
+            "pnl_single_updated + account_pnl_updated for worker %s", label)
 
         # Re-snapshot: the worker's initial snapshot may have fired before
         # this signal was connected.  Ask it to emit all known orders again.
         if worker.is_ib_connected:
             worker.request_order_snapshot()
             worker.request_portfolio_snapshot()
+            worker.request_pnl_snapshot()
 
     def _on_order_status_updated(self, data: dict) -> None:
         """Receive order status from worker thread → update OrderStatusPanel."""
@@ -489,15 +501,13 @@ class FlashTradeView(QWidget):
 
         # Feed account balance info from accounts_model if available
         if self._accounts_model is not None:
-            # Collect unique accounts first to avoid repeated lookups
             seen_accounts: set[str] = set()
-            from .accounts_model import COL_NET_LIQ, COL_ACCOUNT
+            from .accounts_model import COL_NET_LIQ, COL_EXCESS_LIQ, COL_ACCOUNT
             for pos in batch:
                 account = pos.get("account", "")
                 if not account or account in seen_accounts:
                     continue
                 seen_accounts.add(account)
-                # Find the account row in the model to get NetLiquidation
                 for row_idx in range(self._accounts_model.rowCount()):
                     row_data = self._accounts_model._table_data[row_idx]
                     if row_data[COL_ACCOUNT] == account:
@@ -506,9 +516,33 @@ class FlashTradeView(QWidget):
                                         ) if row_data[COL_NET_LIQ] else 0
                         except (ValueError, TypeError):
                             bal = 0
+                        try:
+                            excess = float(row_data[COL_EXCESS_LIQ]
+                                           ) if row_data[COL_EXCESS_LIQ] else 0
+                        except (ValueError, TypeError):
+                            excess = 0
+                        bp = self._accounts_model.get_buying_power(account)
                         self._account_position.set_account_data(
-                            account, bal, 0)
+                            account, balance=bal,
+                            net_liq=bal, excess_liq=excess,
+                            buying_power=bp)
                         break
+
+    def _on_pnl_single_updated(self, account: str, con_id: int,
+                               daily_pnl: float, realized_pnl: float,
+                               unrealized_pnl: float) -> None:
+        """Per-position P&L from pnlSingleEvent → update position panel."""
+        self._account_position.update_pnl_single(
+            account, con_id, daily_pnl, realized_pnl, unrealized_pnl)
+
+    def _on_account_pnl_updated(self, account: str, daily_pnl: float,
+                                realized_pnl: float,
+                                unrealized_pnl: float) -> None:
+        """Account-level P&L from pnlEvent → update account header row."""
+        self._account_position.set_account_data(
+            account, daily_pnl=daily_pnl,
+            realized_pnl=realized_pnl,
+            unrealized_pnl=unrealized_pnl)
 
     def _refresh_portfolio(self) -> None:
         """Ask every connected worker to re-push portfolio positions."""
