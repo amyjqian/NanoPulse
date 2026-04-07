@@ -806,6 +806,8 @@ class StrategyEditorView(QWidget):
     def _on_save(self) -> None:
         try:
             self._model.save_to_db()
+            from src.core.reference_data import get_instance as _rd
+            _rd().reload_strategy_tiers()
             n = self._model.rowCount()
             self._set_status(f"✅  Saved {n} symbol(s) to database")
         except Exception as exc:
@@ -1002,36 +1004,33 @@ class StrategyEditorView(QWidget):
     # ── Multiplier loader ─────────────────────────────────────────────────────
 
     def _load_multipliers(self) -> None:
-        """Read saved contracts and push symbol→multiplier into the model."""
-        from src.core import config_manager
-        contracts = config_manager.load_contracts()
-        mults: dict[str, float] = {}
-        missing: list[str] = []
-        for c in contracts:
-            sym = c.get("symbol", "").strip().upper()
-            if not sym:
-                continue
-            raw = c.get("multiplier", "")
-            try:
-                mults[sym] = float(raw) if raw else 1.0
-            except (ValueError, TypeError):
-                mults[sym] = 1.0
+        """Read multipliers from ReferenceData (already loaded at startup)."""
+        from src.core.reference_data import get_instance as _rd
+        rd = _rd()
 
-        self._model.set_multipliers(mults)
+        # If the cache is still empty (e.g. strategy editor opened before
+        # main window had a chance to reload), fall back to a direct load.
+        if not rd.contracts and not rd.multipliers:
+            rd.reload_contracts()
 
-        # Warn for any strategy symbols that have no contract
-        for sym in (self._model.symbol_at(r)
-                    for r in range(self._model.rowCount())):
-            if sym and sym not in mults:
-                missing.append(sym)
+        mults   = rd.multipliers          # dict[UPPER_SYMBOL → float]
+        missing = [
+            sym for sym in (self._model.symbol_at(r)
+                            for r in range(self._model.rowCount()))
+            if sym and sym.upper() not in mults
+        ]
+
+        self._model.set_multipliers({k.upper(): v for k, v in mults.items()})
 
         if missing:
             self._set_status(
                 f"⚠  Using fallback ×1.0 for: {', '.join(missing)}"
-                f" — add them in the Contracts tab to use their real multiplier")
+                f" — add them in the Contracts tab to use their real multiplier"
+            )
         elif mults:
             self._set_status(
-                f"Multipliers loaded for {len(mults)} contract(s)")
+                f"Multipliers loaded for {len(mults)} contract(s)"
+            )
 
     def _set_status(self, msg: str) -> None:
         self._status_lbl.setText(msg)

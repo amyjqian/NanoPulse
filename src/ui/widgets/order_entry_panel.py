@@ -69,31 +69,9 @@ def _make_btn(text: str, colour: str, min_h: int = 32) -> QPushButton:
 
 
 def _sec_type_for(sym: str) -> str:
-    """Return 'FUT', 'STK', 'OPT', or '?' for a symbol.
-
-    When multiple contracts share the same base symbol (e.g. NVDA has STK
-    and OPT entries), prioritise STK > FUT > OPT so the quantity preset
-    matches what the user most likely intended.
-    """
-    contracts = config_manager.load_contracts()
-    q = sym.upper()
-    # Collect all sec_types that match
-    matched_types: set[str] = set()
-    for c in contracts:
-        if c.get("symbol", "").upper() == q or c.get("local_symbol", "").upper() == q:
-            matched_types.add(c.get("sec_type", "?"))
-    if not matched_types:
-        # prefix fallback
-        for c in contracts:
-            if c.get("symbol", "").upper().startswith(q) or c.get("local_symbol", "").upper().startswith(q):
-                matched_types.add(c.get("sec_type", "?"))
-    if not matched_types:
-        return "?"
-    # Priority: STK > FUT > OPT > anything else
-    for preferred in ("STK", "FUT", "OPT"):
-        if preferred in matched_types:
-            return preferred
-    return matched_types.pop()
+    """Return 'FUT', 'STK', 'OPT', or '?' for *sym* via ReferenceData cache."""
+    from src.core.reference_data import get_instance as _rd
+    return _rd().get_sec_type(sym)
 
 
 def _apply_chip_style(btn: QPushButton, selected: bool) -> None:
@@ -161,10 +139,11 @@ class _ToggleSwitch(QWidget):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class _TierSection(QWidget):
-    """Header (label + toggle) + a row of tier chip buttons + custom input field.
+    """Header (label + dollar display + toggle) + tier chips + custom input.
 
-    Chip labels come from the ``tiers`` list loaded from preferences.
-    The last element in the row is always a free-text input (custom value).
+    Chip labels show the raw offset only (e.g. "5").
+    The dollar display in the header shows  ``{title}: ${dollar*qty}``
+    in a caller-specified colour whenever a chip is selected.
     """
 
     changed = Signal()
@@ -180,10 +159,6 @@ class _TierSection(QWidget):
         "border-radius:6px;padding:4px 12px;font-weight:600;font-size:12px}"
         "QPushButton:hover{background:#4a4a5a}"
     )
-    _SS_DIS = (
-        "QPushButton{background:#252535;color:#444;border:none;"
-        "border-radius:6px;padding:4px 12px;font-size:12px}"
-    )
     _SS_INPUT = (
         "QLineEdit{background:#3a3a4a;color:#ccc;border:none;"
         "border-radius:4px;padding:2px 6px;font-size:11px}"
@@ -192,15 +167,22 @@ class _TierSection(QWidget):
     )
 
     def __init__(self, title: str, tiers: list[dict],
-                 enabled: bool = False, parent=None):
+                 enabled: bool = False,
+                 label_color: str = Theme.ACCENT,
+                 parent=None):
         super().__init__(parent)
-        self._tiers: list[dict] = tiers
-        self._selected_idx: int | None = None
-        self._chip_buttons: list[QPushButton] = []
-        self._input: QLineEdit | None = None
-        self._toggle: _ToggleSwitch | None = None
-        self._state_lbl: QLabel | None = None
-        self._chips_layout: QHBoxLayout | None = None
+        self._title_str    = title
+        self._label_color  = label_color
+        self._tiers:             list[dict]  = tiers
+        self._dollar_per_tier:   list[float] = []
+        self._qty:               int         = 1
+        self._selected_idx:      int | None  = None
+        self._chip_buttons:      list[QPushButton] = []
+        self._input:             QLineEdit | None = None
+        self._toggle:            _ToggleSwitch | None = None
+        self._state_lbl:         QLabel | None = None
+        self._dollar_lbl:        QLabel | None = None
+        self._chips_layout:      QHBoxLayout | None = None
         self._build_ui(title, enabled)
 
     # ── Build ─────────────────────────────────────────────────────────────────
@@ -210,19 +192,26 @@ class _TierSection(QWidget):
         root.setContentsMargins(0, 0, 0, 4)
         root.setSpacing(4)
 
-        # Header row
+        # Header row:  [title: $dollar]  [stretch]  [On/Off]  [toggle]
+        # _dollar_lbl acts as the *combined* title + value label on the left:
+        #   • no chip / no dollar  →  "Take profit"          (plain white)
+        #   • chip selected, off   →  "Take profit: $500"    (dim grey preview)
+        #   • chip selected, on    →  "Take profit: $500"    (accent green/red)
         hdr = QHBoxLayout()
         hdr.setSpacing(6)
         hdr.setContentsMargins(0, 0, 0, 0)
-        lbl = QLabel(title)
-        lbl.setStyleSheet(
+
+        self._dollar_lbl = QLabel(title)
+        self._dollar_lbl.setStyleSheet(
             f"color: {Theme.TEXT}; font-size: 11px; font-weight: bold; border: none;")
-        hdr.addWidget(lbl)
+        hdr.addWidget(self._dollar_lbl)
         hdr.addStretch()
+
         self._state_lbl = QLabel("On" if enabled else "Off")
         self._state_lbl.setStyleSheet(
             f"color: {Theme.TEXT_DIM}; font-size: 11px; border: none;")
         hdr.addWidget(self._state_lbl)
+
         self._toggle = _ToggleSwitch(enabled)
         self._toggle.toggled.connect(self._on_toggled)
         hdr.addWidget(self._toggle)
@@ -248,6 +237,13 @@ class _TierSection(QWidget):
         self._chip_buttons.clear()
         self._selected_idx = None
 
+        # Snapshot dollar values parallel to chip indices
+        self._dollar_per_tier = [t.get("dollar", 0.0) for t in self._tiers]
+
+        # Pre-select chip 0 so the dollar label shows as a preview even before
+        # the user explicitly clicks a chip.
+        self._selected_idx = 0 if self._tiers else None
+
         for i, tier in enumerate(self._tiers):
             label = tier.get("label", f"Tier {i + 1}")
             btn = QPushButton(label)
@@ -259,7 +255,6 @@ class _TierSection(QWidget):
             self._chip_buttons.append(btn)
             lay.addWidget(btn)
 
-        # Custom input (always last, always enabled, expands with the rest)
         self._input = QLineEdit()
         self._input.setFixedHeight(self._CHIP_H)
         self._input.setMinimumWidth(48)
@@ -268,26 +263,74 @@ class _TierSection(QWidget):
         self._input.setStyleSheet(self._SS_INPUT)
         self._input.textChanged.connect(self._on_input_changed)
         lay.addWidget(self._input)
-        # No addStretch() — chips fill all available width
 
         self._update_chip_styles()
+        self._update_dollar_display()
+
+    # ── Dollar display ────────────────────────────────────────────────────────
+
+    def _update_dollar_display(self) -> None:
+        """Refresh the combined title+dollar label in the section header.
+
+        Three visual states:
+          • No chip selected / dollar == 0
+                → plain title only, e.g. "Take profit"  (white)
+          • Chip selected, toggle OFF  (informational preview)
+                → "Take profit: $500"  (dim grey)
+          • Chip selected, toggle ON   (active)
+                → "Take profit: $500"  (accent green / red)
+        """
+        if self._dollar_lbl is None:
+            return
+
+        # ── No valid selection ─────────────────────────────────────────────
+        if (self._selected_idx is None
+                or self._selected_idx >= len(self._dollar_per_tier)):
+            self._dollar_lbl.setStyleSheet(
+                f"color: {Theme.TEXT}; font-size: 11px; "
+                f"font-weight: bold; border: none;")
+            self._dollar_lbl.setText(self._title_str)
+            return
+
+        dollar = self._dollar_per_tier[self._selected_idx]
+
+        # ── No dollar value stored for this tier ──────────────────────────
+        if not dollar or dollar <= 0:
+            self._dollar_lbl.setStyleSheet(
+                f"color: {Theme.TEXT}; font-size: 11px; "
+                f"font-weight: bold; border: none;")
+            self._dollar_lbl.setText(self._title_str)
+            return
+
+        # ── Dollar preview / active ────────────────────────────────────────
+        scaled     = dollar * self._qty
+        toggle_on  = self._toggle.is_on if self._toggle else True
+        colour     = self._label_color if toggle_on else "#6B7280"
+        self._dollar_lbl.setStyleSheet(
+            f"color: {colour}; font-size: 11px; font-weight: bold; border: none;")
+        self._dollar_lbl.setText(f"{self._title_str}: ${scaled:,.0f}")
+
+    def set_qty(self, qty: int) -> None:
+        """Update the quantity and refresh the dollar display (no chip rebuild)."""
+        self._qty = qty
+        self._update_dollar_display()
 
     # ── Slots ─────────────────────────────────────────────────────────────────
 
     def _on_toggled(self, on: bool) -> None:
         self._state_lbl.setText("On" if on else "Off")
         if not on:
-            # Unselect all chips and clear input when toggled OFF
-            self._selected_idx = None
+            # Keep _selected_idx so the dollar label stays as an informational
+            # preview even when the section is disabled.  Clear any custom text.
             if self._input:
                 self._input.blockSignals(True)
                 self._input.clear()
                 self._input.blockSignals(False)
         self._update_chip_styles()
+        self._update_dollar_display()
         self.changed.emit()
 
     def _on_chip_clicked(self, idx: int) -> None:
-        # Auto-switch toggle ON if currently OFF
         if self._toggle and not self._toggle.is_on:
             self._toggle.set_on(True)
             self._state_lbl.setText("On")
@@ -297,12 +340,12 @@ class _TierSection(QWidget):
             self._input.clear()
             self._input.blockSignals(False)
         self._update_chip_styles()
+        self._update_dollar_display()
         self.changed.emit()
 
     def _on_input_changed(self, text: str) -> None:
         stripped = text.strip()
         if stripped:
-            # Auto-switch toggle ON if value > 0 and toggle is currently OFF
             try:
                 if float(stripped) > 0 and self._toggle and not self._toggle.is_on:
                     self._toggle.set_on(True)
@@ -311,19 +354,23 @@ class _TierSection(QWidget):
                 pass
             self._selected_idx = None
             self._update_chip_styles()
+            self._update_dollar_display()
         self.changed.emit()
 
     def _update_chip_styles(self) -> None:
-        # Delegate to the same helper used by symbol chips for identical styling.
+        toggle_on = self._toggle.is_on if self._toggle else True
         for i, btn in enumerate(self._chip_buttons):
-            _apply_chip_style(btn, i == self._selected_idx)
+            # Blue highlight only when the section is active (toggle ON).
+            # While inactive the chip shows grey but the dollar preview is
+            # still driven by _selected_idx.
+            _apply_chip_style(btn, i == self._selected_idx and toggle_on)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def reload_tiers(self, tiers: list[dict]) -> None:
-        """Reload chip buttons when preferences change."""
+        """Reload chip buttons (e.g. when symbol or preferences change)."""
         self._tiers = tiers
-        self._build_chips(enabled=True)  # chips are always interactive
+        self._build_chips(enabled=True)
 
     @property
     def is_enabled(self) -> bool:
@@ -415,6 +462,12 @@ class OrderEntryPanel(QWidget):
         self._rebuild_symbol_buttons()
         self._rebuild_qty_buttons()
         self._refresh_action_labels()
+
+        # Auto-refresh when reference data changes (contract added/removed or
+        # strategy tiers saved from the StrategyEditor tab).
+        from src.core.reference_data import get_instance as _rd
+        _rd().contracts_changed.connect(self._refresh_combo_items)
+        _rd().strategy_tiers_changed.connect(self._reload_tier_sections)
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -609,11 +662,15 @@ class OrderEntryPanel(QWidget):
 
         # ── Take Profit ───────────────────────────────────────────────────────
         pt_tiers, sl_tiers = self._load_tiers_for_active()
-        self._pt_section = _TierSection("Take profit", pt_tiers, enabled=False)
+        self._pt_section = _TierSection(
+            "Take profit", pt_tiers, enabled=False,
+            label_color="#3FB950")   # green
         root.addWidget(self._pt_section)
 
         # ── Stop Loss ─────────────────────────────────────────────────────────
-        self._sl_section = _TierSection("Stop loss", sl_tiers, enabled=False)
+        self._sl_section = _TierSection(
+            "Stop loss", sl_tiers, enabled=False,
+            label_color="#F85149")   # red
         root.addWidget(self._sl_section)
 
         root.addStretch(1)
@@ -657,9 +714,10 @@ class OrderEntryPanel(QWidget):
 
     def _refresh_combo_items(self) -> None:
         """Populate the combo dropdown with saved contracts not already added."""
+        from src.core.reference_data import get_instance as _rd
         self._combo.blockSignals(True)
         self._combo.clear()
-        contracts = config_manager.load_contracts()
+        contracts = _rd().contracts
         added_upper = {s.upper() for s in self._symbols}
         seen: set[str] = set()
         for c in contracts:
@@ -701,7 +759,8 @@ class OrderEntryPanel(QWidget):
                 return
 
         # Find all matching contracts
-        contracts = config_manager.load_contracts()
+        from src.core.reference_data import get_instance as _rd
+        contracts = _rd().contracts
         matches: list[dict] = []
         seen: set[str] = set()
         for c in contracts:
@@ -930,6 +989,11 @@ class OrderEntryPanel(QWidget):
         for btn in self._qty_btn_group:
             _apply_chip_style(btn, int(btn.text()) == qty)
         self._refresh_action_labels()
+        # Update the dollar display in tier headers without rebuilding chips
+        if hasattr(self, "_pt_section"):
+            self._pt_section.set_qty(qty)
+        if hasattr(self, "_sl_section"):
+            self._sl_section.set_qty(qty)
 
     def _on_custom_qty(self, text: str) -> None:
         text = text.strip()
@@ -942,6 +1006,11 @@ class OrderEntryPanel(QWidget):
                 for btn in self._qty_btn_group:
                     _apply_chip_style(btn, False)
                 self._refresh_action_labels()
+                # Update the dollar display in tier headers without rebuilding chips
+                if hasattr(self, "_pt_section"):
+                    self._pt_section.set_qty(qty)
+                if hasattr(self, "_sl_section"):
+                    self._sl_section.set_qty(qty)
         except ValueError:
             pass
 
@@ -968,14 +1037,86 @@ class OrderEntryPanel(QWidget):
     ]
 
     def _load_tiers_for_active(self) -> tuple[list[dict], list[dict]]:
-        """Return (profit_take_tiers, stop_loss_tiers) for the active symbol's asset class."""
-        sec = _sec_type_for(self._active_symbol or "")
-        key = "trading_futures" if sec == "FUT" else "trading_stocks"
-        prefs = config_manager.load_preferences()
-        section = prefs.get(key, {})
-        pt = section.get("profit_take", self._TIER_FALLBACK)
-        sl = section.get("stop_loss",   self._TIER_FALLBACK)
+        """Return (profit_take_tiers, stop_loss_tiers) for the active symbol.
+
+        Lookup order
+        ------------
+        1. Exact symbol rows in strategy_tiers.db  (e.g. "NQ")
+        2. Asset-class fallback rows ("FUT" or "STK") in strategy_tiers.db
+        3. Preferences-based tiers (global per asset-class, set in Settings)
+
+        Chip labels show the raw offset only (e.g. "5").
+        The dollar amount is displayed in the section header by _TierSection.
+        """
+        sym = self._active_symbol or ""
+        from src.core.reference_data import get_instance as _rd
+        rd = _rd()
+
+        pt = rd.get_tiers_for_symbol(sym, "take_profit")
+        sl = rd.get_tiers_for_symbol(sym, "stop_loss")
+
+        # Set offset-only chip labels for DB-sourced tiers
+        if pt is not None:
+            pt = self._format_tier_labels(pt)
+        if sl is not None:
+            sl = self._format_tier_labels(sl)
+
+        # Fall back to preferences when ReferenceData has no rows
+        if pt is None or sl is None:
+            sec = _sec_type_for(sym)
+            key = "trading_futures" if sec == "FUT" else "trading_stocks"
+            prefs   = config_manager.load_preferences()
+            section = prefs.get(key, {})
+            mult    = rd.get_multiplier(sym)   # dollar-per-point for header $-display
+            if pt is None:
+                raw = section.get("profit_take", self._TIER_FALLBACK)
+                pt  = self._format_tier_labels(self._enrich_pref_tiers(raw, mult))
+            if sl is None:
+                raw = section.get("stop_loss",   self._TIER_FALLBACK)
+                sl  = self._format_tier_labels(self._enrich_pref_tiers(raw, mult))
+
         return pt, sl
+
+    @staticmethod
+    def _format_tier_labels(tiers: list[dict]) -> list[dict]:
+        """Return a copy of *tiers* with chip labels showing the offset only.
+
+        E.g. offset=5 → label="5".  Falls back to the 'value' key so that
+        preference-sourced tiers (which use 'value' instead of 'offset') are
+        also formatted as plain numbers.  The dollar display lives in the
+        section header (``_TierSection._dollar_lbl``) and is updated via
+        ``set_qty()``.
+        """
+        result = []
+        for t in tiers:
+            raw = t.get("offset") or t.get("value", 0.0)
+            try:
+                raw = float(raw)
+            except (TypeError, ValueError):
+                raw = 0.0
+            label = f"{raw:g}" if raw > 0 else t.get("label", "")
+            result.append({**t, "label": label})
+        return result
+
+    @staticmethod
+    def _enrich_pref_tiers(tiers: list[dict], multiplier: float) -> list[dict]:
+        """Add ``offset`` and ``dollar`` fields to preference-sourced tiers.
+
+        Preference tiers store the tick offset in ``value`` and have no
+        ``dollar`` field.  We normalise them so ``_format_tier_labels`` and
+        ``_TierSection._update_dollar_display`` work the same way as for
+        DB-sourced tiers.
+        """
+        result = []
+        for t in tiers:
+            raw = t.get("offset") or t.get("value", 0.0)
+            try:
+                offset = float(raw)
+            except (TypeError, ValueError):
+                offset = 0.0
+            dollar = round(offset * multiplier, 2)
+            result.append({**t, "offset": offset, "dollar": dollar})
+        return result
 
     def _reload_tier_sections(self) -> None:
         """Reload PT/SL tier chips when the active symbol or preferences change."""
@@ -984,6 +1125,9 @@ class OrderEntryPanel(QWidget):
         pt_tiers, sl_tiers = self._load_tiers_for_active()
         self._pt_section.reload_tiers(pt_tiers)
         self._sl_section.reload_tiers(sl_tiers)
+        # Sync current qty so the dollar display is correct on next chip click
+        self._pt_section.set_qty(self._active_qty)
+        self._sl_section.set_qty(self._active_qty)
 
     # ── Order signal ──────────────────────────────────────────────────────────
 
@@ -1156,6 +1300,8 @@ class OrderEntryPanel(QWidget):
 
         if added:
             config_manager.save_contracts(existing)
+            from src.core.reference_data import get_instance as _rd
+            _rd().reload_contracts()
             log.info("OrderEntry: saved %d contract(s) from TWS lookup", added)
 
         # Add the symbol chip
@@ -1285,24 +1431,22 @@ class OrderEntryPanel(QWidget):
         return params_list
 
     def _build_bg_params_for_symbol(self, sym: str) -> dict | None:
-        """Build market data params for a single symbol from saved contracts."""
-        contracts = config_manager.load_contracts()
+        """Build market data params for a single symbol from the reference cache."""
+        from src.core.reference_data import get_instance as _rd
         q = sym.upper()
-        for c in contracts:
-            if (c.get("symbol", "").upper() == q
-                    or c.get("local_symbol", "").upper() == q):
-                conid = c.get("conid")
-                if conid:
-                    return {
-                        "conid": int(conid),
-                        "symbol": sym,
-                        "sec_type": c.get("sec_type", ""),
-                        "exchange": c.get("exchange", "SMART"),
-                        "currency": c.get("currency", "USD"),
-                        "local_symbol": c.get("local_symbol", ""),
-                        "expiry": c.get("expiry", ""),
-                        "multiplier": c.get("multiplier", ""),
-                    }
+        for c in _rd().contracts_by_symbol.get(q, []):
+            conid = c.get("conid")
+            if conid:
+                return {
+                    "conid":        int(conid),
+                    "symbol":       sym,
+                    "sec_type":     c.get("sec_type", ""),
+                    "exchange":     c.get("exchange", "SMART"),
+                    "currency":     c.get("currency", "USD"),
+                    "local_symbol": c.get("local_symbol", ""),
+                    "expiry":       c.get("expiry", ""),
+                    "multiplier":   c.get("multiplier", ""),
+                }
         return None
 
     def _on_bg_price_update(self, sym: str, last: float, bid: float, ask: float) -> None:

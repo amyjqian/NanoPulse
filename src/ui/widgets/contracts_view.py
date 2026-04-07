@@ -787,6 +787,8 @@ class ContractsView(QWidget):
         contracts.sort(key=lambda c: (_SEC_ORDER.get(
             c.get("sec_type", ""), 9), c.get("symbol", "")))
         config_manager.save_contracts(contracts)
+        from src.core.reference_data import get_instance as _rd
+        _rd().reload_contracts()
         self.contracts_changed.emit()
 
     def _cell(self, row: int, col: int) -> str:

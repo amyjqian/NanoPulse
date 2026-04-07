@@ -55,6 +55,12 @@ class MainWindow(QWidget):
         self._accounts_model = AccountsTableModel(self)
         self.active_threads: dict[str, IBWorkerThread] = {}
 
+        # Pre-warm the reference data cache so contracts and strategy tiers
+        # are available when the first widgets are constructed below.
+        from src.core.reference_data import get_instance as _rd
+        _rd().reload_contracts()
+        _rd().reload_strategy_tiers()
+
         self._setup_ui()
         self._restore_geometry()
 
