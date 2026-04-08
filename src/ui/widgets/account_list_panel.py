@@ -554,6 +554,9 @@ class AccountListPanel(QWidget):
         if action == "flatten":
             if not self._confirm_flatten(selected):
                 return
+        elif action == "reverse":
+            if not self._confirm_reverse(selected):
+                return
         log.info("AccountList: action '%s' on %d account(s): %s",
                  action, len(selected), selected)
         self.action_requested.emit(action, selected)
@@ -608,6 +611,66 @@ class AccountListPanel(QWidget):
             }
             QPushButton[text="Flatten"]:hover  { background: #d97a00; }
             QPushButton[text="Flatten"]:pressed { background: #b35800; }
+            QPushButton[text="Cancel"] {
+                background: #3A3A3C;
+                color: #C9D1D9;
+            }
+            QPushButton[text="Cancel"]:hover  { background: #4a4a4e; }
+            QPushButton[text="Cancel"]:pressed { background: #2a2a2c; }
+        """)
+
+        return dlg.exec() == QMessageBox.StandardButton.Yes
+
+    def _confirm_reverse(self, accounts: list[str]) -> bool:
+        """Show a styled confirmation dialog before reversing.
+
+        Returns True if the user confirmed, False if they cancelled.
+        """
+        if not accounts:
+            return True   # nothing to reverse; let the normal empty-accounts path handle it
+
+        acct_list = "\n".join(f"  • {a}" for a in accounts)
+
+        dlg = QMessageBox(self)
+        dlg.setWindowTitle("Confirm Reverse")
+        dlg.setIcon(QMessageBox.Icon.Warning)
+        dlg.setText("<b>Reverse all positions?</b>")
+        dlg.setInformativeText(
+            f"This will cancel all open orders and flip every open position "
+            f"(long → short, short → long) for the following account(s):\n\n"
+            f"{acct_list}\n\n"
+            f"This action cannot be undone."
+        )
+        dlg.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
+        )
+        dlg.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        dlg.button(QMessageBox.StandardButton.Yes).setText("Reverse")
+
+        dlg.setStyleSheet("""
+            QMessageBox {
+                background-color: #1e2230;
+                color: #C9D1D9;
+            }
+            QMessageBox QLabel {
+                color: #C9D1D9;
+                font-size: 12px;
+            }
+            QPushButton {
+                min-width: 80px;
+                min-height: 28px;
+                border-radius: 4px;
+                font-weight: bold;
+                font-size: 11px;
+                padding: 4px 12px;
+                border: none;
+            }
+            QPushButton[text="Reverse"] {
+                background: #8E44AD;
+                color: #ffffff;
+            }
+            QPushButton[text="Reverse"]:hover  { background: #9B59B6; }
+            QPushButton[text="Reverse"]:pressed { background: #7D3C98; }
             QPushButton[text="Cancel"] {
                 background: #3A3A3C;
                 color: #C9D1D9;
