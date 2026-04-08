@@ -138,18 +138,18 @@ def save_aliases(
 
 def load_contracts(path: Path | str | None = None) -> list[dict[str, Any]]:
     """
-    Load the saved-contracts list from config JSON.
+    Load the saved-contracts list from SQLite (``data/contracts.db``).
+
+    The *path* argument is accepted for backward-compatibility but ignored;
+    contracts are always read from the SQLite database.  On first run the
+    database is auto-created and any contracts stored in ``app_config.json``
+    are migrated automatically.
 
     Each dict: ``{conid, symbol, sec_type, exchange, currency, expiry,
     strike, right, local_symbol, multiplier}``.
-    Returns an empty list if missing or malformed.
     """
-    p = Path(path) if path else _default_path()
-    data = _read_json(p)
-    contracts = list(data.get("contracts", []))
-    if contracts:
-        log.info("Loaded %d contract(s) from %s", len(contracts), p)
-    return contracts
+    from src.core.contracts_db import load_contracts as _load
+    return _load()
 
 
 def save_contracts(
@@ -157,14 +157,12 @@ def save_contracts(
     path: Path | str | None = None,
 ) -> None:
     """
-    Persist *contracts* into the config JSON.
-    Merges with existing data so connections/aliases are preserved.
+    Persist *contracts* to SQLite (``data/contracts.db``).
+
+    The *path* argument is accepted for backward-compatibility but ignored.
     """
-    p = Path(path) if path else _default_path()
-    data = _read_json(p)
-    data["contracts"] = contracts
-    _write_json(p, data)
-    log.debug("Saved %d contract(s) to %s", len(contracts), p)
+    from src.core.contracts_db import save_contracts as _save
+    _save(contracts)
 
 
 # ── Layout persistence ────────────────────────────────────────────────────────
@@ -291,12 +289,19 @@ def save_preferences(
 
 
 def _read_json(p: Path) -> dict[str, Any]:
-    """Read existing JSON or return empty dict."""
+    """Read existing JSON or return empty dict.
+
+    The ``"contracts"`` key is stripped on read: contracts are now stored
+    exclusively in SQLite (``data/contracts.db``) and must never be written
+    back to the JSON file by any of the save helpers below.
+    """
     if not p.exists():
         return {}
     try:
         with open(p, "r", encoding="utf-8") as fh:
-            return json.load(fh)
+            data = json.load(fh)
+        data.pop("contracts", None)   # owned by contracts_db – not JSON
+        return data
     except Exception:
         return {}
 

@@ -185,9 +185,10 @@ _COL_STRIKE = 6
 _COL_RIGHT = 7
 _COL_LOCAL = 8
 _COL_MULTIPLIER = 9
+_COL_TICK = 10
 _SAVED_COLS = [
     "ConID", "Symbol", "SecType", "Exchange", "Currency",
-    "Expiry", "Strike", "Right", "LocalSymbol", "Multiplier",
+    "Expiry", "Strike", "Right", "LocalSymbol", "Multiplier", "Tick",
 ]
 
 
@@ -200,6 +201,28 @@ _FUT_EXCHANGE: dict[str, str] = {
     "CL": "NYMEX", "MCL": "NYMEX",
     "GC": "COMEX", "MGC": "COMEX",
 }
+
+# ── Futures symbol → minimum tick size ────────────────────────────────────────
+_FUT_TICK: dict[str, float] = {
+    "MNQ": 0.25, "NQ":  0.25,
+    "MES": 0.25, "ES":  0.25,
+    "M2K": 0.1,  "RTY": 0.1,
+    "MYM": 1.0,  "YM":  1.0,
+    "MGC": 0.1,  "GC":  0.1,
+    "MCL": 0.01, "CL":  0.01,
+}
+
+
+def _tick_for(symbol: str, sec_type: str) -> float:
+    """Return the minimum tick size for *symbol* / *sec_type*.
+
+    * STK / OPT → 0.01
+    * FUT       → looked up in ``_FUT_TICK``; defaults to 0.25 for unknowns
+    """
+    if sec_type in ("STK", "OPT"):
+        return 0.01
+    return _FUT_TICK.get(symbol.strip().upper(), 0.25)
+
 
 
 # ── Main view ─────────────────────────────────────────────────────────────────
@@ -495,7 +518,7 @@ class ContractsView(QWidget):
             QHeaderView.ResizeMode.Interactive)
         table.setStyleSheet(_TABLE_STYLE)
 
-        for col, w in enumerate([100, 100, 80, 100, 80, 100, 80, 60, 160, 80]):
+        for col, w in enumerate([100, 100, 80, 100, 80, 100, 80, 60, 160, 80, 60]):
             table.setColumnWidth(col, w)
 
         return table
@@ -719,10 +742,21 @@ class ContractsView(QWidget):
         row = self._saved_table.rowCount()
         self._saved_table.insertRow(row)
 
+        # Compute tick size: use saved value if present, otherwise derive it
+        sec_type = c.get("sec_type", "")
+        symbol   = c.get("symbol", "")
+        raw_tick = c.get("tick_size", "") or c.get("min_tick", "")
+        try:
+            tick_val = float(raw_tick) if raw_tick else _tick_for(symbol, sec_type)
+        except (ValueError, TypeError):
+            tick_val = _tick_for(symbol, sec_type)
+        # Format without trailing zeros (e.g. 0.25 not 0.250000)
+        tick_str = f"{tick_val:g}"
+
         values = [
             str(c.get("conid", "")),
-            c.get("symbol", ""),
-            c.get("sec_type", ""),
+            symbol,
+            sec_type,
             c.get("exchange", ""),
             c.get("currency", ""),
             c.get("expiry", ""),
@@ -730,6 +764,7 @@ class ContractsView(QWidget):
             c.get("right", ""),
             c.get("local_symbol", ""),
             c.get("multiplier", ""),
+            tick_str,
         ]
         for col, val in enumerate(values):
             item = QTableWidgetItem(val)
@@ -740,6 +775,10 @@ class ContractsView(QWidget):
                     item.setForeground(QColor(GREEN))
                 elif val == "OPT":
                     item.setForeground(QColor(ORANGE))
+            if col == _COL_TICK:
+                item.setForeground(QColor(TEXT_DIM))
+                item.setTextAlignment(
+                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             self._saved_table.setItem(row, col, item)
 
     def _on_remove_selected(self) -> None:
@@ -771,22 +810,25 @@ class ContractsView(QWidget):
         contracts: list[dict[str, Any]] = []
         for row in range(self._saved_table.rowCount()):
             contracts.append({
-                "conid": self._cell(row, _COL_CONID),
-                "symbol": self._cell(row, _COL_SYMBOL),
-                "sec_type": self._cell(row, _COL_SECTYPE),
-                "exchange": self._cell(row, _COL_EXCHANGE),
-                "currency": self._cell(row, _COL_CURRENCY),
-                "expiry": self._cell(row, _COL_EXPIRY),
-                "strike": self._cell(row, _COL_STRIKE),
-                "right": self._cell(row, _COL_RIGHT),
+                "conid":        self._cell(row, _COL_CONID),
+                "symbol":       self._cell(row, _COL_SYMBOL),
+                "sec_type":     self._cell(row, _COL_SECTYPE),
+                "exchange":     self._cell(row, _COL_EXCHANGE),
+                "currency":     self._cell(row, _COL_CURRENCY),
+                "expiry":       self._cell(row, _COL_EXPIRY),
+                "strike":       self._cell(row, _COL_STRIKE),
+                "right":        self._cell(row, _COL_RIGHT),
                 "local_symbol": self._cell(row, _COL_LOCAL),
-                "multiplier": self._cell(row, _COL_MULTIPLIER),
+                "multiplier":   self._cell(row, _COL_MULTIPLIER),
+                "tick_size":    self._cell(row, _COL_TICK),
             })
         # Sort by SecType then Symbol for consistent display order
         _SEC_ORDER = {"STK": 0, "FUT": 1, "OPT": 2}
         contracts.sort(key=lambda c: (_SEC_ORDER.get(
             c.get("sec_type", ""), 9), c.get("symbol", "")))
         config_manager.save_contracts(contracts)
+        from src.core.reference_data import get_instance as _rd
+        _rd().reload_contracts()
         self.contracts_changed.emit()
 
     def _cell(self, row: int, col: int) -> str:

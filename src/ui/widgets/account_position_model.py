@@ -409,6 +409,11 @@ class AccountPositionModel(QAbstractTableModel):
         return [k for k, v in self._positions.items()
                 if v.get("position", 0) != 0]
 
+    def get_symbol_for_position(self, account: str, con_id: int) -> str:
+        """Return the best display symbol (localSymbol preferred) for a position."""
+        pos = self._positions.get((account, con_id), {})
+        return pos.get("local_symbol") or pos.get("symbol", "")
+
     # ── Rebuild ───────────────────────────────────────────────────────────────
 
     def rebuild(self) -> None:

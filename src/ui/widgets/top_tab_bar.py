@@ -36,11 +36,12 @@ _FONT_NORMAL.setWeight(QFont.Weight.Normal)
 
 # Unicode icons (lightweight, no image files needed)
 _ICONS: dict[str, str] = {
-    "Connect":    "⚡",
-    "Contracts":  "🔍",
-    "FlashTrade": "⚡",
-    "Executions": "📊",
-    "Settings":   "⚙",
+    "Connect":        "⚡",
+    "Contracts":      "🔍",
+    "FlashTrade":     "⚡",
+    "StrategyEditor": "📐",
+    "Executions":     "📊",
+    "Settings":       "⚙",
 }
 
 
@@ -120,7 +121,7 @@ class TopTabBar(QWidget):
     # Emits tab name for ALL tabs (including Settings)
     tabBarClicked = Signal(str)
 
-    _TABS = ["Connect", "Contracts", "FlashTrade", "Executions", "Settings"]
+    _TABS = ["Connect", "Contracts", "FlashTrade", "StrategyEditor", "Executions", "Settings"]
 
     def __init__(self, parent=None):
         super().__init__(parent)

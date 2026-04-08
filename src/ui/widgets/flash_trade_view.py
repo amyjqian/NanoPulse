@@ -173,6 +173,20 @@ class FlashTradeView(QWidget):
         self._account_position.refresh_requested.connect(
             self._on_position_refresh_requested)
 
+        # ── Wire position panel action buttons ───────────────────────────────
+        # Header-row Flatten: flatten every open position for that account
+        self._account_position.flatten_requested.connect(
+            self._on_position_account_flatten)
+        # Position-row buttons: Flatten (100%) · 25% · 50% · 75%
+        self._account_position.position_close_requested.connect(
+            self._on_position_close_requested)
+
+        # ── Wire account-list action buttons ─────────────────────────────────
+        # 25% · 50% · 75% · Flatten · Reverse · Cancel
+        if isinstance(self._account_list, AccountListPanel):
+            self._account_list.action_requested.connect(
+                self._on_account_list_action)
+
     # ── Order placement ───────────────────────────────────────────────────────
 
     def _wire_all_workers(self) -> None:
@@ -808,6 +822,180 @@ class FlashTradeView(QWidget):
                 worker.request_portfolio_refresh()
                 log.info(
                     "FlashTrade: portfolio snapshot + refresh for worker %s", label)
+
+    def _on_position_account_flatten(self, account: str) -> None:
+        """Header-row Flatten clicked → cancel ALL open orders for *account*,
+        then close every open position.
+
+        Step 1 — ``cancel_all_for_account``: sweeps every open order for the
+        account regardless of symbol, including resting limit orders that have
+        no matching position yet (which per-symbol flatten would miss).
+
+        Step 2 — ``worker.flatten(symbol, account)`` per position: reads the
+        live position size and emits ``flatten_close_needed`` so the offsetting
+        order routes through the normal limit-cap / RTH / prefs path.
+        Note: ``_do_flatten`` also runs a per-symbol cancel internally, but
+        since Step 1 already cancelled everything, the redundant cancel is a
+        no-op and does no harm.
+        """
+        worker = self._find_worker_for_account(account)
+        if not worker:
+            log.warning(
+                "FlashTrade: account flatten — no connected worker for %s", account)
+            return
+
+        # Collect every non-zero position for this account
+        pos_keys = [
+            (acct, con_id)
+            for acct, con_id in self._account_position.get_position_keys()
+            if acct == account
+        ]
+        if not pos_keys:
+            log.warning(
+                "FlashTrade: account flatten %s — no open positions found", account)
+            return
+
+        self._ensure_worker_connected(worker)
+
+        # ── Step 1: cancel ALL open orders for this account (no symbol filter)
+        worker.cancel_all_for_account(account)
+        log.info("FlashTrade: cancel_all_for_account sent for %s", account)
+
+        # ── Step 2: close each non-zero position via the normal flatten path
+        for _, con_id in pos_keys:
+            symbol = self._account_position.get_symbol_for_position(account, con_id)
+            if symbol:
+                worker.flatten(symbol, account)
+                log.info(
+                    "FlashTrade: position flatten %s for account %s", symbol, account)
+
+        log.info(
+            "FlashTrade: account flatten complete — %d position(s) in %s",
+            len(pos_keys), account)
+
+    def _on_position_close_requested(self, account: str,
+                                     con_id: int, pct: int) -> None:
+        """Position-row button clicked.
+
+        ``pct == 100``  → Flatten: cancel open orders then close full position.
+        ``pct < 100``   → Partial close: close *pct*% of the position without
+                          cancelling any open orders.
+
+        Both paths route through the normal limit-cap / RTH / prefs pipeline
+        via ``flatten_close_needed``.
+        """
+        symbol = self._account_position.get_symbol_for_position(account, con_id)
+        if not symbol:
+            log.warning(
+                "FlashTrade: position_close — no symbol for account=%s conId=%d",
+                account, con_id)
+            return
+
+        worker = self._find_worker_for_account(account)
+        if not worker:
+            log.warning(
+                "FlashTrade: position_close — no connected worker for account %s",
+                account)
+            return
+
+        self._ensure_worker_connected(worker)
+        if pct >= 100:
+            worker.flatten(symbol, account)
+            log.info(
+                "FlashTrade: position flatten %s for account %s (conId=%d)",
+                symbol, account, con_id)
+        else:
+            worker.close_pct(symbol, account, pct)
+            log.info(
+                "FlashTrade: position close %d%% %s for account %s (conId=%d)",
+                pct, symbol, account, con_id)
+
+    # ── Account-list action buttons (25% / 50% / 75% / Flatten / Reverse / Cancel) ──
+
+    def _on_account_list_action(self, action: str, accounts: list[str]) -> None:
+        """Dispatch the 6 account-panel buttons across all *accounts*.
+
+        Action strings (from AccountListPanel._emit_action):
+            "close_25"  → close 25 % of every position for each account
+            "close_50"  → close 50 %
+            "close_75"  → close 75 %
+            "flatten"   → cancel all orders + close 100 % of every position
+            "reverse"   → cancel all orders + flip every position
+            "cancel_all"→ cancel all open orders (no position change)
+
+        Symbol resolution uses the live position model so we always act on
+        exactly what is currently held, not a stale chip-bar symbol.
+        """
+        if not accounts:
+            log.warning("FlashTrade: account_list action '%s' — no accounts selected",
+                        action)
+            return
+
+        pct_map = {"close_25": 25, "close_50": 50, "close_75": 75}
+
+        for account in accounts:
+            worker = self._find_worker_for_account(account)
+            if not worker:
+                log.warning(
+                    "FlashTrade: account_list '%s' — no connected worker for %s",
+                    action, account)
+                continue
+
+            self._ensure_worker_connected(worker)
+
+            # ── Cancel all open orders (all actions that touch positions do
+            #    this first; cancel_all does ONLY this) ─────────────────────
+            if action in ("flatten", "reverse", "cancel_all"):
+                worker.cancel_all_for_account(account)
+                log.info("FlashTrade: cancel_all_for_account '%s' (%s)",
+                         account, action)
+
+            if action == "cancel_all":
+                continue   # done — no position change needed
+
+            # ── Resolve every open position for this account ───────────────
+            pos_keys = [
+                (acct, con_id)
+                for acct, con_id in self._account_position.get_position_keys()
+                if acct == account
+            ]
+            if not pos_keys:
+                log.warning(
+                    "FlashTrade: account_list '%s' for %s — no open positions",
+                    action, account)
+                continue
+
+            for _, con_id in pos_keys:
+                symbol = self._account_position.get_symbol_for_position(
+                    account, con_id)
+                if not symbol:
+                    log.warning(
+                        "FlashTrade: account_list '%s' — no symbol for "
+                        "account=%s conId=%d", action, account, con_id)
+                    continue
+
+                if action == "flatten":
+                    # _do_flatten cancels per-symbol again (no-op since we
+                    # already ran cancel_all_for_account) then closes position.
+                    worker.flatten(symbol, account)
+                    log.info("FlashTrade: account_list flatten %s / %s",
+                             symbol, account)
+
+                elif action == "reverse":
+                    # _do_reverse cancels per-symbol (no-op) then sends 2×
+                    # offsetting order to flip through zero.
+                    worker.reverse(symbol, account)
+                    log.info("FlashTrade: account_list reverse %s / %s",
+                             symbol, account)
+
+                elif action in pct_map:
+                    pct = pct_map[action]
+                    worker.close_pct(symbol, account, pct)
+                    log.info("FlashTrade: account_list close_%d%% %s / %s",
+                             pct, symbol, account)
+
+        log.info("FlashTrade: account_list action '%s' dispatched for %d account(s): %s",
+                 action, len(accounts), accounts)
 
     # ── Layout persistence ────────────────────────────────────────────────────
 

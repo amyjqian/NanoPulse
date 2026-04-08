@@ -232,9 +232,9 @@ class AccountHeaderInfoDelegate(QStyledItemDelegate):
 # (label, bg_normal, bg_hover, bg_pressed, pct)   pct=100 → full flatten
 _POS_BTNS = [
     ("Flatten", "#cc6600", "#d97a00", "#b35800", 100),
-    ("25%",     "#5A5A62", "#6E6E76", "#4A4A52",  25),
-    ("50%",     "#5A5A62", "#6E6E76", "#4A4A52",  50),
-    ("75%",     "#5A5A62", "#6E6E76", "#4A4A52",  75),
+    ("25%",     "#8E8E93", "#9E9EA3", "#7E7E83",  25),
+    ("50%",     "#8E8E93", "#9E9EA3", "#7E7E83",  50),
+    ("75%",     "#8E8E93", "#9E9EA3", "#7E7E83",  75),
 ]
 _POS_BTN_H_PAD  = 7
 _POS_BTN_V_PAD  = 2
@@ -478,6 +478,8 @@ class AccountPositionPanel(QWidget):
         self._model = AccountPositionModel(
             get_alias=self._get_alias, parent=self)
         self._setup_ui()
+        # Sync model with persisted toggle state (model defaults to True)
+        self._model.set_show_zero(self._zero_pos_toggle.isChecked())
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -528,7 +530,9 @@ class AccountPositionPanel(QWidget):
         hdr.addWidget(zero_lbl)
         hdr.addSpacing(4)
 
-        self._zero_pos_toggle = _ToggleSwitch(checked=True)
+        _saved_zero = QSettings("NanoPulse", "Dashboard").value(
+            "AccountPositionPanel/showZeroPos", True, type=bool)
+        self._zero_pos_toggle = _ToggleSwitch(checked=_saved_zero)
         self._zero_pos_toggle.toggled.connect(self._on_zero_pos_toggled)
         hdr.addWidget(self._zero_pos_toggle)
 
@@ -663,6 +667,10 @@ class AccountPositionPanel(QWidget):
     def get_position_keys(self) -> list[tuple[str, int]]:
         return self._model.get_position_keys()
 
+    def get_symbol_for_position(self, account: str, con_id: int) -> str:
+        """Return localSymbol (or root symbol) for the given (account, conId)."""
+        return self._model.get_symbol_for_position(account, con_id)
+
     # ── Slots ─────────────────────────────────────────────────────────────────
 
     def _on_refresh_clicked(self) -> None:
@@ -672,6 +680,8 @@ class AccountPositionPanel(QWidget):
 
     def _on_zero_pos_toggled(self, checked: bool) -> None:
         self._model.set_show_zero(checked)
+        QSettings("NanoPulse", "Dashboard").setValue(
+            "AccountPositionPanel/showZeroPos", checked)
 
     def _on_flatten_clicked(self, account: str) -> None:
         log.info("Portfolio: flatten requested for %s", account)
