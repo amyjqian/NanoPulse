@@ -663,6 +663,10 @@ class AccountPositionPanel(QWidget):
     def get_position_keys(self) -> list[tuple[str, int]]:
         return self._model.get_position_keys()
 
+    def get_symbol_for_position(self, account: str, con_id: int) -> str:
+        """Return localSymbol (or root symbol) for the given (account, conId)."""
+        return self._model.get_symbol_for_position(account, con_id)
+
     # ── Slots ─────────────────────────────────────────────────────────────────
 
     def _on_refresh_clicked(self) -> None:

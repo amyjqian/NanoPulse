@@ -406,24 +406,16 @@ class IBWorkerThread(QThread):
         else:
             log.warning("Worker %s: flatten but loop not ready", self._label)
 
-    def reverse(self, symbol: str, account: str) -> None:
-        """Thread-safe: cancel all open orders for *symbol*/*account*, then
-        flip the position (long→short or short→long) with a 2× MKT order."""
+    def cancel_all_for_account(self, account: str) -> None:
+        """Thread-safe: cancel *every* open order for *account* regardless of
+        symbol.  Used by the account-level Flatten so that resting orders with
+        no matching position yet are also swept up."""
         if self._loop is not None and not self._loop.is_closed():
             asyncio.run_coroutine_threadsafe(
-                self._do_reverse(symbol, account), self._loop)
+                self._do_cancel_all_for_account(account), self._loop)
         else:
-            log.warning("Worker %s: reverse but loop not ready", self._label)
-
-    def close_pct(self, symbol: str, account: str, pct: int) -> None:
-        """Thread-safe: close *pct* percent (25/50/75) of the position for
-        *symbol*/*account* with an offsetting MKT order.  No open orders are
-        cancelled — only the position is partially closed."""
-        if self._loop is not None and not self._loop.is_closed():
-            asyncio.run_coroutine_threadsafe(
-                self._do_close_pct(symbol, account, pct), self._loop)
-        else:
-            log.warning("Worker %s: close_pct but loop not ready", self._label)
+            log.warning("Worker %s: cancel_all_for_account but loop not ready",
+                        self._label)
 
     # ── Background market data (multi-symbol cache) ───────────────────────────
 
@@ -1177,6 +1169,51 @@ class IBWorkerThread(QThread):
         order_log.info("[%s] ORDER-CANCEL-ALL  symbol=%s accounts=%s → %d order(s) cancelled",
                        self._label, symbol,
                        sorted(accounts) if accounts else "all", cancelled)
+
+    async def _do_cancel_all_for_account(self, account: str) -> None:
+        """Cancel every open order for *account* regardless of symbol."""
+        if self._ib is None or not self._ib.isConnected():
+            return
+        cancelled = 0
+
+        # Build the authoritative open-order set once from ib_async's own
+        # tracking.  Same race window as trade.orderStatus.status (both are
+        # local caches), but openTrades() is ib_async's primary source of truth
+        # and is updated immediately when a terminal status event is processed.
+        open_ids: set = {getattr(t.order, "orderId", None)
+                         for t in self._ib.openTrades()}
+
+        for oid, trade in list(self._trades.items()):
+            # ── Account filter ────────────────────────────────────────────
+            trade_acct = getattr(trade.order, "account", "") or ""
+            if trade_acct != account:
+                continue
+            # ── Status guard tier 1: ib_async openTrades() ───────────────
+            ib_id = getattr(trade.order, "orderId", None)
+            if ib_id is not None and ib_id not in open_ids:
+                continue
+            # ── Status guard tier 2: cached orderStatus ───────────────────
+            status = (getattr(trade.orderStatus, "status", "")
+                      if getattr(trade, "orderStatus", None) else "")
+            if status in ("Filled", "Cancelled", "Canceled",
+                          "Inactive", "ApiCancelled", "Completed"):
+                continue
+            try:
+                self._ib.cancelOrder(trade.order)
+                cancelled += 1
+                tws_log.info("[%s] API-CALL  cancelOrder(orderId=%s) [cancel_all_for_account '%s']",
+                             self._label, trade.order.orderId, account)
+                order_log.info("[%s] ORDER-CANCEL  %s (cancel-all for account %s) | orderId=%s",
+                               self._label, oid, account, trade.order.orderId)
+            except Exception as exc:
+                log.warning("Worker %s: cancel_all_for_account failed for %s: %s",
+                            self._label, oid, exc)
+                order_log.error("[%s] ORDER-CANCEL  ERROR for %s (cancel-all account %s): %s",
+                                self._label, oid, account, exc)
+        log.info("Worker %s: cancel_all_for_account '%s' → cancelled %d order(s)",
+                 self._label, account, cancelled)
+        order_log.info("[%s] ORDER-CANCEL-ALL  account=%s → %d order(s) cancelled",
+                       self._label, account, cancelled)
 
     async def _do_flatten(self, symbol: str, account: str) -> None:
         """Cancel all open orders for *symbol*/*account*, then signal the UI

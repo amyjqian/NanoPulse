@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -365,18 +366,20 @@ class AccountListPanel(QWidget):
         ag.setContentsMargins(0, 4, 0, 0)
 
         for col, (txt, clr, act) in enumerate([
+            ("25%",     CLR_CLOSE,   "close_25"),
+            ("50%",     CLR_CLOSE,   "close_50"),
             ("Flatten", CLR_FLATTEN, "flatten"),
-            ("Cancel",  CLR_CANCEL,  "cancel_all"),
-            ("Reverse", CLR_REVERSE, "reverse"),
         ]):
             b = _make_btn(txt, clr)
             b.clicked.connect(lambda _, a=act: self._emit_action(a))
             ag.addWidget(b, 0, col)
 
-        for col, (txt, act) in enumerate([
-            ("25%", "close_25"), ("50%", "close_50"), ("75%", "close_75"),
+        for col, (txt, clr, act) in enumerate([
+            ("Reverse", CLR_REVERSE, "reverse"),
+            ("75%",     CLR_CLOSE,   "close_75"),
+            ("Cancel",  CLR_CANCEL,  "cancel_all"),
         ]):
-            b = _make_btn(txt, CLR_CLOSE)
+            b = _make_btn(txt, clr)
             b.clicked.connect(lambda _, a=act: self._emit_action(a))
             ag.addWidget(b, 1, col)
 
@@ -548,9 +551,72 @@ class AccountListPanel(QWidget):
 
     def _emit_action(self, action: str) -> None:
         selected = [a for a, r in self._account_rows.items() if r.is_checked]
+        if action == "flatten":
+            if not self._confirm_flatten(selected):
+                return
         log.info("AccountList: action '%s' on %d account(s): %s",
                  action, len(selected), selected)
         self.action_requested.emit(action, selected)
+
+    def _confirm_flatten(self, accounts: list[str]) -> bool:
+        """Show a styled confirmation dialog before flattening.
+
+        Returns True if the user confirmed, False if they cancelled.
+        """
+        if not accounts:
+            return True   # nothing to flatten; let the normal empty-accounts path handle it
+
+        acct_list = "\n".join(f"  • {a}" for a in accounts)
+
+        dlg = QMessageBox(self)
+        dlg.setWindowTitle("Confirm Flatten")
+        dlg.setIcon(QMessageBox.Icon.Warning)
+        dlg.setText("<b>Flatten all positions?</b>")
+        dlg.setInformativeText(
+            f"This will cancel all open orders and close every open position "
+            f"for the following account(s):\n\n{acct_list}\n\n"
+            f"This action cannot be undone."
+        )
+        dlg.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
+        )
+        dlg.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        dlg.button(QMessageBox.StandardButton.Yes).setText("Flatten")
+
+        # Dark theme styling to match the rest of the app
+        dlg.setStyleSheet("""
+            QMessageBox {
+                background-color: #1e2230;
+                color: #C9D1D9;
+            }
+            QMessageBox QLabel {
+                color: #C9D1D9;
+                font-size: 12px;
+            }
+            QPushButton {
+                min-width: 80px;
+                min-height: 28px;
+                border-radius: 4px;
+                font-weight: bold;
+                font-size: 11px;
+                padding: 4px 12px;
+                border: none;
+            }
+            QPushButton[text="Flatten"] {
+                background: #cc6600;
+                color: #ffffff;
+            }
+            QPushButton[text="Flatten"]:hover  { background: #d97a00; }
+            QPushButton[text="Flatten"]:pressed { background: #b35800; }
+            QPushButton[text="Cancel"] {
+                background: #3A3A3C;
+                color: #C9D1D9;
+            }
+            QPushButton[text="Cancel"]:hover  { background: #4a4a4e; }
+            QPushButton[text="Cancel"]:pressed { background: #2a2a2c; }
+        """)
+
+        return dlg.exec() == QMessageBox.StandardButton.Yes
 
     # ── Persistence helpers ───────────────────────────────────────────────────
 
