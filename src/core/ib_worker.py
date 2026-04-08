@@ -1425,7 +1425,12 @@ class IBWorkerThread(QThread):
         d = {
             "order_id": order_id,
             "order_ref": order_ref,
-            "symbol": params.get("symbol", ""),
+            # Prefer localSymbol ("NQM6") over bare root symbol ("NQ") so the
+            # order blotter is consistent with the positions screen and with
+            # orders that arrive via _build_trade_dict (snapshot / reconnect).
+            # Falls back to bare symbol for instruments that have no localSymbol
+            # (most stocks), then to "" if params are empty.
+            "symbol": (params.get("local_symbol") or params.get("symbol", "")),
             "account": params.get("account", ""),
             "action": params.get("action", ""),
             "order_type": params.get("order_type", "MKT"),

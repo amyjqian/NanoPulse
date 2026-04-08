@@ -232,9 +232,9 @@ class AccountHeaderInfoDelegate(QStyledItemDelegate):
 # (label, bg_normal, bg_hover, bg_pressed, pct)   pct=100 → full flatten
 _POS_BTNS = [
     ("Flatten", "#cc6600", "#d97a00", "#b35800", 100),
-    ("25%",     "#5A5A62", "#6E6E76", "#4A4A52",  25),
-    ("50%",     "#5A5A62", "#6E6E76", "#4A4A52",  50),
-    ("75%",     "#5A5A62", "#6E6E76", "#4A4A52",  75),
+    ("25%",     "#8E8E93", "#9E9EA3", "#7E7E83",  25),
+    ("50%",     "#8E8E93", "#9E9EA3", "#7E7E83",  50),
+    ("75%",     "#8E8E93", "#9E9EA3", "#7E7E83",  75),
 ]
 _POS_BTN_H_PAD  = 7
 _POS_BTN_V_PAD  = 2
