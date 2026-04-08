@@ -478,6 +478,8 @@ class AccountPositionPanel(QWidget):
         self._model = AccountPositionModel(
             get_alias=self._get_alias, parent=self)
         self._setup_ui()
+        # Sync model with persisted toggle state (model defaults to True)
+        self._model.set_show_zero(self._zero_pos_toggle.isChecked())
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -528,7 +530,9 @@ class AccountPositionPanel(QWidget):
         hdr.addWidget(zero_lbl)
         hdr.addSpacing(4)
 
-        self._zero_pos_toggle = _ToggleSwitch(checked=True)
+        _saved_zero = QSettings("NanoPulse", "Dashboard").value(
+            "AccountPositionPanel/showZeroPos", True, type=bool)
+        self._zero_pos_toggle = _ToggleSwitch(checked=_saved_zero)
         self._zero_pos_toggle.toggled.connect(self._on_zero_pos_toggled)
         hdr.addWidget(self._zero_pos_toggle)
 
@@ -676,6 +680,8 @@ class AccountPositionPanel(QWidget):
 
     def _on_zero_pos_toggled(self, checked: bool) -> None:
         self._model.set_show_zero(checked)
+        QSettings("NanoPulse", "Dashboard").setValue(
+            "AccountPositionPanel/showZeroPos", checked)
 
     def _on_flatten_clicked(self, account: str) -> None:
         log.info("Portfolio: flatten requested for %s", account)

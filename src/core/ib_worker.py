@@ -406,6 +406,25 @@ class IBWorkerThread(QThread):
         else:
             log.warning("Worker %s: flatten but loop not ready", self._label)
 
+    def reverse(self, symbol: str, account: str) -> None:
+        """Thread-safe: cancel all open orders for *symbol*/*account*, then
+        flip the position (long→short or short→long) with a 2× MKT order."""
+        if self._loop is not None and not self._loop.is_closed():
+            asyncio.run_coroutine_threadsafe(
+                self._do_reverse(symbol, account), self._loop)
+        else:
+            log.warning("Worker %s: reverse but loop not ready", self._label)
+
+    def close_pct(self, symbol: str, account: str, pct: int) -> None:
+        """Thread-safe: close *pct* percent (25/50/75) of the position for
+        *symbol*/*account* with an offsetting MKT order.  No open orders are
+        cancelled — only the position is partially closed."""
+        if self._loop is not None and not self._loop.is_closed():
+            asyncio.run_coroutine_threadsafe(
+                self._do_close_pct(symbol, account, pct), self._loop)
+        else:
+            log.warning("Worker %s: close_pct but loop not ready", self._label)
+
     def cancel_all_for_account(self, account: str) -> None:
         """Thread-safe: cancel *every* open order for *account* regardless of
         symbol.  Used by the account-level Flatten so that resting orders with
@@ -969,9 +988,12 @@ class IBWorkerThread(QThread):
             status = trade.orderStatus.status if trade.orderStatus.status else "Submitted"
             self._emit_order_status(trade, order_id, params, status)
 
-            order_log.info("[%s] ORDER-STATUS  %s | status=%s symbol=%s account=%s",
+            order_log.info("[%s] ORDER-STATUS  %s | status=%s filled=%s "
+                           "avgFill=%s symbol=%s account=%s orderRef=%s",
                            self._label, order_id, status,
-                           params.get("symbol", "?"), account)
+                           trade.orderStatus.filled, trade.orderStatus.avgFillPrice,
+                           params.get("symbol", "?"), account,
+                           getattr(trade.order, "orderRef", ""))
 
             # ── Bind trade.statusEvent for live updates ───────────────────
             # The key never changes (orderRef-based), so the closure is
