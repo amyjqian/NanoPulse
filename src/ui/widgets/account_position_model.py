@@ -140,10 +140,14 @@ class AccountPositionModel(QAbstractTableModel):
         self._show_zero: bool = True   # default ON – show zero-qty rows
 
     def set_show_zero(self, show: bool) -> None:
-        """Show or hide rows where position qty == 0, then rebuild."""
-        if self._show_zero != show:
-            self._show_zero = show
-            self.rebuild()
+        """Show or hide rows where position qty == 0, then rebuild.
+
+        Always rebuilds unconditionally so that zero-qty rows which arrived
+        while the toggle was in its current state (e.g. after a data refresh)
+        are immediately reflected without requiring a state transition.
+        """
+        self._show_zero = show
+        self.rebuild()
 
     # ── Qt table interface ────────────────────────────────────────────────────
 
@@ -323,16 +327,26 @@ class AccountPositionModel(QAbstractTableModel):
             old = self._positions.get(key)
             pos = dict(pos)
             self._compute_display_avg(pos)
+            new_qty = pos.get("position", 0)
+            old_qty = old.get("position", 0) if old is not None else None
             self._positions[key] = pos
 
-            if key in self._row_map and old is not None:
-                # Re-sort whenever market_value changes — it drives the sort order
-                if pos.get("market_value", 0) != old.get("market_value", 0):
+            in_view        = key in self._row_map
+            should_be_visible = self._show_zero or new_qty != 0
+
+            if in_view:
+                if new_qty != old_qty:
+                    # Qty changed → row may need to appear/disappear or reorder
                     needs_rebuild = True
                 else:
+                    # Same qty — fast path: refresh only the affected cells
                     self._update_row_in_place(key, pos)
-            else:
-                needs_rebuild = True  # new key – always add to view
+            elif should_be_visible:
+                # Row ought to be in the view but isn't (new position or
+                # show_zero just turned on) → rebuild to add it
+                needs_rebuild = True
+            # else: qty==0 and show_zero=False → row is intentionally hidden;
+            # no rebuild needed, just keep _positions updated.
 
         if needs_rebuild:
             self.rebuild()
