@@ -325,12 +325,15 @@ class IBWorkerThread(QThread):
         """Request all positions across all accounts simultaneously.
 
         Uses reqPositionsAsync() which covers every managed account in a
-        single call.  After the call completes, compares the authoritative
-        IB position list against our local cache and emits zero-qty updates
-        for any position that has gone flat.  This is necessary because IB
-        only returns non-zero positions from reqPositions — a completely
-        closed position will never appear in the response, so without this
-        explicit zero-out the UI model would show the stale old qty forever.
+        single call.  After the call completes, builds a definitive batch
+        directly from ``ib.positions()`` and emits it immediately via
+        ``portfolio_updated``.  This bypasses the
+        ``positionEvent → buffer → throttler`` path which can be unreliable
+        for multi-account connections where TWS may not stream individual
+        position changes after the initial snapshot.
+
+        Also emits zero-qty updates for any cached position that has gone
+        flat (IB only returns non-zero positions from reqPositions).
         """
         if self._ib is None or not self._ib.isConnected():
             return
@@ -338,18 +341,47 @@ class IBWorkerThread(QThread):
         tws_log.info("[%s] API-CALL  reqPositionsAsync() [refresh, all accounts]",
                      self._label)
 
-        # Build the definitive set of (account, conId) keys that IB considers
-        # open (non-zero) right now.
+        # ── Build a definitive batch from the authoritative IB positions ──
+        # Reading directly from ib.positions() guarantees we pick up every
+        # qty change, regardless of whether positionEvent fired individually.
+        batch: list[dict] = []
+        current_keys: set[tuple[str, int]] = set()
         try:
-            current_keys: set[tuple[str, int]] = {
-                (pos.account, pos.contract.conId)
-                for pos in self._ib.positions()
-                if pos.contract and pos.contract.conId
-            }
+            for pos in self._ib.positions():
+                contract = pos.contract
+                acct = pos.account
+                con_id = getattr(contract, "conId", 0)
+                if not acct or not con_id:
+                    continue
+                current_keys.add((acct, con_id))
+                entry = {
+                    "label":        self._label,
+                    "account":      acct,
+                    "con_id":       con_id,
+                    "symbol":       getattr(contract, "symbol", ""),
+                    "local_symbol": getattr(contract, "localSymbol", ""),
+                    "sec_type":     getattr(contract, "secType", ""),
+                    "exchange":     getattr(contract, "exchange", ""),
+                    "currency":     getattr(contract, "currency", "USD"),
+                    "multiplier":   getattr(contract, "multiplier", ""),
+                    "position":     float(pos.position),
+                    "avg_cost":     float(pos.avgCost),
+                    # market_price / market_value / pnl come from pnlSingleEvent;
+                    # preserve any cached values so we don't zero out live data.
+                    "market_price":    self._portfolio_cache.get(
+                        (acct, con_id), {}).get("market_price", 0.0),
+                    "market_value":    self._portfolio_cache.get(
+                        (acct, con_id), {}).get("market_value", 0.0),
+                    "unrealized_pnl":  self._portfolio_cache.get(
+                        (acct, con_id), {}).get("unrealized_pnl", 0.0),
+                    "realized_pnl":    self._portfolio_cache.get(
+                        (acct, con_id), {}).get("realized_pnl", 0.0),
+                }
+                self._portfolio_cache[(acct, con_id)] = entry
+                batch.append(entry)
         except Exception:
             log.debug("Worker %s: portfolio refresh – could not read ib.positions()",
                       self._label)
-            current_keys = set()
 
         # Any entry in our local cache that is NOT in current_keys has gone
         # flat (position closed).  Emit a zero-qty update so the UI model
@@ -361,15 +393,27 @@ class IBWorkerThread(QThread):
                 zero["position"]     = 0.0
                 zero["market_value"] = 0.0
                 zero["market_price"] = 0.0
-                self._portfolio_buffer[key] = zero
-                self._portfolio_cache[key]  = zero
+                self._portfolio_cache[key] = zero
+                batch.append(zero)
                 zeroed += 1
                 tws_log.info("[%s] POSITION-ZERO  account=%s conId=%s "
                              "(no longer in IB positions – emitting qty=0)",
                              self._label, key[0], key[1])
 
-        log.debug("Worker %s: portfolio refresh complete (%d account(s), %d zeroed)",
-                  self._label, len(self._ib.managedAccounts()), zeroed)
+        # Emit the definitive batch directly, bypassing the throttler.
+        # This guarantees the UI gets the latest position data immediately
+        # even when positionEvent streaming is unreliable (multi-account).
+        if batch:
+            self._portfolio_buffer.clear()  # discard any stale buffered data
+            self.portfolio_updated.emit(batch)
+            tws_log.debug("[%s] PORTFOLIO-REFRESH  emitted %d positions "
+                          "(%d zeroed) directly",
+                          self._label, len(batch), zeroed)
+
+        log.debug("Worker %s: portfolio refresh complete (%d account(s), "
+                  "%d positions, %d zeroed)",
+                  self._label, len(self._ib.managedAccounts()),
+                  len(batch) - zeroed, zeroed)
 
     def request_browse(self, params: dict) -> None:
         """Thread-safe: browse all contracts matching params via reqContractDetails."""
@@ -1059,6 +1103,13 @@ class IBWorkerThread(QThread):
                                _p.get("symbol", "?"), _p.get("account", ""),
                                getattr(t.order, "orderRef", ""))
 
+                # On fill: compute the new position from fill data and emit
+                # immediately.  positionEvent only sends the changed position
+                # (not a full snapshot), so a closed position would simply be
+                # absent and the UI would never learn it went to zero.
+                if new_status in ("Filled", "Completed"):
+                    self._apply_fill_to_position(t, _p)
+
             trade.statusEvent += _on_status
 
         except Exception as exc:
@@ -1553,6 +1604,61 @@ class IBWorkerThread(QThread):
 
     # ── ib_async callbacks ────────────────────────────────────────────────────
 
+    def _apply_fill_to_position(self, trade, params: dict) -> None:
+        """Immediately adjust the cached position after an order fills.
+
+        TWS sends ``positionEvent`` only for the *changed* position, not a
+        full snapshot.  For a position that goes to zero TWS simply omits
+        it from subsequent events, so the UI would never learn it closed.
+        Computing the new qty from the fill data guarantees an immediate
+        and correct update.
+
+        The next ``positionEvent`` or manual refresh will reconcile.
+        """
+        try:
+            account = params.get("account", "")
+            con_id = int(params.get("conid", 0))
+            if not account or not con_id:
+                return
+
+            action = (params.get("action", "") or "").upper()
+            filled_qty = float(getattr(trade.orderStatus, "filled", 0) or 0)
+            if filled_qty <= 0:
+                filled_qty = float(params.get("qty", 0) or 0)
+            if filled_qty <= 0:
+                return
+
+            key = (account, con_id)
+            cached = self._portfolio_cache.get(key)
+            if cached is None:
+                return  # unknown position – positionEvent will handle it
+
+            old_pos = float(cached.get("position", 0))
+            if action == "BUY":
+                new_pos = old_pos + filled_qty
+            elif action == "SELL":
+                new_pos = old_pos - filled_qty
+            else:
+                return
+
+            cached["position"] = new_pos
+            if new_pos == 0:
+                cached["market_value"] = 0.0
+            self._portfolio_cache[key] = cached
+
+            # Emit immediately so the UI updates without waiting for positionEvent
+            self.portfolio_updated.emit([cached])
+
+            tws_log.info(
+                "[%s] FILL-POS-UPDATE  account=%s conId=%s %s %.0f → "
+                "pos %.0f→%.0f",
+                self._label, account, con_id, action, filled_qty,
+                old_pos, new_pos)
+
+        except Exception:
+            log.debug("Worker %s: _apply_fill_to_position failed", self._label,
+                      exc_info=True)
+
     def _on_price_update(self, ticker) -> None:
         """Called by ib_async when a subscribed ticker receives a new tick."""
         try:
@@ -1869,7 +1975,18 @@ class IBWorkerThread(QThread):
             pos_qty = float(getattr(entry, "position", 0) or 0)
             mkt_price = 0.0
             if pos_qty != 0 and mkt_value != 0.0:
-                mkt_price = mkt_value / pos_qty
+                # For futures, entry.value = qty × price × multiplier,
+                # so mkt_value / pos_qty = price × multiplier (e.g. 2× for
+                # MNQ).  Divide by the multiplier to get the true price.
+                key = (acct, con_id)
+                cached_for_mult = self._portfolio_cache.get(key, {})
+                try:
+                    mult = float(cached_for_mult.get("multiplier", "") or 1)
+                except (ValueError, TypeError):
+                    mult = 1.0
+                if mult < 1:
+                    mult = 1.0
+                mkt_price = mkt_value / (pos_qty * mult)
 
             key = (acct, con_id)
             if key in self._portfolio_cache:
@@ -1933,21 +2050,28 @@ class IBWorkerThread(QThread):
                 "sec_type": getattr(contract, "secType", ""),
                 "exchange": getattr(contract, "exchange", ""),
                 "currency": getattr(contract, "currency", "USD"),
+                "multiplier": getattr(contract, "multiplier", ""),
                 "position": float(getattr(item, "position", 0)),
                 # positionEvent → Position(account, contract, position, avgCost)
                 # market_price / market_value / unrealized_pnl / realized_pnl
                 # are NOT available from positionEvent; they come in via
                 # pnlSingleEvent (_on_pnl_single) and are merged into the
-                # portfolio cache there.
+                # portfolio cache there.  Preserve any cached values so we
+                # don't zero out live data from pnlSingle.
                 "avg_cost": float(getattr(item, "avgCost", 0)),
-                "market_price": 0.0,
-                "market_value": 0.0,
-                "unrealized_pnl": 0.0,
-                "realized_pnl": 0.0,
+                "market_price":   self._portfolio_cache.get(
+                    (acct, con_id), {}).get("market_price", 0.0),
+                "market_value":   self._portfolio_cache.get(
+                    (acct, con_id), {}).get("market_value", 0.0),
+                "unrealized_pnl": self._portfolio_cache.get(
+                    (acct, con_id), {}).get("unrealized_pnl", 0.0),
+                "realized_pnl":   self._portfolio_cache.get(
+                    (acct, con_id), {}).get("realized_pnl", 0.0),
             }
             # Also persist into the long-lived cache for late subscribers
             self._portfolio_cache[(acct, con_id)
                                   ] = self._portfolio_buffer[(acct, con_id)]
+
 
             # Subscribe to per-position PnL for ALL positions (including zero).
             # Keeping the subscription active after a position closes ensures

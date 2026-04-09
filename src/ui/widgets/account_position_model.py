@@ -140,14 +140,10 @@ class AccountPositionModel(QAbstractTableModel):
         self._show_zero: bool = True   # default ON – show zero-qty rows
 
     def set_show_zero(self, show: bool) -> None:
-        """Show or hide rows where position qty == 0, then rebuild.
-
-        Always rebuilds unconditionally so that zero-qty rows which arrived
-        while the toggle was in its current state (e.g. after a data refresh)
-        are immediately reflected without requiring a state transition.
-        """
-        self._show_zero = show
-        self.rebuild()
+        """Show or hide rows where position qty == 0, then rebuild."""
+        if self._show_zero != show:
+            self._show_zero = show
+            self.rebuild()
 
     # ── Qt table interface ────────────────────────────────────────────────────
 
@@ -444,9 +440,12 @@ class AccountPositionModel(QAbstractTableModel):
             acct_pos.setdefault(key[0], []).append((key, pos))
 
         for account in sorted(acct_pos):
-            # Sort positions within the account by abs(market_value) desc
+            # Sort positions within the account by abs(market_value) desc,
+            # with abs(position qty) as tiebreaker for rows where market
+            # value hasn't arrived yet from pnlSingleEvent.
             acct_pos[account].sort(
-                key=lambda kv: abs(kv[1].get("market_value", 0)),
+                key=lambda kv: (abs(kv[1].get("market_value", 0)),
+                                abs(kv[1].get("position", 0))),
                 reverse=True,
             )
 

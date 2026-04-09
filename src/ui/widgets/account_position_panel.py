@@ -682,15 +682,6 @@ class AccountPositionPanel(QWidget):
         self._model.set_show_zero(checked)
         QSettings("NanoPulse", "Dashboard").setValue(
             "AccountPositionPanel/showZeroPos", checked)
-        if checked:
-            # Soft-refresh: re-emit _portfolio_cache + run zero-out detection.
-            # This ensures any recently-closed (flat) positions that haven't
-            # arrived via positionEvent yet are still shown immediately.
-            # NOTE: refresh_requested here does NOT call clear_positions() –
-            # it connects to _on_position_refresh_requested in flash_trade_view
-            # which only calls request_portfolio_snapshot() +
-            # request_portfolio_refresh(), leaving existing rows intact.
-            self.refresh_requested.emit()
 
     def _on_flatten_clicked(self, account: str) -> None:
         log.info("Portfolio: flatten requested for %s", account)

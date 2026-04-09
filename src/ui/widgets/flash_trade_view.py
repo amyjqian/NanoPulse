@@ -501,12 +501,6 @@ class FlashTradeView(QWidget):
             "error_message": data.get("error_message", ""),
         })
 
-        # When an order fills, IB *should* fire updatePortfolioEvent but
-        # on paper accounts it can be delayed or missed.  Schedule a
-        # portfolio refresh after a short delay to guarantee the panel
-        # reflects the new position.
-        if status in ("Filled", "Completed"):
-            QTimer.singleShot(2000, self._refresh_portfolio)
 
     def _on_portfolio_updated(self, batch: list[dict]) -> None:
         """Receive portfolio position batch from worker thread → update panel."""
