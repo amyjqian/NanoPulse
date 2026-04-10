@@ -17,6 +17,7 @@ import logging
 import math
 import random
 import string
+import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -196,12 +197,16 @@ class IBWorkerThread(QThread):
         # so late-connecting UI consumers can get an instant snapshot.
         self._portfolio_cache: dict[tuple[str, int], dict] = {}
 
-        # Market data subscription state
+        # Background market data subscription state
         self._active_ticker = None
         self._active_price_symbol: str = ""
 
         # Background market data cache: multiple simultaneous subscriptions
         self._bg_tickers: dict[str, object] = {}  # symbol → ib_async Ticker
+
+        # Last valid bid/ask per background symbol so "last-price-only" ticks
+        # (common with IB delayed data for futures) don't blank out the display.
+        self._bg_last_bid_ask: dict[str, tuple[float, float]] = {}  # sym → (bid, ask)
 
         # Order tracking: order_id → Trade
         self._trades: dict[str, object] = {}
@@ -237,6 +242,26 @@ class IBWorkerThread(QThread):
         # Last-known pnlSingle values per (account, conId).
         # Persists across reconnects so the UI can re-snapshot missed events.
         self._pnl_single_cache: dict[tuple[str, int], tuple[float, float, float]] = {}
+
+        # RC #1: throttle buffer — stores the LATEST pnl_single values keyed by
+        # (account, conId).  Flushed by the throttler every 250 ms so the main
+        # thread receives at most 4 batch emissions per second instead of one
+        # QMetaCallEvent per raw pnlSingleEvent tick.
+        self._pnl_single_buffer: dict[tuple[str, int], tuple[float, float, float]] = {}
+
+        # RC #3: deferred cancellation queue for flat positions.
+        # When a position goes to zero we keep reqPnLSingle active for 60 s so
+        # the realized P&L is still visible in the UI, then cancel it.
+        # key → monotonic deadline (time.monotonic() + 60)
+        self._pnl_zero_pending_cancel: dict[tuple[str, int], float] = {}
+
+        # RC #6: reverse index for O(1) background-ticker lookup.
+        # Replaces the O(n) scan over _bg_tickers on every pendingTickersEvent.
+        self._ticker_to_sym: dict[int, str] = {}  # id(ticker) → symbol
+
+        # RC #5: counter for periodic stale-data pruning in the throttler loop
+        # (every 300 ticks × 250 ms ≈ 75 s).
+        self._prune_ticker: int = 0
 
     def set_auto_reconnect(self, auto_reconnect: bool) -> None:
         """Update the auto-reconnect flag natively while running."""
@@ -688,9 +713,13 @@ class IBWorkerThread(QThread):
                 self._trades.clear()
                 self._has_status_handler.clear()
                 self._bg_tickers.clear()
+                self._bg_last_bid_ask.clear()   # bid/ask cache stale after reconnect
+                self._ticker_to_sym.clear()         # RC #6: clear reverse index
                 # Clear pnlSingle subscriptions so they are re-established
                 # after reconnect (IB drops all subscriptions on disconnect).
                 self._pnl_single_subs.clear()
+                self._pnl_single_buffer.clear()        # RC #1: discard stale buffered data
+                self._pnl_zero_pending_cancel.clear()  # RC #3: no pending cancels after reconnect
 
                 # Post-connect setup: errors here should NOT reset the
                 # connection status — the IB link is alive; only the
@@ -763,6 +792,45 @@ class IBWorkerThread(QThread):
                 p_batch = list(self._portfolio_buffer.values())
                 self._portfolio_buffer.clear()
                 self.portfolio_updated.emit(p_batch)
+
+            # RC #1: flush pnl_single buffer — at most 4 batch emissions/second
+            # instead of one QMetaCallEvent per raw pnlSingleEvent tick.
+            # The dict naturally de-duplicates: only the latest value per
+            # (account, conId) is kept, so rapid ticks collapse into one emit.
+            if self._pnl_single_buffer:
+                for (acct, con_id), (daily, realized, unrealized) in \
+                        list(self._pnl_single_buffer.items()):
+                    self.pnl_single_updated.emit(
+                        acct, con_id, daily, realized, unrealized)
+                self._pnl_single_buffer.clear()
+
+            # RC #3: process deferred pnlSingle cancellations for flat positions.
+            # Positions that reached zero ≥60 s ago have their reqPnLSingle
+            # cancelled here so the subscription count doesn't grow all day.
+            if self._pnl_zero_pending_cancel \
+                    and self._ib is not None and self._ib.isConnected():
+                now = time.monotonic()
+                for key, deadline in list(self._pnl_zero_pending_cancel.items()):
+                    if now >= deadline:
+                        acct, con_id = key
+                        try:
+                            self._ib.cancelPnLSingle(acct, "", con_id)
+                            tws_log.info(
+                                "[%s] API-CALL  cancelPnLSingle(account=%s, conId=%s)"
+                                " [pos flat ≥60 s]",
+                                self._label, acct, con_id)
+                        except Exception as exc:
+                            log.debug(
+                                "Worker %s: cancelPnLSingle failed for %s/%s: %s",
+                                self._label, acct, con_id, exc)
+                        self._pnl_single_subs.discard(key)
+                        del self._pnl_zero_pending_cancel[key]
+
+            # RC #5: periodic stale-data pruning (every ~75 s: 300 × 250 ms).
+            self._prune_ticker += 1
+            if self._prune_ticker >= 300:
+                self._prune_ticker = 0
+                self._prune_stale_data()
 
     async def _do_browse(self, params: dict) -> None:
         """Find contracts matching *params*.
@@ -1655,6 +1723,15 @@ class IBWorkerThread(QThread):
             # Emit immediately so the UI updates without waiting for positionEvent
             self.portfolio_updated.emit([cached])
 
+            # RC #3: mirror the deferred-cancellation logic from _on_position_update.
+            # Fill events resolve the position before positionEvent arrives, so
+            # we schedule the cancellation here too.
+            pnl_key = (account, con_id)
+            if new_pos == 0 and pnl_key in self._pnl_single_subs:
+                self._pnl_zero_pending_cancel[pnl_key] = time.monotonic() + 60
+            elif new_pos != 0 and pnl_key in self._pnl_zero_pending_cancel:
+                del self._pnl_zero_pending_cancel[pnl_key]
+
             tws_log.info(
                 "[%s] FILL-POS-UPDATE  account=%s conId=%s %s %.0f → "
                 "pos %.0f→%.0f",
@@ -1723,12 +1800,13 @@ class IBWorkerThread(QThread):
                     and ticker is self._active_ticker):
                 self._on_price_update(ticker)
 
-            # Background multi-symbol subscriptions
-            if self._bg_tickers:
-                for sym, bg_ticker in self._bg_tickers.items():
-                    if ticker is bg_ticker:
-                        self._emit_bg_price(sym, ticker)
-                        break
+            # RC #6: O(1) reverse-index lookup instead of O(M) linear scan.
+            # Previously iterated over every entry in _bg_tickers on each tick,
+            # which scaled quadratically as background subscriptions grew.
+            if self._ticker_to_sym:
+                sym = self._ticker_to_sym.get(id(ticker))
+                if sym:
+                    self._emit_bg_price(sym, ticker)
 
     async def _do_market_data(self, params: dict) -> None:
         """Subscribe to live top-of-book data for the contract in *params*."""
@@ -1840,6 +1918,7 @@ class IBWorkerThread(QThread):
                 ticker = self._ib.reqMktData(
                     c, genericTickList="", snapshot=False)
                 self._bg_tickers[sym] = ticker
+                self._ticker_to_sym[id(ticker)] = sym  # RC #6: reverse index
                 log.info("Worker %s: bg subscribed to %s (conId=%d)",
                          self._label, sym, conid)
                 tws_log.info("[%s] API-CALL  reqMktData(conId=%d, symbol=%s, exchange=%s, "
@@ -1857,13 +1936,16 @@ class IBWorkerThread(QThread):
     async def _do_unsubscribe_bg_symbol(self, symbol: str) -> None:
         """Unsubscribe one background market-data stream."""
         ticker = self._bg_tickers.pop(symbol, None)
-        if ticker is not None and self._ib is not None and self._ib.isConnected():
-            try:
-                self._ib.cancelMktData(ticker.contract)
-                log.debug("Worker %s: bg unsubscribed %s", self._label, symbol)
-            except Exception as exc:
-                log.debug("Worker %s: bg cancel error for %s: %s",
-                          self._label, symbol, exc)
+        self._bg_last_bid_ask.pop(symbol, None)  # clear stale bid/ask cache
+        if ticker is not None:
+            self._ticker_to_sym.pop(id(ticker), None)  # RC #6: clean reverse index
+            if self._ib is not None and self._ib.isConnected():
+                try:
+                    self._ib.cancelMktData(ticker.contract)
+                    log.debug("Worker %s: bg unsubscribed %s", self._label, symbol)
+                except Exception as exc:
+                    log.debug("Worker %s: bg cancel error for %s: %s",
+                              self._label, symbol, exc)
 
     async def _do_unsubscribe_all_bg(self) -> None:
         """Unsubscribe all background market-data streams."""
@@ -1875,11 +1957,18 @@ class IBWorkerThread(QThread):
                     pass
         count = len(self._bg_tickers)
         self._bg_tickers.clear()
+        self._bg_last_bid_ask.clear()    # clear stale bid/ask cache
+        self._ticker_to_sym.clear()  # RC #6: clear reverse index
         log.debug("Worker %s: all %d bg subscriptions cleared",
                   self._label, count)
 
     def _emit_bg_price(self, sym: str, ticker) -> None:
-        """Extract last/bid/ask from a background ticker and emit ``bg_price_updated``."""
+        """Extract last/bid/ask from a background ticker and emit ``bg_price_updated``.
+
+        Bid/ask are carried forward from the last valid tick so that a
+        "last-price-only" update (common with IB delayed / type-3 data for
+        futures) does not emit bid=0 / ask=0 and blank out the UI display.
+        """
         try:
             last = getattr(ticker, "last", float('nan'))
             bid = getattr(ticker, "bid", float('nan'))
@@ -1901,13 +1990,83 @@ class IBWorkerThread(QThread):
 
             if math.isnan(last):
                 last = 0.0
-            bid_out = bid if bid_valid else 0.0
-            ask_out = ask if ask_valid else 0.0
+
+            # Preserve the last known valid bid/ask — fall back to the cache
+            # when the current tick doesn't carry bid or ask data.
+            prev = self._bg_last_bid_ask.get(sym, (0.0, 0.0))
+            bid_out = bid if bid_valid else prev[0]
+            ask_out = ask if ask_valid else prev[1]
+            if bid_valid or ask_valid:
+                self._bg_last_bid_ask[sym] = (bid_out, ask_out)
 
             self.bg_price_updated.emit(sym, last, bid_out, ask_out)
         except Exception:
             log.debug("Worker %s: bg price emit error for %s",
                       self._label, sym)
+
+    def _prune_stale_data(self) -> None:
+        """RC #5 — trim permanent dictionaries to bound memory over long sessions.
+
+        Called by the throttler loop every ~75 s.  Removes:
+        * Order-ref caches (_order_times, _order_error_messages,
+          _rejected_order_cache) for orders placed on a previous calendar day.
+        * Terminal-status _trades entries that are NOT from today.
+        * _portfolio_cache entries for zero-position instruments whose
+          reqPnLSingle subscription has already been cancelled (they will
+          never receive another update).
+        """
+        today_mmdd = datetime.now(_ET).strftime("%m%d")
+        today_prefix = f"nano_{today_mmdd}_"
+
+        # ── Order-ref caches ─────────────────────────────────────────────────
+        stale_refs = [r for r in list(self._order_times)
+                      if not r.startswith(today_prefix)]
+        for r in stale_refs:
+            self._order_times.pop(r, None)
+            self._order_error_messages.pop(r, None)
+
+        stale_rejected = [oid for oid in list(self._rejected_order_cache)
+                          if today_prefix not in oid]
+        for oid in stale_rejected:
+            self._rejected_order_cache.pop(oid, None)
+
+        # ── _trades ──────────────────────────────────────────────────────────
+        # Keep all of today's orders; prune terminal-status orders from
+        # previous days (they can no longer be cancelled or modified).
+        stale_trades: list[str] = []
+        for oid, trade in list(self._trades.items()):
+            if today_prefix in oid:
+                continue  # today — keep regardless of status
+            status = (getattr(trade.orderStatus, "status", "")
+                      if getattr(trade, "orderStatus", None) else "")
+            if status in ("Filled", "Cancelled", "Canceled",
+                          "Inactive", "ApiCancelled", "Completed"):
+                stale_trades.append(oid)
+        for oid in stale_trades:
+            self._trades.pop(oid, None)
+            self._has_status_handler.discard(oid)
+
+        # ── _portfolio_cache ─────────────────────────────────────────────────
+        # Remove zero-position entries whose reqPnLSingle subscription has
+        # been cancelled (not in _pnl_single_subs, not pending cancel).
+        # These entries will never receive another pnlSingle update.
+        stale_pos: list[tuple[str, int]] = []
+        for key, pos in list(self._portfolio_cache.items()):
+            if (pos.get("position", 0) == 0
+                    and key not in self._pnl_single_subs
+                    and key not in self._pnl_zero_pending_cancel):
+                stale_pos.append(key)
+        for key in stale_pos:
+            self._portfolio_cache.pop(key, None)
+            self._pnl_single_cache.pop(key, None)
+
+        if stale_refs or stale_rejected or stale_trades or stale_pos:
+            log.debug(
+                "Worker %s: pruned %d order refs, %d rejected orders, "
+                "%d stale trades, %d flat positions",
+                self._label,
+                len(stale_refs), len(stale_rejected),
+                len(stale_trades), len(stale_pos))
 
     def _on_account_summary(self, value) -> None:
         """De-duplicate rapid ticks into the buffer dict.
@@ -1969,7 +2128,10 @@ class IBWorkerThread(QThread):
             realized = _safe_pnl(entry.realizedPnL)
             unrealized = _safe_pnl(entry.unrealizedPnL)
             self._pnl_single_cache[(acct, con_id)] = (daily, realized, unrealized)
-            self.pnl_single_updated.emit(acct, con_id, daily, realized, unrealized)
+            # RC #1: store in throttle buffer — the _throttler_loop flushes
+            # at most every 250 ms, collapsing rapid ticks into one signal
+            # per (account, conId) instead of flooding the Qt event queue.
+            self._pnl_single_buffer[(acct, con_id)] = (daily, realized, unrealized)
 
             # ── Merge market_value / market_price into portfolio cache ────────
             # positionEvent only delivers position qty + avgCost.  PnLSingle
@@ -2093,6 +2255,15 @@ class IBWorkerThread(QThread):
                 except Exception as exc:
                     log.debug("Worker %s: reqPnLSingle failed for %s/%s: %s",
                               self._label, acct, con_id, exc)
+
+            # RC #3: manage deferred cancellation when position goes flat.
+            # Schedule cancellation 60 s from now so realized P&L stays
+            # visible in the UI after the close; abort if position re-opens.
+            if pos == 0 and pnl_key in self._pnl_single_subs:
+                self._pnl_zero_pending_cancel[pnl_key] = time.monotonic() + 60
+            elif pos != 0 and pnl_key in self._pnl_zero_pending_cancel:
+                # Position re-opened before the cancellation timer fired.
+                del self._pnl_zero_pending_cancel[pnl_key]
 
         except Exception:
             log.debug("Worker %s: bad portfolio item: %s", self._label, item)

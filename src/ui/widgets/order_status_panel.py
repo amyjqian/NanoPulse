@@ -105,24 +105,41 @@ _TABLE_STYLE = f"""
     }}
     QScrollBar:vertical {{
         background: {BG_TABLE};
-        width: 6px;
+        width: 8px;
+        margin: 0;
     }}
     QScrollBar::handle:vertical {{
-        background: #3A3E48;
-        border-radius: 3px;
-        min-height: 20px;
+        background: #4A4E58;
+        border-radius: 4px;
+        min-height: 24px;
+    }}
+    QScrollBar::handle:vertical:hover {{
+        background: #5E6370;
+    }}
+    QScrollBar::handle:vertical:pressed {{
+        background: #6E7380;
     }}
     QScrollBar:horizontal {{
         background: {BG_TABLE};
-        height: 6px;
+        height: 10px;
+        margin: 0;
     }}
     QScrollBar::handle:horizontal {{
-        background: #3A3E48;
-        border-radius: 3px;
-        min-width: 20px;
+        background: #4A4E58;
+        border-radius: 4px;
+        min-width: 40px;
     }}
-    QScrollBar::add-line, QScrollBar::sub-line {{
-        height: 0; width: 0;
+    QScrollBar::handle:horizontal:hover {{
+        background: #5E6370;
+    }}
+    QScrollBar::handle:horizontal:pressed {{
+        background: #6E7380;
+    }}
+    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+        height: 0;
+    }}
+    QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+        width: 0;
     }}
 """
 

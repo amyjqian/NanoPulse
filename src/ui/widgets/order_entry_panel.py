@@ -2049,21 +2049,39 @@ class OrderEntryPanel(QWidget):
         return None
 
     def _on_bg_price_update(self, sym: str, last: float, bid: float, ask: float) -> None:
-        """Receive a background price tick — update cache and display if active."""
-        self._price_cache[sym.upper()] = (last, bid, ask)
+        """Receive a background price tick — update cache and display if active.
+
+        Bid/ask are preserved from the last valid tick rather than being
+        overwritten with 0 when a tick carries only a last-price update.
+        IB delayed data (type 3) for futures often streams ``last`` ticks
+        without bid/ask, which previously cleared the label on every tick.
+        """
+        # Retrieve the last-known cache entry so we can fall back to its
+        # bid/ask when the incoming values are absent (0 or never received).
+        cached = self._price_cache.get(sym.upper(), (0.0, 0.0, 0.0))
+
+        # Only replace cached values when the incoming values are actually valid
+        effective_last = last if last > 0 else cached[0]
+        effective_bid  = bid  if bid  > 0 else cached[1]
+        effective_ask  = ask  if ask  > 0 else cached[2]
+
+        self._price_cache[sym.upper()] = (effective_last, effective_bid, effective_ask)
 
         if sym.upper() == (self._active_symbol or "").upper():
-            self._last_price = last
-            self._last_bid = bid
-            self._last_ask = ask
             if last > 0:
+                self._last_price = last
                 self._lbl_price.setText(f"{last:,.2f}")
                 if hasattr(self, "_pt_section"):
                     ts = self._tick_size_for_symbol(sym)
                     self._pt_section.set_market_price(last, ts)
                     self._sl_section.set_market_price(last, ts)
-            self._update_bid_ask_display(bid, ask)
-            self._update_bid_ask_buttons(bid, ask)
+            # Preserve last known bid/ask — only replace when newly valid
+            if bid > 0:
+                self._last_bid = bid
+            if ask > 0:
+                self._last_ask = ask
+            self._update_bid_ask_display(self._last_bid, self._last_ask)
+            self._update_bid_ask_buttons(self._last_bid, self._last_ask)
 
     def _update_bid_ask_display(self, bid: float, ask: float) -> None:
         """Update the bid/ask label beneath the price."""
