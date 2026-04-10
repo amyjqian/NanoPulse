@@ -261,10 +261,10 @@ class _AccountRow(QFrame):
         if abs(val) > 1e100:
             return "-"
         if abs(val) >= 1_000_000:
-            return f"${val / 1_000_000:.1f}M"
+            return f"{val / 1_000_000:.1f}M"
         if abs(val) >= 1_000:
-            return f"${val / 1_000:.0f}k"
-        return f"${val:,.0f}"
+            return f"{val / 1_000:.0f}k"
+        return f"{val:,.0f}"
 
 
 # ── Main Panel ────────────────────────────────────────────────────────────────
@@ -274,6 +274,9 @@ class AccountListPanel(QWidget):
 
     # Emitted when an action button is clicked: (action_name, [account_ids])
     action_requested = Signal(str, list)
+    # Emitted whenever the checked/selected set of accounts changes.
+    # Payload: frozenset of currently-selected account ID strings.
+    selection_changed = Signal(object)   # set[str]
 
     def __init__(self, accounts_model: AccountsTableModel, parent=None):
         super().__init__(parent)
@@ -505,6 +508,7 @@ class AccountListPanel(QWidget):
 
     def _on_rows_changed(self, *args) -> None:
         self._sync_rows()
+        self._emit_selection_changed()
 
     def _on_row_toggled(self, account: str, checked: bool) -> None:
         log.debug("AccountList: %s toggled → %s", account, checked)
@@ -513,6 +517,7 @@ class AccountListPanel(QWidget):
         else:
             self._unchecked.add(account)
         self._persist_selection()
+        self._emit_selection_changed()
 
     def _on_row_removed(self, account: str) -> None:
         self._remove_account_row(account)
@@ -521,6 +526,7 @@ class AccountListPanel(QWidget):
         self._persist_selection()
         self._persist_hidden()
         self._refresh_add_combo()
+        self._emit_selection_changed()
         log.info("AccountList: user removed %s from visible list", account)
 
     def _on_add_account(self, index: int) -> None:
@@ -535,19 +541,34 @@ class AccountListPanel(QWidget):
                     acct, rd[COL_ALIAS], rd[COL_NET_LIQ], rd[COL_TYPE])
                 break
         self._refresh_add_combo()
+        self._emit_selection_changed()
         log.info("AccountList: user re-added %s", acct)
+
+    def get_selected_count(self) -> int:
+        """Return the number of currently checked (selected) account rows."""
+        return sum(1 for r in self._account_rows.values() if r.is_checked)
+
+    def get_selected_accounts(self) -> set[str]:
+        """Return the set of currently checked account IDs."""
+        return {a for a, r in self._account_rows.items() if r.is_checked}
+
+    def _emit_selection_changed(self) -> None:
+        """Broadcast the current selected-account set."""
+        self.selection_changed.emit(self.get_selected_accounts())
 
     def _select_all(self) -> None:
         for r in self._account_rows.values():
             r.set_checked(True)
         self._unchecked.clear()
         self._persist_selection()
+        self._emit_selection_changed()
 
     def _select_none(self) -> None:
         for r in self._account_rows.values():
             r.set_checked(False)
         self._unchecked = set(self._account_rows.keys())
         self._persist_selection()
+        self._emit_selection_changed()
 
     def _emit_action(self, action: str) -> None:
         selected = [a for a, r in self._account_rows.items() if r.is_checked]

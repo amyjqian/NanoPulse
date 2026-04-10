@@ -72,9 +72,17 @@ class MainWindow(QWidget):
         log.info("MainWindow initialised (%dx%d)", self.width(), self.height())
 
     def _update_status(self) -> None:
-        conn_count = sum(1 for w in self.active_threads.values() if w._ib and w._ib.isConnected())
+        conn_count = sum(
+            1 for w in self.active_threads.values()
+            if w._ib and w._ib.isConnected()
+        )
         acct_count = self._accounts_model.rowCount()
-        self._tab_bar.set_status(conn_count, acct_count)
+        # Selected = checked accounts in the Account List panel
+        try:
+            selected_count = self._flash_trade._account_list.get_selected_count()
+        except AttributeError:
+            selected_count = 0
+        self._tab_bar.set_status(conn_count, acct_count, selected_count)
 
     # ── Window geometry persistence ───────────────────────────────────────────
 

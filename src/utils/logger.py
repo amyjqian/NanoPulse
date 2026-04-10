@@ -60,15 +60,22 @@ def _configure_dedicated_logger(
     logger: logging.Logger,
     log_file: Path,
     fmt: str,
+    file_level: int = logging.DEBUG,
 ) -> None:
     """Attach a rotating-file handler to *logger* (idempotent).
 
     ``propagate`` is set to ``False`` so messages stay in the dedicated
     file and do not bubble up to the root / console handlers.
+
+    *file_level* controls both the logger and handler threshold.
+    Pass ``logging.INFO`` for high-frequency loggers (e.g. tws_log) to
+    avoid disk I/O from DEBUG-level pnlSingle / accountSummary spam.
+    Setting the logger level (not just the handler level) ensures Python
+    skips LogRecord creation entirely for below-threshold calls.
     """
     if logger.handlers:
         return  # already configured
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(file_level)
     logger.propagate = False
 
     fh = RotatingFileHandler(
@@ -77,7 +84,7 @@ def _configure_dedicated_logger(
         backupCount=_BACKUP_COUNT,
         encoding="utf-8",
     )
-    fh.setLevel(logging.DEBUG)
+    fh.setLevel(file_level)
     fh.setFormatter(logging.Formatter(fmt, datefmt=_DATE_FMT))
     logger.addHandler(fh)
 
@@ -122,8 +129,14 @@ def setup_logging(level: int = logging.DEBUG) -> None:
     root.addHandler(file_h)
 
     # ── Dedicated loggers ─────────────────────────────────────────────────────
-    _configure_dedicated_logger(tws_log, TWS_LOG_FILE, _TWS_FMT)
-    _configure_dedicated_logger(order_log, ORDER_LOG_FILE, _ORDER_FMT)
+    # RC #4: tws_log at INFO — pnlSingleEvent / accountSummaryEvent fire
+    # thousands of times per minute; writing them at DEBUG saturates disk I/O
+    # and locks RotatingFileHandler's internal threading.Lock on every tick.
+    # order_log stays at DEBUG for a full order audit trail.
+    _configure_dedicated_logger(tws_log, TWS_LOG_FILE, _TWS_FMT,
+                                file_level=logging.INFO)
+    _configure_dedicated_logger(order_log, ORDER_LOG_FILE, _ORDER_FMT,
+                                file_level=logging.DEBUG)
 
     logging.getLogger("NanoPulse").info(
         "Logging initialised  (console=INFO, file=%s level=%s)",

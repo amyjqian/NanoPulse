@@ -278,6 +278,11 @@ class ConnectionsView(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self._model = accounts_model
         self._active_threads = active_threads
+        # Tracks the last-detected type per connection label.
+        # Persisted to JSON independently of the visual label state so that
+        # transient "blank" visuals (during connecting / disconnected) never
+        # overwrite a previously-detected "Paper"/"Live" value in the config.
+        self._detected_types: dict[str, str] = {}
         self._setup_ui()
         self._load_config()
 
@@ -441,7 +446,7 @@ class ConnectionsView(QWidget):
         host: str = "127.0.0.1",
         port: int = 7497,
         client_id: int | None = None,
-        conn_type: str = "Paper",
+        conn_type: str = "",
         priority: int = 1,
         auto: bool = False,
         auto_reconnect: bool = True,
@@ -468,83 +473,26 @@ class ConnectionsView(QWidget):
         cid_item.setForeground(QColor(TEXT_DIM))
         self._cfg_table.setItem(row, _COL_CID, cid_item)
 
-        # Type dropdown (Paper / Live)
-        type_combo = _CellComboBox()
-        type_combo.addItems(["Paper", "Live"])
-        type_combo.setCurrentText(
-            conn_type if conn_type in ("Paper", "Live") else "Paper")
-
-        # Force Qt-drawn items instead of native macOS rendering.
-        type_combo.setItemDelegate(QStyledItemDelegate(type_combo))
-
-        # Style the closed combo box.
-        type_combo.setStyleSheet(f"""
-            QComboBox {{
-                background-color: {BG_SECONDARY};
-                color: {TEXT};
-                border: 1px solid {BORDER};
-                border-radius: 4px;
-                padding: 3px 8px;
+        # Type label (read-only, auto-detected from account numbers)
+        type_lbl = QLabel(conn_type if conn_type in ("Paper", "Live") else "")
+        type_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        _type_color = GREEN if conn_type == "Live" else (BLUE if conn_type == "Paper" else TEXT_DIM)
+        type_lbl.setStyleSheet(f"""
+            QLabel {{
+                color: {_type_color};
+                background: transparent;
                 font-size: 12px;
-                min-width: 50px;
-            }}
-            QComboBox:hover {{
-                border: 1px solid {BLUE};
-            }}
-            QComboBox::drop-down {{
-                subcontrol-origin: padding;
-                subcontrol-position: center right;
-                width: 20px;
-                border: none;
-            }}
-            QComboBox::down-arrow {{
-                image: none;
-                border-left: 4px solid transparent;
-                border-right: 4px solid transparent;
-                border-top: 5px solid {TEXT_DIM};
-                margin-right: 6px;
+                font-weight: 600;
+                padding: 3px 8px;
             }}
         """)
-
-        # Style the popup view DIRECTLY — sub-selector stylesheets on QComboBox
-        # are overridden by the parent QTableWidget stylesheet on macOS.
-        popup_view = type_combo.view()
-        popup_view.setStyleSheet(f"""
-            QAbstractItemView {{
-                background-color: {BG_SECONDARY};
-                color: {TEXT};
-                border: 1px solid {BORDER};
-                padding: 4px 0;
-                outline: 0;
-                selection-background-color: #1A3A5C;
-                selection-color: {TEXT};
-            }}
-            QAbstractItemView::item {{
-                padding: 6px 12px;
-                min-height: 22px;
-            }}
-            QAbstractItemView::item:hover,
-            QAbstractItemView::item:selected {{
-                background-color: #1A3A5C;
-                color: {TEXT};
-            }}
-        """)
-        # Also style the popup's container frame (the white border you see).
-        popup_container = popup_view.window()
-        popup_container.setWindowFlags(
-            Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint | Qt.WindowType.NoDropShadowWindowHint
-        )
-        popup_container.setAttribute(
-            Qt.WidgetAttribute.WA_TranslucentBackground, False)
-        popup_container.setStyleSheet(f"""
-            QWidget {{
-                background-color: {BG_SECONDARY};
-                border: 1px solid {BORDER};
-                border-radius: 4px;
-            }}
-        """)
-        type_combo.currentTextChanged.connect(self._auto_save)
-        self._cfg_table.setCellWidget(row, _COL_TYPE, type_combo)
+        type_lbl.setObjectName("type_label")
+        type_container = QWidget()
+        type_container.setStyleSheet("background: transparent;")
+        type_layout = QHBoxLayout(type_container)
+        type_layout.setContentsMargins(0, 0, 0, 0)
+        type_layout.addWidget(type_lbl)
+        self._cfg_table.setCellWidget(row, _COL_TYPE, type_container)
 
         # Priority dropdown (1–4)
         pri_combo = _CellComboBox()
@@ -685,6 +633,9 @@ class ConnectionsView(QWidget):
         if label and label in self._active_threads:
             self._disconnect_label(label)
 
+        # Remove tracked type for this label
+        self._detected_types.pop(label, None)
+
         self._cfg_table.removeRow(row)
         self._cfg_table.blockSignals(False)
 
@@ -770,6 +721,7 @@ class ConnectionsView(QWidget):
         # The Funnel: worker → shared model
         worker.summary_batch_updated.connect(self._model.update_batch)
         worker.connection_status_changed.connect(self._on_connection_status)
+        worker.accounts_detected.connect(self._on_accounts_detected)
         self._active_threads[label] = worker
         worker.start()
 
@@ -794,6 +746,10 @@ class ConnectionsView(QWidget):
                 self._on_connection_status)
         except RuntimeError:
             pass
+        try:
+            worker.accounts_detected.disconnect(self._on_accounts_detected)
+        except RuntimeError:
+            pass
 
         worker.stop()
         worker.wait(5000)
@@ -804,6 +760,7 @@ class ConnectionsView(QWidget):
 
         self._model.remove_rows_by_label(label)
         log.info("Stopped worker for %s", label)
+        self._auto_save()
 
     def _on_connection_status(self, label: str, connected: bool) -> None:
         """Update both Action button and Status cell for the matching row."""
@@ -813,6 +770,56 @@ class ConnectionsView(QWidget):
             if self._row_label(row) == label:
                 self._set_row_state(row, connected=connected)
                 break
+
+    def _on_accounts_detected(self, label: str, accounts: list) -> None:
+        """Auto-populate the Type column based on detected account IDs.
+
+        Rules:
+        - Account starts with D/d → Paper
+        - Account starts with U/u/F/f → Live
+        If the connection has mixed types we prefer "Live".
+        """
+        detected_type = ""
+        for acct in accounts:
+            first = acct[0].upper() if acct else ""
+            if first in ("U", "F"):
+                detected_type = "Live"
+                break  # Live takes precedence
+            elif first == "D":
+                if not detected_type:
+                    detected_type = "Paper"
+
+        if not detected_type:
+            return
+
+        log.info("Auto-detected type for %s: %s (accounts=%s)",
+                 label, detected_type, accounts)
+
+        # Persist in the dict – this is the authoritative value for JSON.
+        self._detected_types[label] = detected_type
+
+        for row in range(self._cfg_table.rowCount()):
+            if self._row_label(row) == label:
+                self._set_type_for_row(row, detected_type)
+                self._auto_save()
+                break
+
+    def _set_type_for_row(self, row: int, type_text: str) -> None:
+        """Update the read-only Type label for the given row."""
+        lbl = self._get_type_label(row)
+        if lbl is None:
+            return
+        lbl.setText(type_text)
+        color = GREEN if type_text == "Live" else (BLUE if type_text == "Paper" else TEXT_DIM)
+        lbl.setStyleSheet(f"""
+            QLabel {{
+                color: {color};
+                background: transparent;
+                font-size: 12px;
+                font-weight: 600;
+                padding: 3px 8px;
+            }}
+        """)
 
     # ── Connection ↔ Account highlight sync ───────────────────────────────────
 
@@ -842,6 +849,10 @@ class ConnectionsView(QWidget):
 
     def _set_row_state(self, row: int, *, connected: bool, connecting: bool = False) -> None:
         """Update both the Action button and Status cell for *row* in one place."""
+        # Clear Type label when not fully connected
+        if not connected or connecting:
+            self._set_type_for_row(row, "")
+
         # Action button (inside a container widget)
         btn = self._get_action_button(row)
         if btn is not None:
@@ -919,12 +930,19 @@ class ConnectionsView(QWidget):
                 ) else config_manager.get_next_client_id()
             except (ValueError, TypeError):
                 client_id = config_manager.get_next_client_id()
+            saved_type = r.get("type", "")
+            label = r.get("label", "")
+            # Re-hydrate the detected-types dict so the saved type is preserved
+            # for future JSON writes — but do NOT show it in the visual label yet.
+            # The label stays blank until the connection is actually established.
+            if label and saved_type in ("Paper", "Live"):
+                self._detected_types[label] = saved_type
             self._add_config_row(
-                label=r.get("label", ""),
+                label=label,
                 host=r.get("host", "127.0.0.1"),
                 port=port,
                 client_id=client_id,
-                conn_type=r.get("type", "Paper"),
+                conn_type="",          # always blank on startup
                 priority=int(r.get("priority", 1)),
                 auto=bool(r.get("auto", False)),
                 auto_reconnect=bool(r.get("auto_reconnect", True)),
@@ -935,14 +953,17 @@ class ConnectionsView(QWidget):
         for row in range(self._cfg_table.rowCount()):
             auto_cb = self._get_auto_checkbox(row)
             recon_cb = self._get_reconnect_checkbox(row)
-            type_combo = self._get_type_combo(row)
             pri_combo = self._get_priority_combo(row)
+            label = self._row_text(row, _COL_LABEL)
+            # Use the authoritative detected type (not the visual label, which
+            # can be transiently blank while connecting / disconnected).
+            saved_type = self._detected_types.get(label, "")
             rows.append({
-                "label": self._row_text(row, _COL_LABEL),
+                "label": label,
                 "host": self._row_text(row, _COL_HOST),
                 "port": self._row_text(row, _COL_PORT),
                 "client_id": self._row_text(row, _COL_CID),
-                "type": type_combo.currentText() if type_combo else "Paper",
+                "type": saved_type,
                 "priority": int(pri_combo.currentText()) if pri_combo else 1,
                 "auto": auto_cb.isChecked() if auto_cb else False,
                 "auto_reconnect": recon_cb.isChecked() if recon_cb else True,
@@ -958,9 +979,13 @@ class ConnectionsView(QWidget):
         item = self._cfg_table.item(row, col)
         return item.text().strip() if item else ""
 
-    def _get_type_combo(self, row: int) -> QComboBox | None:
-        widget = self._cfg_table.cellWidget(row, _COL_TYPE)
-        return widget if isinstance(widget, QComboBox) else None
+    def _get_type_label(self, row: int) -> QLabel | None:
+        """Return the QLabel inside the Type column's container widget."""
+        container = self._cfg_table.cellWidget(row, _COL_TYPE)
+        if container is None:
+            return None
+        lbl = container.findChild(QLabel, "type_label")
+        return lbl
 
     def _get_priority_combo(self, row: int) -> QComboBox | None:
         widget = self._cfg_table.cellWidget(row, _COL_PRIORITY)

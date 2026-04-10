@@ -17,6 +17,7 @@ import logging
 import math
 import random
 import string
+import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -162,6 +163,8 @@ class IBWorkerThread(QThread):
     # account-level P&L from pnlEvent
     # (account, daily_pnl, realized_pnl, unrealized_pnl)
     account_pnl_updated = Signal(str, float, float, float)
+    # (label, list_of_account_ids) – emitted once after connection established
+    accounts_detected = Signal(str, list)
 
     def __init__(
         self,
@@ -194,12 +197,16 @@ class IBWorkerThread(QThread):
         # so late-connecting UI consumers can get an instant snapshot.
         self._portfolio_cache: dict[tuple[str, int], dict] = {}
 
-        # Market data subscription state
+        # Background market data subscription state
         self._active_ticker = None
         self._active_price_symbol: str = ""
 
         # Background market data cache: multiple simultaneous subscriptions
         self._bg_tickers: dict[str, object] = {}  # symbol → ib_async Ticker
+
+        # Last valid bid/ask per background symbol so "last-price-only" ticks
+        # (common with IB delayed data for futures) don't blank out the display.
+        self._bg_last_bid_ask: dict[str, tuple[float, float]] = {}  # sym → (bid, ask)
 
         # Order tracking: order_id → Trade
         self._trades: dict[str, object] = {}
@@ -235,6 +242,26 @@ class IBWorkerThread(QThread):
         # Last-known pnlSingle values per (account, conId).
         # Persists across reconnects so the UI can re-snapshot missed events.
         self._pnl_single_cache: dict[tuple[str, int], tuple[float, float, float]] = {}
+
+        # RC #1: throttle buffer — stores the LATEST pnl_single values keyed by
+        # (account, conId).  Flushed by the throttler every 250 ms so the main
+        # thread receives at most 4 batch emissions per second instead of one
+        # QMetaCallEvent per raw pnlSingleEvent tick.
+        self._pnl_single_buffer: dict[tuple[str, int], tuple[float, float, float]] = {}
+
+        # RC #3: deferred cancellation queue for flat positions.
+        # When a position goes to zero we keep reqPnLSingle active for 60 s so
+        # the realized P&L is still visible in the UI, then cancel it.
+        # key → monotonic deadline (time.monotonic() + 60)
+        self._pnl_zero_pending_cancel: dict[tuple[str, int], float] = {}
+
+        # RC #6: reverse index for O(1) background-ticker lookup.
+        # Replaces the O(n) scan over _bg_tickers on every pendingTickersEvent.
+        self._ticker_to_sym: dict[int, str] = {}  # id(ticker) → symbol
+
+        # RC #5: counter for periodic stale-data pruning in the throttler loop
+        # (every 300 ticks × 250 ms ≈ 75 s).
+        self._prune_ticker: int = 0
 
     def set_auto_reconnect(self, auto_reconnect: bool) -> None:
         """Update the auto-reconnect flag natively while running."""
@@ -322,15 +349,98 @@ class IBWorkerThread(QThread):
                 "Worker %s: request_portfolio_refresh but loop not ready", self._label)
 
     async def _do_portfolio_refresh(self) -> None:
-        """Request account updates for each managed account to refresh positions."""
+        """Request all positions across all accounts simultaneously.
+
+        Uses reqPositionsAsync() which covers every managed account in a
+        single call.  After the call completes, builds a definitive batch
+        directly from ``ib.positions()`` and emits it immediately via
+        ``portfolio_updated``.  This bypasses the
+        ``positionEvent → buffer → throttler`` path which can be unreliable
+        for multi-account connections where TWS may not stream individual
+        position changes after the initial snapshot.
+
+        Also emits zero-qty updates for any cached position that has gone
+        flat (IB only returns non-zero positions from reqPositions).
+        """
         if self._ib is None or not self._ib.isConnected():
             return
-        for acct in self._ib.managedAccounts():
-            await self._ib.reqAccountUpdatesAsync(acct)
-            tws_log.info("[%s] API-CALL  reqAccountUpdates(account=%s) [refresh]",
-                         self._label, acct)
-        log.debug("Worker %s: portfolio refresh (requested for %d account(s))",
-                  self._label, len(self._ib.managedAccounts()))
+        await self._ib.reqPositionsAsync()
+        tws_log.info("[%s] API-CALL  reqPositionsAsync() [refresh, all accounts]",
+                     self._label)
+
+        # ── Build a definitive batch from the authoritative IB positions ──
+        # Reading directly from ib.positions() guarantees we pick up every
+        # qty change, regardless of whether positionEvent fired individually.
+        batch: list[dict] = []
+        current_keys: set[tuple[str, int]] = set()
+        try:
+            for pos in self._ib.positions():
+                contract = pos.contract
+                acct = pos.account
+                con_id = getattr(contract, "conId", 0)
+                if not acct or not con_id:
+                    continue
+                current_keys.add((acct, con_id))
+                entry = {
+                    "label":        self._label,
+                    "account":      acct,
+                    "con_id":       con_id,
+                    "symbol":       getattr(contract, "symbol", ""),
+                    "local_symbol": getattr(contract, "localSymbol", ""),
+                    "sec_type":     getattr(contract, "secType", ""),
+                    "exchange":     getattr(contract, "exchange", ""),
+                    "currency":     getattr(contract, "currency", "USD"),
+                    "multiplier":   getattr(contract, "multiplier", ""),
+                    "position":     float(pos.position),
+                    "avg_cost":     float(pos.avgCost),
+                    # market_price / market_value / pnl come from pnlSingleEvent;
+                    # preserve any cached values so we don't zero out live data.
+                    "market_price":    self._portfolio_cache.get(
+                        (acct, con_id), {}).get("market_price", 0.0),
+                    "market_value":    self._portfolio_cache.get(
+                        (acct, con_id), {}).get("market_value", 0.0),
+                    "unrealized_pnl":  self._portfolio_cache.get(
+                        (acct, con_id), {}).get("unrealized_pnl", 0.0),
+                    "realized_pnl":    self._portfolio_cache.get(
+                        (acct, con_id), {}).get("realized_pnl", 0.0),
+                }
+                self._portfolio_cache[(acct, con_id)] = entry
+                batch.append(entry)
+        except Exception:
+            log.debug("Worker %s: portfolio refresh – could not read ib.positions()",
+                      self._label)
+
+        # Any entry in our local cache that is NOT in current_keys has gone
+        # flat (position closed).  Emit a zero-qty update so the UI model
+        # removes or zeros the row.
+        zeroed = 0
+        for key, cached in list(self._portfolio_cache.items()):
+            if key not in current_keys:
+                zero = dict(cached)
+                zero["position"]     = 0.0
+                zero["market_value"] = 0.0
+                zero["market_price"] = 0.0
+                self._portfolio_cache[key] = zero
+                batch.append(zero)
+                zeroed += 1
+                tws_log.info("[%s] POSITION-ZERO  account=%s conId=%s "
+                             "(no longer in IB positions – emitting qty=0)",
+                             self._label, key[0], key[1])
+
+        # Emit the definitive batch directly, bypassing the throttler.
+        # This guarantees the UI gets the latest position data immediately
+        # even when positionEvent streaming is unreliable (multi-account).
+        if batch:
+            self._portfolio_buffer.clear()  # discard any stale buffered data
+            self.portfolio_updated.emit(batch)
+            tws_log.debug("[%s] PORTFOLIO-REFRESH  emitted %d positions "
+                          "(%d zeroed) directly",
+                          self._label, len(batch), zeroed)
+
+        log.debug("Worker %s: portfolio refresh complete (%d account(s), "
+                  "%d positions, %d zeroed)",
+                  self._label, len(self._ib.managedAccounts()),
+                  len(batch) - zeroed, zeroed)
 
     def request_browse(self, params: dict) -> None:
         """Thread-safe: browse all contracts matching params via reqContractDetails."""
@@ -486,12 +596,15 @@ class IBWorkerThread(QThread):
         # Global order-status listener – catches ALL order updates
         # (including orders placed before a reconnect and TWS manual orders)
         self._ib.orderStatusEvent += self._on_global_order_status
-        # Portfolio updates – fires for each PortfolioItem change
-        self._ib.updatePortfolioEvent += self._on_portfolio_update
+        # positionEvent fires for ALL accounts simultaneously.
+        # updatePortfolioEvent only supports one account at a time and
+        # cancels the previous subscription on each new call — broken for
+        # multi-account connections.
+        self._ib.positionEvent += self._on_position_update
 
         tws_log.info("[%s] IB instance created – event subscriptions: "
                      "accountSummaryEvent, pnlEvent, pnlSingleEvent, errorEvent, "
-                     "pendingTickersEvent, orderStatusEvent, updatePortfolioEvent",
+                     "pendingTickersEvent, orderStatusEvent, positionEvent",
                      self._label)
 
         try:
@@ -584,6 +697,10 @@ class IBWorkerThread(QThread):
 
                 # Connection established — update status immediately
                 self.connection_status_changed.emit(self._label, True)
+                # Notify UI of discovered account IDs for auto-type detection
+                managed = list(self._ib.managedAccounts())
+                if managed:
+                    self.accounts_detected.emit(self._label, managed)
                 log.info(
                     "Worker %s connected – seeding initial snapshot", self._label)
                 tws_log.info(
@@ -596,9 +713,13 @@ class IBWorkerThread(QThread):
                 self._trades.clear()
                 self._has_status_handler.clear()
                 self._bg_tickers.clear()
+                self._bg_last_bid_ask.clear()   # bid/ask cache stale after reconnect
+                self._ticker_to_sym.clear()         # RC #6: clear reverse index
                 # Clear pnlSingle subscriptions so they are re-established
                 # after reconnect (IB drops all subscriptions on disconnect).
                 self._pnl_single_subs.clear()
+                self._pnl_single_buffer.clear()        # RC #1: discard stale buffered data
+                self._pnl_zero_pending_cancel.clear()  # RC #3: no pending cancels after reconnect
 
                 # Post-connect setup: errors here should NOT reset the
                 # connection status — the IB link is alive; only the
@@ -629,13 +750,14 @@ class IBWorkerThread(QThread):
                         tws_log.info(
                             "[%s] API-CALL  reqPnL(account=%s)", self._label, acct)
 
-                    # Subscribe to portfolio updates (positions, market values)
-                    for acct in self._ib.managedAccounts():
-                        await self._ib.reqAccountUpdatesAsync(acct)
-                        log.info(
-                            "Worker %s subscribed to portfolio for %s", self._label, acct)
-                        tws_log.info(
-                            "[%s] API-CALL  reqAccountUpdates(account=%s)", self._label, acct)
+                    # reqPositionsAsync subscribes to ALL accounts simultaneously.
+                    # reqAccountUpdates only covers one account at a time and
+                    # cancels the previous subscription on each new call.
+                    await self._ib.reqPositionsAsync()
+                    log.info("Worker %s: subscribed to positions for all %d account(s)",
+                             self._label, len(self._ib.managedAccounts()))
+                    tws_log.info("[%s] API-CALL  reqPositionsAsync() [all accounts]",
+                                 self._label)
 
                     # Snapshot existing open + completed orders
                     tws_log.info(
@@ -670,6 +792,45 @@ class IBWorkerThread(QThread):
                 p_batch = list(self._portfolio_buffer.values())
                 self._portfolio_buffer.clear()
                 self.portfolio_updated.emit(p_batch)
+
+            # RC #1: flush pnl_single buffer — at most 4 batch emissions/second
+            # instead of one QMetaCallEvent per raw pnlSingleEvent tick.
+            # The dict naturally de-duplicates: only the latest value per
+            # (account, conId) is kept, so rapid ticks collapse into one emit.
+            if self._pnl_single_buffer:
+                for (acct, con_id), (daily, realized, unrealized) in \
+                        list(self._pnl_single_buffer.items()):
+                    self.pnl_single_updated.emit(
+                        acct, con_id, daily, realized, unrealized)
+                self._pnl_single_buffer.clear()
+
+            # RC #3: process deferred pnlSingle cancellations for flat positions.
+            # Positions that reached zero ≥60 s ago have their reqPnLSingle
+            # cancelled here so the subscription count doesn't grow all day.
+            if self._pnl_zero_pending_cancel \
+                    and self._ib is not None and self._ib.isConnected():
+                now = time.monotonic()
+                for key, deadline in list(self._pnl_zero_pending_cancel.items()):
+                    if now >= deadline:
+                        acct, con_id = key
+                        try:
+                            self._ib.cancelPnLSingle(acct, "", con_id)
+                            tws_log.info(
+                                "[%s] API-CALL  cancelPnLSingle(account=%s, conId=%s)"
+                                " [pos flat ≥60 s]",
+                                self._label, acct, con_id)
+                        except Exception as exc:
+                            log.debug(
+                                "Worker %s: cancelPnLSingle failed for %s/%s: %s",
+                                self._label, acct, con_id, exc)
+                        self._pnl_single_subs.discard(key)
+                        del self._pnl_zero_pending_cancel[key]
+
+            # RC #5: periodic stale-data pruning (every ~75 s: 300 × 250 ms).
+            self._prune_ticker += 1
+            if self._prune_ticker >= 300:
+                self._prune_ticker = 0
+                self._prune_stale_data()
 
     async def _do_browse(self, params: dict) -> None:
         """Find contracts matching *params*.
@@ -1015,6 +1176,13 @@ class IBWorkerThread(QThread):
                                t.orderStatus.filled, t.orderStatus.avgFillPrice,
                                _p.get("symbol", "?"), _p.get("account", ""),
                                getattr(t.order, "orderRef", ""))
+
+                # On fill: compute the new position from fill data and emit
+                # immediately.  positionEvent only sends the changed position
+                # (not a full snapshot), so a closed position would simply be
+                # absent and the UI would never learn it went to zero.
+                if new_status in ("Filled", "Completed"):
+                    self._apply_fill_to_position(t, _p)
 
             trade.statusEvent += _on_status
 
@@ -1510,6 +1678,70 @@ class IBWorkerThread(QThread):
 
     # ── ib_async callbacks ────────────────────────────────────────────────────
 
+    def _apply_fill_to_position(self, trade, params: dict) -> None:
+        """Immediately adjust the cached position after an order fills.
+
+        TWS sends ``positionEvent`` only for the *changed* position, not a
+        full snapshot.  For a position that goes to zero TWS simply omits
+        it from subsequent events, so the UI would never learn it closed.
+        Computing the new qty from the fill data guarantees an immediate
+        and correct update.
+
+        The next ``positionEvent`` or manual refresh will reconcile.
+        """
+        try:
+            account = params.get("account", "")
+            con_id = int(params.get("conid", 0))
+            if not account or not con_id:
+                return
+
+            action = (params.get("action", "") or "").upper()
+            filled_qty = float(getattr(trade.orderStatus, "filled", 0) or 0)
+            if filled_qty <= 0:
+                filled_qty = float(params.get("qty", 0) or 0)
+            if filled_qty <= 0:
+                return
+
+            key = (account, con_id)
+            cached = self._portfolio_cache.get(key)
+            if cached is None:
+                return  # unknown position – positionEvent will handle it
+
+            old_pos = float(cached.get("position", 0))
+            if action == "BUY":
+                new_pos = old_pos + filled_qty
+            elif action == "SELL":
+                new_pos = old_pos - filled_qty
+            else:
+                return
+
+            cached["position"] = new_pos
+            if new_pos == 0:
+                cached["market_value"] = 0.0
+            self._portfolio_cache[key] = cached
+
+            # Emit immediately so the UI updates without waiting for positionEvent
+            self.portfolio_updated.emit([cached])
+
+            # RC #3: mirror the deferred-cancellation logic from _on_position_update.
+            # Fill events resolve the position before positionEvent arrives, so
+            # we schedule the cancellation here too.
+            pnl_key = (account, con_id)
+            if new_pos == 0 and pnl_key in self._pnl_single_subs:
+                self._pnl_zero_pending_cancel[pnl_key] = time.monotonic() + 60
+            elif new_pos != 0 and pnl_key in self._pnl_zero_pending_cancel:
+                del self._pnl_zero_pending_cancel[pnl_key]
+
+            tws_log.info(
+                "[%s] FILL-POS-UPDATE  account=%s conId=%s %s %.0f → "
+                "pos %.0f→%.0f",
+                self._label, account, con_id, action, filled_qty,
+                old_pos, new_pos)
+
+        except Exception:
+            log.debug("Worker %s: _apply_fill_to_position failed", self._label,
+                      exc_info=True)
+
     def _on_price_update(self, ticker) -> None:
         """Called by ib_async when a subscribed ticker receives a new tick."""
         try:
@@ -1568,12 +1800,13 @@ class IBWorkerThread(QThread):
                     and ticker is self._active_ticker):
                 self._on_price_update(ticker)
 
-            # Background multi-symbol subscriptions
-            if self._bg_tickers:
-                for sym, bg_ticker in self._bg_tickers.items():
-                    if ticker is bg_ticker:
-                        self._emit_bg_price(sym, ticker)
-                        break
+            # RC #6: O(1) reverse-index lookup instead of O(M) linear scan.
+            # Previously iterated over every entry in _bg_tickers on each tick,
+            # which scaled quadratically as background subscriptions grew.
+            if self._ticker_to_sym:
+                sym = self._ticker_to_sym.get(id(ticker))
+                if sym:
+                    self._emit_bg_price(sym, ticker)
 
     async def _do_market_data(self, params: dict) -> None:
         """Subscribe to live top-of-book data for the contract in *params*."""
@@ -1685,6 +1918,7 @@ class IBWorkerThread(QThread):
                 ticker = self._ib.reqMktData(
                     c, genericTickList="", snapshot=False)
                 self._bg_tickers[sym] = ticker
+                self._ticker_to_sym[id(ticker)] = sym  # RC #6: reverse index
                 log.info("Worker %s: bg subscribed to %s (conId=%d)",
                          self._label, sym, conid)
                 tws_log.info("[%s] API-CALL  reqMktData(conId=%d, symbol=%s, exchange=%s, "
@@ -1702,13 +1936,16 @@ class IBWorkerThread(QThread):
     async def _do_unsubscribe_bg_symbol(self, symbol: str) -> None:
         """Unsubscribe one background market-data stream."""
         ticker = self._bg_tickers.pop(symbol, None)
-        if ticker is not None and self._ib is not None and self._ib.isConnected():
-            try:
-                self._ib.cancelMktData(ticker.contract)
-                log.debug("Worker %s: bg unsubscribed %s", self._label, symbol)
-            except Exception as exc:
-                log.debug("Worker %s: bg cancel error for %s: %s",
-                          self._label, symbol, exc)
+        self._bg_last_bid_ask.pop(symbol, None)  # clear stale bid/ask cache
+        if ticker is not None:
+            self._ticker_to_sym.pop(id(ticker), None)  # RC #6: clean reverse index
+            if self._ib is not None and self._ib.isConnected():
+                try:
+                    self._ib.cancelMktData(ticker.contract)
+                    log.debug("Worker %s: bg unsubscribed %s", self._label, symbol)
+                except Exception as exc:
+                    log.debug("Worker %s: bg cancel error for %s: %s",
+                              self._label, symbol, exc)
 
     async def _do_unsubscribe_all_bg(self) -> None:
         """Unsubscribe all background market-data streams."""
@@ -1720,11 +1957,18 @@ class IBWorkerThread(QThread):
                     pass
         count = len(self._bg_tickers)
         self._bg_tickers.clear()
+        self._bg_last_bid_ask.clear()    # clear stale bid/ask cache
+        self._ticker_to_sym.clear()  # RC #6: clear reverse index
         log.debug("Worker %s: all %d bg subscriptions cleared",
                   self._label, count)
 
     def _emit_bg_price(self, sym: str, ticker) -> None:
-        """Extract last/bid/ask from a background ticker and emit ``bg_price_updated``."""
+        """Extract last/bid/ask from a background ticker and emit ``bg_price_updated``.
+
+        Bid/ask are carried forward from the last valid tick so that a
+        "last-price-only" update (common with IB delayed / type-3 data for
+        futures) does not emit bid=0 / ask=0 and blank out the UI display.
+        """
         try:
             last = getattr(ticker, "last", float('nan'))
             bid = getattr(ticker, "bid", float('nan'))
@@ -1746,13 +1990,83 @@ class IBWorkerThread(QThread):
 
             if math.isnan(last):
                 last = 0.0
-            bid_out = bid if bid_valid else 0.0
-            ask_out = ask if ask_valid else 0.0
+
+            # Preserve the last known valid bid/ask — fall back to the cache
+            # when the current tick doesn't carry bid or ask data.
+            prev = self._bg_last_bid_ask.get(sym, (0.0, 0.0))
+            bid_out = bid if bid_valid else prev[0]
+            ask_out = ask if ask_valid else prev[1]
+            if bid_valid or ask_valid:
+                self._bg_last_bid_ask[sym] = (bid_out, ask_out)
 
             self.bg_price_updated.emit(sym, last, bid_out, ask_out)
         except Exception:
             log.debug("Worker %s: bg price emit error for %s",
                       self._label, sym)
+
+    def _prune_stale_data(self) -> None:
+        """RC #5 — trim permanent dictionaries to bound memory over long sessions.
+
+        Called by the throttler loop every ~75 s.  Removes:
+        * Order-ref caches (_order_times, _order_error_messages,
+          _rejected_order_cache) for orders placed on a previous calendar day.
+        * Terminal-status _trades entries that are NOT from today.
+        * _portfolio_cache entries for zero-position instruments whose
+          reqPnLSingle subscription has already been cancelled (they will
+          never receive another update).
+        """
+        today_mmdd = datetime.now(_ET).strftime("%m%d")
+        today_prefix = f"nano_{today_mmdd}_"
+
+        # ── Order-ref caches ─────────────────────────────────────────────────
+        stale_refs = [r for r in list(self._order_times)
+                      if not r.startswith(today_prefix)]
+        for r in stale_refs:
+            self._order_times.pop(r, None)
+            self._order_error_messages.pop(r, None)
+
+        stale_rejected = [oid for oid in list(self._rejected_order_cache)
+                          if today_prefix not in oid]
+        for oid in stale_rejected:
+            self._rejected_order_cache.pop(oid, None)
+
+        # ── _trades ──────────────────────────────────────────────────────────
+        # Keep all of today's orders; prune terminal-status orders from
+        # previous days (they can no longer be cancelled or modified).
+        stale_trades: list[str] = []
+        for oid, trade in list(self._trades.items()):
+            if today_prefix in oid:
+                continue  # today — keep regardless of status
+            status = (getattr(trade.orderStatus, "status", "")
+                      if getattr(trade, "orderStatus", None) else "")
+            if status in ("Filled", "Cancelled", "Canceled",
+                          "Inactive", "ApiCancelled", "Completed"):
+                stale_trades.append(oid)
+        for oid in stale_trades:
+            self._trades.pop(oid, None)
+            self._has_status_handler.discard(oid)
+
+        # ── _portfolio_cache ─────────────────────────────────────────────────
+        # Remove zero-position entries whose reqPnLSingle subscription has
+        # been cancelled (not in _pnl_single_subs, not pending cancel).
+        # These entries will never receive another pnlSingle update.
+        stale_pos: list[tuple[str, int]] = []
+        for key, pos in list(self._portfolio_cache.items()):
+            if (pos.get("position", 0) == 0
+                    and key not in self._pnl_single_subs
+                    and key not in self._pnl_zero_pending_cancel):
+                stale_pos.append(key)
+        for key in stale_pos:
+            self._portfolio_cache.pop(key, None)
+            self._pnl_single_cache.pop(key, None)
+
+        if stale_refs or stale_rejected or stale_trades or stale_pos:
+            log.debug(
+                "Worker %s: pruned %d order refs, %d rejected orders, "
+                "%d stale trades, %d flat positions",
+                self._label,
+                len(stale_refs), len(stale_rejected),
+                len(stale_trades), len(stale_pos))
 
     def _on_account_summary(self, value) -> None:
         """De-duplicate rapid ticks into the buffer dict.
@@ -1797,49 +2111,104 @@ class IBWorkerThread(QThread):
         ``pnlSingleEvent`` emits a :class:`PnLSingle` object per call.
         Fields may be ``float('nan')`` or ``DBL_MAX`` (1.7976e+308) when
         unavailable.
+
+        Also extracts ``entry.value`` (market value) and injects it into
+        the portfolio cache so positions populated via ``positionEvent``
+        (which does **not** carry market data) get live market values.
         """
         try:
             acct = entry.account
             con_id = entry.conId
             tws_log.debug("[%s] EVENT     pnlSingleEvent → account=%s conId=%s "
-                          "dailyPnL=%s unrealizedPnL=%s realizedPnL=%s",
+                          "dailyPnL=%s unrealizedPnL=%s realizedPnL=%s value=%s",
                           self._label, acct, con_id,
-                          entry.dailyPnL, entry.unrealizedPnL, entry.realizedPnL)
+                          entry.dailyPnL, entry.unrealizedPnL, entry.realizedPnL,
+                          getattr(entry, "value", None))
             daily = _safe_pnl(entry.dailyPnL)
             realized = _safe_pnl(entry.realizedPnL)
             unrealized = _safe_pnl(entry.unrealizedPnL)
             self._pnl_single_cache[(acct, con_id)] = (daily, realized, unrealized)
-            self.pnl_single_updated.emit(acct, con_id, daily, realized, unrealized)
+            # RC #1: store in throttle buffer — the _throttler_loop flushes
+            # at most every 250 ms, collapsing rapid ticks into one signal
+            # per (account, conId) instead of flooding the Qt event queue.
+            self._pnl_single_buffer[(acct, con_id)] = (daily, realized, unrealized)
+
+            # ── Merge market_value / market_price into portfolio cache ────────
+            # positionEvent only delivers position qty + avgCost.  PnLSingle
+            # adds value (market_value) and position (qty), from which we can
+            # derive market_price when position != 0.  Merge these into the
+            # cached dict so snapshot callers and the UI position model see
+            # live values.
+            mkt_value = _safe_pnl(getattr(entry, "value", None))
+            pos_qty = float(getattr(entry, "position", 0) or 0)
+            mkt_price = 0.0
+            if pos_qty != 0 and mkt_value != 0.0:
+                # For futures, entry.value = qty × price × multiplier,
+                # so mkt_value / pos_qty = price × multiplier (e.g. 2× for
+                # MNQ).  Divide by the multiplier to get the true price.
+                key = (acct, con_id)
+                cached_for_mult = self._portfolio_cache.get(key, {})
+                try:
+                    mult = float(cached_for_mult.get("multiplier", "") or 1)
+                except (ValueError, TypeError):
+                    mult = 1.0
+                if mult < 1:
+                    mult = 1.0
+                mkt_price = mkt_value / (pos_qty * mult)
+
+            key = (acct, con_id)
+            if key in self._portfolio_cache:
+                cached = self._portfolio_cache[key]
+                # ── IMPORTANT: never write position qty from pnlSingle. ────────
+                # pnlSingle events can arrive out-of-order or with a stale
+                # position value AFTER positionEvent has already zeroed the
+                # cache.  Writing pos_qty here would overwrite the correct
+                # position=0 set by positionEvent, causing the closed position
+                # to reappear with the old (pre-sell) qty.
+                # Position qty is owned exclusively by _on_position_update.
+                if pos_qty == 0:
+                    # Market value / price for a flat position are definitively
+                    # zero — zero them out without the != 0.0 guard so the UI
+                    # model shows market_value=0 even when positionEvent is late.
+                    cached["market_value"] = 0.0
+                    cached["market_price"] = 0.0
+                else:
+                    # Position is still open — update live market data.
+                    if mkt_value != 0.0:
+                        cached["market_value"] = mkt_value
+                    if mkt_price != 0.0:
+                        cached["market_price"] = mkt_price
+                if unrealized != 0.0:
+                    cached["unrealized_pnl"] = unrealized
+                if realized != 0.0:
+                    cached["realized_pnl"] = realized
+                # Re-buffer so the throttler emits an updated portfolio row
+                self._portfolio_buffer[key] = cached
         except Exception:
             log.debug("Worker %s: bad PnLSingle entry: %s", self._label, entry)
 
-    def _on_portfolio_update(self, item) -> None:
+    def _on_position_update(self, item) -> None:
         """Buffer a PortfolioItem update for throttled emission.
 
-        ``updatePortfolioEvent`` fires once per position change.
+        ``positionEvent`` fires once per position change.
         """
         try:
             contract = item.contract
             acct = getattr(item, "account", "")
             con_id = getattr(contract, "conId", 0)
             if not acct or not con_id:
-                log.debug("Worker %s: portfolio update dropped (acct=%r, conId=%r)",
+                log.debug("Worker %s: position update dropped (acct=%r, conId=%r)",
                           self._label, acct, con_id)
                 return
             sym = getattr(contract, "localSymbol", "") or getattr(
                 contract, "symbol", "")
             pos = float(getattr(item, "position", 0))
-            log.debug("Worker %s: portfolio event %s %s pos=%.1f acct=%s",
+            log.debug("Worker %s: position event %s %s pos=%.1f acct=%s",
                       self._label, sym, con_id, pos, acct)
-            tws_log.debug("[%s] EVENT     updatePortfolioEvent → account=%s symbol=%s "
-                          "conId=%s pos=%.1f avgCost=%.2f mktPrice=%.2f mktValue=%.2f "
-                          "unrealizedPnL=%.2f realizedPnL=%.2f",
+            tws_log.debug("[%s] EVENT     positionEvent → account=%s symbol=%s "
+                          "conId=%s pos=%.1f avgCost=%.4f",
                           self._label, acct, sym, con_id, pos,
-                          float(getattr(item, "averageCost", 0)),
-                          float(getattr(item, "marketPrice", 0)),
-                          float(getattr(item, "marketValue", 0)),
-                          float(getattr(item, "unrealizedPNL", 0)),
-                          float(getattr(item, "realizedPNL", 0)))
+                          float(getattr(item, "avgCost", 0)))
             self._portfolio_buffer[(acct, con_id)] = {
                 "label": self._label,
                 "account": acct,
@@ -1849,16 +2218,28 @@ class IBWorkerThread(QThread):
                 "sec_type": getattr(contract, "secType", ""),
                 "exchange": getattr(contract, "exchange", ""),
                 "currency": getattr(contract, "currency", "USD"),
+                "multiplier": getattr(contract, "multiplier", ""),
                 "position": float(getattr(item, "position", 0)),
-                "avg_cost": float(getattr(item, "averageCost", 0)),
-                "market_price": float(getattr(item, "marketPrice", 0)),
-                "market_value": float(getattr(item, "marketValue", 0)),
-                "unrealized_pnl": float(getattr(item, "unrealizedPNL", 0)),
-                "realized_pnl": float(getattr(item, "realizedPNL", 0)),
+                # positionEvent → Position(account, contract, position, avgCost)
+                # market_price / market_value / unrealized_pnl / realized_pnl
+                # are NOT available from positionEvent; they come in via
+                # pnlSingleEvent (_on_pnl_single) and are merged into the
+                # portfolio cache there.  Preserve any cached values so we
+                # don't zero out live data from pnlSingle.
+                "avg_cost": float(getattr(item, "avgCost", 0)),
+                "market_price":   self._portfolio_cache.get(
+                    (acct, con_id), {}).get("market_price", 0.0),
+                "market_value":   self._portfolio_cache.get(
+                    (acct, con_id), {}).get("market_value", 0.0),
+                "unrealized_pnl": self._portfolio_cache.get(
+                    (acct, con_id), {}).get("unrealized_pnl", 0.0),
+                "realized_pnl":   self._portfolio_cache.get(
+                    (acct, con_id), {}).get("realized_pnl", 0.0),
             }
             # Also persist into the long-lived cache for late subscribers
             self._portfolio_cache[(acct, con_id)
                                   ] = self._portfolio_buffer[(acct, con_id)]
+
 
             # Subscribe to per-position PnL for ALL positions (including zero).
             # Keeping the subscription active after a position closes ensures
@@ -1874,6 +2255,15 @@ class IBWorkerThread(QThread):
                 except Exception as exc:
                     log.debug("Worker %s: reqPnLSingle failed for %s/%s: %s",
                               self._label, acct, con_id, exc)
+
+            # RC #3: manage deferred cancellation when position goes flat.
+            # Schedule cancellation 60 s from now so realized P&L stays
+            # visible in the UI after the close; abort if position re-opens.
+            if pos == 0 and pnl_key in self._pnl_single_subs:
+                self._pnl_zero_pending_cancel[pnl_key] = time.monotonic() + 60
+            elif pos != 0 and pnl_key in self._pnl_zero_pending_cancel:
+                # Position re-opened before the cancellation timer fired.
+                del self._pnl_zero_pending_cancel[pnl_key]
 
         except Exception:
             log.debug("Worker %s: bad portfolio item: %s", self._label, item)

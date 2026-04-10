@@ -103,24 +103,41 @@ _TABLE_STYLE = f"""
     }}
     QScrollBar:vertical {{
         background: {BG_TABLE};
-        width: 6px;
+        width: 8px;
+        margin: 0;
     }}
     QScrollBar::handle:vertical {{
-        background: #3A3E48;
-        border-radius: 3px;
-        min-height: 20px;
+        background: #4A4E58;
+        border-radius: 4px;
+        min-height: 24px;
+    }}
+    QScrollBar::handle:vertical:hover {{
+        background: #5E6370;
+    }}
+    QScrollBar::handle:vertical:pressed {{
+        background: #6E7380;
     }}
     QScrollBar:horizontal {{
         background: {BG_TABLE};
-        height: 6px;
+        height: 10px;
+        margin: 0;
     }}
     QScrollBar::handle:horizontal {{
-        background: #3A3E48;
-        border-radius: 3px;
-        min-width: 20px;
+        background: #4A4E58;
+        border-radius: 4px;
+        min-width: 40px;
     }}
-    QScrollBar::add-line, QScrollBar::sub-line {{
-        height: 0; width: 0;
+    QScrollBar::handle:horizontal:hover {{
+        background: #5E6370;
+    }}
+    QScrollBar::handle:horizontal:pressed {{
+        background: #6E7380;
+    }}
+    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+        height: 0;
+    }}
+    QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+        width: 0;
     }}
 """
 
@@ -182,10 +199,10 @@ class AccountHeaderInfoDelegate(QStyledItemDelegate):
         excess_liq   = ad.get("excess_liq",   0.0)
         buying_power = ad.get("buying_power", 0.0)
 
-        # Header-specific format: always show a value (including +$0)
+        # Header-specific format: always show a value (including +0)
         if math.isfinite(daily_pnl):
             v = int(round(daily_pnl))
-            daily_str = f"+${v:,}" if v >= 0 else f"-${abs(v):,}"
+            daily_str = f"+{v:,}" if v >= 0 else f"-{abs(v):,}"
         else:
             daily_str = "–"
         net_str    = _fmt_money(net_liq)
@@ -670,6 +687,14 @@ class AccountPositionPanel(QWidget):
     def get_symbol_for_position(self, account: str, con_id: int) -> str:
         """Return localSymbol (or root symbol) for the given (account, conId)."""
         return self._model.get_symbol_for_position(account, con_id)
+
+    def set_selected_accounts(self, accounts: set) -> None:
+        """Filter positions view to only the given selected accounts.
+
+        Delegates to the model; an empty set means show all accounts.
+        Called whenever the Account List panel's checked state changes.
+        """
+        self._model.set_selected_accounts(accounts)
 
     # ── Slots ─────────────────────────────────────────────────────────────────
 

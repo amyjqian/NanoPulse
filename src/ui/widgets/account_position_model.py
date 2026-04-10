@@ -88,7 +88,7 @@ def _fmt_price(val: float) -> str:
 def _fmt_money(val: float) -> str:
     if val == 0 or not math.isfinite(val):
         return "–"
-    return f"${val:,.0f}"
+    return f"{val:,.0f}"
 
 
 def _fmt_pnl(val: float) -> str:
@@ -97,7 +97,7 @@ def _fmt_pnl(val: float) -> str:
     v = int(round(val))
     if v == 0:
         return ""
-    return f"+${v:,}" if v > 0 else f"-${abs(v):,}"
+    return f"+{v:,}" if v > 0 else f"-{abs(v):,}"
 
 
 def _fmt_qty(val: float) -> str:
@@ -112,7 +112,7 @@ def _fmt_mktval(val: float) -> str:
     v = int(round(val))
     if v == 0:
         return ""
-    return f"${v:,}" if v > 0 else f"-${abs(v):,}"
+    return f"{v:,}" if v > 0 else f"-{abs(v):,}"
 
 
 def _pnl_color(val: float) -> QColor:
@@ -131,18 +131,33 @@ class AccountPositionModel(QAbstractTableModel):
     def __init__(self, get_alias=None, parent=None):
         super().__init__(parent)
         self._rows: list[dict] = []
-        self._row_map: dict[tuple[str, int], int] = {}  # (acct, conId) → row idx
-        self._acct_row_map: dict[str, int] = {}          # account → header row idx
+        self._row_map: dict[tuple[str, int], int] = {}
+        self._acct_row_map: dict[str, int] = {}
         self._positions: dict[tuple[str, int], dict] = {}
         self._pnl_single: dict[tuple[str, int], dict] = {}
         self._acct_data: dict[str, dict] = {}
         self._get_alias = get_alias
-        self._show_zero: bool = True   # default ON – show zero-qty rows
+        self._show_zero: bool = True
+        # None  = no filter, show all accounts (initial state before the
+        #         Account List panel has pushed a selection).
+        # set() = user has explicitly deselected everything → show nothing.
+        self._selected_accounts: set[str] | None = None
 
     def set_show_zero(self, show: bool) -> None:
         """Show or hide rows where position qty == 0, then rebuild."""
         if self._show_zero != show:
             self._show_zero = show
+            self.rebuild()
+
+    def set_selected_accounts(self, accounts: set[str]) -> None:
+        """Filter the view to only the given accounts.
+
+        Pass an empty set to show nothing (all accounts deselected).
+        Pass None to clear the filter and show all accounts.
+        """
+        new = set(accounts) if accounts is not None else None
+        if self._selected_accounts != new:
+            self._selected_accounts = new
             self.rebuild()
 
     # ── Qt table interface ────────────────────────────────────────────────────
@@ -323,16 +338,26 @@ class AccountPositionModel(QAbstractTableModel):
             old = self._positions.get(key)
             pos = dict(pos)
             self._compute_display_avg(pos)
+            new_qty = pos.get("position", 0)
+            old_qty = old.get("position", 0) if old is not None else None
             self._positions[key] = pos
 
-            if key in self._row_map and old is not None:
-                # Re-sort whenever market_value changes — it drives the sort order
-                if pos.get("market_value", 0) != old.get("market_value", 0):
+            in_view        = key in self._row_map
+            should_be_visible = self._show_zero or new_qty != 0
+
+            if in_view:
+                if new_qty != old_qty:
+                    # Qty changed → row may need to appear/disappear or reorder
                     needs_rebuild = True
                 else:
+                    # Same qty — fast path: refresh only the affected cells
                     self._update_row_in_place(key, pos)
-            else:
-                needs_rebuild = True  # new key – always add to view
+            elif should_be_visible:
+                # Row ought to be in the view but isn't (new position or
+                # show_zero just turned on) → rebuild to add it
+                needs_rebuild = True
+            # else: qty==0 and show_zero=False → row is intentionally hidden;
+            # no rebuild needed, just keep _positions updated.
 
         if needs_rebuild:
             self.rebuild()
@@ -425,14 +450,24 @@ class AccountPositionModel(QAbstractTableModel):
         # Collect all positions grouped by account (including zero positions)
         acct_pos: dict[str, list] = {}
         for key, pos in self._positions.items():
+            account = key[0]
+            # _selected_accounts is None  → no filter, show all
+            # _selected_accounts is set() → user deselected all, show nothing
+            # _selected_accounts is {...} → show only listed accounts
+            if self._selected_accounts is not None \
+                    and account not in self._selected_accounts:
+                continue
             if not self._show_zero and pos.get("position", 0) == 0:
                 continue
-            acct_pos.setdefault(key[0], []).append((key, pos))
+            acct_pos.setdefault(account, []).append((key, pos))
 
         for account in sorted(acct_pos):
-            # Sort positions within the account by abs(market_value) desc
+            # Sort positions within the account by abs(market_value) desc,
+            # with abs(position qty) as tiebreaker for rows where market
+            # value hasn't arrived yet from pnlSingleEvent.
             acct_pos[account].sort(
-                key=lambda kv: abs(kv[1].get("market_value", 0)),
+                key=lambda kv: (abs(kv[1].get("market_value", 0)),
+                                abs(kv[1].get("position", 0))),
                 reverse=True,
             )
 

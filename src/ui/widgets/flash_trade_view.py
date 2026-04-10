@@ -173,6 +173,15 @@ class FlashTradeView(QWidget):
         self._account_position.refresh_requested.connect(
             self._on_position_refresh_requested)
 
+        # ── Wire account list selection → positions filter ────────────────────
+        if isinstance(self._account_list, AccountListPanel):
+            self._account_list.selection_changed.connect(
+                self._account_position.set_selected_accounts)
+            # Push the initial persisted selection so the view is correct
+            # before the user clicks anything.
+            self._account_position.set_selected_accounts(
+                self._account_list.get_selected_accounts())
+
         # ── Wire position panel action buttons ───────────────────────────────
         # Header-row Flatten: flatten every open position for that account
         self._account_position.flatten_requested.connect(
@@ -501,46 +510,45 @@ class FlashTradeView(QWidget):
             "error_message": data.get("error_message", ""),
         })
 
-        # When an order fills, IB *should* fire updatePortfolioEvent but
-        # on paper accounts it can be delayed or missed.  Schedule a
-        # portfolio refresh after a short delay to guarantee the panel
-        # reflects the new position.
-        if status in ("Filled", "Completed"):
-            QTimer.singleShot(2000, self._refresh_portfolio)
 
     def _on_portfolio_updated(self, batch: list[dict]) -> None:
         """Receive portfolio position batch from worker thread → update panel."""
         log.debug("FlashTrade: portfolio batch received (%d positions)", len(batch))
         self._account_position.update_positions(batch)
 
-        # Feed account balance info from accounts_model if available
+        # Feed account balance info from accounts_model if available.
+        # RC #2: use O(1) reverse-index lookup (_acct_to_label + _row_map)
+        # instead of the previous O(n×m) linear scan over every account row
+        # for every position in the batch.
         if self._accounts_model is not None:
             seen_accounts: set[str] = set()
-            from .accounts_model import COL_NET_LIQ, COL_EXCESS_LIQ, COL_ACCOUNT
+            from .accounts_model import COL_NET_LIQ, COL_EXCESS_LIQ
             for pos in batch:
                 account = pos.get("account", "")
                 if not account or account in seen_accounts:
                     continue
                 seen_accounts.add(account)
-                for row_idx in range(self._accounts_model.rowCount()):
-                    row_data = self._accounts_model._table_data[row_idx]
-                    if row_data[COL_ACCOUNT] == account:
-                        try:
-                            bal = float(row_data[COL_NET_LIQ]
-                                        ) if row_data[COL_NET_LIQ] else 0
-                        except (ValueError, TypeError):
-                            bal = 0
-                        try:
-                            excess = float(row_data[COL_EXCESS_LIQ]
-                                           ) if row_data[COL_EXCESS_LIQ] else 0
-                        except (ValueError, TypeError):
-                            excess = 0
-                        bp = self._accounts_model.get_buying_power(account)
-                        self._account_position.set_account_data(
-                            account, balance=bal,
-                            net_liq=bal, excess_liq=excess,
-                            buying_power=bp)
-                        break
+                # O(1): resolve label → row index directly
+                label = self._accounts_model.connection_for_account(account)
+                if label is None:
+                    continue
+                row_idx = self._accounts_model._row_map.get((label, account))
+                if row_idx is None:
+                    continue
+                row_data = self._accounts_model._table_data[row_idx]
+                try:
+                    bal = float(row_data[COL_NET_LIQ]) if row_data[COL_NET_LIQ] else 0
+                except (ValueError, TypeError):
+                    bal = 0
+                try:
+                    excess = float(row_data[COL_EXCESS_LIQ]) if row_data[COL_EXCESS_LIQ] else 0
+                except (ValueError, TypeError):
+                    excess = 0
+                bp = self._accounts_model.get_buying_power(account)
+                self._account_position.set_account_data(
+                    account, balance=bal,
+                    net_liq=bal, excess_liq=excess,
+                    buying_power=bp)
 
     def _on_pnl_single_updated(self, account: str, con_id: int,
                                daily_pnl: float, realized_pnl: float,

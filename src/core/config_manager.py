@@ -198,10 +198,15 @@ def save_layout(
 
 
 def load_order_entry_symbols(path: Path | str | None = None) -> list[str]:
-    """Load the list of local_symbol strings pinned to the Order Entry panel."""
+    """Load the list of local_symbol strings pinned to the Order Entry panel.
+
+    Falls back to ``["MNQ"]`` on first launch so the panel has a sensible
+    default without requiring the user to add a symbol manually.
+    """
     p = Path(path) if path else _default_path()
     data = _read_json(p)
-    return list(data.get("order_entry_symbols", []))
+    saved = list(data.get("order_entry_symbols", []))
+    return saved if saved else ["MNQ"]
 
 
 def save_order_entry_symbols(
@@ -214,6 +219,25 @@ def save_order_entry_symbols(
     data["order_entry_symbols"] = symbols
     _write_json(p, data)
     log.debug("Saved %d order-entry symbol(s) to %s", len(symbols), p)
+
+
+def load_active_order_entry_symbol(path: Path | str | None = None) -> str:
+    """Return the last-active symbol in the Order Entry panel, or ``""``."""
+    p = Path(path) if path else _default_path()
+    data = _read_json(p)
+    return str(data.get("order_entry_active_symbol", ""))
+
+
+def save_active_order_entry_symbol(
+    symbol: str,
+    path: Path | str | None = None,
+) -> None:
+    """Persist the currently-active Order Entry symbol."""
+    p = Path(path) if path else _default_path()
+    data = _read_json(p)
+    data["order_entry_active_symbol"] = symbol
+    _write_json(p, data)
+    log.debug("Saved active order-entry symbol %r to %s", symbol, p)
 
 
 # ── Account-list panel state persistence ──────────────────────────────────────

@@ -153,18 +153,20 @@ class TopTabBar(QWidget):
         first = next(iter(self._buttons.values()))
         first.set_active(True)
 
-    def set_status(self, conn_count: int, acct_count: int) -> None:
-        if conn_count == 0 and acct_count == 0:
+    def set_status(self, conn_count: int, acct_count: int,
+                   selected_count: int = 0) -> None:
+        """Update the top-right stats label.
+
+        Format: ``Conn: 2 | Accts: 5 | Selected: 3``
+        When everything is zero the label is hidden.
+        """
+        if conn_count == 0 and acct_count == 0 and selected_count == 0:
             self._status_label.setText("")
             return
-            
-        parts = []
-        if conn_count > 0:
-            parts.append(f"Connections — {conn_count} Active")
-        if acct_count > 0:
-            parts.append(f"Accounts — {acct_count} Total")
-            
-        self._status_label.setText("  |  ".join(parts))
+        text = (f"Conn: {conn_count}"
+                f"  |  Accts: {acct_count}"
+                f"  |  Selected: {selected_count}")
+        self._status_label.setText(text)
 
     def _on_tab_click(self, name: str) -> None:
         for label, btn in self._buttons.items():
