@@ -537,6 +537,10 @@ class AccountListPanel(QWidget):
         self._refresh_add_combo()
         log.info("AccountList: user re-added %s", acct)
 
+    def get_selected_count(self) -> int:
+        """Return the number of currently checked (selected) account rows."""
+        return sum(1 for r in self._account_rows.values() if r.is_checked)
+
     def _select_all(self) -> None:
         for r in self._account_rows.values():
             r.set_checked(True)
