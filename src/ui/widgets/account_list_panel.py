@@ -261,10 +261,10 @@ class _AccountRow(QFrame):
         if abs(val) > 1e100:
             return "-"
         if abs(val) >= 1_000_000:
-            return f"${val / 1_000_000:.1f}M"
+            return f"{val / 1_000_000:.1f}M"
         if abs(val) >= 1_000:
-            return f"${val / 1_000:.0f}k"
-        return f"${val:,.0f}"
+            return f"{val / 1_000:.0f}k"
+        return f"{val:,.0f}"
 
 
 # ── Main Panel ────────────────────────────────────────────────────────────────

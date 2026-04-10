@@ -118,6 +118,8 @@ class AccountsTableModel(QAbstractTableModel):
         raw = self._table_data[row][col]
 
         if role == Qt.ItemDataRole.DisplayRole:
+            if col == COL_DAILY_PNL:
+                return self._format_pnl(raw)
             if col in _FINANCIAL_COLS:
                 return self._format_financial(raw)
             return raw
@@ -244,6 +246,22 @@ class AccountsTableModel(QAbstractTableModel):
             self._acct_to_label[row[COL_ACCOUNT]] = row[COL_CONNECTION]
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _format_pnl(raw: str) -> str:
+        """Format Daily P&L as a signed integer (no decimals)."""
+        if not raw:
+            return ""
+        try:
+            val = float(raw)
+        except (ValueError, TypeError):
+            return raw
+        if abs(val) > 1e100:
+            return "-"
+        v = int(round(val))
+        if v == 0:
+            return ""
+        return f"+{v:,}" if v > 0 else f"{v:,}"
 
     @staticmethod
     def _format_financial(raw: str) -> str:

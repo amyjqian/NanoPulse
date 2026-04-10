@@ -88,7 +88,7 @@ def _fmt_price(val: float) -> str:
 def _fmt_money(val: float) -> str:
     if val == 0 or not math.isfinite(val):
         return "–"
-    return f"${val:,.0f}"
+    return f"{val:,.0f}"
 
 
 def _fmt_pnl(val: float) -> str:
@@ -97,7 +97,7 @@ def _fmt_pnl(val: float) -> str:
     v = int(round(val))
     if v == 0:
         return ""
-    return f"+${v:,}" if v > 0 else f"-${abs(v):,}"
+    return f"+{v:,}" if v > 0 else f"-{abs(v):,}"
 
 
 def _fmt_qty(val: float) -> str:
@@ -112,7 +112,7 @@ def _fmt_mktval(val: float) -> str:
     v = int(round(val))
     if v == 0:
         return ""
-    return f"${v:,}" if v > 0 else f"-${abs(v):,}"
+    return f"{v:,}" if v > 0 else f"-{abs(v):,}"
 
 
 def _pnl_color(val: float) -> QColor:

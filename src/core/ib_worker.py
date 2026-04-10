@@ -162,6 +162,8 @@ class IBWorkerThread(QThread):
     # account-level P&L from pnlEvent
     # (account, daily_pnl, realized_pnl, unrealized_pnl)
     account_pnl_updated = Signal(str, float, float, float)
+    # (label, list_of_account_ids) – emitted once after connection established
+    accounts_detected = Signal(str, list)
 
     def __init__(
         self,
@@ -670,6 +672,10 @@ class IBWorkerThread(QThread):
 
                 # Connection established — update status immediately
                 self.connection_status_changed.emit(self._label, True)
+                # Notify UI of discovered account IDs for auto-type detection
+                managed = list(self._ib.managedAccounts())
+                if managed:
+                    self.accounts_detected.emit(self._label, managed)
                 log.info(
                     "Worker %s connected – seeding initial snapshot", self._label)
                 tws_log.info(

@@ -817,7 +817,7 @@ class _TierSection(QWidget):
         self._dollar_lbl.setText(
             f'{self._title_str}: '
             f'<span style="color:{val_clr};font-weight:bold;">'
-            f'${scaled:,.0f}</span>'
+            f'{scaled:,.0f}</span>'
         )
 
     def set_qty(self, qty: int) -> None:
@@ -970,7 +970,14 @@ class OrderEntryPanel(QWidget):
         self._last_bid: float = 0.0    # latest live bid price
         self._last_ask: float = 0.0    # latest live ask price
         self._symbols: list[str] = config_manager.load_order_entry_symbols()
-        self._active_symbol: str | None = self._symbols[0] if self._symbols else None
+        # Restore last-active symbol; fall back to MNQ, then the first symbol.
+        _saved_active = config_manager.load_active_order_entry_symbol()
+        if _saved_active and _saved_active in self._symbols:
+            self._active_symbol: str | None = _saved_active
+        elif "MNQ" in self._symbols:
+            self._active_symbol = "MNQ"
+        else:
+            self._active_symbol = self._symbols[0] if self._symbols else None
         self._active_qty: int = 1
         self._sym_buttons: dict[str, QPushButton] = {}
 
@@ -1332,6 +1339,7 @@ class OrderEntryPanel(QWidget):
                 if params:
                     self._bg_worker.subscribe_background_symbols([params])
         self._active_symbol = sym
+        config_manager.save_active_order_entry_symbol(sym)
         self._combo.setCurrentText("")
         # Restore full list for next search
         self._refresh_combo_items()
@@ -1404,6 +1412,7 @@ class OrderEntryPanel(QWidget):
 
     def _on_symbol_clicked(self, sym: str) -> None:
         self._active_symbol = sym
+        config_manager.save_active_order_entry_symbol(sym)
         for s, btn in self._sym_buttons.items():
             _apply_chip_style(btn, s == sym)
         self._update_symbol_display()

@@ -182,10 +182,10 @@ class AccountHeaderInfoDelegate(QStyledItemDelegate):
         excess_liq   = ad.get("excess_liq",   0.0)
         buying_power = ad.get("buying_power", 0.0)
 
-        # Header-specific format: always show a value (including +$0)
+        # Header-specific format: always show a value (including +0)
         if math.isfinite(daily_pnl):
             v = int(round(daily_pnl))
-            daily_str = f"+${v:,}" if v >= 0 else f"-${abs(v):,}"
+            daily_str = f"+{v:,}" if v >= 0 else f"-{abs(v):,}"
         else:
             daily_str = "–"
         net_str    = _fmt_money(net_liq)
