@@ -671,6 +671,14 @@ class AccountPositionPanel(QWidget):
         """Return localSymbol (or root symbol) for the given (account, conId)."""
         return self._model.get_symbol_for_position(account, con_id)
 
+    def set_selected_accounts(self, accounts: set) -> None:
+        """Filter positions view to only the given selected accounts.
+
+        Delegates to the model; an empty set means show all accounts.
+        Called whenever the Account List panel's checked state changes.
+        """
+        self._model.set_selected_accounts(accounts)
+
     # ── Slots ─────────────────────────────────────────────────────────────────
 
     def _on_refresh_clicked(self) -> None:

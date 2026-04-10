@@ -173,6 +173,15 @@ class FlashTradeView(QWidget):
         self._account_position.refresh_requested.connect(
             self._on_position_refresh_requested)
 
+        # ── Wire account list selection → positions filter ────────────────────
+        if isinstance(self._account_list, AccountListPanel):
+            self._account_list.selection_changed.connect(
+                self._account_position.set_selected_accounts)
+            # Push the initial persisted selection so the view is correct
+            # before the user clicks anything.
+            self._account_position.set_selected_accounts(
+                self._account_list.get_selected_accounts())
+
         # ── Wire position panel action buttons ───────────────────────────────
         # Header-row Flatten: flatten every open position for that account
         self._account_position.flatten_requested.connect(

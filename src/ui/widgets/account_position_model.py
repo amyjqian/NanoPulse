@@ -131,18 +131,33 @@ class AccountPositionModel(QAbstractTableModel):
     def __init__(self, get_alias=None, parent=None):
         super().__init__(parent)
         self._rows: list[dict] = []
-        self._row_map: dict[tuple[str, int], int] = {}  # (acct, conId) → row idx
-        self._acct_row_map: dict[str, int] = {}          # account → header row idx
+        self._row_map: dict[tuple[str, int], int] = {}
+        self._acct_row_map: dict[str, int] = {}
         self._positions: dict[tuple[str, int], dict] = {}
         self._pnl_single: dict[tuple[str, int], dict] = {}
         self._acct_data: dict[str, dict] = {}
         self._get_alias = get_alias
-        self._show_zero: bool = True   # default ON – show zero-qty rows
+        self._show_zero: bool = True
+        # None  = no filter, show all accounts (initial state before the
+        #         Account List panel has pushed a selection).
+        # set() = user has explicitly deselected everything → show nothing.
+        self._selected_accounts: set[str] | None = None
 
     def set_show_zero(self, show: bool) -> None:
         """Show or hide rows where position qty == 0, then rebuild."""
         if self._show_zero != show:
             self._show_zero = show
+            self.rebuild()
+
+    def set_selected_accounts(self, accounts: set[str]) -> None:
+        """Filter the view to only the given accounts.
+
+        Pass an empty set to show nothing (all accounts deselected).
+        Pass None to clear the filter and show all accounts.
+        """
+        new = set(accounts) if accounts is not None else None
+        if self._selected_accounts != new:
+            self._selected_accounts = new
             self.rebuild()
 
     # ── Qt table interface ────────────────────────────────────────────────────
@@ -435,9 +450,16 @@ class AccountPositionModel(QAbstractTableModel):
         # Collect all positions grouped by account (including zero positions)
         acct_pos: dict[str, list] = {}
         for key, pos in self._positions.items():
+            account = key[0]
+            # _selected_accounts is None  → no filter, show all
+            # _selected_accounts is set() → user deselected all, show nothing
+            # _selected_accounts is {...} → show only listed accounts
+            if self._selected_accounts is not None \
+                    and account not in self._selected_accounts:
+                continue
             if not self._show_zero and pos.get("position", 0) == 0:
                 continue
-            acct_pos.setdefault(key[0], []).append((key, pos))
+            acct_pos.setdefault(account, []).append((key, pos))
 
         for account in sorted(acct_pos):
             # Sort positions within the account by abs(market_value) desc,
