@@ -38,7 +38,7 @@ _FONT_NORMAL.setWeight(QFont.Weight.Normal)
 _ICONS: dict[str, str] = {
     "Connect":        "⚡",
     "Contracts":      "🔍",
-    "FlashTrade":     "⚡",
+    "Trade":          "⚡",
     "StrategyEditor": "📐",
     "Executions":     "📊",
     "Settings":       "⚙",
@@ -121,7 +121,7 @@ class TopTabBar(QWidget):
     # Emits tab name for ALL tabs (including Settings)
     tabBarClicked = Signal(str)
 
-    _TABS = ["Connect", "Contracts", "FlashTrade", "StrategyEditor", "Executions", "Settings"]
+    _TABS = ["Connect", "Contracts", "Trade", "StrategyEditor", "Executions", "Settings"]
 
     def __init__(self, parent=None):
         super().__init__(parent)

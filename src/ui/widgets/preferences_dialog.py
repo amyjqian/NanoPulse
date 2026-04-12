@@ -51,15 +51,6 @@ _FONT_TITLE.setWeight(QFont.Weight.Bold)
 _FONT_SECTION = QFont("Helvetica Neue, Arial", 12)
 _FONT_SECTION.setWeight(QFont.Weight.DemiBold)
 
-# ── Tier constants ────────────────────────────────────────────────────────────
-_TIER_LABELS   = ["Tier 1", "Tier 2", "Tier 3", "Tier 4"]
-_TIER_DEFAULTS = [
-    {"label": "Tier 1", "value": 20,  "unit": "ticks"},
-    {"label": "Tier 2", "value": 40,  "unit": "ticks"},
-    {"label": "Tier 3", "value": 80,  "unit": "ticks"},
-    {"label": "Tier 4", "value": 160, "unit": "ticks"},
-]
-_TIER_UNITS = ["ticks", "%", "amt"]
 
 # ── Default preference values ─────────────────────────────────────────────────
 _DEFAULTS: dict = {
@@ -74,8 +65,6 @@ _DEFAULTS: dict = {
         "mid_price_behavior": "Normal",
         "buy_bid_behavior": "Patient",
         "sell_ask_behavior": "Patient",
-        "profit_take": [dict(d) for d in _TIER_DEFAULTS],
-        "stop_loss":   [dict(d) for d in _TIER_DEFAULTS],
     },
     "trading_stocks": {
         "quantity": 100,
@@ -87,8 +76,6 @@ _DEFAULTS: dict = {
         "buy_bid_unit": "ticks",
         "sell_ask_offset": 0,
         "sell_ask_unit": "ticks",
-        "profit_take": [dict(d) for d in _TIER_DEFAULTS],
-        "stop_loss":   [dict(d) for d in _TIER_DEFAULTS],
     },
 }
 
@@ -419,142 +406,6 @@ class _DisplayPage(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Profit-Take / Stop-Loss tier table
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class _TiersTable(QWidget):
-    """Grid showing an editable Label + Profit Take and Stop Loss tiers.
-
-    Layout (QGridLayout):
-        col 0 : Tier label        (static, 60 px)
-        col 1 : Label input       (editable QLineEdit, 110 px)
-        col 2 : PT value spin     (70 px)
-        col 3 : PT unit combo     (80 px)
-        col 4 : gap column        (20 px min)
-        col 5 : SL value spin     (70 px)
-        col 6 : SL unit combo     (80 px)
-    """
-
-    changed = Signal()
-
-    def __init__(self, pt_data: list[dict], sl_data: list[dict], parent=None):
-        super().__init__(parent)
-        self._label_inputs: list[QLineEdit] = []
-        self._spins_pt:     list[QSpinBox]  = []
-        self._combos_pt:    list[QComboBox] = []
-        self._spins_sl:     list[QSpinBox]  = []
-        self._combos_sl:    list[QComboBox] = []
-        self._build_ui(pt_data, sl_data)
-
-    def _build_ui(self, pt_data: list[dict], sl_data: list[dict]) -> None:
-        grid = QGridLayout(self)
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setHorizontalSpacing(6)
-        grid.setVerticalSpacing(6)
-
-        hdr_qss = (f"color: {_TEXT}; border: none; font-size: 12px;"
-                   f" font-weight: bold;")
-        lbl_qss = f"color: {_TEXT_DIM}; border: none; font-size: 12px;"
-
-        # ── Column headers (row 0) ─────────────────────────────────────────
-        tier_hdr = QLabel("Tier")
-        tier_hdr.setStyleSheet(hdr_qss)
-        tier_hdr.setFixedWidth(60)
-        grid.addWidget(tier_hdr, 0, 0)
-
-        label_hdr = QLabel("Label")
-        label_hdr.setStyleSheet(hdr_qss)
-        label_hdr.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        grid.addWidget(label_hdr, 0, 1)
-
-        pt_hdr = QLabel("Profit Take")
-        pt_hdr.setStyleSheet(hdr_qss)
-        pt_hdr.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        grid.addWidget(pt_hdr, 0, 2, 1, 2)
-
-        grid.setColumnMinimumWidth(4, 20)
-
-        sl_hdr = QLabel("Stop Loss")
-        sl_hdr.setStyleSheet(hdr_qss)
-        sl_hdr.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        grid.addWidget(sl_hdr, 0, 5, 1, 2)
-
-        # ── Data rows (rows 1-4) ──────────────────────────────────────────
-        for i in range(len(_TIER_LABELS)):
-            row = i + 1
-            default = _TIER_DEFAULTS[i]
-
-            # Static tier name
-            tier_lbl = QLabel(_TIER_LABELS[i])
-            tier_lbl.setStyleSheet(lbl_qss)
-            tier_lbl.setFixedWidth(60)
-            grid.addWidget(tier_lbl, row, 0)
-
-            # Editable label input
-            pt_d = pt_data[i] if i < len(pt_data) else default
-            sl_d = sl_data[i] if i < len(sl_data) else default
-            label_val = pt_d.get("label", default["label"])
-            label_edit = QLineEdit(label_val)
-            label_edit.setFixedWidth(110)
-            label_edit.setStyleSheet(_INPUT_QSS)
-            label_edit.setPlaceholderText(default["label"])
-            self._label_inputs.append(label_edit)
-            grid.addWidget(label_edit, row, 1)
-
-            # Profit Take
-            pt_spin = QSpinBox()
-            pt_spin.setRange(0, 99999)
-            pt_spin.setValue(pt_d.get("value", default["value"]))
-            pt_spin.setFixedWidth(70)
-            pt_spin.setStyleSheet(_INPUT_QSS)
-            pt_combo = _combo(_TIER_UNITS, pt_d.get("unit", default["unit"]))
-            pt_combo.setFixedWidth(80)
-            self._spins_pt.append(pt_spin)
-            self._combos_pt.append(pt_combo)
-            grid.addWidget(pt_spin,  row, 2)
-            grid.addWidget(pt_combo, row, 3)
-
-            # Stop Loss
-            sl_spin = QSpinBox()
-            sl_spin.setRange(0, 99999)
-            sl_spin.setValue(sl_d.get("value", default["value"]))
-            sl_spin.setFixedWidth(70)
-            sl_spin.setStyleSheet(_INPUT_QSS)
-            sl_combo = _combo(_TIER_UNITS, sl_d.get("unit", default["unit"]))
-            sl_combo.setFixedWidth(80)
-            self._spins_sl.append(sl_spin)
-            self._combos_sl.append(sl_combo)
-            grid.addWidget(sl_spin,  row, 5)
-            grid.addWidget(sl_combo, row, 6)
-
-            # Wire
-            label_edit.textChanged.connect(self.changed)
-            pt_spin.valueChanged.connect(self.changed)
-            pt_combo.currentTextChanged.connect(self.changed)
-            sl_spin.valueChanged.connect(self.changed)
-            sl_combo.currentTextChanged.connect(self.changed)
-
-    def revert(self) -> None:
-        for i, d in enumerate(_TIER_DEFAULTS):
-            self._label_inputs[i].setText(d["label"])
-            self._spins_pt[i].setValue(d["value"])
-            self._combos_pt[i].setCurrentText(d["unit"])
-            self._spins_sl[i].setValue(d["value"])
-            self._combos_sl[i].setCurrentText(d["unit"])
-
-    def collect(self) -> tuple[list[dict], list[dict]]:
-        pt = [{"label": self._label_inputs[i].text() or _TIER_DEFAULTS[i]["label"],
-               "value": self._spins_pt[i].value(),
-               "unit":  self._combos_pt[i].currentText()}
-              for i in range(len(_TIER_LABELS))]
-        sl = [{"label": self._label_inputs[i].text() or _TIER_DEFAULTS[i]["label"],
-               "value": self._spins_sl[i].value(),
-               "unit":  self._combos_sl[i].currentText()}
-              for i in range(len(_TIER_LABELS))]
-        return pt, sl
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 #  Reusable asset-settings block  (Futures / Stocks / …)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -741,23 +592,6 @@ class _AssetSettingsGroup(QWidget):
         sa_row.addStretch()
         root.addLayout(sa_row)
 
-        root.addSpacing(12)
-
-        # ── Profit Take / Stop Loss tiers ─────────────────────────────────────
-        tiers_sep = QFrame()
-        tiers_sep.setFrameShape(QFrame.Shape.HLine)
-        tiers_sep.setStyleSheet(f"color: {_BORDER};")
-        tiers_sep.setFixedHeight(1)
-        root.addWidget(tiers_sep)
-        root.addSpacing(6)
-
-        self._tiers_table = _TiersTable(
-            tp.get("profit_take", [dict(d) for d in _TIER_DEFAULTS]),
-            tp.get("stop_loss",   [dict(d) for d in _TIER_DEFAULTS]),
-        )
-        root.addWidget(self._tiers_table)
-
-        root.addSpacing(8)
 
         # ── Wire all widgets → changed ────────────────────────────────────────
         self._qty_spin.valueChanged.connect(self.changed)
@@ -765,7 +599,6 @@ class _AssetSettingsGroup(QWidget):
         self._lc_spin.valueChanged.connect(self.changed)
         self._lc_unit.currentTextChanged.connect(self.changed)
         self._mid_toggle.value_changed.connect(self.changed)
-        self._tiers_table.changed.connect(self.changed)
 
         if self._use_urgency:
             self._bb_toggle.value_changed.connect(self.changed)
@@ -850,7 +683,6 @@ class _AssetSettingsGroup(QWidget):
             self._bb_unit.setCurrentText(d.get("buy_bid_unit", "ticks"))
             self._sa_spin.setText(str(d.get("sell_ask_offset", 0)))
             self._sa_unit.setCurrentText(d.get("sell_ask_unit", "ticks"))
-        self._tiers_table.revert()
         log.info("%s preferences reverted to defaults", self._title)
         self.changed.emit()
 
@@ -873,9 +705,6 @@ class _AssetSettingsGroup(QWidget):
             result["sell_ask_offset"] = self._parse_offset(
                 self._sa_spin.text())
             result["sell_ask_unit"] = self._sa_unit.currentText()
-        pt_data, sl_data = self._tiers_table.collect()
-        result["profit_take"] = pt_data
-        result["stop_loss"]   = sl_data
         return result
 
 

@@ -164,7 +164,7 @@ class _AccountRow(QFrame):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setContentsMargins(8, 1, 8, 1)
         layout.setSpacing(10)
 
         # Custom painted checkbox
@@ -402,7 +402,7 @@ class AccountListPanel(QWidget):
             QComboBox {{
                 background: {BG_ITEM_INACTIVE}; color: {TEXT};
                 border: 1px solid {BORDER}; border-radius: 6px;
-                padding: 6px 12px; font-size: 11px; min-height: 28px;
+                padding: 2px 8px; font-size: 11px; min-height: 20px;
             }}
             QComboBox:hover {{ border-color: {TEXT_DIM}; }}
             QComboBox::drop-down {{

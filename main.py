@@ -30,8 +30,8 @@ def main() -> None:
     log.info("NanoPulse starting …")
 
     app = QApplication(sys.argv)
-    app.setApplicationName("NanoPulse")
-    app.setOrganizationName("NanoPulse")
+    app.setApplicationName("nanoPulse")
+    app.setOrganizationName("nanoPulse")
     app.setStyle("Fusion")
 
     # Default application font
