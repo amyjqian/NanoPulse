@@ -7,7 +7,7 @@ import math
 from typing import Any
 
 from PySide6.QtCore import QEvent, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QPainter
+from PySide6.QtGui import QColor, QDoubleValidator, QFont, QIntValidator, QPainter
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -36,6 +36,16 @@ _FUT_QTYS = [1, 2, 3, 5]
 _STK_QTYS = [10, 25, 50, 100, 500]
 _FUT_DEFAULT = 1
 _STK_DEFAULT = 100
+
+# Popup ladder values for the qty input
+_FUT_QTY_POPUP: list[int] = list(range(1, 101))          # 1 – 100
+_STK_QTY_POPUP: list[int] = (
+    list(range(1, 11))                                    # 1 – 10
+    + list(range(20, 110, 10))                            # 20, 30, … 100
+    + list(range(200, 1100, 100))                         # 200, 300, … 1000
+    + list(range(1100, 10100, 100))                       # 1100, 1200, … 10000
+    + list(range(11000, 51000, 1000))                     # 11000, 12000, … 50000
+)
 
 # ── Fonts ─────────────────────────────────────────────────────────────────────
 _TITLE_FONT = QFont("Helvetica Neue, Arial", 11)
@@ -200,15 +210,24 @@ class TickPriceInput(QWidget):
         lay.setSpacing(0)
 
         self._edit = QLineEdit()
-        self._edit.setPlaceholderText("Price")
+        self._edit.setPlaceholderText("Dist")
         self._edit.setFixedHeight(self._CHIP_H)
+        self._edit.setMinimumWidth(0)
+        self._edit.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self._edit.setStyleSheet(
             "QLineEdit{background:#3a3a4a;color:#ccc;border:none;"
-            "border-radius:4px 0 0 4px;padding:2px 6px;font-size:11px}"
+            "border-radius:6px 0 0 6px;padding:2px 6px;font-size:11px}"
             "QLineEdit:focus{background:#4a4a5a;color:white}"
             "QLineEdit:disabled{background:#252535;color:#444;border:none}"
         )
+        # Reject non-numeric keystrokes; positive floats only
+        _dv = QDoubleValidator(0.0, 1e12, 10, self._edit)
+        _dv.setNotation(QDoubleValidator.Notation.StandardNotation)
+        self._edit.setValidator(_dv)
         self._edit.textChanged.connect(self._relay_text)
+        self._edit.returnPressed.connect(self._close_popup)
+        self._edit.editingFinished.connect(self._snap_to_tick)
         self._edit.installEventFilter(self)
 
         _arrow_ss = (
@@ -246,7 +265,7 @@ class TickPriceInput(QWidget):
         self._arrow_w = QWidget()
         self._arrow_w.setFixedSize(self._BTN_W, self._CHIP_H)
         self._arrow_w.setStyleSheet(
-            "QWidget{background:#3a3a4a;border:none;border-radius:0 4px 4px 0}")
+            "QWidget{background:#3a3a4a;border:none;border-radius:0 6px 6px 0}")
         self._arrow_w.setLayout(arrow_col)
 
         lay.addWidget(self._edit, 1)
@@ -343,6 +362,23 @@ class TickPriceInput(QWidget):
     def _fmt(self, price: float) -> str:
         return f"{price:.{self._decimals()}f}"
 
+    def _snap_to_tick(self) -> None:
+        """If the field holds a non-tick-aligned number, round it to the nearest tick."""
+        text = self._edit.text().strip()
+        if not text or self._tick_size <= 0:
+            return
+        try:
+            val = float(text)
+        except ValueError:
+            return
+        snapped = self._snap(val)
+        formatted = self._fmt(snapped)
+        if formatted != text:
+            self._edit.blockSignals(True)
+            self._edit.setText(formatted)
+            self._edit.blockSignals(False)
+            self.textChanged.emit(formatted)
+
     # ── Up / Down spin ────────────────────────────────────────────────────────
 
     def _on_up(self) -> None:
@@ -390,7 +426,7 @@ class TickPriceInput(QWidget):
         )
         popup.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         popup.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        popup.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        popup.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         popup.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         popup.setStyleSheet("""
             QListWidget {
@@ -404,50 +440,24 @@ class TickPriceInput(QWidget):
             QListWidget::item            { padding: 3px 14px; border: none; }
             QListWidget::item:selected,
             QListWidget::item:hover      { background: #0071e3; color: white; }
-            QScrollBar:vertical {
-                background: #1E222A; width: 6px; margin: 0;
-            }
-            QScrollBar::handle:vertical {
-                background: #3a3f50; border-radius: 3px; min-height: 20px;
-            }
-            QScrollBar::add-line:vertical,
-            QScrollBar::sub-line:vertical { height: 0; }
         """)
 
-        # ── Determine anchor price ────────────────────────────────────────
-        has_price   = self._market_price > 0 or bool(self._edit.text().strip())
-        centre      = 0.0
-        centre_item = None   # will point at the row to centre in the viewport
-
-        if has_price:
-            text = self._edit.text().strip()
+        # ── Populate tick-based offset rows (1*tick, 2*tick, ..., N*tick) ──
+        # Large values at top, small values at bottom.  Scroll defaults to
+        # the bottom so the smallest tick is visible on open.
+        centre_item = None
+        if self._tick_size > 0:
+            current_text = self._edit.text().strip()
             try:
-                centre = self._snap(float(text)) if text else self._snap(self._market_price)
+                current_val = self._snap(float(current_text)) if current_text else 0.0
             except ValueError:
-                centre = self._snap(self._market_price)
-            if centre <= 0:
-                has_price = False
+                current_val = 0.0
 
-        # ── Populate price rows ───────────────────────────────────────────
-        if has_price:
-            mid   = centre
-            steps = self._LADDER_ROWS
-
-            # "Market" header (non-selectable)
-            hdr = QListWidgetItem("  Market")
-            hdr.setForeground(QColor("#8B949E"))
-            hdr.setFont(_TITLE_FONT)
-            hdr.setFlags(hdr.flags()
-                         & ~Qt.ItemFlag.ItemIsSelectable
-                         & ~Qt.ItemFlag.ItemIsEnabled)
-            popup.addItem(hdr)
-
-            mid_row_in_popup = steps + 1   # index of the centre price row (+1 for header)
-            for i in range(steps * 2 + 1):
-                price_val = mid + (steps - i) * self._tick_size
-                price_str = self._fmt(self._snap(price_val))
-                item = QListWidgetItem(price_str)
-                if i == steps:          # centre / current-price row
+            ladder_max = 5000  # number of tick multiples to populate
+            for i in range(ladder_max, 0, -1):
+                tick_val = self._snap(self._tick_size * i)
+                item = QListWidgetItem(self._fmt(tick_val))
+                if current_val > 0 and abs(tick_val - current_val) < self._tick_size / 2:
                     f = item.font()
                     f.setBold(True)
                     item.setFont(f)
@@ -455,7 +465,7 @@ class TickPriceInput(QWidget):
                     centre_item = item
                 popup.addItem(item)
         else:
-            ph = QListWidgetItem("  Waiting for market data…")
+            ph = QListWidgetItem("  Tick size unknown")
             ph.setForeground(QColor("#6B7280"))
             ph.setFlags(ph.flags()
                         & ~Qt.ItemFlag.ItemIsSelectable
@@ -511,17 +521,15 @@ class TickPriceInput(QWidget):
         popup.move(global_origin)   # ← exact alignment enforced post-show
         popup.raise_()              # keep it on top of the main window
 
-        # IMPORTANT: scrollToItem(PositionAtCenter) must be called AFTER
-        # show() so Qt has computed the actual viewport height.  Calling it
-        # before show() means Qt doesn't know how tall the visible area is
-        # and the item ends up at the top rather than the centre.
+        # Scroll: highlight current value if any, otherwise show smallest tick
+        # at the bottom.  Deferred to after show() so Qt has computed the
+        # viewport height.
         if centre_item is not None:
             _ci = centre_item   # local ref for the lambda capture
             QTimer.singleShot(0, lambda: popup.scrollToItem(
                 _ci, QAbstractItemView.ScrollHint.PositionAtCenter))
-
-        # Dynamic scroll-extension: more rows added when user reaches either end
-        popup.verticalScrollBar().valueChanged.connect(self._on_popup_scroll)
+        else:
+            QTimer.singleShot(0, popup.scrollToBottom)
 
         # App-level filter: detect outside clicks to close without swallowing them
         app = _QApp.instance()
@@ -645,6 +653,297 @@ class TickPriceInput(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  _QtyInput  –  integer quantity field with ▲/▼ spinners + preset popup
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class _QtyInput(QWidget):
+    """Styled integer input (matches TickPriceInput look) with a preset popup."""
+
+    _CHIP_H       = 28
+    _BTN_W        = 18
+    _VISIBLE_ROWS = 10
+    _ROW_H        = 22
+
+    textChanged   = Signal(str)
+    returnPressed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._presets:              list[int]          = []
+        self._popup:                QListWidget | None = None
+        self._arrow_w:              QWidget     | None = None
+        self._app_filter_installed: bool               = False
+        self._win_filter_installed: bool               = False
+        self._tracked_win:          QWidget     | None = None
+        self._build_ui()
+
+    # ── UI construction ───────────────────────────────────────────────────────
+
+    def _build_ui(self) -> None:
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        self._edit = QLineEdit()
+        self._edit.setPlaceholderText("Qty")
+        self._edit.setFixedHeight(self._CHIP_H)
+        self._edit.setMinimumWidth(0)
+        self._edit.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        # Reject non-numeric keystrokes at input time
+        self._edit.setValidator(QIntValidator(1, 999_999_999, self._edit))
+        self._edit.setStyleSheet(
+            "QLineEdit{background:#3a3a4a;color:#ccc;border:none;"
+            "border-radius:6px 0 0 6px;padding:2px 6px;font-size:11px}"
+            "QLineEdit:focus{background:#4a4a5a;color:white}"
+        )
+        self._edit.textChanged.connect(self._relay_text)
+        self._edit.returnPressed.connect(self._close_popup)
+        self._edit.returnPressed.connect(self.returnPressed.emit)
+        self._edit.installEventFilter(self)
+
+        _arrow_ss = (
+            "QToolButton{background:#3a3a4a;color:#aaa;border:none;"
+            "font-size:7px;padding:0;margin:0}"
+            "QToolButton:hover{background:#4a4a5a;color:white}"
+            "QToolButton:pressed{background:#0071e3;color:white}"
+        )
+        self._btn_up = QToolButton()
+        self._btn_up.setText("▲")
+        self._btn_up.setFixedSize(self._BTN_W, self._CHIP_H // 2)
+        self._btn_up.setStyleSheet(_arrow_ss)
+        self._btn_up.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_up.setAutoRepeat(True)
+        self._btn_up.setAutoRepeatDelay(400)
+        self._btn_up.setAutoRepeatInterval(80)
+        self._btn_up.clicked.connect(self._on_up)
+
+        self._btn_dn = QToolButton()
+        self._btn_dn.setText("▼")
+        self._btn_dn.setFixedSize(self._BTN_W, self._CHIP_H // 2)
+        self._btn_dn.setStyleSheet(_arrow_ss)
+        self._btn_dn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_dn.setAutoRepeat(True)
+        self._btn_dn.setAutoRepeatDelay(400)
+        self._btn_dn.setAutoRepeatInterval(80)
+        self._btn_dn.clicked.connect(self._on_dn)
+
+        arrow_col = QVBoxLayout()
+        arrow_col.setSpacing(0)
+        arrow_col.setContentsMargins(0, 0, 0, 0)
+        arrow_col.addWidget(self._btn_up)
+        arrow_col.addWidget(self._btn_dn)
+
+        self._arrow_w = QWidget()
+        self._arrow_w.setFixedSize(self._BTN_W, self._CHIP_H)
+        self._arrow_w.setStyleSheet(
+            "QWidget{background:#3a3a4a;border:none;border-radius:0 6px 6px 0}")
+        self._arrow_w.setLayout(arrow_col)
+
+        lay.addWidget(self._edit, 1)
+        lay.addWidget(self._arrow_w)
+
+        self.setFixedHeight(self._CHIP_H)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def set_presets(self, values: list[int]) -> None:
+        self._presets = values
+
+    def text(self) -> str:
+        return self._edit.text()
+
+    def clear(self) -> None:
+        self._edit.blockSignals(True)
+        self._edit.clear()
+        self._edit.blockSignals(False)
+
+    def setText(self, txt: str) -> None:
+        self._edit.setText(txt)
+
+    def setPlaceholderText(self, txt: str) -> None:
+        self._edit.setPlaceholderText(txt)
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _relay_text(self, text: str) -> None:
+        if not self.signalsBlocked():
+            self.textChanged.emit(text)
+
+    def _current_value(self) -> int | None:
+        try:
+            v = int(self._edit.text().strip())
+            return v if v > 0 else None
+        except ValueError:
+            return None
+
+    def _on_up(self) -> None:
+        v = self._current_value()
+        self._edit.setText("1" if v is None else str(v + 1))
+
+    def _on_dn(self) -> None:
+        v = self._current_value()
+        if v is not None and v > 1:
+            self._edit.setText(str(v - 1))
+
+    # ── Popup ─────────────────────────────────────────────────────────────────
+
+    def eventFilter(self, obj, event) -> bool:          # noqa: N802
+        t = event.type()
+        # Close when the main window is dragged/moved
+        if obj is self._tracked_win and t == QEvent.Type.Move:
+            self._close_popup()
+            return False
+        # Close on click outside the popup
+        if (self._popup is not None and self._popup.isVisible()
+                and t == QEvent.Type.MouseButtonPress
+                and obj is not self._popup):
+            try:
+                gpos = event.globalPosition().toPoint()  # type: ignore[attr-defined]
+            except AttributeError:
+                gpos = event.globalPos()                  # type: ignore[attr-defined]
+            if not self._popup.geometry().contains(gpos):
+                self._close_popup()
+                return False
+        if obj is self._edit and t == QEvent.Type.MouseButtonPress:
+            if self._popup is None or not self._popup.isVisible():
+                QTimer.singleShot(50, self._show_popup)
+        return False
+
+    def _remove_app_filter(self) -> None:
+        if self._app_filter_installed:
+            from PySide6.QtWidgets import QApplication as _QApp
+            app = _QApp.instance()
+            if app:
+                try:
+                    app.removeEventFilter(self)
+                except RuntimeError:
+                    pass
+            self._app_filter_installed = False
+
+    def _remove_win_filter(self) -> None:
+        if self._win_filter_installed and self._tracked_win is not None:
+            try:
+                self._tracked_win.removeEventFilter(self)
+            except RuntimeError:
+                pass
+            self._win_filter_installed = False
+            self._tracked_win = None
+
+    def _close_popup(self) -> None:
+        self._remove_app_filter()
+        self._remove_win_filter()
+        if self._popup is not None:
+            try:
+                self._popup.destroyed.disconnect(self._on_popup_destroyed)
+            except RuntimeError:
+                pass
+            self._popup.close()
+            self._popup.deleteLater()
+            self._popup = None
+
+    def _on_popup_destroyed(self) -> None:
+        self._popup = None
+        self._remove_app_filter()
+        self._remove_win_filter()
+
+    def _show_popup(self) -> None:
+        if self._popup is not None and self._popup.isVisible():
+            return
+        self._close_popup()
+
+        from PySide6.QtCore import QPoint
+        from PySide6.QtWidgets import QApplication as _QApp
+
+        popup = QListWidget()
+        popup.setUniformItemSizes(True)
+        popup.setWindowFlags(
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
+        popup.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        popup.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        popup.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        popup.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        popup.setStyleSheet("""
+            QListWidget {
+                background: #1E222A; color: #C9D1D9;
+                border: 1px solid #3a3f50; border-radius: 4px;
+                font-size: 12px; outline: none;
+            }
+            QListWidget::item            { padding: 3px 14px; border: none; }
+            QListWidget::item:selected,
+            QListWidget::item:hover      { background: #0071e3; color: white; }
+        """)
+
+        # Large values at top, small values at bottom; initial view shows the bottom
+        current     = self._current_value()
+        centre_item: QListWidgetItem | None = None
+        for v in reversed(self._presets):
+            item = QListWidgetItem(str(v))
+            if v == current:
+                f = item.font()
+                f.setBold(True)
+                item.setFont(f)
+                item.setForeground(QColor("#3FB950"))
+                centre_item = item
+            popup.addItem(item)
+
+        popup_w = 90
+        popup_h = min(len(self._presets), self._VISIBLE_ROWS) * self._ROW_H + 8
+        popup.setFixedSize(popup_w, popup_h)
+        popup.itemClicked.connect(self._on_popup_item)
+        popup.destroyed.connect(self._on_popup_destroyed)
+
+        # Position popup next to the arrow widget, centred on the input row
+        if self._arrow_w is not None:
+            arrow_gx = self._arrow_w.mapToGlobal(QPoint(0, 0)).x()
+        else:
+            arrow_gx = self.mapToGlobal(QPoint(self.width() - self._BTN_W, 0)).x()
+        widget_gcy    = self.mapToGlobal(QPoint(0, self.height() // 2)).y()
+        global_origin = QPoint(arrow_gx, widget_gcy - popup_h // 2)
+
+        wc = self.mapToGlobal(QPoint(self.width() // 2, self.height() // 2))
+        screen = _QApp.screenAt(wc) or _QApp.primaryScreen()
+        if screen:
+            sg = screen.availableGeometry()
+            gx = max(sg.left(), min(global_origin.x(), sg.right()  - popup_w))
+            gy = max(sg.top(),  min(global_origin.y(), sg.bottom() - popup_h))
+            global_origin = QPoint(gx, gy)
+
+        popup.move(global_origin)
+        popup.show()
+        self._popup = popup
+
+        # If a value is already selected scroll to it, otherwise show the bottom
+        # (smallest values) so the user scrolls up to reach larger ones.
+        if centre_item is not None:
+            popup.scrollToItem(centre_item, QAbstractItemView.ScrollHint.PositionAtBottom)
+        else:
+            popup.scrollToBottom()
+
+        # Track app-level clicks for outside-dismiss
+        app = _QApp.instance()
+        if app:
+            app.installEventFilter(self)
+            self._app_filter_installed = True
+
+        # Track top-level window moves to dismiss popup
+        top_win = self.window()
+        if top_win and top_win is not self:
+            top_win.installEventFilter(self)
+            self._tracked_win          = top_win
+            self._win_filter_installed = True
+
+    def _on_popup_item(self, item: QListWidgetItem) -> None:
+        self._edit.setText(item.text())
+        self._close_popup()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  _TierSection
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -686,6 +985,7 @@ class _TierSection(QWidget):
         self._tiers:             list[dict]  = tiers
         self._dollar_per_tier:   list[float] = []
         self._qty:               int         = 1
+        self._multiplier:        float       = 1.0
         self._selected_idx:      int | None  = None
         self._chip_buttons:      list[QPushButton] = []
         self._input:             TickPriceInput | None = None
@@ -750,10 +1050,6 @@ class _TierSection(QWidget):
         # Snapshot dollar values parallel to chip indices
         self._dollar_per_tier = [t.get("dollar", 0.0) for t in self._tiers]
 
-        # Pre-select chip 0 so the dollar label shows as a preview even before
-        # the user explicitly clicks a chip.
-        self._selected_idx = 0 if self._tiers else None
-
         for i, tier in enumerate(self._tiers):
             label = tier.get("label", f"Tier {i + 1}")
             btn = QPushButton(label)
@@ -767,9 +1063,8 @@ class _TierSection(QWidget):
 
         self._input = TickPriceInput()
         self._input.setFixedHeight(self._CHIP_H)
-        self._input.setFixedWidth(80)    # ~half the expanding width it used to take
         self._input.setSizePolicy(
-            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._input.textChanged.connect(self._on_input_changed)
         lay.addWidget(self._input)
 
@@ -794,14 +1089,20 @@ class _TierSection(QWidget):
         _base_ss = (f"color: {Theme.TEXT}; font-size: 11px; "
                     f"font-weight: bold; border: none;")
 
-        # ── No valid selection or no dollar value ──────────────────────────
-        if (self._selected_idx is None
-                or self._selected_idx >= len(self._dollar_per_tier)):
-            self._dollar_lbl.setStyleSheet(_base_ss)
-            self._dollar_lbl.setText(self._title_str)
-            return
-
-        dollar = self._dollar_per_tier[self._selected_idx]
+        # Per-unit dollar: custom Dist input wins over chip selection
+        dollar = 0.0
+        if self._input is not None:
+            custom = self._input.text().strip()
+            if custom:
+                try:
+                    dist = float(custom)
+                    if dist > 0:
+                        dollar = dist * self._multiplier
+                except ValueError:
+                    dollar = 0.0
+        if dollar <= 0 and self._selected_idx is not None \
+                and self._selected_idx < len(self._dollar_per_tier):
+            dollar = self._dollar_per_tier[self._selected_idx]
 
         if not dollar or dollar <= 0:
             self._dollar_lbl.setStyleSheet(_base_ss)
@@ -823,6 +1124,11 @@ class _TierSection(QWidget):
     def set_qty(self, qty: int) -> None:
         """Update the quantity and refresh the dollar display (no chip rebuild)."""
         self._qty = qty
+        self._update_dollar_display()
+
+    def set_multiplier(self, multiplier: float) -> None:
+        """Update the contract multiplier used for custom-distance dollar math."""
+        self._multiplier = multiplier if multiplier and multiplier > 0 else 1.0
         self._update_dollar_display()
 
     # ── Slots ─────────────────────────────────────────────────────────────────
@@ -855,16 +1161,27 @@ class _TierSection(QWidget):
 
     def _on_input_changed(self, text: str) -> None:
         stripped = text.strip()
-        if stripped:
-            try:
-                if float(stripped) > 0 and self._toggle and not self._toggle.is_on:
-                    self._toggle.set_on(True)
-                    self._state_lbl.setText("On")
-            except ValueError:
-                pass
+        try:
+            val = float(stripped) if stripped else 0.0
+        except ValueError:
+            val = 0.0
+
+        if val > 0:
+            if self._toggle and not self._toggle.is_on:
+                self._toggle.set_on(True)
+                self._state_lbl.setText("On")
             self._selected_idx = None
             self._update_chip_styles()
-            self._update_dollar_display()
+        else:
+            # Empty / 0 / invalid Dist → turn the section off
+            if self._toggle and self._toggle.is_on:
+                self._toggle.blockSignals(True)
+                self._toggle.set_on(False)
+                self._toggle.blockSignals(False)
+                self._state_lbl.setText("Off")
+                self._update_chip_styles()
+        # Always refresh dollar display so cleared / zeroed text removes the preview
+        self._update_dollar_display()
         self.changed.emit()
 
     def _update_chip_styles(self) -> None:
@@ -1476,7 +1793,7 @@ class OrderEntryPanel(QWidget):
     # ── Quantity buttons ──────────────────────────────────────────────────────
 
     def _rebuild_qty_buttons(self) -> None:
-        """Swap qty preset buttons based on FUT vs STK."""
+        """Rebuild qty row: preset chips + _QtyInput, sized to the asset class."""
         while self._qty_layout.count():
             item = self._qty_layout.takeAt(0)
             if item and item.widget():
@@ -1484,11 +1801,13 @@ class OrderEntryPanel(QWidget):
 
         sec = _sec_type_for(self._active_symbol or "")
         if sec == "STK":
-            presets = _STK_QTYS
-            default = _STK_DEFAULT
+            presets    = _STK_QTYS
+            popup_vals = _STK_QTY_POPUP
+            default    = _STK_DEFAULT
         else:
-            presets = _FUT_QTYS
-            default = _FUT_DEFAULT
+            presets    = _FUT_QTYS
+            popup_vals = _FUT_QTY_POPUP
+            default    = _FUT_DEFAULT
 
         self._active_qty = default
         self._qty_btn_group: list[QPushButton] = []
@@ -1498,26 +1817,19 @@ class OrderEntryPanel(QWidget):
             btn.setFixedHeight(28)
             btn.setMinimumWidth(36)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setSizePolicy(
+                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             _apply_chip_style(btn, q == default)
             btn.clicked.connect(lambda checked, v=q: self._on_qty_preset(v))
             self._qty_btn_group.append(btn)
             self._qty_layout.addWidget(btn)
 
-        self._custom_qty = QLineEdit()
-        self._custom_qty.setPlaceholderText("Qty")
-        self._custom_qty.setFixedHeight(28)
-        self._custom_qty.setMaximumWidth(60)
-        self._custom_qty.setStyleSheet(
-            "QLineEdit{background:#3a3a4a;color:#ccc;border:none;"
-            "border-radius:6px;padding:4px 8px;font-weight:600;font-size:12px}"
-            "QLineEdit:focus{background:#4a4a5a;color:white}"
-        )
+        self._custom_qty = _QtyInput()
+        self._custom_qty.set_presets(popup_vals)
         self._custom_qty.textChanged.connect(self._on_custom_qty)
+        self._custom_qty.returnPressed.connect(self._on_custom_qty_enter)
         self._qty_layout.addWidget(self._custom_qty)
 
-        # Push the new default qty into the tier sections so their dollar
-        # display is correct immediately (without waiting for the user to
-        # click a qty chip).
         if hasattr(self, "_pt_section"):
             self._pt_section.set_qty(self._active_qty)
         if hasattr(self, "_sl_section"):
@@ -1531,7 +1843,6 @@ class OrderEntryPanel(QWidget):
         for btn in self._qty_btn_group:
             _apply_chip_style(btn, int(btn.text()) == qty)
         self._refresh_action_labels()
-        # Update the dollar display in tier headers without rebuilding chips
         if hasattr(self, "_pt_section"):
             self._pt_section.set_qty(qty)
         if hasattr(self, "_sl_section"):
@@ -1548,13 +1859,40 @@ class OrderEntryPanel(QWidget):
                 for btn in self._qty_btn_group:
                     _apply_chip_style(btn, False)
                 self._refresh_action_labels()
-                # Update the dollar display in tier headers without rebuilding chips
                 if hasattr(self, "_pt_section"):
                     self._pt_section.set_qty(qty)
                 if hasattr(self, "_sl_section"):
                     self._sl_section.set_qty(qty)
+                return
         except ValueError:
             pass
+        # Invalid (non-numeric or <= 0) → reset qty state to default
+        self._reset_qty_to_default()
+
+    def _reset_qty_to_default(self) -> None:
+        """Restore qty state to the asset-class default and refresh UI."""
+        sec = _sec_type_for(self._active_symbol or "")
+        default = _STK_DEFAULT if sec == "STK" else _FUT_DEFAULT
+        self._active_qty = default
+        for btn in self._qty_btn_group:
+            _apply_chip_style(btn, int(btn.text()) == default)
+        self._refresh_action_labels()
+        if hasattr(self, "_pt_section"):
+            self._pt_section.set_qty(default)
+        if hasattr(self, "_sl_section"):
+            self._sl_section.set_qty(default)
+
+    def _on_custom_qty_enter(self) -> None:
+        """Clear the custom qty field on Enter if its content is invalid."""
+        text = self._custom_qty.text().strip()
+        try:
+            if int(text) > 0:
+                return
+        except ValueError:
+            pass
+        self._custom_qty.blockSignals(True)
+        self._custom_qty.clear()
+        self._custom_qty.blockSignals(False)
 
     # ── Action label refresh ──────────────────────────────────────────────────
 
@@ -1679,6 +2017,11 @@ class OrderEntryPanel(QWidget):
         # Sync current qty so the dollar display is correct on next chip click
         self._pt_section.set_qty(self._active_qty)
         self._sl_section.set_qty(self._active_qty)
+        # Push contract multiplier for custom-distance dollar math
+        from src.core.reference_data import get_instance as _rd
+        mult = _rd().get_multiplier(self._active_symbol or "") or 1.0
+        self._pt_section.set_multiplier(mult)
+        self._sl_section.set_multiplier(mult)
         # Sync live price into the TickPriceInput spinners
         if self._last_price > 0:
             ts = self._tick_size_for_symbol(self._active_symbol or "")
