@@ -210,15 +210,19 @@ class TickPriceInput(QWidget):
         lay.setSpacing(0)
 
         self._edit = QLineEdit()
-        self._edit.setPlaceholderText("Price")
+        self._edit.setPlaceholderText("Dist")
         self._edit.setFixedHeight(self._CHIP_H)
+        self._edit.setMinimumWidth(0)
+        self._edit.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self._edit.setStyleSheet(
             "QLineEdit{background:#3a3a4a;color:#ccc;border:none;"
-            "border-radius:4px 0 0 4px;padding:2px 6px;font-size:11px}"
+            "border-radius:6px 0 0 6px;padding:2px 6px;font-size:11px}"
             "QLineEdit:focus{background:#4a4a5a;color:white}"
             "QLineEdit:disabled{background:#252535;color:#444;border:none}"
         )
         self._edit.textChanged.connect(self._relay_text)
+        self._edit.returnPressed.connect(self._close_popup)
         self._edit.installEventFilter(self)
 
         _arrow_ss = (
@@ -256,7 +260,7 @@ class TickPriceInput(QWidget):
         self._arrow_w = QWidget()
         self._arrow_w.setFixedSize(self._BTN_W, self._CHIP_H)
         self._arrow_w.setStyleSheet(
-            "QWidget{background:#3a3a4a;border:none;border-radius:0 4px 4px 0}")
+            "QWidget{background:#3a3a4a;border:none;border-radius:0 6px 6px 0}")
         self._arrow_w.setLayout(arrow_col)
 
         lay.addWidget(self._edit, 1)
@@ -400,7 +404,7 @@ class TickPriceInput(QWidget):
         )
         popup.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         popup.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        popup.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        popup.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         popup.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         popup.setStyleSheet("""
             QListWidget {
@@ -414,50 +418,24 @@ class TickPriceInput(QWidget):
             QListWidget::item            { padding: 3px 14px; border: none; }
             QListWidget::item:selected,
             QListWidget::item:hover      { background: #0071e3; color: white; }
-            QScrollBar:vertical {
-                background: #1E222A; width: 6px; margin: 0;
-            }
-            QScrollBar::handle:vertical {
-                background: #3a3f50; border-radius: 3px; min-height: 20px;
-            }
-            QScrollBar::add-line:vertical,
-            QScrollBar::sub-line:vertical { height: 0; }
         """)
 
-        # ── Determine anchor price ────────────────────────────────────────
-        has_price   = self._market_price > 0 or bool(self._edit.text().strip())
-        centre      = 0.0
-        centre_item = None   # will point at the row to centre in the viewport
-
-        if has_price:
-            text = self._edit.text().strip()
+        # ── Populate tick-based offset rows (1*tick, 2*tick, ..., N*tick) ──
+        # Large values at top, small values at bottom.  Scroll defaults to
+        # the bottom so the smallest tick is visible on open.
+        centre_item = None
+        if self._tick_size > 0:
+            current_text = self._edit.text().strip()
             try:
-                centre = self._snap(float(text)) if text else self._snap(self._market_price)
+                current_val = self._snap(float(current_text)) if current_text else 0.0
             except ValueError:
-                centre = self._snap(self._market_price)
-            if centre <= 0:
-                has_price = False
+                current_val = 0.0
 
-        # ── Populate price rows ───────────────────────────────────────────
-        if has_price:
-            mid   = centre
-            steps = self._LADDER_ROWS
-
-            # "Market" header (non-selectable)
-            hdr = QListWidgetItem("  Market")
-            hdr.setForeground(QColor("#8B949E"))
-            hdr.setFont(_TITLE_FONT)
-            hdr.setFlags(hdr.flags()
-                         & ~Qt.ItemFlag.ItemIsSelectable
-                         & ~Qt.ItemFlag.ItemIsEnabled)
-            popup.addItem(hdr)
-
-            mid_row_in_popup = steps + 1   # index of the centre price row (+1 for header)
-            for i in range(steps * 2 + 1):
-                price_val = mid + (steps - i) * self._tick_size
-                price_str = self._fmt(self._snap(price_val))
-                item = QListWidgetItem(price_str)
-                if i == steps:          # centre / current-price row
+            ladder_max = 5000  # number of tick multiples to populate
+            for i in range(ladder_max, 0, -1):
+                tick_val = self._snap(self._tick_size * i)
+                item = QListWidgetItem(self._fmt(tick_val))
+                if current_val > 0 and abs(tick_val - current_val) < self._tick_size / 2:
                     f = item.font()
                     f.setBold(True)
                     item.setFont(f)
@@ -465,7 +443,7 @@ class TickPriceInput(QWidget):
                     centre_item = item
                 popup.addItem(item)
         else:
-            ph = QListWidgetItem("  Waiting for market data…")
+            ph = QListWidgetItem("  Tick size unknown")
             ph.setForeground(QColor("#6B7280"))
             ph.setFlags(ph.flags()
                         & ~Qt.ItemFlag.ItemIsSelectable
@@ -521,17 +499,15 @@ class TickPriceInput(QWidget):
         popup.move(global_origin)   # ← exact alignment enforced post-show
         popup.raise_()              # keep it on top of the main window
 
-        # IMPORTANT: scrollToItem(PositionAtCenter) must be called AFTER
-        # show() so Qt has computed the actual viewport height.  Calling it
-        # before show() means Qt doesn't know how tall the visible area is
-        # and the item ends up at the top rather than the centre.
+        # Scroll: highlight current value if any, otherwise show smallest tick
+        # at the bottom.  Deferred to after show() so Qt has computed the
+        # viewport height.
         if centre_item is not None:
             _ci = centre_item   # local ref for the lambda capture
             QTimer.singleShot(0, lambda: popup.scrollToItem(
                 _ci, QAbstractItemView.ScrollHint.PositionAtCenter))
-
-        # Dynamic scroll-extension: more rows added when user reaches either end
-        popup.verticalScrollBar().valueChanged.connect(self._on_popup_scroll)
+        else:
+            QTimer.singleShot(0, popup.scrollToBottom)
 
         # App-level filter: detect outside clicks to close without swallowing them
         app = _QApp.instance()
@@ -688,12 +664,16 @@ class _QtyInput(QWidget):
         self._edit = QLineEdit()
         self._edit.setPlaceholderText("Qty")
         self._edit.setFixedHeight(self._CHIP_H)
+        self._edit.setMinimumWidth(0)
+        self._edit.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self._edit.setStyleSheet(
             "QLineEdit{background:#3a3a4a;color:#ccc;border:none;"
-            "border-radius:4px 0 0 4px;padding:2px 6px;font-size:11px}"
+            "border-radius:6px 0 0 6px;padding:2px 6px;font-size:11px}"
             "QLineEdit:focus{background:#4a4a5a;color:white}"
         )
         self._edit.textChanged.connect(self._relay_text)
+        self._edit.returnPressed.connect(self._close_popup)
         self._edit.installEventFilter(self)
 
         _arrow_ss = (
@@ -731,14 +711,15 @@ class _QtyInput(QWidget):
         self._arrow_w = QWidget()
         self._arrow_w.setFixedSize(self._BTN_W, self._CHIP_H)
         self._arrow_w.setStyleSheet(
-            "QWidget{background:#3a3a4a;border:none;border-radius:0 4px 4px 0}")
+            "QWidget{background:#3a3a4a;border:none;border-radius:0 6px 6px 0}")
         self._arrow_w.setLayout(arrow_col)
 
         lay.addWidget(self._edit, 1)
         lay.addWidget(self._arrow_w)
 
         self.setFixedHeight(self._CHIP_H)
-        self.setFixedWidth(60)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -1055,9 +1036,8 @@ class _TierSection(QWidget):
 
         self._input = TickPriceInput()
         self._input.setFixedHeight(self._CHIP_H)
-        self._input.setFixedWidth(80)    # ~half the expanding width it used to take
         self._input.setSizePolicy(
-            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._input.textChanged.connect(self._on_input_changed)
         lay.addWidget(self._input)
 
@@ -1788,6 +1768,8 @@ class OrderEntryPanel(QWidget):
             btn.setFixedHeight(28)
             btn.setMinimumWidth(36)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setSizePolicy(
+                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             _apply_chip_style(btn, q == default)
             btn.clicked.connect(lambda checked, v=q: self._on_qty_preset(v))
             self._qty_btn_group.append(btn)
