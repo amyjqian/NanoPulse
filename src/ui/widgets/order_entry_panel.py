@@ -7,7 +7,7 @@ import math
 from typing import Any
 
 from PySide6.QtCore import QEvent, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QPainter
+from PySide6.QtGui import QColor, QDoubleValidator, QFont, QIntValidator, QPainter
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -221,8 +221,13 @@ class TickPriceInput(QWidget):
             "QLineEdit:focus{background:#4a4a5a;color:white}"
             "QLineEdit:disabled{background:#252535;color:#444;border:none}"
         )
+        # Reject non-numeric keystrokes; positive floats only
+        _dv = QDoubleValidator(0.0, 1e12, 10, self._edit)
+        _dv.setNotation(QDoubleValidator.Notation.StandardNotation)
+        self._edit.setValidator(_dv)
         self._edit.textChanged.connect(self._relay_text)
         self._edit.returnPressed.connect(self._close_popup)
+        self._edit.editingFinished.connect(self._snap_to_tick)
         self._edit.installEventFilter(self)
 
         _arrow_ss = (
@@ -356,6 +361,23 @@ class TickPriceInput(QWidget):
 
     def _fmt(self, price: float) -> str:
         return f"{price:.{self._decimals()}f}"
+
+    def _snap_to_tick(self) -> None:
+        """If the field holds a non-tick-aligned number, round it to the nearest tick."""
+        text = self._edit.text().strip()
+        if not text or self._tick_size <= 0:
+            return
+        try:
+            val = float(text)
+        except ValueError:
+            return
+        snapped = self._snap(val)
+        formatted = self._fmt(snapped)
+        if formatted != text:
+            self._edit.blockSignals(True)
+            self._edit.setText(formatted)
+            self._edit.blockSignals(False)
+            self.textChanged.emit(formatted)
 
     # ── Up / Down spin ────────────────────────────────────────────────────────
 
@@ -642,7 +664,8 @@ class _QtyInput(QWidget):
     _VISIBLE_ROWS = 10
     _ROW_H        = 22
 
-    textChanged = Signal(str)
+    textChanged   = Signal(str)
+    returnPressed = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -667,6 +690,8 @@ class _QtyInput(QWidget):
         self._edit.setMinimumWidth(0)
         self._edit.setSizePolicy(
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        # Reject non-numeric keystrokes at input time
+        self._edit.setValidator(QIntValidator(1, 999_999_999, self._edit))
         self._edit.setStyleSheet(
             "QLineEdit{background:#3a3a4a;color:#ccc;border:none;"
             "border-radius:6px 0 0 6px;padding:2px 6px;font-size:11px}"
@@ -674,6 +699,7 @@ class _QtyInput(QWidget):
         )
         self._edit.textChanged.connect(self._relay_text)
         self._edit.returnPressed.connect(self._close_popup)
+        self._edit.returnPressed.connect(self.returnPressed.emit)
         self._edit.installEventFilter(self)
 
         _arrow_ss = (
@@ -959,6 +985,7 @@ class _TierSection(QWidget):
         self._tiers:             list[dict]  = tiers
         self._dollar_per_tier:   list[float] = []
         self._qty:               int         = 1
+        self._multiplier:        float       = 1.0
         self._selected_idx:      int | None  = None
         self._chip_buttons:      list[QPushButton] = []
         self._input:             TickPriceInput | None = None
@@ -1062,14 +1089,20 @@ class _TierSection(QWidget):
         _base_ss = (f"color: {Theme.TEXT}; font-size: 11px; "
                     f"font-weight: bold; border: none;")
 
-        # ── No valid selection or no dollar value ──────────────────────────
-        if (self._selected_idx is None
-                or self._selected_idx >= len(self._dollar_per_tier)):
-            self._dollar_lbl.setStyleSheet(_base_ss)
-            self._dollar_lbl.setText(self._title_str)
-            return
-
-        dollar = self._dollar_per_tier[self._selected_idx]
+        # Per-unit dollar: custom Dist input wins over chip selection
+        dollar = 0.0
+        if self._input is not None:
+            custom = self._input.text().strip()
+            if custom:
+                try:
+                    dist = float(custom)
+                    if dist > 0:
+                        dollar = dist * self._multiplier
+                except ValueError:
+                    dollar = 0.0
+        if dollar <= 0 and self._selected_idx is not None \
+                and self._selected_idx < len(self._dollar_per_tier):
+            dollar = self._dollar_per_tier[self._selected_idx]
 
         if not dollar or dollar <= 0:
             self._dollar_lbl.setStyleSheet(_base_ss)
@@ -1091,6 +1124,11 @@ class _TierSection(QWidget):
     def set_qty(self, qty: int) -> None:
         """Update the quantity and refresh the dollar display (no chip rebuild)."""
         self._qty = qty
+        self._update_dollar_display()
+
+    def set_multiplier(self, multiplier: float) -> None:
+        """Update the contract multiplier used for custom-distance dollar math."""
+        self._multiplier = multiplier if multiplier and multiplier > 0 else 1.0
         self._update_dollar_display()
 
     # ── Slots ─────────────────────────────────────────────────────────────────
@@ -1123,16 +1161,27 @@ class _TierSection(QWidget):
 
     def _on_input_changed(self, text: str) -> None:
         stripped = text.strip()
-        if stripped:
-            try:
-                if float(stripped) > 0 and self._toggle and not self._toggle.is_on:
-                    self._toggle.set_on(True)
-                    self._state_lbl.setText("On")
-            except ValueError:
-                pass
+        try:
+            val = float(stripped) if stripped else 0.0
+        except ValueError:
+            val = 0.0
+
+        if val > 0:
+            if self._toggle and not self._toggle.is_on:
+                self._toggle.set_on(True)
+                self._state_lbl.setText("On")
             self._selected_idx = None
             self._update_chip_styles()
-            self._update_dollar_display()
+        else:
+            # Empty / 0 / invalid Dist → turn the section off
+            if self._toggle and self._toggle.is_on:
+                self._toggle.blockSignals(True)
+                self._toggle.set_on(False)
+                self._toggle.blockSignals(False)
+                self._state_lbl.setText("Off")
+                self._update_chip_styles()
+        # Always refresh dollar display so cleared / zeroed text removes the preview
+        self._update_dollar_display()
         self.changed.emit()
 
     def _update_chip_styles(self) -> None:
@@ -1778,6 +1827,7 @@ class OrderEntryPanel(QWidget):
         self._custom_qty = _QtyInput()
         self._custom_qty.set_presets(popup_vals)
         self._custom_qty.textChanged.connect(self._on_custom_qty)
+        self._custom_qty.returnPressed.connect(self._on_custom_qty_enter)
         self._qty_layout.addWidget(self._custom_qty)
 
         if hasattr(self, "_pt_section"):
@@ -1813,8 +1863,36 @@ class OrderEntryPanel(QWidget):
                     self._pt_section.set_qty(qty)
                 if hasattr(self, "_sl_section"):
                     self._sl_section.set_qty(qty)
+                return
         except ValueError:
             pass
+        # Invalid (non-numeric or <= 0) → reset qty state to default
+        self._reset_qty_to_default()
+
+    def _reset_qty_to_default(self) -> None:
+        """Restore qty state to the asset-class default and refresh UI."""
+        sec = _sec_type_for(self._active_symbol or "")
+        default = _STK_DEFAULT if sec == "STK" else _FUT_DEFAULT
+        self._active_qty = default
+        for btn in self._qty_btn_group:
+            _apply_chip_style(btn, int(btn.text()) == default)
+        self._refresh_action_labels()
+        if hasattr(self, "_pt_section"):
+            self._pt_section.set_qty(default)
+        if hasattr(self, "_sl_section"):
+            self._sl_section.set_qty(default)
+
+    def _on_custom_qty_enter(self) -> None:
+        """Clear the custom qty field on Enter if its content is invalid."""
+        text = self._custom_qty.text().strip()
+        try:
+            if int(text) > 0:
+                return
+        except ValueError:
+            pass
+        self._custom_qty.blockSignals(True)
+        self._custom_qty.clear()
+        self._custom_qty.blockSignals(False)
 
     # ── Action label refresh ──────────────────────────────────────────────────
 
@@ -1939,6 +2017,11 @@ class OrderEntryPanel(QWidget):
         # Sync current qty so the dollar display is correct on next chip click
         self._pt_section.set_qty(self._active_qty)
         self._sl_section.set_qty(self._active_qty)
+        # Push contract multiplier for custom-distance dollar math
+        from src.core.reference_data import get_instance as _rd
+        mult = _rd().get_multiplier(self._active_symbol or "") or 1.0
+        self._pt_section.set_multiplier(mult)
+        self._sl_section.set_multiplier(mult)
         # Sync live price into the TickPriceInput spinners
         if self._last_price > 0:
             ts = self._tick_size_for_symbol(self._active_symbol or "")
