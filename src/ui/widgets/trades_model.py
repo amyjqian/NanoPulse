@@ -41,6 +41,14 @@ HEADERS: list[str] = [
     "ORDER ID", "SUBMITTER", "LIQUIDATION", "LAST LIQUIDITY",
 ]
 
+# Stable keys for each column — used by the preferences dialog for
+# visibility / ordering state that survives header renames.
+COL_KEYS: list[str] = [
+    "time", "symbol", "sec_type", "side", "qty", "price", "exchange",
+    "order_ref", "account", "expiry", "strike_right", "commission",
+    "realized_pnl", "order_id", "submitter", "liquidation", "last_liquidity",
+]
+
 _NUM_COLS = len(HEADERS)
 
 _RIGHT_ALIGN_COLS = {
@@ -71,6 +79,21 @@ class TradesModel(QAbstractTableModel):
 
         self._symbol_font = QFont("Helvetica Neue, Arial", 11)
         self._symbol_font.setWeight(QFont.Weight.DemiBold)
+
+    # ── Proxy helpers ───────────────────────────────────────────────────────
+
+    def column_keys(self) -> list[str]:
+        return list(COL_KEYS)
+
+    def column_headers(self) -> list[str]:
+        return list(HEADERS)
+
+    def row_data(self, row: int) -> dict | None:
+        """Return the raw row dict so ``TradesFilterProxy`` can filter on
+        keys directly without string-scanning every display column."""
+        if 0 <= row < len(self._rows):
+            return self._rows[row]
+        return None
 
     # ── Qt model plumbing ───────────────────────────────────────────────────
 
