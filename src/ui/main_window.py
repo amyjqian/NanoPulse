@@ -34,7 +34,7 @@ _C_WINDOW_BG = QColor("#30363D")
 _PAGE_INDEX: dict[str, int] = {
     "Connect":        0,
     "Contracts":      1,
-    "Trade":          2,
+    "Nano":           2,
     "StrategyEditor": 3,
     "Executions":     4,
 }
