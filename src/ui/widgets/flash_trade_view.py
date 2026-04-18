@@ -19,6 +19,8 @@ from .order_status_panel import OrderStatusPanel
 from .account_list_panel import AccountListPanel
 from .account_position_panel import AccountPositionPanel
 from .accounts_model import AccountsTableModel
+from .trades_panel import TradesPanel
+from .positions_trades_tabs import PositionsTradesTabs
 
 log = logging.getLogger(__name__)
 
@@ -123,14 +125,20 @@ class FlashTradeView(QWidget):
         self._top_right_splitter.setStretchFactor(0, 1)
         self._top_right_splitter.setStretchFactor(1, 1)
 
-        # Bottom half of right side — Account Position
+        # Bottom half of right side — Positions / Trades tabs
         self._account_position = AccountPositionPanel(
             accounts_model=self._accounts_model,
             parent=self,
         )
+        self._trades_panel = TradesPanel(self)
+        self._positions_trades = PositionsTradesTabs(
+            positions_widget=self._account_position,
+            trades_widget=self._trades_panel,
+            parent=self,
+        )
 
         self._right_splitter.addWidget(self._top_right_splitter)
-        self._right_splitter.addWidget(self._account_position)
+        self._right_splitter.addWidget(self._positions_trades)
         self._right_splitter.setStretchFactor(0, 1)
         self._right_splitter.setStretchFactor(1, 1)
 
@@ -454,6 +462,10 @@ class FlashTradeView(QWidget):
                 prev.account_pnl_updated.disconnect(self._on_account_pnl_updated)
             except RuntimeError:
                 pass
+            try:
+                prev.fill_updated.disconnect(self._on_fill_updated)
+            except RuntimeError:
+                pass
             log.debug("FlashTrade: unwired stale signals for worker %s", label)
 
         worker.order_status_updated.connect(self._on_order_status_updated)
@@ -462,18 +474,22 @@ class FlashTradeView(QWidget):
         worker.reverse_close_needed.connect(self._on_reverse_close_needed)
         worker.pnl_single_updated.connect(self._on_pnl_single_updated)
         worker.account_pnl_updated.connect(self._on_account_pnl_updated)
+        worker.fill_updated.connect(self._on_fill_updated)
         self._connected_order_workers[label] = worker
         self._connected_portfolio_workers[label] = worker
         log.debug(
             "FlashTrade: wired order_status_updated + portfolio_updated + "
-            "pnl_single_updated + account_pnl_updated for worker %s", label)
+            "pnl_single_updated + account_pnl_updated + fill_updated "
+            "for worker %s", label)
 
         # Re-snapshot: the worker's initial snapshot may have fired before
-        # this signal was connected.  Ask it to emit all known orders again.
+        # this signal was connected.  Ask it to emit all known orders and
+        # fills again so the Trades view is populated.
         if worker.is_ib_connected:
             worker.request_order_snapshot()
             worker.request_portfolio_snapshot()
             worker.request_pnl_snapshot()
+            worker.request_fills_snapshot()
 
     def _on_order_status_updated(self, data: dict) -> None:
         """Receive order status from worker thread → update OrderStatusPanel."""
@@ -565,6 +581,18 @@ class FlashTradeView(QWidget):
             account, daily_pnl=daily_pnl,
             realized_pnl=realized_pnl,
             unrealized_pnl=unrealized_pnl)
+
+    def _on_fill_updated(self, fill: dict) -> None:
+        """Execution arrived (startup snapshot or live execDetailsEvent) →
+        insert/refresh a row in the Trades view.  Dedupe by execId is
+        handled in the model."""
+        display_account = fill.get("account", "")
+        if self._accounts_model and display_account:
+            alias = self._accounts_model._aliases.get(display_account, "")
+            if alias:
+                fill = dict(fill)
+                fill["account"] = alias
+        self._trades_panel.add_fill(fill)
 
     def _refresh_portfolio(self) -> None:
         """Ask every connected worker to re-push portfolio positions."""
