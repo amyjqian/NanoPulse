@@ -20,6 +20,7 @@ import logging
 import math
 
 from PySide6.QtCore import QEvent, QRect, QSettings, QSize, Qt, Signal
+from src.core import config_manager
 from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -253,6 +254,17 @@ _POS_BTNS = [
     ("50%",     "#8E8E93", "#9E9EA3", "#7E7E83",  50),
     ("75%",     "#8E8E93", "#9E9EA3", "#7E7E83",  75),
 ]
+# ── Position column definitions (configurable via Column Management) ───────────
+_POS_COL_KEYS = [
+    "account", "symbol", "qty", "unrealized_pnl",
+    "avg_price", "last_price", "realized_pnl", "market_value",
+]
+_POS_COL_HEADERS = [
+    "Account", "Symbol", "Qty", "Unrealized",
+    "Avg Price", "Last Price", "Realized", "Mkt Value",
+]
+_POS_KEY_TO_COL: dict[str, int] = {k: i for i, k in enumerate(_POS_COL_KEYS)}
+
 _POS_BTN_H_PAD  = 7
 _POS_BTN_V_PAD  = 2
 _POS_BTN_GAP    = 4
@@ -307,6 +319,7 @@ class FlattenButtonDelegate(QStyledItemDelegate):
         All buttons share the same width (widest label wins)."""
         btn_w   = max(fm.horizontalAdvance(lbl) + 2 * _POS_BTN_H_PAD
                       for lbl, *_ in _POS_BTNS)
+        btn_w   = int(btn_w * 0.7)
         n       = len(_POS_BTNS)
         total_w = btn_w * n + _POS_BTN_GAP * (n - 1)
         btn_h   = min(int((fm.height() + 2 * _POS_BTN_V_PAD) * 1.4),
@@ -489,9 +502,10 @@ class AccountPositionPanel(QWidget):
     flatten_requested         = Signal(str)          # account id (header row Flatten)
     position_close_requested  = Signal(str, int, int)  # account, con_id, pct (100=flatten)
 
-    def __init__(self, accounts_model=None, parent=None):
+    def __init__(self, accounts_model=None, parent=None, *, open_preferences=None):
         super().__init__(parent)
         self._accounts_model = accounts_model
+        self._open_preferences_callback = open_preferences
         self._model = AccountPositionModel(
             get_alias=self._get_alias, parent=self)
         self._setup_ui()
@@ -514,46 +528,12 @@ class AccountPositionPanel(QWidget):
         root.setContentsMargins(10, 8, 10, 8)
         root.setSpacing(6)
 
-        # ── Title bar ────────────────────────────────────────────────────
-        hdr = QHBoxLayout()
-        hdr.setSpacing(0)
-        title = QLabel("Positions")
-        title.setFont(_TITLE_FONT)
-        title.setStyleSheet("color: #ffffff; border: none;")
-        hdr.addWidget(title)
-
-        btn = QPushButton("⟳")
-        btn.setToolTip("Refresh positions")
-        btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn.setFixedSize(26, 26)
-        btn.setStyleSheet(f"""
-            QPushButton {{
-                background: transparent; color: {TEXT_DIM_PNL};
-                border: 1px solid {BORDER}; border-radius: 4px;
-                font-size: 14px; font-weight: bold;
-            }}
-            QPushButton:hover {{ color: #ffffff; border-color: {CLR_OPEN}; background: #253545; }}
-            QPushButton:pressed {{ background: #1a2535; }}
-        """)
-        btn.clicked.connect(self._on_refresh_clicked)
-        hdr.addWidget(btn)
-
-        hdr.addStretch(1)
-
-        # Zero-position toggle  (right corner, default ON)
-        zero_lbl = QLabel("Zero Pos")
-        zero_lbl.setStyleSheet(
-            f"color: {TEXT_DIM_PNL}; font-size: 10px; border: none;")
-        hdr.addWidget(zero_lbl)
-        hdr.addSpacing(4)
-
-        _saved_zero = QSettings("NanoPulse", "Dashboard").value(
-            "AccountPositionPanel/showZeroPos", True, type=bool)
-        self._zero_pos_toggle = _ToggleSwitch(checked=_saved_zero)
-        self._zero_pos_toggle.toggled.connect(self._on_zero_pos_toggled)
-        hdr.addWidget(self._zero_pos_toggle)
-
-        root.addLayout(hdr)
+        # Build the utility bar (Refresh + Zero Pos toggle).  It is NOT
+        # added to our own layout — PositionsTradesTabs parks it in the
+        # QTabWidget's top-right corner so the controls sit on the same
+        # row as the POSITIONS / TRADES tabs.  The tab bar already shows
+        # the view name, so no in-panel title is needed anymore.
+        self._control_bar = self._build_control_bar()
 
         # ── Table ────────────────────────────────────────────────────────
         self._table = QTableView()
@@ -591,6 +571,7 @@ class AccountPositionPanel(QWidget):
         h.setStretchLastSection(True)
 
         self._restore_col_widths()
+        self._apply_column_visibility(self._load_visible_pos_keys())
         h.sectionResized.connect(self._on_section_resized)
 
         # Apply column spans whenever model is rebuilt
@@ -696,6 +677,69 @@ class AccountPositionPanel(QWidget):
         """
         self._model.set_selected_accounts(accounts)
 
+    # ── Control-bar builder ──────────────────────────────────────────────────
+
+    def _build_control_bar(self) -> QWidget:
+        bar = QWidget()
+        bar.setObjectName("PositionsControlBar")
+        bar.setStyleSheet(f"QWidget#PositionsControlBar {{ background: transparent; border: none; }}")
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(8, 2, 8, 2)
+        lay.setSpacing(8)
+        # Stretch first so the buttons cluster on the right side of the
+        # tab-bar corner (the stack can be much wider than our content).
+        lay.addStretch(1)
+
+        btn = QPushButton("⟳")
+        btn.setToolTip("Refresh positions")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setFixedSize(26, 26)
+        btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; color: {TEXT_DIM_PNL};
+                border: 1px solid {BORDER}; border-radius: 4px;
+                font-size: 14px; font-weight: bold;
+            }}
+            QPushButton:hover {{ color: #ffffff; border-color: {CLR_OPEN}; background: #253545; }}
+            QPushButton:pressed {{ background: #1a2535; }}
+        """)
+        btn.clicked.connect(self._on_refresh_clicked)
+        lay.addWidget(btn)
+
+        zero_lbl = QLabel("Zero Pos")
+        zero_lbl.setStyleSheet(
+            f"color: {TEXT_DIM_PNL}; font-size: 10px; border: none;")
+        lay.addWidget(zero_lbl)
+
+        _saved_zero = QSettings("NanoPulse", "Dashboard").value(
+            "AccountPositionPanel/showZeroPos", True, type=bool)
+        self._zero_pos_toggle = _ToggleSwitch(checked=_saved_zero)
+        self._zero_pos_toggle.toggled.connect(self._on_zero_pos_toggled)
+        lay.addWidget(self._zero_pos_toggle)
+
+        gear = QPushButton("\u2699")   # ⚙
+        gear.setToolTip("Column preferences")
+        gear.setCursor(Qt.CursorShape.PointingHandCursor)
+        gear.setFixedSize(26, 26)
+        gear.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; color: {TEXT_DIM_PNL};
+                border: 1px solid {BORDER}; border-radius: 4px;
+                font-size: 14px;
+            }}
+            QPushButton:hover {{ color: #ffffff; border-color: {CLR_OPEN}; background: #253545; }}
+            QPushButton:pressed {{ background: #1a2535; }}
+        """)
+        gear.clicked.connect(self._on_gear_clicked)
+        lay.addWidget(gear)
+        return bar
+
+    @property
+    def control_bar(self) -> QWidget:
+        """Hand-off point for ``PositionsTradesTabs`` to install these
+        utility controls in the tab-bar corner."""
+        return self._control_bar
+
     # ── Slots ─────────────────────────────────────────────────────────────────
 
     def _on_refresh_clicked(self) -> None:
@@ -708,6 +752,10 @@ class AccountPositionPanel(QWidget):
         QSettings("NanoPulse", "Dashboard").setValue(
             "AccountPositionPanel/showZeroPos", checked)
 
+    def _on_gear_clicked(self) -> None:
+        if self._open_preferences_callback:
+            self._open_preferences_callback("positions")
+
     def _on_flatten_clicked(self, account: str) -> None:
         log.info("Portfolio: flatten requested for %s", account)
         self.flatten_requested.emit(account)
@@ -717,6 +765,27 @@ class AccountPositionPanel(QWidget):
         log.info("Portfolio: close %d%% requested – %s conId=%d",
                  pct, account, con_id)
         self.position_close_requested.emit(account, con_id, pct)
+
+    # ── Column management (ColumnsProvider protocol) ──────────────────────────
+
+    def column_state(self, kind: str) -> tuple[list, list, list]:
+        visible = self._load_visible_pos_keys()
+        return list(_POS_COL_KEYS), list(_POS_COL_HEADERS), visible
+
+    def apply_columns(self, kind: str, visible_keys: list[str]) -> None:
+        prefs = config_manager.load_preferences()
+        prefs.setdefault("positions_columns", {})["visible"] = visible_keys
+        config_manager.save_preferences(prefs)
+        self._apply_column_visibility(visible_keys)
+
+    def _load_visible_pos_keys(self) -> list[str]:
+        prefs = config_manager.load_preferences()
+        return prefs.get("positions_columns", {}).get(
+            "visible", list(_POS_COL_KEYS))
+
+    def _apply_column_visibility(self, visible_keys: list[str]) -> None:
+        for key, col in _POS_KEY_TO_COL.items():
+            self._table.setColumnHidden(col, key not in visible_keys)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

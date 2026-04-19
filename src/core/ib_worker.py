@@ -165,6 +165,9 @@ class IBWorkerThread(QThread):
     account_pnl_updated = Signal(str, float, float, float)
     # (label, list_of_account_ids) – emitted once after connection established
     accounts_detected = Signal(str, list)
+    # Flattened Fill dict – one emission per execution (startup + live).
+    # Keyed by fill.execution.execId so the UI can dedupe across reconnects.
+    fill_updated = Signal(dict)
 
     def __init__(
         self,
@@ -235,6 +238,12 @@ class IBWorkerThread(QThread):
         # refresh instead of falling back to 00:00:00.
         # NOT cleared on reconnect.
         self._order_times: dict[str, str] = {}
+
+        # Fills cache: execId → flattened fill dict.
+        # Populated by _on_exec_details and _snapshot_fills.  Lets the UI
+        # replay today's fills when the Trades view wires its signals
+        # after the worker has already run its initial snapshot.
+        self._fills_cache: dict[str, dict] = {}
 
         # Track per-position PnL subscriptions: set of (account, conId)
         self._pnl_single_subs: set[tuple[str, int]] = set()
@@ -333,6 +342,29 @@ class IBWorkerThread(QThread):
         else:
             log.debug("Worker %s: request_pnl_snapshot but cache is empty",
                       self._label)
+
+    def request_fills_snapshot(self) -> None:
+        """Thread-safe: re-emit every cached fill through ``fill_updated``.
+
+        Called by the Trades view when it is wired after the worker's
+        initial fills snapshot has already fired (e.g. user switches to
+        the Trades tab after the app has been up for a while).  Reads
+        from ``_fills_cache`` — no IB API call is made.
+        """
+        if not self._fills_cache:
+            log.debug("Worker %s: request_fills_snapshot but cache empty",
+                      self._label)
+            return
+        # Sort chronologically so the model's head-insert logic ends up
+        # with the newest fill on top.
+        items = sorted(
+            self._fills_cache.values(),
+            key=lambda f: f.get("time_sort", ""),
+        )
+        for d in items:
+            self.fill_updated.emit(d)
+        log.debug("Worker %s: fills snapshot emitted %d fill(s) from cache",
+                  self._label, len(items))
 
     def request_portfolio_refresh(self) -> None:
         """Thread-safe: re-subscribe to account updates so IB re-pushes all positions.
@@ -601,10 +633,17 @@ class IBWorkerThread(QThread):
         # cancels the previous subscription on each new call — broken for
         # multi-account connections.
         self._ib.positionEvent += self._on_position_update
+        # Live execution stream – feeds the Trades view.  commissionReport
+        # arrives on a separate callback a few hundred ms after
+        # execDetails / execDetailsEnd, so we subscribe to it too and
+        # re-emit fill_updated with the populated commission.
+        self._ib.execDetailsEvent += self._on_exec_details
+        self._ib.commissionReportEvent += self._on_commission_report
 
         tws_log.info("[%s] IB instance created – event subscriptions: "
                      "accountSummaryEvent, pnlEvent, pnlSingleEvent, errorEvent, "
-                     "pendingTickersEvent, orderStatusEvent, positionEvent",
+                     "pendingTickersEvent, orderStatusEvent, positionEvent, "
+                     "execDetailsEvent, commissionReportEvent",
                      self._label)
 
         try:
@@ -763,6 +802,10 @@ class IBWorkerThread(QThread):
                     tws_log.info(
                         "[%s] API-CALL  _snapshot_existing_orders()", self._label)
                     await self._snapshot_existing_orders()
+
+                    # Snapshot today's fills so the Trades view is populated
+                    # on startup and after a reconnect.
+                    await self._snapshot_fills()
 
                 except Exception as exc:
                     log.exception("Worker %s post-connect setup error (connection still alive): %s",
@@ -2537,6 +2580,169 @@ class IBWorkerThread(QThread):
             log.debug("Worker %s: _build_trade_dict error",
                       self._label, exc_info=True)
             return None
+
+    def _flatten_fill(self, fill) -> dict:
+        """Flatten an ib_async ``Fill`` into a dict matching the Trades
+        view schema.  Handles missing attributes gracefully.
+
+        ``commission`` / ``realized_pnl`` are ``None`` when the
+        ``commissionReport`` has not populated yet (e.g. a live
+        ``execDetailsEvent`` arriving before TWS's commission callback).
+        They become real floats once ``reqExecutionsAsync`` refreshes
+        the snapshot on the next (re)connection.
+        """
+        ex = getattr(fill, "execution", None)
+        contract = getattr(fill, "contract", None)
+        report = getattr(fill, "commissionReport", None)
+
+        raw_time = getattr(ex, "time", None) if ex is not None else None
+        et_time = _to_eastern(raw_time) if raw_time else None
+
+        exec_id = getattr(ex, "execId", "") if ex is not None else ""
+
+        # ib_async attaches a default-initialised ``CommissionReport`` to
+        # every ``Fill`` (all fields 0.0, execId='').  Treat it as "not
+        # populated yet" — the real report arrives via commissionReportEvent,
+        # which we don't subscribe to, so values only appear once a
+        # subsequent reqExecutionsAsync snapshot refreshes the fill.
+        commission: float | None = None
+        realized_pnl: float | None = None
+        report_populated = (
+            report is not None and bool(getattr(report, "execId", ""))
+        )
+        if report_populated:
+            c = getattr(report, "commission", None)
+            if c is not None:
+                cf = float(c)
+                if not math.isnan(cf) and abs(cf) < _IB_DBL_MAX:
+                    commission = cf
+            r = getattr(report, "realizedPNL", None)
+            if r is not None:
+                rf = float(r)
+                if not math.isnan(rf) and abs(rf) < _IB_DBL_MAX:
+                    realized_pnl = rf
+
+        return {
+            "exec_id":       exec_id,
+            "time":          et_time.strftime("%b%d %H:%M:%S") if et_time else "",
+            "time_sort":     et_time.isoformat() if et_time else "",
+            "symbol":        getattr(contract, "symbol", "") if contract else "",
+            "sec_type":      getattr(contract, "secType", "") if contract else "",
+            "side":          getattr(ex, "side", "") if ex is not None else "",
+            "shares":        float(getattr(ex, "shares", 0) or 0) if ex is not None else 0.0,
+            "price":         float(getattr(ex, "price", 0) or 0) if ex is not None else 0.0,
+            "exchange":      getattr(ex, "exchange", "") if ex is not None else "",
+            "order_ref":     getattr(ex, "orderRef", "") if ex is not None else "",
+            "account":       getattr(ex, "acctNumber", "") if ex is not None else "",
+            "expiry":        getattr(contract, "lastTradeDateOrContractMonth", "") if contract else "",
+            "strike":        float(getattr(contract, "strike", 0) or 0) if contract else 0.0,
+            "right":         getattr(contract, "right", "") if contract else "",
+            "commission":    commission,
+            "realized_pnl":  realized_pnl,
+            "order_id":      int(getattr(ex, "orderId", 0) or 0) if ex is not None else 0,
+            "client_id":     int(getattr(ex, "clientId", 0) or 0) if ex is not None else 0,
+            "liquidation":   int(getattr(ex, "liquidation", 0) or 0) if ex is not None else 0,
+            "last_liquidity": int(getattr(ex, "lastLiquidity", 0) or 0) if ex is not None else 0,
+            "label":         self._label,
+        }
+
+    def _on_exec_details(self, trade, fill) -> None:
+        """Live execDetailsEvent → emit + cache a flattened fill dict."""
+        try:
+            d = self._flatten_fill(fill)
+        except Exception:
+            log.debug("Worker %s: _on_exec_details flatten error",
+                      self._label, exc_info=True)
+            return
+        exec_id = d.get("exec_id", "")
+        if exec_id:
+            self._fills_cache[exec_id] = d
+        tws_log.info("[%s] EVENT     execDetailsEvent → execId=%s %s %s %s @ %s",
+                     self._label, exec_id, d.get("symbol", ""),
+                     d.get("side", ""), d.get("shares", 0), d.get("price", 0))
+        self.fill_updated.emit(d)
+
+    def _on_commission_report(self, trade, fill, report) -> None:
+        """commissionReportEvent → re-flatten & re-emit.
+
+        ib_async attaches ``report`` onto ``fill.commissionReport`` before
+        firing this event, so ``_flatten_fill`` naturally picks up the
+        populated commission / realizedPNL values.  The downstream models
+        dedupe by execId, so re-emitting updates the existing row in the
+        flat view and correctly re-aggregates the summary view.
+        """
+        try:
+            d = self._flatten_fill(fill)
+        except Exception:
+            log.debug("Worker %s: _on_commission_report flatten error",
+                      self._label, exc_info=True)
+            return
+        exec_id = d.get("exec_id", "")
+        if exec_id:
+            self._fills_cache[exec_id] = d
+        tws_log.debug("[%s] EVENT     commissionReportEvent → execId=%s "
+                      "commission=%s realizedPNL=%s",
+                      self._label, exec_id,
+                      d.get("commission"), d.get("realized_pnl"))
+        self.fill_updated.emit(d)
+
+    async def _snapshot_fills(self) -> None:
+        """Fetch today's fills and emit each through ``fill_updated``.
+
+        Uses ``reqExecutionsAsync`` to trigger/refresh the fetch, then
+        reads from ``ib.fills()`` — the internal ib_async cache — which
+        is where ib_async merges ``commissionReport`` data in.  The list
+        returned by ``reqExecutionsAsync`` itself holds *fresh* Fill
+        objects whose ``CommissionReport`` is never populated (commission
+        arrives on a separate callback after execDetailsEnd); ``ib.fills()``
+        holds the authoritative merged copies.
+
+        Called on every (re)connection, after ``_snapshot_existing_orders``.
+        Cached in ``self._fills_cache`` so ``request_fills_snapshot`` can
+        replay them when the UI wires in late without another API call.
+        """
+        if self._ib is None or not self._ib.isConnected():
+            return
+
+        try:
+            from ib_async import ExecutionFilter
+            tws_log.info("[%s] API-CALL  reqExecutionsAsync() [Trades snapshot]",
+                         self._label)
+            await self._ib.reqExecutionsAsync(ExecutionFilter())
+        except Exception:
+            log.exception("Worker %s: _snapshot_fills reqExecutions failed",
+                          self._label)
+            tws_log.error(
+                "[%s] API-ERR   reqExecutionsAsync [Trades] failed", self._label)
+            return
+
+        try:
+            fills = list(self._ib.fills())
+        except Exception:
+            log.exception("Worker %s: ib.fills() read failed", self._label)
+            fills = []
+        tws_log.info("[%s] API-RESP  ib.fills() → %d fill(s) [Trades]",
+                     self._label, len(fills))
+
+        def _key(f):
+            ex = getattr(f, "execution", None)
+            return getattr(ex, "time", None) or datetime.min.replace(tzinfo=timezone.utc)
+
+        emitted = 0
+        for f in sorted(fills, key=_key):
+            try:
+                d = self._flatten_fill(f)
+            except Exception:
+                log.debug("Worker %s: _snapshot_fills flatten error",
+                          self._label, exc_info=True)
+                continue
+            exec_id = d.get("exec_id", "")
+            if exec_id:
+                self._fills_cache[exec_id] = d
+            self.fill_updated.emit(d)
+            emitted += 1
+        tws_log.info("[%s] SNAPSHOT  fills emitted %d (cache size=%d)",
+                     self._label, emitted, len(self._fills_cache))
 
     def _on_global_order_status(self, trade) -> None:
         """Global ``orderStatusEvent`` callback – fires for **every** order

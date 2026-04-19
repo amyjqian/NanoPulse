@@ -19,6 +19,8 @@ from .order_status_panel import OrderStatusPanel
 from .account_list_panel import AccountListPanel
 from .account_position_panel import AccountPositionPanel
 from .accounts_model import AccountsTableModel
+from .trades_panel import TradesPanel
+from .positions_trades_tabs import PositionsTradesTabs
 
 log = logging.getLogger(__name__)
 
@@ -37,9 +39,9 @@ _TITLE_FONT.setWeight(QFont.Weight.Bold)
 _SPLITTER_SS = f"QSplitter::handle {{ background: {BORDER}; }}"
 
 # Config keys for each splitter
-_K_MAIN = "flash_main_splitter"
-_K_RIGHT_V = "flash_right_v_splitter"
-_K_TOP_RIGHT = "flash_top_right_splitter"
+_K_MAIN      = "flash_main_splitter"
+_K_RIGHT_H   = "flash_right_h_splitter"   # horizontal: left-content | accounts
+_K_LEFT_V    = "flash_left_v_splitter"    # vertical:   orders | positions-trades
 
 
 def _titled_panel(title: str) -> QWidget:
@@ -67,12 +69,14 @@ class FlashTradeView(QWidget):
     """Skeleton layout for the FlashTrade page — section titles only."""
 
     def __init__(self, active_threads: dict[str, IBWorkerThread] | None = None,
-                 accounts_model: AccountsTableModel | None = None, parent=None):
+                 accounts_model: AccountsTableModel | None = None, parent=None,
+                 *, open_preferences=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self._active_threads: dict[str,
                                    IBWorkerThread] = active_threads if active_threads is not None else {}
         self._accounts_model = accounts_model
+        self._open_preferences_callback = open_preferences
         # label → worker instance wired
         self._connected_order_workers: dict[str, IBWorkerThread] = {}
         # label → worker for portfolio
@@ -102,36 +106,45 @@ class FlashTradeView(QWidget):
         # ── Middle 1/5 — Book Trading ─────────────────────────────────────────
         self._book_trading = _titled_panel("Book Trading")
 
-        # ── Right 3/5 — split top / bottom ────────────────────────────────────
-        self._right_splitter = QSplitter(Qt.Orientation.Vertical)
+        # ── Right 3/5 — Account List full-height on right; left side split top/bottom
+        self._right_splitter = QSplitter(Qt.Orientation.Horizontal)
         self._right_splitter.setHandleWidth(2)
         self._right_splitter.setStyleSheet(_SPLITTER_SS)
 
-        # Top half of right side — Order Status | Account List (resizable)
-        self._top_right_splitter = QSplitter(Qt.Orientation.Horizontal)
+        # Left column: Order Status (top) | Positions+Trades (bottom)
+        self._top_right_splitter = QSplitter(Qt.Orientation.Vertical)
         self._top_right_splitter.setHandleWidth(2)
         self._top_right_splitter.setStyleSheet(_SPLITTER_SS)
         self._order_status = OrderStatusPanel(self)
 
+        self._account_position = AccountPositionPanel(
+            accounts_model=self._accounts_model,
+            parent=self,
+            open_preferences=self._open_preferences_callback,
+        )
+        self._trades_panel = TradesPanel(
+            self, open_preferences=self._open_preferences_callback,
+        )
+        self._positions_trades = PositionsTradesTabs(
+            positions_widget=self._account_position,
+            trades_widget=self._trades_panel,
+            parent=self,
+        )
+
+        self._top_right_splitter.addWidget(self._order_status)
+        self._top_right_splitter.addWidget(self._positions_trades)
+        self._top_right_splitter.setStretchFactor(0, 1)
+        self._top_right_splitter.setStretchFactor(1, 1)
+
+        # Right column: Account List spans full height
         if self._accounts_model is not None:
             self._account_list = AccountListPanel(self._accounts_model, self)
         else:
             self._account_list = _titled_panel("Account List")
 
-        self._top_right_splitter.addWidget(self._order_status)
-        self._top_right_splitter.addWidget(self._account_list)
-        self._top_right_splitter.setStretchFactor(0, 1)
-        self._top_right_splitter.setStretchFactor(1, 1)
-
-        # Bottom half of right side — Account Position
-        self._account_position = AccountPositionPanel(
-            accounts_model=self._accounts_model,
-            parent=self,
-        )
-
         self._right_splitter.addWidget(self._top_right_splitter)
-        self._right_splitter.addWidget(self._account_position)
-        self._right_splitter.setStretchFactor(0, 1)
+        self._right_splitter.addWidget(self._account_list)
+        self._right_splitter.setStretchFactor(0, 3)
         self._right_splitter.setStretchFactor(1, 1)
 
         # ── Assemble into main horizontal splitter ────────────────────────────
@@ -195,6 +208,16 @@ class FlashTradeView(QWidget):
         if isinstance(self._account_list, AccountListPanel):
             self._account_list.action_requested.connect(
                 self._on_account_list_action)
+
+    @property
+    def trades_panel(self) -> TradesPanel:
+        """Host-side accessor so MainWindow can use it as a ColumnsProvider."""
+        return self._trades_panel
+
+    @property
+    def account_position(self) -> AccountPositionPanel:
+        """Host-side accessor so MainWindow can include it in the combined ColumnsProvider."""
+        return self._account_position
 
     # ── Order placement ───────────────────────────────────────────────────────
 
@@ -454,6 +477,10 @@ class FlashTradeView(QWidget):
                 prev.account_pnl_updated.disconnect(self._on_account_pnl_updated)
             except RuntimeError:
                 pass
+            try:
+                prev.fill_updated.disconnect(self._on_fill_updated)
+            except RuntimeError:
+                pass
             log.debug("FlashTrade: unwired stale signals for worker %s", label)
 
         worker.order_status_updated.connect(self._on_order_status_updated)
@@ -462,18 +489,22 @@ class FlashTradeView(QWidget):
         worker.reverse_close_needed.connect(self._on_reverse_close_needed)
         worker.pnl_single_updated.connect(self._on_pnl_single_updated)
         worker.account_pnl_updated.connect(self._on_account_pnl_updated)
+        worker.fill_updated.connect(self._on_fill_updated)
         self._connected_order_workers[label] = worker
         self._connected_portfolio_workers[label] = worker
         log.debug(
             "FlashTrade: wired order_status_updated + portfolio_updated + "
-            "pnl_single_updated + account_pnl_updated for worker %s", label)
+            "pnl_single_updated + account_pnl_updated + fill_updated "
+            "for worker %s", label)
 
         # Re-snapshot: the worker's initial snapshot may have fired before
-        # this signal was connected.  Ask it to emit all known orders again.
+        # this signal was connected.  Ask it to emit all known orders and
+        # fills again so the Trades view is populated.
         if worker.is_ib_connected:
             worker.request_order_snapshot()
             worker.request_portfolio_snapshot()
             worker.request_pnl_snapshot()
+            worker.request_fills_snapshot()
 
     def _on_order_status_updated(self, data: dict) -> None:
         """Receive order status from worker thread → update OrderStatusPanel."""
@@ -565,6 +596,18 @@ class FlashTradeView(QWidget):
             account, daily_pnl=daily_pnl,
             realized_pnl=realized_pnl,
             unrealized_pnl=unrealized_pnl)
+
+    def _on_fill_updated(self, fill: dict) -> None:
+        """Execution arrived (startup snapshot or live execDetailsEvent) →
+        insert/refresh a row in the Trades view.  Dedupe by execId is
+        handled in the model."""
+        display_account = fill.get("account", "")
+        if self._accounts_model and display_account:
+            alias = self._accounts_model._aliases.get(display_account, "")
+            if alias:
+                fill = dict(fill)
+                fill["account"] = alias
+        self._trades_panel.add_fill(fill)
 
     def _refresh_portfolio(self) -> None:
         """Ask every connected worker to re-push portfolio positions."""
@@ -1012,20 +1055,18 @@ class FlashTradeView(QWidget):
 
     def _persist_layout(self) -> None:
         layout = config_manager.load_layout()
-        layout[_K_MAIN] = self._main_splitter.sizes()
-        layout[_K_RIGHT_V] = self._right_splitter.sizes()
-        layout[_K_TOP_RIGHT] = self._top_right_splitter.sizes()
+        layout[_K_MAIN]    = self._main_splitter.sizes()
+        layout[_K_RIGHT_H] = self._right_splitter.sizes()
+        layout[_K_LEFT_V]  = self._top_right_splitter.sizes()
         config_manager.save_layout(layout)
         log.debug("FlashTrade layout saved")
 
     def _restore_layout(self) -> None:
         layout = config_manager.load_layout()
-        if _K_MAIN in layout:
-            self._main_splitter.setSizes(layout[_K_MAIN])
-        if _K_RIGHT_V in layout:
-            self._right_splitter.setSizes(layout[_K_RIGHT_V])
-        if _K_TOP_RIGHT in layout:
-            self._top_right_splitter.setSizes(layout[_K_TOP_RIGHT])
+        # Default sizes matching the target layout (pixels, ~1500px wide x ~720px tall)
+        self._main_splitter.setSizes(layout.get(_K_MAIN, [265, 285, 950]))
+        self._right_splitter.setSizes(layout.get(_K_RIGHT_H, [760, 190]))
+        self._top_right_splitter.setSizes(layout.get(_K_LEFT_V, [380, 340]))
         log.debug("FlashTrade layout restored")
 
     # ── Paint ─────────────────────────────────────────────────────────────────
