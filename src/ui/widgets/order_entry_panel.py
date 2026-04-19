@@ -7,7 +7,7 @@ import math
 from typing import Any
 
 from PySide6.QtCore import QEvent, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QDoubleValidator, QFont, QIntValidator, QPainter
+from PySide6.QtGui import QColor, QDoubleValidator, QFont, QFontMetrics, QIntValidator, QPainter
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -944,6 +944,30 @@ class _QtyInput(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  _ChipButton
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class _ChipButton(QPushButton):
+    """QPushButton that also emits ``doubleClicked`` on a mouse double-click.
+
+    We intentionally do NOT call ``super().mouseDoubleClickEvent``.  The default
+    QAbstractButton implementation re-enters ``emitPressed()``, which sets the
+    button's internal ``down`` flag so the following mouse release would fire a
+    second ``clicked`` — which would re-select the chip right after our
+    double-click handler cleared it.
+    """
+
+    doubleClicked = Signal()
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.doubleClicked.emit()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  _TierSection
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1011,9 +1035,16 @@ class _TierSection(QWidget):
         hdr.setSpacing(6)
         hdr.setContentsMargins(0, 0, 0, 0)
 
-        self._dollar_lbl = QLabel(title)
-        self._dollar_lbl.setStyleSheet(
-            f"color: {Theme.TEXT}; font-size: 11px; font-weight: bold; border: none;")
+        self._dollar_lbl = _make_btn(title, self._label_color, 30)
+        self._dollar_lbl.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        # Pin min width to fit "Take Profit" so TP and SL buttons have the
+        # same initial width regardless of which title is shorter.
+        _fm = QFontMetrics(self._dollar_lbl.font())
+        self._dollar_lbl.setMinimumWidth(_fm.horizontalAdvance("Take Profit") + 24)
+        self._dollar_lbl.clicked.connect(self._on_header_clicked)
+        # Disabled until a chip is selected or a custom Dist is typed.
+        self._dollar_lbl.setEnabled(False)
         hdr.addWidget(self._dollar_lbl)
         hdr.addStretch()
 
@@ -1052,12 +1083,13 @@ class _TierSection(QWidget):
 
         for i, tier in enumerate(self._tiers):
             label = tier.get("label", f"Tier {i + 1}")
-            btn = QPushButton(label)
+            btn = _ChipButton(label)
             btn.setFixedHeight(self._CHIP_H)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setSizePolicy(
                 QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             btn.clicked.connect(lambda chk, idx=i: self._on_chip_clicked(idx))
+            btn.doubleClicked.connect(self._on_chip_double_clicked)
             self._chip_buttons.append(btn)
             lay.addWidget(btn)
 
@@ -1074,52 +1106,47 @@ class _TierSection(QWidget):
     # ── Dollar display ────────────────────────────────────────────────────────
 
     def _update_dollar_display(self) -> None:
-        """Refresh the combined title+dollar label in the section header.
+        """Refresh the Take Profit / Stop Loss button label.
 
-        Title text is always white.
-        Only the dollar value is coloured:
-          • No chip / dollar == 0  → plain white title, no value shown
-          • Toggle OFF (preview)   → "Take profit: " white + "$500" dim grey
-          • Toggle ON  (active)    → "Take profit: " white + "$500" green/red
+        Shows just the title ("Take profit") when no chip is selected and no
+        custom Dist is typed; shows "Take profit | 500" once either provides
+        a positive dollar value.
         """
         if self._dollar_lbl is None:
             return
 
-        # Label stylesheet is fixed at white — colour is applied via HTML span
-        _base_ss = (f"color: {Theme.TEXT}; font-size: 11px; "
-                    f"font-weight: bold; border: none;")
+        input_text = self._input.text().strip() if self._input is not None else ""
+        toggle_on = self._toggle.is_on if self._toggle else True
+        has_selection = self._selected_idx is not None or bool(input_text)
+        # Button is enabled only when the section is on and the user has
+        # expressed a choice — either a chip or a non-empty Dist.
+        self._dollar_lbl.setEnabled(toggle_on and has_selection)
+
+        # When the section is off or nothing is selected, show just the title
+        # with no dollar value suffix.
+        if not toggle_on or not has_selection:
+            self._dollar_lbl.setText(self._title_str)
+            return
 
         # Per-unit dollar: custom Dist input wins over chip selection
         dollar = 0.0
-        if self._input is not None:
-            custom = self._input.text().strip()
-            if custom:
-                try:
-                    dist = float(custom)
-                    if dist > 0:
-                        dollar = dist * self._multiplier
-                except ValueError:
-                    dollar = 0.0
+        if input_text:
+            try:
+                dist = float(input_text)
+                if dist > 0:
+                    dollar = dist * self._multiplier
+            except ValueError:
+                dollar = 0.0
         if dollar <= 0 and self._selected_idx is not None \
                 and self._selected_idx < len(self._dollar_per_tier):
             dollar = self._dollar_per_tier[self._selected_idx]
 
         if not dollar or dollar <= 0:
-            self._dollar_lbl.setStyleSheet(_base_ss)
             self._dollar_lbl.setText(self._title_str)
             return
 
-        # ── Colour only the value, keep the title white ────────────────────
-        scaled    = dollar * self._qty
-        toggle_on = self._toggle.is_on if self._toggle else True
-        val_clr   = self._label_color if toggle_on else "#6B7280"
-
-        self._dollar_lbl.setStyleSheet(_base_ss)
-        self._dollar_lbl.setText(
-            f'{self._title_str}: '
-            f'<span style="color:{val_clr};font-weight:bold;">'
-            f'{scaled:,.0f}</span>'
-        )
+        scaled = dollar * self._qty
+        self._dollar_lbl.setText(f"{self._title_str} | {scaled:,.2f}")
 
     def set_qty(self, qty: int) -> None:
         """Update the quantity and refresh the dollar display (no chip rebuild)."""
@@ -1146,6 +1173,20 @@ class _TierSection(QWidget):
         self._update_dollar_display()
         self.changed.emit()
 
+    def _on_header_clicked(self) -> None:
+        """Clicking the Take Profit / Stop Loss header button clears the
+        chip selection and the custom Dist input so the section returns to
+        the 'nothing selected' state.
+        """
+        self._selected_idx = None
+        if self._input is not None:
+            self._input.blockSignals(True)
+            self._input.clear()
+            self._input.blockSignals(False)
+        self._update_chip_styles()
+        self._update_dollar_display()
+        self.changed.emit()
+
     def _on_chip_clicked(self, idx: int) -> None:
         if self._toggle and not self._toggle.is_on:
             self._toggle.set_on(True)
@@ -1155,6 +1196,25 @@ class _TierSection(QWidget):
             self._input.blockSignals(True)
             self._input.clear()
             self._input.blockSignals(False)
+        self._update_chip_styles()
+        self._update_dollar_display()
+        self.changed.emit()
+
+    def _on_chip_double_clicked(self) -> None:
+        """Double-clicking a chip resets the section: chip deselected, toggle
+        off, Dist input cleared, and the header button disabled (via the
+        standard _update_dollar_display rules)."""
+        self._selected_idx = None
+        if self._input is not None:
+            self._input.blockSignals(True)
+            self._input.clear()
+            self._input.blockSignals(False)
+        if self._toggle and self._toggle.is_on:
+            self._toggle.blockSignals(True)
+            self._toggle.set_on(False)
+            self._toggle.blockSignals(False)
+        if self._state_lbl is not None:
+            self._state_lbl.setText("Off")
         self._update_chip_styles()
         self._update_dollar_display()
         self.changed.emit()
@@ -1308,9 +1368,20 @@ class OrderEntryPanel(QWidget):
         self._pt_section.set_qty(self._active_qty)
         self._sl_section.set_qty(self._active_qty)
 
+        # Push the contract multiplier + tick size for the initial active symbol
+        # so the custom Dist input calculates dollars correctly before the user
+        # first clicks a different symbol chip (which would call
+        # _reload_tier_sections).
+        from src.core.reference_data import get_instance as _rd
+        _init_mult = _rd().get_multiplier(self._active_symbol or "") or 1.0
+        self._pt_section.set_multiplier(_init_mult)
+        self._sl_section.set_multiplier(_init_mult)
+        _init_ts = self._tick_size_for_symbol(self._active_symbol or "")
+        self._pt_section.set_market_price(self._last_price, _init_ts)
+        self._sl_section.set_market_price(self._last_price, _init_ts)
+
         # Auto-refresh when reference data changes (contract added/removed or
         # strategy tiers saved from the StrategyEditor tab).
-        from src.core.reference_data import get_instance as _rd
         _rd().contracts_changed.connect(self._refresh_combo_items)
         _rd().strategy_tiers_changed.connect(self._reload_tier_sections)
 
@@ -1508,14 +1579,14 @@ class OrderEntryPanel(QWidget):
         # ── Take Profit ───────────────────────────────────────────────────────
         pt_tiers, sl_tiers = self._load_tiers_for_active()
         self._pt_section = _TierSection(
-            "Take profit", pt_tiers, enabled=False,
-            label_color="#3FB950")   # green
+            "Take Profit", pt_tiers, enabled=False,
+            label_color=Theme.CLR_BUY)
         root.addWidget(self._pt_section)
 
         # ── Stop Loss ─────────────────────────────────────────────────────────
         self._sl_section = _TierSection(
-            "Stop loss", sl_tiers, enabled=False,
-            label_color="#F85149")   # red
+            "Stop Loss", sl_tiers, enabled=False,
+            label_color=Theme.CLR_SELL)
         root.addWidget(self._sl_section)
 
         root.addStretch(1)
@@ -2022,11 +2093,13 @@ class OrderEntryPanel(QWidget):
         mult = _rd().get_multiplier(self._active_symbol or "") or 1.0
         self._pt_section.set_multiplier(mult)
         self._sl_section.set_multiplier(mult)
-        # Sync live price into the TickPriceInput spinners
-        if self._last_price > 0:
-            ts = self._tick_size_for_symbol(self._active_symbol or "")
-            self._pt_section.set_market_price(self._last_price, ts)
-            self._sl_section.set_market_price(self._last_price, ts)
+        # Sync live price + tick size into the TickPriceInput (and its Dist
+        # ladder popup).  Tick size must be pushed even before the first price
+        # tick arrives so the popup shows multiples of the *selected* symbol's
+        # tick size instead of the 0.25 default.
+        ts = self._tick_size_for_symbol(self._active_symbol or "")
+        self._pt_section.set_market_price(self._last_price, ts)
+        self._sl_section.set_market_price(self._last_price, ts)
 
     def _tick_size_for_symbol(self, sym: str) -> float:
         """Return the minimum tick size for *sym*.
