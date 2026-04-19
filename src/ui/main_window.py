@@ -191,10 +191,30 @@ class MainWindow(QWidget):
                             subview: str | None = None) -> "PreferencesDialog":
         """Single entry point for opening the global Preferences dialog.
 
-        ``section`` / ``subview`` are used by the Trades gear button to
-        land on Columns → Trades / Summary without a second click.
+        ``section`` / ``subview`` are used by gear buttons to land on
+        Columns → Positions / Trades / Summary without a second click.
         """
-        dlg = PreferencesDialog(self, columns_provider=self._flash_trade.trades_panel)
+        class _CombinedProvider:
+            def __init__(self, trades_panel, position_panel):
+                self._trades = trades_panel
+                self._positions = position_panel
+
+            def column_state(self, kind):
+                if kind == "positions":
+                    return self._positions.column_state(kind)
+                return self._trades.column_state(kind)
+
+            def apply_columns(self, kind, keys):
+                if kind == "positions":
+                    self._positions.apply_columns(kind, keys)
+                else:
+                    self._trades.apply_columns(kind, keys)
+
+        provider = _CombinedProvider(
+            self._flash_trade.trades_panel,
+            self._flash_trade.account_position,
+        )
+        dlg = PreferencesDialog(self, columns_provider=provider)
         if section is not None:
             dlg.navigate_to(section, subview)
         if modeless:
@@ -204,8 +224,8 @@ class MainWindow(QWidget):
         return dlg
 
     def _open_trades_preferences(self, view_kind: str) -> None:
-        """Callback wired into the Trades gear button.  ``view_kind`` is
-        ``"flat"`` or ``"summary"``."""
+        """Callback wired into gear buttons.  ``view_kind`` is
+        ``"positions"``, ``"flat"``, or ``"summary"``."""
         self._launch_preferences(modeless=True, section="Columns",
                                  subview=view_kind)
 

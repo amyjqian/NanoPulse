@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont, QFontMetrics
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
 
 from typing import Callable
 
+from src.core import config_manager
 from .trades_control_bar import TradesControlBar
 from .trades_filter_proxy import TradesFilterProxy
 from .trades_model import (
@@ -145,13 +146,36 @@ class TradesPanel(QWidget):
         self._summary_proxy = TradesFilterProxy(self, is_summary=True)
         self._summary_proxy.setSourceModel(self._summary_model)
 
-        # Per-view visible column keys (order matters)
-        self._visible_flat = list(_DEFAULT_FLAT_VISIBLE)
-        self._visible_summary = list(_DEFAULT_SUMMARY_VISIBLE)
+        # Load persisted column state (visible keys + widths) — falls back
+        # to defaults on first run / missing keys.
+        persisted = self._load_persisted_columns()
+        self._visible_flat = persisted["flat"].get(
+            "visible", list(_DEFAULT_FLAT_VISIBLE))
+        self._visible_summary = persisted["summary"].get(
+            "visible", list(_DEFAULT_SUMMARY_VISIBLE))
+        self._saved_widths_flat: dict[str, int] = dict(
+            persisted["flat"].get("widths", {}))
+        self._saved_widths_summary: dict[str, int] = dict(
+            persisted["summary"].get("widths", {}))
+
+        # Debounced save – user drag/resize fires many events per second.
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(350)
+        self._save_timer.timeout.connect(self._save_persisted_columns)
+
+        # Suppress save callbacks while we programmatically move/resize
+        # sections during init and apply_columns.
+        self._suspend_save = True
 
         self._setup_ui()
         self._apply_column_visibility("flat")
         self._apply_column_visibility("summary")
+
+        self._wire_header_signals(self._flat_table, "flat")
+        self._wire_header_signals(self._summary_table, "summary")
+
+        self._suspend_save = False
 
     # ── UI construction ─────────────────────────────────────────────────────
 
@@ -160,12 +184,16 @@ class TradesPanel(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
+        # Control bar is not added to our own layout — PositionsTradesTabs
+        # reparents it into the QTabWidget's top-right corner so the
+        # utility controls sit on the same row as the POSITIONS / TRADES
+        # tabs.  Signal wiring still lives here since TradesPanel owns
+        # the proxies the bar drives.
         self._control_bar = TradesControlBar(self)
         self._control_bar.summaryToggled.connect(self._on_summary_toggled)
         self._control_bar.dateFilterChanged.connect(self._on_date_changed)
         self._control_bar.searchTextChanged.connect(self._on_search_changed)
         self._control_bar.settingsClicked.connect(self._on_gear_clicked)
-        root.addWidget(self._control_bar)
 
         self._stack = QStackedWidget(self)
         self._flat_table = self._make_table(self._flat_proxy)
@@ -286,38 +314,150 @@ class TradesPanel(QWidget):
         else:
             self._visible_flat = list(visible_keys)
         self._apply_column_visibility(kind)
+        # Re-snapshot so widths (possibly new columns) are captured too.
+        self._snapshot_into_state(kind)
+        self._save_timer.start()
 
     def _apply_column_visibility(self, kind: str) -> None:
         """Project the visible-keys list onto the QTableView header:
-        hide non-selected columns, then reorder selected ones to match."""
+        hide non-selected columns, reorder selected ones to match, and
+        apply any persisted widths on top."""
+        prev_suspend = self._suspend_save
+        self._suspend_save = True
+        try:
+            if kind == "flat":
+                table = self._flat_table
+                all_keys = self._flat_model.column_keys()
+                visible = self._visible_flat
+                saved_widths = self._saved_widths_flat
+            else:
+                table = self._summary_table
+                all_keys = self._summary_model.column_keys()
+                visible = self._visible_summary
+                saved_widths = self._saved_widths_summary
+            hdr = table.horizontalHeader()
+
+            key_to_logical = {k: i for i, k in enumerate(all_keys)}
+
+            # 1. Hide / show
+            visible_set = set(visible)
+            for k, logical in key_to_logical.items():
+                hdr.setSectionHidden(logical, k not in visible_set)
+
+            # 2. Reorder
+            for target_visual, key in enumerate(visible):
+                logical = key_to_logical.get(key)
+                if logical is None:
+                    continue
+                current_visual = hdr.visualIndex(logical)
+                if current_visual != target_visual:
+                    hdr.moveSection(current_visual, target_visual)
+
+            # 3. Apply persisted widths (no-op for columns not in saved state)
+            for key, width in saved_widths.items():
+                logical = key_to_logical.get(key)
+                if logical is not None and width > 0:
+                    table.setColumnWidth(logical, int(width))
+        finally:
+            self._suspend_save = prev_suspend
+
+    # ── Header change plumbing → debounced persistence ──────────────────────
+
+    def _wire_header_signals(self, table: QTableView, kind: str) -> None:
+        hdr = table.horizontalHeader()
+        hdr.sectionResized.connect(
+            lambda _logical, _old, _new, k=kind: self._on_header_changed(k))
+        hdr.sectionMoved.connect(
+            lambda _logical, _from, _to, k=kind: self._on_header_changed(k))
+
+    def _on_header_changed(self, kind: str) -> None:
+        if self._suspend_save:
+            return
+        self._snapshot_into_state(kind)
+        self._save_timer.start()
+
+    def _snapshot_into_state(self, kind: str) -> None:
+        """Read the table's current visual order + widths back into our
+        in-memory state so what we persist matches what the user sees."""
         if kind == "flat":
             table = self._flat_table
             all_keys = self._flat_model.column_keys()
-            visible = self._visible_flat
         else:
             table = self._summary_table
             all_keys = self._summary_model.column_keys()
-            visible = self._visible_summary
         hdr = table.horizontalHeader()
 
-        key_to_logical = {k: i for i, k in enumerate(all_keys)}
-
-        # 1. Hide / show
-        visible_set = set(visible)
-        for k, logical in key_to_logical.items():
-            hdr.setSectionHidden(logical, k not in visible_set)
-
-        # 2. Reorder.  For each position in the desired order, find the
-        # section whose current visual index maps to that key and move it.
-        for target_visual, key in enumerate(visible):
-            logical = key_to_logical.get(key)
-            if logical is None:
+        # Visible keys in current visual order, skipping hidden sections.
+        visible: list[str] = []
+        for visual in range(hdr.count()):
+            logical = hdr.logicalIndex(visual)
+            if logical < 0 or logical >= len(all_keys):
                 continue
-            current_visual = hdr.visualIndex(logical)
-            if current_visual != target_visual:
-                hdr.moveSection(current_visual, target_visual)
+            if hdr.isSectionHidden(logical):
+                continue
+            visible.append(all_keys[logical])
+
+        # Widths – store per key for every non-hidden column.
+        widths: dict[str, int] = {}
+        for logical, key in enumerate(all_keys):
+            if hdr.isSectionHidden(logical):
+                continue
+            w = table.columnWidth(logical)
+            if w > 0:
+                widths[key] = int(w)
+
+        if kind == "flat":
+            self._visible_flat = visible
+            self._saved_widths_flat = widths
+        else:
+            self._visible_summary = visible
+            self._saved_widths_summary = widths
+
+    # ── Persistence (preferences.trades_columns) ────────────────────────────
+
+    def _load_persisted_columns(self) -> dict[str, dict]:
+        """Returns ``{"flat": {"visible": [...], "widths": {...}},
+        "summary": {...}}``.  Missing sections become empty dicts so
+        callers can `.get(...)` into them with defaults."""
+        try:
+            prefs = config_manager.load_preferences()
+        except Exception:
+            log.exception("TradesPanel: load_preferences failed")
+            return {"flat": {}, "summary": {}}
+        tc = prefs.get("trades_columns", {})
+        flat = tc.get("flat", {}) if isinstance(tc, dict) else {}
+        summ = tc.get("summary", {}) if isinstance(tc, dict) else {}
+        return {
+            "flat": flat if isinstance(flat, dict) else {},
+            "summary": summ if isinstance(summ, dict) else {},
+        }
+
+    def _save_persisted_columns(self) -> None:
+        """Atomically merge our current column state into the preferences
+        JSON.  Triggered by the debounce timer."""
+        try:
+            prefs = config_manager.load_preferences()
+            prefs["trades_columns"] = {
+                "flat": {
+                    "visible": list(self._visible_flat),
+                    "widths":  dict(self._saved_widths_flat),
+                },
+                "summary": {
+                    "visible": list(self._visible_summary),
+                    "widths":  dict(self._saved_widths_summary),
+                },
+            }
+            config_manager.save_preferences(prefs)
+        except Exception:
+            log.exception("TradesPanel: save_preferences failed")
 
     # ── Public API (unchanged) ──────────────────────────────────────────────
+
+    @property
+    def control_bar(self) -> TradesControlBar:
+        """Hand-off point for the host (``PositionsTradesTabs``) to park
+        the utility controls in the QTabWidget's corner."""
+        return self._control_bar
 
     def add_fill(self, fill: dict) -> None:
         self._flat_model.add_fill(fill)

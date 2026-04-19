@@ -131,6 +131,7 @@ class FlashTradeView(QWidget):
         self._account_position = AccountPositionPanel(
             accounts_model=self._accounts_model,
             parent=self,
+            open_preferences=self._open_preferences_callback,
         )
         self._trades_panel = TradesPanel(
             self, open_preferences=self._open_preferences_callback,
@@ -212,6 +213,11 @@ class FlashTradeView(QWidget):
     def trades_panel(self) -> TradesPanel:
         """Host-side accessor so MainWindow can use it as a ColumnsProvider."""
         return self._trades_panel
+
+    @property
+    def account_position(self) -> AccountPositionPanel:
+        """Host-side accessor so MainWindow can include it in the combined ColumnsProvider."""
+        return self._account_position
 
     # ── Order placement ───────────────────────────────────────────────────────
 

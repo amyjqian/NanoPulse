@@ -33,9 +33,9 @@ S_COL_REALIZED      = 9
 S_COL_EXCHANGES     = 10
 
 S_HEADERS: list[str] = [
-    "FINANCIAL INSTRUMENT", "BUYS", "SELLS", "NET",
-    "AVG BUY PRICE", "AVG SELL PRICE", "NET TOTAL",
-    "COMMISSION", "NET INCL. COMM", "REALIZED P&L", "EXCHANGES",
+    "Financial instrument", "Buys", "Sells", "Net",
+    "Avg buy price", "Avg sell price", "Net total",
+    "Comm", "Net incl. comm", "Rlz P&L", "Exchanges",
 ]
 
 # Column key used by the preferences dialog / column visibility state

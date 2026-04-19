@@ -36,9 +36,9 @@ COL_LIQUIDATION   = 15
 COL_LAST_LIQ      = 16
 
 HEADERS: list[str] = [
-    "TIME", "SYMBOL", "TYPE", "SIDE", "QTY", "PRICE", "EXCH", "REF",
-    "ACCOUNT", "EXPIRY", "STRIKE / RIGHT", "COMMISSION", "REALIZED PNL",
-    "ORDER ID", "SUBMITTER", "LIQUIDATION", "LAST LIQUIDITY",
+    "Time", "Symbol", "Type", "Side", "Qty", "Price", "Exch", "Ref",
+    "Account", "Expiry", "Strike / right", "Comm", "Rlz P&L",
+    "Order id", "Submitter", "Liquidation", "Last liquidity",
 ]
 
 # Stable keys for each column — used by the preferences dialog for
@@ -178,7 +178,12 @@ class TradesModel(QAbstractTableModel):
             return right
         if col == COL_COMM:
             c = row.get("commission")
-            return "…" if c is None else f"{c:.2f}"
+            # TWS only sends a commissionReport for a subset of fills.
+            # Render blank when the report isn't present; show the value
+            # otherwise (including legitimate zeros).
+            if c is None:
+                return ""
+            return f"{c:.4f}".rstrip("0").rstrip(".")
         if col == COL_REAL_PNL:
             pnl = row.get("realized_pnl")
             if pnl is None:

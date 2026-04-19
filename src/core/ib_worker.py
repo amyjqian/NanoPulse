@@ -633,13 +633,17 @@ class IBWorkerThread(QThread):
         # cancels the previous subscription on each new call — broken for
         # multi-account connections.
         self._ib.positionEvent += self._on_position_update
-        # Live execution stream – feeds the Trades view.
+        # Live execution stream – feeds the Trades view.  commissionReport
+        # arrives on a separate callback a few hundred ms after
+        # execDetails / execDetailsEnd, so we subscribe to it too and
+        # re-emit fill_updated with the populated commission.
         self._ib.execDetailsEvent += self._on_exec_details
+        self._ib.commissionReportEvent += self._on_commission_report
 
         tws_log.info("[%s] IB instance created – event subscriptions: "
                      "accountSummaryEvent, pnlEvent, pnlSingleEvent, errorEvent, "
                      "pendingTickersEvent, orderStatusEvent, positionEvent, "
-                     "execDetailsEvent",
+                     "execDetailsEvent, commissionReportEvent",
                      self._label)
 
         try:
@@ -2656,6 +2660,30 @@ class IBWorkerThread(QThread):
         tws_log.info("[%s] EVENT     execDetailsEvent → execId=%s %s %s %s @ %s",
                      self._label, exec_id, d.get("symbol", ""),
                      d.get("side", ""), d.get("shares", 0), d.get("price", 0))
+        self.fill_updated.emit(d)
+
+    def _on_commission_report(self, trade, fill, report) -> None:
+        """commissionReportEvent → re-flatten & re-emit.
+
+        ib_async attaches ``report`` onto ``fill.commissionReport`` before
+        firing this event, so ``_flatten_fill`` naturally picks up the
+        populated commission / realizedPNL values.  The downstream models
+        dedupe by execId, so re-emitting updates the existing row in the
+        flat view and correctly re-aggregates the summary view.
+        """
+        try:
+            d = self._flatten_fill(fill)
+        except Exception:
+            log.debug("Worker %s: _on_commission_report flatten error",
+                      self._label, exc_info=True)
+            return
+        exec_id = d.get("exec_id", "")
+        if exec_id:
+            self._fills_cache[exec_id] = d
+        tws_log.debug("[%s] EVENT     commissionReportEvent → execId=%s "
+                      "commission=%s realizedPNL=%s",
+                      self._label, exec_id,
+                      d.get("commission"), d.get("realized_pnl"))
         self.fill_updated.emit(d)
 
     async def _snapshot_fills(self) -> None:

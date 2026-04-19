@@ -33,13 +33,12 @@ BORDER     = "#30363D"
 TEXT       = "#C9D1D9"
 TEXT_DIM   = "#8B949E"
 
-_BAR_HEIGHT = 38
+_BAR_HEIGHT = 32
 
 _BAR_QSS = f"""
     QWidget#tradesControlBar {{
-        background: {BG_PANEL};
+        background: transparent;
         border: none;
-        border-bottom: 1px solid {BORDER};
     }}
     QLabel#tbSummaryLabel {{
         color: {TEXT};
@@ -142,8 +141,11 @@ class TradesControlBar(QWidget):
 
     def _build_ui(self) -> None:
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(8, 4, 8, 4)
+        lay.setContentsMargins(8, 2, 8, 2)
         lay.setSpacing(8)
+        # Stretch first so the controls cluster on the right side of the
+        # tab-bar corner (the stack can be wider than our content).
+        lay.addStretch(1)
 
         # Summary toggle + label (pair, label after switch)
         self._summary_toggle = QCheckBox(self)
@@ -158,7 +160,6 @@ class TradesControlBar(QWidget):
         self._summary_label.setCursor(Qt.CursorShape.PointingHandCursor)
         self._summary_label.mousePressEvent = self._toggle_from_label  # type: ignore[assignment]
 
-        lay.addStretch(1)
         lay.addWidget(self._summary_toggle)
         lay.addWidget(self._summary_label)
 

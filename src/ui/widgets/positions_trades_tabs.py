@@ -2,17 +2,17 @@
 PositionsTradesTabs – tabbed container hosting the Positions grid and the
 Trades execution log.
 
-Uses a plain ``QTabWidget`` in document-mode with a custom stylesheet so
-that:
-  * the pane has no visible border,
-  * the tab bar sits flush on the panel background,
-  * unselected tabs are subdued gray,
-  * the selected tab shows its label in the #CC6600 accent and carries a
-    2 px accent-coloured bottom border.
+The utility controls that belong to each view — Refresh + Zero Pos toggle
+for Positions; Summary toggle + date filter + search + gear for Trades —
+are pulled out of their panels and parked in this QTabWidget's top-right
+corner so they sit on the same horizontal line as the POSITIONS / TRADES
+tabs.  A ``QStackedWidget`` swaps between the two bars on tab change so
+only the controls relevant to the active view are visible.
 """
 from __future__ import annotations
 
-from PySide6.QtWidgets import QTabWidget, QWidget
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QStackedWidget, QTabWidget, QWidget
 
 # ── Theme tokens ──────────────────────────────────────────────────────────────
 ACCENT   = "#CC6600"
@@ -55,9 +55,18 @@ _TAB_QSS = f"""
     }}
 """
 
+_POSITIONS_TAB_INDEX = 0
+_TRADES_TAB_INDEX = 1
+
 
 class PositionsTradesTabs(QTabWidget):
-    """QTabWidget switching between ``positions_widget`` and ``trades_widget``."""
+    """QTabWidget switching between ``positions_widget`` and ``trades_widget``.
+
+    Each child widget may expose a ``control_bar`` attribute; both are
+    installed into a single QStackedWidget that lives in the tab-bar
+    corner.  Switching tabs flips the stack so only the active view's
+    utility controls are visible.
+    """
 
     def __init__(self, positions_widget: QWidget,
                  trades_widget: QWidget, parent=None):
@@ -67,4 +76,21 @@ class PositionsTradesTabs(QTabWidget):
         self.setStyleSheet(_TAB_QSS)
         self.addTab(positions_widget, "POSITIONS")
         self.addTab(trades_widget, "TRADES")
-        self.setCurrentIndex(0)
+
+        self._corner_stack = QStackedWidget(self)
+        # Index 0 → Positions bar; Index 1 → Trades bar.  An empty widget
+        # is substituted when a view doesn't expose a control_bar so
+        # tab-bar geometry stays stable.
+        positions_bar = getattr(positions_widget, "control_bar", None) or QWidget()
+        trades_bar = getattr(trades_widget, "control_bar", None) or QWidget()
+        self._corner_stack.addWidget(positions_bar)    # 0
+        self._corner_stack.addWidget(trades_bar)       # 1
+        self.setCornerWidget(self._corner_stack, Qt.Corner.TopRightCorner)
+
+        self.currentChanged.connect(self._on_tab_changed)
+        self.setCurrentIndex(_POSITIONS_TAB_INDEX)
+        self._on_tab_changed(_POSITIONS_TAB_INDEX)
+
+    def _on_tab_changed(self, index: int) -> None:
+        self._corner_stack.setCurrentIndex(
+            1 if index == _TRADES_TAB_INDEX else 0)

@@ -20,9 +20,8 @@ from __future__ import annotations
 import logging
 from typing import Protocol
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
-    QDialogButtonBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -49,9 +48,10 @@ TEXT_BOLD  = "#E6EDF3"
 TEXT_DIM   = "#8B949E"
 LINK       = "#4C9AFF"
 
-SUBVIEW_OVERVIEW = "overview"
-SUBVIEW_FLAT     = "flat"
-SUBVIEW_SUMMARY  = "summary"
+SUBVIEW_OVERVIEW   = "overview"
+SUBVIEW_POSITIONS  = "positions"
+SUBVIEW_FLAT       = "flat"
+SUBVIEW_SUMMARY    = "summary"
 
 
 class ColumnsProvider(Protocol):
@@ -198,12 +198,12 @@ class _OverviewRow(QFrame):
 
 
 class _ColumnsOverview(QWidget):
-    """Top-level overview page – two rows that open an editor."""
+    """Top-level overview page – three rows that open an editor."""
 
-    rowSelected = Signal(str)   # "flat" or "summary"
+    rowSelected = Signal(str)   # "positions", "flat", or "summary"
 
-    def __init__(self, flat_summary: str, summary_summary: str,
-                 parent=None):
+    def __init__(self, pos_summary: str, flat_summary: str,
+                 summary_summary: str, parent=None):
         super().__init__(parent)
         self.setStyleSheet(_OVERVIEW_QSS)
 
@@ -238,13 +238,17 @@ class _ColumnsOverview(QWidget):
         tabs.addStretch(1)
         root.addLayout(tabs)
 
-        # Card holding the two rows
+        # Card holding the three rows
         card = QFrame(self)
         card.setObjectName("overviewCard")
         card_lay = QVBoxLayout(card)
         card_lay.setContentsMargins(0, 0, 0, 0)
         card_lay.setSpacing(0)
 
+        pos_row = _OverviewRow(
+            kind="positions", title="Positions", subtitle=pos_summary,
+            icon_char="\u25A3", active=True, parent=card,   # ▣
+        )
         flat_row = _OverviewRow(
             kind="flat", title="Trades", subtitle=flat_summary,
             icon_char="\u2714", active=True, parent=card,   # ✔ check
@@ -255,8 +259,10 @@ class _ColumnsOverview(QWidget):
             active=False, parent=card,
         )
         summary_row.setProperty("last", "true")
+        pos_row.clicked.connect(self.rowSelected.emit)
         flat_row.clicked.connect(self.rowSelected.emit)
         summary_row.clicked.connect(self.rowSelected.emit)
+        card_lay.addWidget(pos_row)
         card_lay.addWidget(flat_row)
         card_lay.addWidget(summary_row)
 
@@ -373,11 +379,24 @@ class _ColumnsEditor(QWidget):
         # key → header lookup populated each time the editor is loaded
         self._header_by_key: dict[str, str] = {}
         self._all_keys: list[str] = []
+
+        # Auto-apply plumbing
+        self._loaded = False
+        self._emit_pending = False
         self._build_ui()
+
+        # After initial load, any row insert / remove / move on the
+        # Selected list means the user changed the column set; coalesce
+        # via a 0-timer so one drag doesn't fire multiple signals.
+        m = self._selected_list.model()
+        m.rowsInserted.connect(self._schedule_emit)
+        m.rowsRemoved.connect(self._schedule_emit)
+        m.rowsMoved.connect(self._schedule_emit)
 
     # Public: load / reload from provider state
     def load(self, all_keys: list[str], all_headers: list[str],
              visible_keys: list[str], *, title: str) -> None:
+        self._loaded = False  # suppress emits during population
         self._all_keys = list(all_keys)
         self._header_by_key = dict(zip(all_keys, all_headers))
         self._title.setText(title)
@@ -391,6 +410,7 @@ class _ColumnsEditor(QWidget):
             self._add_selected_row(key)
         for key in available:
             self._add_available_row(key)
+        self._loaded = True
 
     # ── UI construction ─────────────────────────────────────────────────────
 
@@ -419,15 +439,6 @@ class _ColumnsEditor(QWidget):
         lists_row.addWidget(self._build_selected_frame())
         lists_row.addWidget(self._build_available_frame())
         root.addLayout(lists_row, 1)
-
-        btns = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Apply
-            | QDialogButtonBox.StandardButton.Cancel,
-            parent=self,
-        )
-        btns.button(QDialogButtonBox.StandardButton.Apply).clicked.connect(self._on_apply)
-        btns.rejected.connect(self.back.emit)
-        root.addWidget(btns)
 
     def _build_selected_frame(self) -> QWidget:
         frame = QFrame(self)
@@ -525,7 +536,7 @@ class _ColumnsEditor(QWidget):
             header = self._header_by_key.get(key, key).lower()
             it.setHidden(bool(needle) and needle not in header and needle not in key.lower())
 
-    # ── Apply ───────────────────────────────────────────────────────────────
+    # ── Auto-apply ──────────────────────────────────────────────────────────
 
     def _current_selected_keys(self) -> list[str]:
         keys: list[str] = []
@@ -538,9 +549,20 @@ class _ColumnsEditor(QWidget):
                 keys.append(str(k))
         return keys
 
-    def _on_apply(self) -> None:
+    def _schedule_emit(self, *_args) -> None:
+        """Coalesce a batch of model-row changes (e.g. remove + insert
+        during a drag) into a single ``applied`` emission at the end of
+        the event loop tick."""
+        if not self._loaded or self._emit_pending:
+            return
+        self._emit_pending = True
+        QTimer.singleShot(0, self._emit_now)
+
+    def _emit_now(self) -> None:
+        self._emit_pending = False
+        if not self._loaded:
+            return
         self.applied.emit(self._kind, self._current_selected_keys())
-        self.back.emit()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -566,33 +588,43 @@ class ColumnsPage(QWidget):
         lay.addWidget(self._stack)
 
         self._overview = _ColumnsOverview(
+            pos_summary=self._summary_line("positions"),
             flat_summary=self._summary_line("flat"),
             summary_summary=self._summary_line("summary"),
             parent=self,
         )
         self._overview.rowSelected.connect(self.navigate_to)
-        self._stack.addWidget(self._overview)      # 0
+        self._stack.addWidget(self._overview)        # 0
+
+        self._editor_positions = _ColumnsEditor("positions", self)
+        self._editor_positions.applied.connect(self._on_applied)
+        self._editor_positions.back.connect(lambda: self.navigate_to("overview"))
+        self._stack.addWidget(self._editor_positions)  # 1
 
         self._editor_flat = _ColumnsEditor("flat", self)
         self._editor_flat.applied.connect(self._on_applied)
         self._editor_flat.back.connect(lambda: self.navigate_to("overview"))
-        self._stack.addWidget(self._editor_flat)   # 1
+        self._stack.addWidget(self._editor_flat)     # 2
 
         self._editor_summary = _ColumnsEditor("summary", self)
         self._editor_summary.applied.connect(self._on_applied)
         self._editor_summary.back.connect(lambda: self.navigate_to("overview"))
-        self._stack.addWidget(self._editor_summary)  # 2
+        self._stack.addWidget(self._editor_summary)  # 3
 
     # ── Public API ──────────────────────────────────────────────────────────
 
     def navigate_to(self, subview: str) -> None:
-        if subview == SUBVIEW_FLAT:
-            self._load_editor(self._editor_flat, "flat", "Trades Columns")
+        if subview == SUBVIEW_POSITIONS:
+            self._load_editor(self._editor_positions, "positions",
+                              "Positions Columns")
             self._stack.setCurrentIndex(1)
+        elif subview == SUBVIEW_FLAT:
+            self._load_editor(self._editor_flat, "flat", "Trades Columns")
+            self._stack.setCurrentIndex(2)
         elif subview == SUBVIEW_SUMMARY:
             self._load_editor(self._editor_summary, "summary",
                               "Summary of Trades Columns")
-            self._stack.setCurrentIndex(2)
+            self._stack.setCurrentIndex(3)
         else:
             self._refresh_overview_subtitles()
             self._stack.setCurrentIndex(0)
@@ -614,12 +646,11 @@ class ColumnsPage(QWidget):
         """First handful of header names, comma-joined, ending in ``...``."""
         if self._provider is None:
             return ""
-        _, headers, visible = self._provider.column_state(kind)
-        # Title-case the headers since the overview uses readable casing
-        key_to_header = {}
-        all_keys, all_hdrs, _ = self._provider.column_state(kind)
-        for k, h in zip(all_keys, all_hdrs):
-            key_to_header[k] = h.title()
+        try:
+            all_keys, all_hdrs, visible = self._provider.column_state(kind)
+        except Exception:
+            return ""
+        key_to_header = dict(zip(all_keys, all_hdrs))
         names = [key_to_header.get(k, k).title() for k in visible][:7]
         return ", ".join(names) + (", \u2026" if len(visible) > len(names) else "")
 
@@ -629,6 +660,7 @@ class ColumnsPage(QWidget):
         self._stack.removeWidget(self._overview)
         self._overview.deleteLater()
         self._overview = _ColumnsOverview(
+            pos_summary=self._summary_line("positions"),
             flat_summary=self._summary_line("flat"),
             summary_summary=self._summary_line("summary"),
             parent=self,
