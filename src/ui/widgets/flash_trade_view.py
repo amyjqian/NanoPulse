@@ -39,9 +39,9 @@ _TITLE_FONT.setWeight(QFont.Weight.Bold)
 _SPLITTER_SS = f"QSplitter::handle {{ background: {BORDER}; }}"
 
 # Config keys for each splitter
-_K_MAIN = "flash_main_splitter"
-_K_RIGHT_V = "flash_right_v_splitter"
-_K_TOP_RIGHT = "flash_top_right_splitter"
+_K_MAIN      = "flash_main_splitter"
+_K_RIGHT_H   = "flash_right_h_splitter"   # horizontal: left-content | accounts
+_K_LEFT_V    = "flash_left_v_splitter"    # vertical:   orders | positions-trades
 
 
 def _titled_panel(title: str) -> QWidget:
@@ -106,28 +106,17 @@ class FlashTradeView(QWidget):
         # ── Middle 1/5 — Book Trading ─────────────────────────────────────────
         self._book_trading = _titled_panel("Book Trading")
 
-        # ── Right 3/5 — split top / bottom ────────────────────────────────────
-        self._right_splitter = QSplitter(Qt.Orientation.Vertical)
+        # ── Right 3/5 — Account List full-height on right; left side split top/bottom
+        self._right_splitter = QSplitter(Qt.Orientation.Horizontal)
         self._right_splitter.setHandleWidth(2)
         self._right_splitter.setStyleSheet(_SPLITTER_SS)
 
-        # Top half of right side — Order Status | Account List (resizable)
-        self._top_right_splitter = QSplitter(Qt.Orientation.Horizontal)
+        # Left column: Order Status (top) | Positions+Trades (bottom)
+        self._top_right_splitter = QSplitter(Qt.Orientation.Vertical)
         self._top_right_splitter.setHandleWidth(2)
         self._top_right_splitter.setStyleSheet(_SPLITTER_SS)
         self._order_status = OrderStatusPanel(self)
 
-        if self._accounts_model is not None:
-            self._account_list = AccountListPanel(self._accounts_model, self)
-        else:
-            self._account_list = _titled_panel("Account List")
-
-        self._top_right_splitter.addWidget(self._order_status)
-        self._top_right_splitter.addWidget(self._account_list)
-        self._top_right_splitter.setStretchFactor(0, 1)
-        self._top_right_splitter.setStretchFactor(1, 1)
-
-        # Bottom half of right side — Positions / Trades tabs
         self._account_position = AccountPositionPanel(
             accounts_model=self._accounts_model,
             parent=self,
@@ -142,9 +131,20 @@ class FlashTradeView(QWidget):
             parent=self,
         )
 
+        self._top_right_splitter.addWidget(self._order_status)
+        self._top_right_splitter.addWidget(self._positions_trades)
+        self._top_right_splitter.setStretchFactor(0, 1)
+        self._top_right_splitter.setStretchFactor(1, 1)
+
+        # Right column: Account List spans full height
+        if self._accounts_model is not None:
+            self._account_list = AccountListPanel(self._accounts_model, self)
+        else:
+            self._account_list = _titled_panel("Account List")
+
         self._right_splitter.addWidget(self._top_right_splitter)
-        self._right_splitter.addWidget(self._positions_trades)
-        self._right_splitter.setStretchFactor(0, 1)
+        self._right_splitter.addWidget(self._account_list)
+        self._right_splitter.setStretchFactor(0, 3)
         self._right_splitter.setStretchFactor(1, 1)
 
         # ── Assemble into main horizontal splitter ────────────────────────────
@@ -1055,20 +1055,18 @@ class FlashTradeView(QWidget):
 
     def _persist_layout(self) -> None:
         layout = config_manager.load_layout()
-        layout[_K_MAIN] = self._main_splitter.sizes()
-        layout[_K_RIGHT_V] = self._right_splitter.sizes()
-        layout[_K_TOP_RIGHT] = self._top_right_splitter.sizes()
+        layout[_K_MAIN]    = self._main_splitter.sizes()
+        layout[_K_RIGHT_H] = self._right_splitter.sizes()
+        layout[_K_LEFT_V]  = self._top_right_splitter.sizes()
         config_manager.save_layout(layout)
         log.debug("FlashTrade layout saved")
 
     def _restore_layout(self) -> None:
         layout = config_manager.load_layout()
-        if _K_MAIN in layout:
-            self._main_splitter.setSizes(layout[_K_MAIN])
-        if _K_RIGHT_V in layout:
-            self._right_splitter.setSizes(layout[_K_RIGHT_V])
-        if _K_TOP_RIGHT in layout:
-            self._top_right_splitter.setSizes(layout[_K_TOP_RIGHT])
+        # Default sizes matching the target layout (pixels, ~1500px wide x ~720px tall)
+        self._main_splitter.setSizes(layout.get(_K_MAIN, [265, 285, 950]))
+        self._right_splitter.setSizes(layout.get(_K_RIGHT_H, [760, 190]))
+        self._top_right_splitter.setSizes(layout.get(_K_LEFT_V, [380, 340]))
         log.debug("FlashTrade layout restored")
 
     # ── Paint ─────────────────────────────────────────────────────────────────
