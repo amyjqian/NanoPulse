@@ -1367,6 +1367,7 @@ class OrderEntryPanel(QWidget):
         # they start with _qty=1.  Push the real default here (e.g. 100 for STK).
         self._pt_section.set_qty(self._active_qty)
         self._sl_section.set_qty(self._active_qty)
+        self._tr_section.set_qty(self._active_qty)
 
         # Push the contract multiplier + tick size for the initial active symbol
         # so the custom Dist input calculates dollars correctly before the user
@@ -1376,9 +1377,11 @@ class OrderEntryPanel(QWidget):
         _init_mult = _rd().get_multiplier(self._active_symbol or "") or 1.0
         self._pt_section.set_multiplier(_init_mult)
         self._sl_section.set_multiplier(_init_mult)
+        self._tr_section.set_multiplier(_init_mult)
         _init_ts = self._tick_size_for_symbol(self._active_symbol or "")
         self._pt_section.set_market_price(self._last_price, _init_ts)
         self._sl_section.set_market_price(self._last_price, _init_ts)
+        self._tr_section.set_market_price(self._last_price, _init_ts)
 
         # Auto-refresh when reference data changes (contract added/removed or
         # strategy tiers saved from the StrategyEditor tab).
@@ -1577,7 +1580,7 @@ class OrderEntryPanel(QWidget):
         root.addSpacing(8)
 
         # ── Take Profit ───────────────────────────────────────────────────────
-        pt_tiers, sl_tiers = self._load_tiers_for_active()
+        pt_tiers, sl_tiers, tr_tiers = self._load_tiers_for_active()
         self._pt_section = _TierSection(
             "Take Profit", pt_tiers, enabled=False,
             label_color=Theme.CLR_BUY)
@@ -1588,6 +1591,12 @@ class OrderEntryPanel(QWidget):
             "Stop Loss", sl_tiers, enabled=False,
             label_color=Theme.CLR_SELL)
         root.addWidget(self._sl_section)
+
+        # ── Trailing ──────────────────────────────────────────────────────────
+        self._tr_section = _TierSection(
+            "Trail Stop", tr_tiers, enabled=False,
+            label_color=Theme.CLR_FLATTEN)
+        root.addWidget(self._tr_section)
 
         root.addStretch(1)
 
@@ -1825,6 +1834,7 @@ class OrderEntryPanel(QWidget):
                         ts = self._tick_size_for_symbol(self._active_symbol)
                         self._pt_section.set_market_price(last, ts)
                         self._sl_section.set_market_price(last, ts)
+                        self._tr_section.set_market_price(last, ts)
                 else:
                     self._lbl_price.setText("")
                 self._update_bid_ask_display(bid, ask)
@@ -1905,6 +1915,8 @@ class OrderEntryPanel(QWidget):
             self._pt_section.set_qty(self._active_qty)
         if hasattr(self, "_sl_section"):
             self._sl_section.set_qty(self._active_qty)
+        if hasattr(self, "_tr_section"):
+            self._tr_section.set_qty(self._active_qty)
 
     def _on_qty_preset(self, qty: int) -> None:
         self._active_qty = qty
@@ -1918,6 +1930,8 @@ class OrderEntryPanel(QWidget):
             self._pt_section.set_qty(qty)
         if hasattr(self, "_sl_section"):
             self._sl_section.set_qty(qty)
+        if hasattr(self, "_tr_section"):
+            self._tr_section.set_qty(qty)
 
     def _on_custom_qty(self, text: str) -> None:
         text = text.strip()
@@ -1934,6 +1948,8 @@ class OrderEntryPanel(QWidget):
                     self._pt_section.set_qty(qty)
                 if hasattr(self, "_sl_section"):
                     self._sl_section.set_qty(qty)
+                if hasattr(self, "_tr_section"):
+                    self._tr_section.set_qty(qty)
                 return
         except ValueError:
             pass
@@ -1952,6 +1968,8 @@ class OrderEntryPanel(QWidget):
             self._pt_section.set_qty(default)
         if hasattr(self, "_sl_section"):
             self._sl_section.set_qty(default)
+        if hasattr(self, "_tr_section"):
+            self._tr_section.set_qty(default)
 
     def _on_custom_qty_enter(self) -> None:
         """Clear the custom qty field on Enter if its content is invalid."""
@@ -1987,14 +2005,16 @@ class OrderEntryPanel(QWidget):
         {"label": "Tier 4", "value": 160, "unit": "ticks"},
     ]
 
-    def _load_tiers_for_active(self) -> tuple[list[dict], list[dict]]:
-        """Return (profit_take_tiers, stop_loss_tiers) for the active symbol.
+    def _load_tiers_for_active(self) -> tuple[list[dict], list[dict], list[dict]]:
+        """Return (profit_take_tiers, stop_loss_tiers, trailing_tiers) for the
+        active symbol.
 
         Lookup order
         ------------
         1. Exact symbol rows in strategy_tiers.db  (e.g. "NQ")
         2. Asset-class fallback rows ("FUT" or "STK") in strategy_tiers.db
-        3. Preferences-based tiers (global per asset-class, set in Settings)
+        3. Preferences-based tiers (global per asset-class, set in Settings).
+           Trailing has no preferences entry — falls back to ``_TIER_FALLBACK``.
 
         Chip labels show the raw offset only (e.g. "5").
         The dollar amount is displayed in the section header by _TierSection.
@@ -2005,15 +2025,18 @@ class OrderEntryPanel(QWidget):
 
         pt = rd.get_tiers_for_symbol(sym, "take_profit")
         sl = rd.get_tiers_for_symbol(sym, "stop_loss")
+        tr = rd.get_tiers_for_symbol(sym, "trailing")
 
         # Set offset-only chip labels for DB-sourced tiers
         if pt is not None:
             pt = self._format_tier_labels(pt)
         if sl is not None:
             sl = self._format_tier_labels(sl)
+        if tr is not None:
+            tr = self._format_tier_labels(tr)
 
         # Fall back to preferences when ReferenceData has no rows
-        if pt is None or sl is None:
+        if pt is None or sl is None or tr is None:
             sec  = _sec_type_for(sym)
             key  = "trading_futures" if sec == "FUT" else "trading_stocks"
             prefs = config_manager.load_preferences()
@@ -2026,8 +2049,12 @@ class OrderEntryPanel(QWidget):
             if sl is None:
                 raw = section.get("stop_loss",   self._TIER_FALLBACK)
                 sl  = self._format_tier_labels(self._enrich_pref_tiers(raw, mult, tick))
+            if tr is None:
+                # Trailing has no preferences key; use the generic fallback.
+                tr  = self._format_tier_labels(
+                    self._enrich_pref_tiers(self._TIER_FALLBACK, mult, tick))
 
-        return pt, sl
+        return pt, sl, tr
 
     @staticmethod
     def _format_tier_labels(tiers: list[dict]) -> list[dict]:
@@ -2079,20 +2106,24 @@ class OrderEntryPanel(QWidget):
         return result
 
     def _reload_tier_sections(self) -> None:
-        """Reload PT/SL tier chips when the active symbol or preferences change."""
+        """Reload PT/SL/Trailing tier chips when the active symbol or
+        preferences change."""
         if not hasattr(self, "_pt_section"):
             return
-        pt_tiers, sl_tiers = self._load_tiers_for_active()
+        pt_tiers, sl_tiers, tr_tiers = self._load_tiers_for_active()
         self._pt_section.reload_tiers(pt_tiers)
         self._sl_section.reload_tiers(sl_tiers)
+        self._tr_section.reload_tiers(tr_tiers)
         # Sync current qty so the dollar display is correct on next chip click
         self._pt_section.set_qty(self._active_qty)
         self._sl_section.set_qty(self._active_qty)
+        self._tr_section.set_qty(self._active_qty)
         # Push contract multiplier for custom-distance dollar math
         from src.core.reference_data import get_instance as _rd
         mult = _rd().get_multiplier(self._active_symbol or "") or 1.0
         self._pt_section.set_multiplier(mult)
         self._sl_section.set_multiplier(mult)
+        self._tr_section.set_multiplier(mult)
         # Sync live price + tick size into the TickPriceInput (and its Dist
         # ladder popup).  Tick size must be pushed even before the first price
         # tick arrives so the popup shows multiples of the *selected* symbol's
@@ -2100,6 +2131,7 @@ class OrderEntryPanel(QWidget):
         ts = self._tick_size_for_symbol(self._active_symbol or "")
         self._pt_section.set_market_price(self._last_price, ts)
         self._sl_section.set_market_price(self._last_price, ts)
+        self._tr_section.set_market_price(self._last_price, ts)
 
     def _tick_size_for_symbol(self, sym: str) -> float:
         """Return the minimum tick size for *sym*.
@@ -2159,6 +2191,7 @@ class OrderEntryPanel(QWidget):
             "last_price": self._last_price,
             "profit_take": self._pt_section.get_value() if hasattr(self, "_pt_section") else None,
             "stop_loss":   self._sl_section.get_value() if hasattr(self, "_sl_section") else None,
+            "trailing":    self._tr_section.get_value() if hasattr(self, "_tr_section") else None,
         }
         log.info("Order requested: %s", payload)
         self.order_requested.emit(payload)
@@ -2491,6 +2524,7 @@ class OrderEntryPanel(QWidget):
                     ts = self._tick_size_for_symbol(sym)
                     self._pt_section.set_market_price(last, ts)
                     self._sl_section.set_market_price(last, ts)
+                    self._tr_section.set_market_price(last, ts)
             # Preserve last known bid/ask — only replace when newly valid
             if bid > 0:
                 self._last_bid = bid

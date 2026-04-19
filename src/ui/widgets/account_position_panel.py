@@ -307,7 +307,11 @@ class FlattenButtonDelegate(QStyledItemDelegate):
         return index.data(RowTypeRole) == ROW_TYPE_POSITION
 
     def _hdr_button_rect(self, cell_rect: QRect, fm: QFontMetrics) -> QRect:
-        tw = fm.horizontalAdvance(self._HDR_TEXT) + 2 * self._HDR_H_PAD
+        # Match the position-row Flatten button width so the two Flatten
+        # buttons line up across header and position rows.
+        tw = max(fm.horizontalAdvance(lbl) + 2 * _POS_BTN_H_PAD
+                 for lbl, *_ in _POS_BTNS)
+        tw = int(tw * 0.7)
         th = int((fm.height() + 2 * self._HDR_V_PAD) * 1.4)
         x  = cell_rect.x() + 6
         y  = cell_rect.y() + (cell_rect.height() - th) // 2
