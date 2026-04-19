@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.core import config_manager
+from .preferences_columns_page import ColumnsPage
 
 log = logging.getLogger(__name__)
 
@@ -781,11 +782,12 @@ class PreferencesDialog(QDialog):
     """Preferences dialog that auto-closes on focus loss and persists
     all settings to ``app_config.json``."""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, columns_provider=None):
         super().__init__(parent)
         self.setWindowTitle("Preferences")
         self.resize(920, 540)
         self.setMinimumSize(800, 420)
+        self._columns_provider = columns_provider
         self.setStyleSheet(f"""
             QDialog {{
                 background: {_BG_DIALOG};
@@ -820,6 +822,7 @@ class PreferencesDialog(QDialog):
         self._sidebar = _styled_sidebar()
         self._sidebar.addItem(QListWidgetItem("Display"))
         self._sidebar.addItem(QListWidgetItem("Trading"))
+        self._sidebar.addItem(QListWidgetItem("Columns"))
         self._sidebar.setCurrentRow(0)
         self._sidebar.currentRowChanged.connect(self._on_page_changed)
         main_lay.addWidget(self._sidebar)
@@ -837,9 +840,11 @@ class PreferencesDialog(QDialog):
 
         self._display_page = _DisplayPage(self._prefs)
         self._trading_page = _TradingPage(self._prefs)
+        self._columns_page = ColumnsPage(self._columns_provider, self)
 
         self._stack.addWidget(self._display_page)
         self._stack.addWidget(self._trading_page)
+        self._stack.addWidget(self._columns_page)
         main_lay.addWidget(self._stack, stretch=1)
 
         # Auto-save: any change on either page persists to config immediately
@@ -850,6 +855,21 @@ class PreferencesDialog(QDialog):
 
     def _on_page_changed(self, idx: int) -> None:
         self._stack.setCurrentIndex(idx)
+        # When jumping into Columns via the sidebar, land on the overview.
+        if self._stack.currentWidget() is self._columns_page:
+            self._columns_page.navigate_to("overview")
+
+    def navigate_to(self, section: str, subview: str | None = None) -> None:
+        """Programmatically switch to a sidebar section; for ``Columns`` you
+        may additionally pass ``"flat"`` / ``"summary"`` / ``"overview"`` to
+        land on a specific subview (used by the Trades gear button)."""
+        section_to_row = {"Display": 0, "Trading": 1, "Columns": 2}
+        row = section_to_row.get(section)
+        if row is None:
+            return
+        self._sidebar.setCurrentRow(row)
+        if section == "Columns" and subview:
+            self._columns_page.navigate_to(subview)
 
     # ── Auto-close on focus loss (geometry-based with absolute screen coordinates) ──
 

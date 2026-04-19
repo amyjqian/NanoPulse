@@ -8,9 +8,13 @@ add_fill(fill_dict)   – routes the fill into *both* underlying models so
                         flipping the Summary toggle is instant (no re-fetch).
 clear_fills()         – wipes both models.
 
-The Settings gear opens ``TradesColumnsDialog`` for whichever view is
-active; Apply projects the returned visible-keys list onto the table via
-``setColumnHidden`` + ``header.moveSection``.
+The Settings gear forwards to a host-supplied ``open_preferences``
+callback (typically ``MainWindow._open_trades_preferences``) which opens
+the global Preferences dialog at Columns → Trades / Summary.  Column
+changes come back through the ``ColumnsProvider`` protocol
+(``column_state`` / ``apply_columns``); Apply projects the new
+visible-keys order onto the table via ``setColumnHidden`` +
+``header.moveSection``.
 """
 from __future__ import annotations
 
@@ -27,8 +31,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from typing import Callable
+
 from .trades_control_bar import TradesControlBar
-from .trades_columns_dialog import TradesColumnsDialog
 from .trades_filter_proxy import TradesFilterProxy
 from .trades_model import (
     TradesModel,
@@ -119,10 +124,18 @@ _DEFAULT_SUMMARY_VISIBLE = [
 
 
 class TradesPanel(QWidget):
-    """Control-bar + stacked flat/summary tables, each behind a proxy."""
+    """Control-bar + stacked flat/summary tables, each behind a proxy.
 
-    def __init__(self, parent=None):
+    The gear button in the control bar does *not* open its own dialog.
+    Instead ``open_preferences`` is called with the current view kind
+    ("flat"/"summary") so the host can route the request to the global
+    Preferences dialog (Columns section) at the right subview.
+    """
+
+    def __init__(self, parent=None, *,
+                 open_preferences: Callable[[str], None] | None = None):
         super().__init__(parent)
+        self._open_preferences = open_preferences
         self._flat_model = TradesModel(self)
         self._summary_model = TradesSummaryModel(self)
 
@@ -151,7 +164,7 @@ class TradesPanel(QWidget):
         self._control_bar.summaryToggled.connect(self._on_summary_toggled)
         self._control_bar.dateFilterChanged.connect(self._on_date_changed)
         self._control_bar.searchTextChanged.connect(self._on_search_changed)
-        self._control_bar.settingsClicked.connect(self._open_columns_dialog)
+        self._control_bar.settingsClicked.connect(self._on_gear_clicked)
         root.addWidget(self._control_bar)
 
         self._stack = QStackedWidget(self)
@@ -248,32 +261,30 @@ class TradesPanel(QWidget):
     def _active_view_kind(self) -> str:
         return "summary" if self._stack.currentIndex() == 1 else "flat"
 
-    def _open_columns_dialog(self) -> None:
-        kind = self._active_view_kind()
-        if kind == "flat":
-            all_keys = self._flat_model.column_keys()
-            headers = self._flat_model.column_headers()
-            visible = self._visible_flat
-        else:
-            all_keys = self._summary_model.column_keys()
-            headers = self._summary_model.column_headers()
-            visible = self._visible_summary
+    def _on_gear_clicked(self) -> None:
+        """Forward to the host's preferences router so the user lands on
+        the right Columns subview."""
+        if self._open_preferences is None:
+            return
+        self._open_preferences(self._active_view_kind())
 
-        dlg = TradesColumnsDialog(
-            view_kind=kind,
-            all_keys=all_keys,
-            all_headers=headers,
-            visible_keys=visible,
-            parent=self.window(),
-        )
-        dlg.columnsApplied.connect(lambda keys, k=kind: self._apply_new_columns(k, keys))
-        dlg.exec()
+    # ── ColumnsProvider protocol ────────────────────────────────────────────
 
-    def _apply_new_columns(self, kind: str, keys: list[str]) -> None:
-        if kind == "flat":
-            self._visible_flat = list(keys)
+    def column_state(self, kind: str
+                     ) -> tuple[list[str], list[str], list[str]]:
+        if kind == "summary":
+            return (self._summary_model.column_keys(),
+                    self._summary_model.column_headers(),
+                    list(self._visible_summary))
+        return (self._flat_model.column_keys(),
+                self._flat_model.column_headers(),
+                list(self._visible_flat))
+
+    def apply_columns(self, kind: str, visible_keys: list[str]) -> None:
+        if kind == "summary":
+            self._visible_summary = list(visible_keys)
         else:
-            self._visible_summary = list(keys)
+            self._visible_flat = list(visible_keys)
         self._apply_column_visibility(kind)
 
     def _apply_column_visibility(self, kind: str) -> None:

@@ -138,6 +138,7 @@ class MainWindow(QWidget):
             active_threads=self.active_threads,
             accounts_model=self._accounts_model,
             parent=self,
+            open_preferences=self._open_trades_preferences,
         )                                                  # index 2 – FlashTrade
         self._strategy_editor = StrategyEditorView(
             parent=self,
@@ -176,17 +177,37 @@ class MainWindow(QWidget):
     def _on_tab_clicked(self, name: str) -> None:
         """Handle tab bar clicks - intercept Settings tab and launch modeless dialog."""
         if name == "Settings":
-            # Launch PreferencesDialog as modeless (detached floating window)
-            dlg = PreferencesDialog(self)
-            dlg.show()  # Use show() not exec_() for modeless
+            self._launch_preferences(modeless=True)
         else:
             # Normal tab navigation
             self._on_nav_changed(name)
 
     def _on_settings(self) -> None:
         """Open the Preferences dialog."""
-        dlg = PreferencesDialog(self)
-        dlg.exec()
+        self._launch_preferences(modeless=False)
+
+    def _launch_preferences(self, *, modeless: bool,
+                            section: str | None = None,
+                            subview: str | None = None) -> "PreferencesDialog":
+        """Single entry point for opening the global Preferences dialog.
+
+        ``section`` / ``subview`` are used by the Trades gear button to
+        land on Columns → Trades / Summary without a second click.
+        """
+        dlg = PreferencesDialog(self, columns_provider=self._flash_trade.trades_panel)
+        if section is not None:
+            dlg.navigate_to(section, subview)
+        if modeless:
+            dlg.show()
+        else:
+            dlg.exec()
+        return dlg
+
+    def _open_trades_preferences(self, view_kind: str) -> None:
+        """Callback wired into the Trades gear button.  ``view_kind`` is
+        ``"flat"`` or ``"summary"``."""
+        self._launch_preferences(modeless=True, section="Columns",
+                                 subview=view_kind)
 
     # ── Paint ─────────────────────────────────────────────────────────────────
 

@@ -69,12 +69,14 @@ class FlashTradeView(QWidget):
     """Skeleton layout for the FlashTrade page — section titles only."""
 
     def __init__(self, active_threads: dict[str, IBWorkerThread] | None = None,
-                 accounts_model: AccountsTableModel | None = None, parent=None):
+                 accounts_model: AccountsTableModel | None = None, parent=None,
+                 *, open_preferences=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self._active_threads: dict[str,
                                    IBWorkerThread] = active_threads if active_threads is not None else {}
         self._accounts_model = accounts_model
+        self._open_preferences_callback = open_preferences
         # label → worker instance wired
         self._connected_order_workers: dict[str, IBWorkerThread] = {}
         # label → worker for portfolio
@@ -130,7 +132,9 @@ class FlashTradeView(QWidget):
             accounts_model=self._accounts_model,
             parent=self,
         )
-        self._trades_panel = TradesPanel(self)
+        self._trades_panel = TradesPanel(
+            self, open_preferences=self._open_preferences_callback,
+        )
         self._positions_trades = PositionsTradesTabs(
             positions_widget=self._account_position,
             trades_widget=self._trades_panel,
@@ -203,6 +207,11 @@ class FlashTradeView(QWidget):
         if isinstance(self._account_list, AccountListPanel):
             self._account_list.action_requested.connect(
                 self._on_account_list_action)
+
+    @property
+    def trades_panel(self) -> TradesPanel:
+        """Host-side accessor so MainWindow can use it as a ColumnsProvider."""
+        return self._trades_panel
 
     # ── Order placement ───────────────────────────────────────────────────────
 
