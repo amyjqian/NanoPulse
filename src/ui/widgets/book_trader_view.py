@@ -1,1015 +1,841 @@
-"""
-BookTraderView - Depth-of-Market (DOM) price ladder for order entry.
+"""Book Trader (Depth-of-Market) panel.
 
-Replicates the TWS BookTrader:
-  - Vertical price ladder centred on the last-traded price
-  - Bid / Ask depth with proportional coloured bars
-  - Bold text on round-number price levels
-  - Last-traded row highlighted with "qty @ price" annotation
-  - Click bid column to BUY LMT, click ask column to SELL LMT
-  - Auto-centre with a manual re-centre button
-  - Lightweight demo data so the view works immediately without TWS
+Sits in the middle column of FlashTradeView and offers click-to-trade
+against a live price ladder.  Layout top→bottom:
+
+    ┌ TickerStrip (sym • last • bid • ask • chg • chg%)  [+] ┐
+    ├ SymbolChipBar (grid of saved symbols)                  ┤
+    ├ QtyChipRow (1 / 2 / 3 / 5 / [Qty])                     ┤
+    ├ Toolbar (Recenter)                                     ┤
+    ├ DOMLadderView (bid-size | price | ask-size)  ← click   ┤
+    ├ Reverse / Flatten / Cancel                             ┤
+    ├ Take Profit  (_TierSection)                            ┤
+    ├ Stop Loss    (_TierSection)                            ┤
+    └ Trail Stop   (_TierSection)                            ┘
+
+Shared widgets live in ``order_panel_parts.py``; the price ladder lives
+in ``dom_ladder.py``.  ``_TierSection`` is imported from
+``order_entry_panel.py`` as-is.
+
+Data in:
+  * ``feed_price(symbol, last, bid, ask, close)`` — fed by each worker's
+    ``bg_price_updated`` signal
+  * ``feed_depth(symbol, bids, asks)`` — fed by each worker's new
+    ``depth_updated`` signal (100 ms throttle)
+
+Signals out (mirror OrderEntryPanel so FlashTradeView's existing
+handlers route Book Trader clicks to the same worker methods):
+
+  * ``order_requested(dict)``        — click on a ladder row (LMT)
+  * ``cancel_all_requested(str)``    — Cancel button
+  * ``flatten_requested(str)``       — Flatten button
+  * ``reverse_requested(str)``       — Reverse button
+  * ``close_tier_requested(dict)``   — TP / SL header-button close
+  * ``active_symbol_changed(str)``
 """
 from __future__ import annotations
 
 import logging
-from decimal import Decimal
-from typing import Optional
 
-from PySide6.QtCore import (
-    QAbstractTableModel,
-    QModelIndex,
-    QTimer,
-    Qt,
-    Signal,
-)
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
-    QAbstractItemView,
-    QComboBox,
-    QCompleter,
+    QDialog,
     QFrame,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QPushButton,
-    QSizePolicy,
-    QSpinBox,
-    QStyledItemDelegate,
-    QTableView,
     QVBoxLayout,
     QWidget,
 )
 
 from src.core import config_manager
+from src.ui.theme import Theme
+from src.ui.widgets.dom_ladder import DOMLadderModel, DOMLadderView
+from src.ui.widgets.order_entry_panel import (
+    _make_btn,
+    _sec_type_for,
+    _TierSection,
+)
+from src.ui.widgets.order_panel_parts import (
+    QtyChipRow,
+    SymbolChipBar,
+    TickerStrip,
+)
 
 log = logging.getLogger(__name__)
 
-# -- Theme tokens -------------------------------------------------------------
-BG_MAIN = "#161a25"
-BG_PANEL = "#1e2230"
-BG_HEADER = "#14171D"
-BORDER = "#2A2E37"
-TEXT = "#C9D1D9"
-TEXT_DIM = "#8B949E"
-TEXT_BRIGHT = "#E6EDF3"
-GREEN = "#2e7d32"
-RED = "#c62828"
-BLUE = "#58A6FF"
 
-BID_BAR = "#4A3C10"
-BID_BAR_FILL = "#6B5A1A"
-ASK_BAR = "#0E3E30"
-ASK_BAR_FILL = "#186050"
-
-LAST_ROW_BG = "#0E3460"
-LAST_ROW_EDGE = "#1A4E80"
-
-# -- Column indices ------------------------------------------------------------
-COL_BID_ORD = 0
-COL_BID_SZ = 1
-COL_PRICE = 2
-COL_ASK_SZ = 3
-COL_ASK_ORD = 4
-
-_HEADERS = ["Bid #", "Bid Qty", "Price", "Ask Qty", "Ask #"]
-_NUM_ROWS = 400
-
-
-# ==============================================================================
-#  Model
-# ==============================================================================
-
-class PriceLadderModel(QAbstractTableModel):
-    """Row-per-tick model.  Row 0 = highest price, last row = lowest."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._tick: Decimal = Decimal("0.25")
-        self._prices: list[Decimal] = []
-
-        self._bids: dict[Decimal, int] = {}
-        self._asks: dict[Decimal, int] = {}
-        self._max_bid: int = 1
-        self._max_ask: int = 1
-
-        self._bid_orders: dict[Decimal, int] = {}
-        self._ask_orders: dict[Decimal, int] = {}
-
-        self._last: Decimal = Decimal("0")
-        self._last_sz: int = 0
-
-        self._total_bid_sz: int = 0
-        self._total_ask_sz: int = 0
-
-    def set_tick(self, tick) -> None:
-        self._tick = Decimal(str(tick))
-
-    @property
-    def tick(self) -> Decimal:
-        return self._tick
-
-    def rebuild(self, centre: float, n: int = _NUM_ROWS) -> None:
-        self.beginResetModel()
-        # Snap to the nearest tick *multiple* (not just decimal places)
-        raw = Decimal(str(centre))
-        c = (raw / self._tick).quantize(Decimal("1")) * self._tick
-        half = n // 2
-        high = c + self._tick * half
-        self._prices = [high - self._tick * i for i in range(n)]
-        self.endResetModel()
-
-    def row_of(self, price: Decimal) -> int:
-        if not self._prices or self._tick == 0:
-            return -1
-        top = self._prices[0]
-        offset = (top - price) / self._tick
-        idx = int(offset)
-        if 0 <= idx < len(self._prices) and self._prices[idx] == price:
-            return idx
-        return -1
-
-    def price_at(self, row: int) -> Optional[Decimal]:
-        if 0 <= row < len(self._prices):
-            return self._prices[row]
-        return None
-
-    # -- market-data feeds -----------------------------------------------------
-
-    def feed_depth(self, bids: dict[float, int], asks: dict[float, int]) -> None:
-        self._bids = {Decimal(str(p)): s for p, s in bids.items()}
-        self._asks = {Decimal(str(p)): s for p, s in asks.items()}
-        self._max_bid = max(self._bids.values(), default=1) or 1
-        self._max_ask = max(self._asks.values(), default=1) or 1
-        self._total_bid_sz = sum(self._bids.values())
-        self._total_ask_sz = sum(self._asks.values())
-        self._emit_columns(COL_BID_SZ, COL_ASK_SZ)
-        self.headerDataChanged.emit(
-            Qt.Orientation.Horizontal, COL_BID_SZ, COL_ASK_SZ)
-
-    def feed_last(self, price: float, size: int = 0) -> None:
-        old = self._last
-        self._last = Decimal(str(price))
-        self._last_sz = size
-        for p in (old, self._last):
-            r = self.row_of(p)
-            if r >= 0:
-                self._emit_row(r)
-
-    def feed_orders(self, bids: dict[float, int], asks: dict[float, int]) -> None:
-        self._bid_orders = {Decimal(str(p)): q for p, q in bids.items()}
-        self._ask_orders = {Decimal(str(p)): q for p, q in asks.items()}
-        self._emit_columns(COL_BID_ORD, COL_ASK_ORD)
-
-    # -- Qt model interface ----------------------------------------------------
-
-    def rowCount(self, parent=QModelIndex()) -> int:
-        return len(self._prices)
-
-    def columnCount(self, parent=QModelIndex()) -> int:
-        return 5
-
-    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
-        if role != Qt.ItemDataRole.DisplayRole:
-            return None
-        if orientation == Qt.Orientation.Horizontal:
-            if section == COL_BID_SZ and self._total_bid_sz:
-                return f"Bid Qty ({self._total_bid_sz})"
-            if section == COL_ASK_SZ and self._total_ask_sz:
-                return f"Ask Qty ({self._total_ask_sz})"
-            return _HEADERS[section]
-        return None
-
-    def data(self, index: QModelIndex, role=Qt.ItemDataRole.DisplayRole):
-        if not index.isValid():
-            return None
-        row, col = index.row(), index.column()
-        if row >= len(self._prices):
-            return None
-        price = self._prices[row]
-
-        if role == Qt.ItemDataRole.DisplayRole:
-            if col == COL_PRICE:
-                return str(price)
-            if col == COL_BID_SZ:
-                v = self._bids.get(price, 0)
-                return str(v) if v else ""
-            if col == COL_ASK_SZ:
-                v = self._asks.get(price, 0)
-                return str(v) if v else ""
-            if col == COL_BID_ORD:
-                v = self._bid_orders.get(price, 0)
-                return str(v) if v else ""
-            if col == COL_ASK_ORD:
-                v = self._ask_orders.get(price, 0)
-                return str(v) if v else ""
-            return None
-
-        if role == Qt.ItemDataRole.TextAlignmentRole:
-            if col == COL_PRICE:
-                return int(Qt.AlignmentFlag.AlignCenter)
-            if col in (COL_BID_SZ, COL_BID_ORD):
-                return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            return int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-
-        if role == Qt.ItemDataRole.UserRole:
-            bid_sz = self._bids.get(price, 0)
-            ask_sz = self._asks.get(price, 0)
-            return {
-                "price": price,
-                "bid": bid_sz,
-                "ask": ask_sz,
-                "max_bid": self._max_bid,
-                "max_ask": self._max_ask,
-                "is_last": price == self._last,
-                "last_sz": self._last_sz if price == self._last else 0,
-                "bid_ord": self._bid_orders.get(price, 0),
-                "ask_ord": self._ask_orders.get(price, 0),
-            }
-
-        return None
-
-    def flags(self, index: QModelIndex) -> Qt.ItemFlag:
-        return Qt.ItemFlag(
-            Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
-        )
-
-    def _emit_columns(self, c1: int, c2: int) -> None:
-        if self._prices:
-            self.dataChanged.emit(
-                self.index(0, c1),
-                self.index(len(self._prices) - 1, c2),
-            )
-
-    def _emit_row(self, row: int) -> None:
-        self.dataChanged.emit(
-            self.index(row, 0),
-            self.index(row, self.columnCount() - 1),
-        )
-
-
-# ==============================================================================
-#  Delegate
-# ==============================================================================
-
-class PriceLadderDelegate(QStyledItemDelegate):
-    """Custom-paints each cell: depth bars, price text, highlights."""
-
-    ROW_H = 20
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._font = QFont("Menlo", 11)
-        self._font.setStyleHint(QFont.StyleHint.Monospace)
-        self._font_bold = QFont("Menlo", 11)
-        self._font_bold.setStyleHint(QFont.StyleHint.Monospace)
-        self._font_bold.setWeight(QFont.Weight.Bold)
-        self._font_sm = QFont("Menlo", 9)
-        self._font_sm.setStyleHint(QFont.StyleHint.Monospace)
-
-    def paint(self, painter: QPainter, option, index: QModelIndex) -> None:
-        painter.save()
-        painter.setClipRect(option.rect)
-        rect = option.rect
-        col = index.column()
-        info: dict = index.data(Qt.ItemDataRole.UserRole) or {}
-        text: str = index.data(Qt.ItemDataRole.DisplayRole) or ""
-        price: Decimal = info.get("price", Decimal(0))
-        bid: int = info.get("bid", 0)
-        ask: int = info.get("ask", 0)
-        max_bid: int = info.get("max_bid", 1)
-        max_ask: int = info.get("max_ask", 1)
-        is_last: bool = info.get("is_last", False)
-        last_sz: int = info.get("last_sz", 0)
-        bid_ord: int = info.get("bid_ord", 0)
-        ask_ord: int = info.get("ask_ord", 0)
-
-        # 1. base background
-        painter.fillRect(rect, QColor(BG_MAIN))
-
-        # 2. bid / ask depth bars
-        if col == COL_BID_SZ and bid > 0:
-            frac = min(bid / max_bid, 1.0)
-            bar_w = max(int(rect.width() * frac), 4)
-            bar_rect = rect.adjusted(rect.width() - bar_w, 1, 0, -1)
-            painter.fillRect(bar_rect, QColor(BID_BAR))
-            if frac > 0.5:
-                inner = bar_rect.adjusted(bar_rect.width() // 3, 0, 0, 0)
-                c = QColor(BID_BAR_FILL)
-                c.setAlpha(120)
-                painter.fillRect(inner, c)
-        elif col == COL_ASK_SZ and ask > 0:
-            frac = min(ask / max_ask, 1.0)
-            bar_w = max(int(rect.width() * frac), 4)
-            bar_rect = rect.adjusted(0, 1, -(rect.width() - bar_w), -1)
-            painter.fillRect(bar_rect, QColor(ASK_BAR))
-            if frac > 0.5:
-                inner = bar_rect.adjusted(0, 0, -(bar_rect.width() // 3), 0)
-                c = QColor(ASK_BAR_FILL)
-                c.setAlpha(120)
-                painter.fillRect(inner, c)
-
-        # 3. price column colouring
-        if col == COL_PRICE:
-            if is_last:
-                painter.fillRect(rect, QColor(LAST_ROW_BG))
-                painter.setPen(QPen(QColor(LAST_ROW_EDGE), 1))
-                painter.drawLine(rect.left(), rect.top(),
-                                 rect.left(), rect.bottom())
-                painter.drawLine(rect.right(), rect.top(),
-                                 rect.right(), rect.bottom())
-            elif bid > 0:
-                c = QColor(BID_BAR)
-                c.setAlpha(80)
-                painter.fillRect(rect, c)
-            elif ask > 0:
-                c = QColor(ASK_BAR)
-                c.setAlpha(80)
-                painter.fillRect(rect, c)
-
-        # 4. subtle row tint for last-traded on non-price cols
-        if is_last and col != COL_PRICE:
-            c = QColor(LAST_ROW_BG)
-            c.setAlpha(40)
-            painter.fillRect(rect, c)
-
-        # 5. working order highlights
-        if col == COL_BID_ORD and bid_ord > 0:
-            c = QColor(GREEN)
-            c.setAlpha(50)
-            painter.fillRect(rect, c)
-        elif col == COL_ASK_ORD and ask_ord > 0:
-            c = QColor(RED)
-            c.setAlpha(50)
-            painter.fillRect(rect, c)
-
-        # 6. grid lines
-        painter.setPen(QPen(QColor(BORDER), 1))
-        painter.drawLine(rect.bottomLeft(), rect.bottomRight())
-        painter.drawLine(rect.topRight(), rect.bottomRight())
-
-        # 7. text
-        if not text:
-            painter.restore()
-            return
-
-        is_round = False
-        if col == COL_PRICE:
-            try:
-                if price == int(price):
-                    is_round = True
-                elif price % 1 == Decimal("0.50") or price % 1 == Decimal("0.5"):
-                    is_round = True
-            except Exception:
-                pass
-
-        if col in (COL_BID_ORD, COL_ASK_ORD):
-            painter.setFont(self._font_sm)
-        elif is_round and col == COL_PRICE:
-            painter.setFont(self._font_bold)
-        else:
-            painter.setFont(self._font)
-
-        if col == COL_BID_SZ:
-            painter.setPen(QColor("#D4A82A") if bid > 0 else QColor(TEXT_DIM))
-        elif col == COL_ASK_SZ:
-            painter.setPen(QColor("#4AD080") if ask > 0 else QColor(TEXT_DIM))
-        elif col == COL_PRICE:
-            if is_last:
-                painter.setPen(QColor("#FFFFFF"))
-            elif is_round:
-                painter.setPen(QColor(TEXT_BRIGHT))
-            else:
-                painter.setPen(QColor(TEXT))
-        elif col == COL_BID_ORD:
-            painter.setPen(QColor("#66BB6A") if bid_ord >
-                           0 else QColor(TEXT_DIM))
-        elif col == COL_ASK_ORD:
-            painter.setPen(QColor("#EF5350") if ask_ord >
-                           0 else QColor(TEXT_DIM))
-        else:
-            painter.setPen(QColor(TEXT_DIM))
-
-        align = index.data(Qt.ItemDataRole.TextAlignmentRole)
-        if align is None:
-            align = int(Qt.AlignmentFlag.AlignCenter)
-        else:
-            align = int(align)
-
-        draw_text = text
-        if col == COL_PRICE and is_last and last_sz:
-            draw_text = f"{last_sz} @ {text}"
-
-        painter.drawText(rect.adjusted(6, 0, -6, 0), align, draw_text)
-        painter.restore()
-
-    def sizeHint(self, option, index: QModelIndex):
-        sh = super().sizeHint(option, index)
-        sh.setHeight(self.ROW_H)
-        col = index.column()
-        if col == COL_PRICE:
-            sh.setWidth(120)
-        elif col in (COL_BID_SZ, COL_ASK_SZ):
-            sh.setWidth(90)
-        else:
-            sh.setWidth(50)
-        return sh
-
-
-# ==============================================================================
-#  Stylesheet fragments
-# ==============================================================================
-
-_TABLE_QSS = f"""
-QTableView {{
-    background-color: {BG_MAIN};
-    color: {TEXT};
-    gridline-color: {BORDER};
-    border: none;
-    outline: none;
-    selection-background-color: #1A3050;
-    selection-color: {TEXT};
-}}
-QHeaderView::section {{
-    background-color: {BG_HEADER};
-    color: {TEXT_DIM};
-    border: none;
-    border-bottom: 1px solid {BORDER};
-    border-right: 1px solid {BORDER};
-    padding: 4px 6px;
-    font-weight: 600;
-    font-size: 10px;
-    font-family: "Menlo", monospace;
-}}
-QScrollBar:vertical {{
-    background: {BG_MAIN};
-    width: 8px;
-    margin: 0;
-}}
-QScrollBar::handle:vertical {{
-    background: #3A3E48;
-    border-radius: 4px;
-    min-height: 20px;
-}}
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
-    height: 0; width: 0;
-}}
-QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
-    background: none;
-}}
-"""
-
-
-def _make_btn(text, bg, fg, hover, min_w=60):
-    btn = QPushButton(text)
-    btn.setFixedHeight(26)
-    btn.setMinimumWidth(min_w)
-    btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    btn.setStyleSheet(
-        f"QPushButton{{background:{bg};color:{fg};"
-        f"border:1px solid {bg};border-radius:3px;"
-        f"padding:2px 8px;font-size:11px;font-weight:600;}}"
-        f"QPushButton:hover{{background:{hover};}}"
-        f"QPushButton:pressed{{background:{bg};}}"
-    )
-    return btn
-
-
-def _toolbar_label(text, color=TEXT_DIM, size=10, bold=False):
-    weight = "600" if bold else "normal"
-    lbl = QLabel(text)
-    lbl.setStyleSheet(
-        f"QLabel{{color:{color};background:transparent;"
-        f"font-size:{size}px;font-weight:{weight};"
-        f"font-family:\'Menlo\',monospace;}}"
-    )
-    return lbl
-
-
-_INPUT_QSS = (
-    f"QLineEdit{{background:{BG_MAIN};color:{TEXT};"
-    f"border:1px solid {BORDER};border-radius:3px;"
-    f"padding:3px 6px;font-size:12px;font-family:\'Menlo\',monospace;}}"
-    f"QLineEdit:focus{{border-color:{BLUE};}}"
-)
-_SPIN_QSS = (
-    f"QSpinBox{{background:{BG_MAIN};color:{TEXT};"
-    f"border:1px solid {BORDER};border-radius:3px;"
-    f"padding:3px 4px;font-size:12px;min-width:50px;"
-    f"font-family:\'Menlo\',monospace;}}"
-    f"QSpinBox:focus{{border-color:{BLUE};}}"
-    f"QSpinBox::up-button, QSpinBox::down-button{{"
-    f"background:{BG_PANEL};border:none;width:14px;}}"
-)
-_COMBO_QSS = (
-    f"QComboBox{{background:{BG_MAIN};color:{TEXT};"
-    f"border:1px solid {BORDER};border-radius:3px;"
-    f"padding:3px 6px;font-size:11px;min-width:55px;"
-    f"font-family:\'Menlo\',monospace;}}"
-    f"QComboBox::drop-down{{border:none;width:16px;}}"
-    f"QComboBox QAbstractItemView{{background:{BG_MAIN};color:{TEXT};"
-    f"selection-background-color:#253545;}}"
+# Qty presets (same rule as OrderEntryPanel: different sets for FUT vs. STK).
+_FUT_QTYS = [1, 2, 3, 5]
+_STK_QTYS = [10, 25, 50, 100, 500]
+_FUT_DEFAULT = 1
+_STK_DEFAULT = 100
+_FUT_QTY_POPUP: list[int] = list(range(1, 101))
+_STK_QTY_POPUP: list[int] = (
+    list(range(1, 11))
+    + list(range(20, 110, 10))
+    + list(range(200, 1100, 100))
+    + list(range(1100, 10100, 100))
+    + list(range(11000, 51000, 1000))
 )
 
 
-# ==============================================================================
-#  Main widget
-# ==============================================================================
+def _presets_for_sec(sec: str) -> tuple[list[int], int, list[int]]:
+    """(presets, default, popup_ladder) for an asset-class string."""
+    if sec == "FUT":
+        return _FUT_QTYS, _FUT_DEFAULT, _FUT_QTY_POPUP
+    return _STK_QTYS, _STK_DEFAULT, _STK_QTY_POPUP
+
+
+def _tick_size_for_contract(cached: dict | None) -> float:
+    """Minimum tick size for *cached* contract row, with sensible defaults."""
+    if cached:
+        for key in ("tick_size", "min_tick", "minTick"):
+            v = cached.get(key)
+            if v:
+                try:
+                    f = float(v)
+                    if f > 0:
+                        return f
+                except (TypeError, ValueError):
+                    pass
+        sec = cached.get("sec_type", "")
+        if sec == "FUT":
+            return 0.25
+    return 0.01
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BookTraderView
+# ══════════════════════════════════════════════════════════════════════════════
 
 class BookTraderView(QWidget):
-    """
-    Full Book Trader / DOM price-ladder widget.
-    Emits order_requested(dict) when the user clicks to place an order.
-    """
+    """Depth-of-Market panel — click a ladder row to submit a LMT."""
 
-    order_requested = Signal(object)
+    order_requested = Signal(dict)
+    cancel_all_requested = Signal(str)
+    flatten_requested = Signal(str)
+    reverse_requested = Signal(str)
+    close_tier_requested = Signal(dict)
+    active_symbol_changed = Signal(str)
 
-    # Default tick sizes by symbol (common futures)
-    _TICK_MAP = {
-        "ES": "0.25", "MES": "0.25", "NQ": "0.25", "MNQ": "0.25",
-        "RTY": "0.10", "M2K": "0.10", "YM": "1.00", "MYM": "1.00",
-        "CL": "0.01", "MCL": "0.01", "GC": "0.10", "MGC": "0.10",
-    }
-
-    def __init__(self, active_threads=None, parent=None):
+    def __init__(
+        self,
+        active_threads: dict | None = None,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding,
-                           QSizePolicy.Policy.Expanding)
-        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        # Share MainWindow's dict by reference so entries added later
+        # (when the user clicks Connect) are visible here too.
+        # IMPORTANT: ``active_threads or {}`` would create a NEW dict when
+        # an empty dict is passed, breaking the reference and leaving
+        # this panel with no workers forever — use ``is not None``.
+        self._active_threads: dict = (
+            active_threads if active_threads is not None else {})
 
-        self._model = PriceLadderModel(self)
-        self._symbol: str = ""
-        self._auto_centre: bool = True
+        # State
+        self._symbols: list[str] = config_manager.load_order_entry_symbols()
+        self._active_symbol: str | None = (
+            self._symbols[0] if self._symbols else None)
+        self._active_sec_type: str = (
+            _sec_type_for(self._active_symbol) if self._active_symbol else "")
+        self._active_qty: int = (
+            _FUT_DEFAULT if self._active_sec_type == "FUT" else _STK_DEFAULT)
+        self._last_price: float = 0.0
+        self._bg_worker = None   # single worker for L2 subscription
 
-        # External state – keep the *same* dict reference so workers added later are visible
-        self._active_threads = active_threads if active_threads is not None else {}
-        self._current_worker = None          # IBWorkerThread feeding us depth
-        self._current_contract: dict = {}    # contract dict for current sub
-        self._saved_contracts: list[dict] = []
+        # Ladder model/view (built first so _reload_tier_sections can call it).
+        # ``rows_each_side`` defaults to 20 → 41-row ladder; the view scrolls
+        # vertically when the panel isn't tall enough to show all rows.
+        tick = _tick_size_for_contract(self._active_contract_cached())
+        self._model = DOMLadderModel(tick_size=tick)
 
-        self._build_ui()
-        self._reload_contracts()
-        self._load_demo_data()
+        self._setup_ui()
+        self._wire_internals()
 
-    def _build_ui(self) -> None:
+        # Push the initial symbol into the children.
+        if self._active_symbol:
+            self._ticker.set_symbol(self._active_symbol)
+            self._chip_bar.set_active(self._active_symbol)
+        self._reload_tier_sections()
+
+        # Subscribe depth on the first connected worker, if any.
+        self._ensure_bg_worker()
+        if self._bg_worker is not None and self._active_symbol:
+            self._bg_worker.subscribe_depth(self._active_symbol)
+
+    # ── UI construction ───────────────────────────────────────────────────────
+
+    def _setup_ui(self) -> None:
+        self.setObjectName("BookTraderView")
+        self.setStyleSheet(f"""
+            QWidget#BookTraderView {{
+                background: {Theme.BG_PANEL};
+                border: 1px solid {Theme.BORDER};
+                border-radius: 4px;
+            }}
+        """)
+
         root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
+        root.setContentsMargins(10, 8, 10, 8)
+        root.setSpacing(8)
 
-        # -- top toolbar -------------------------------------------------------
-        toolbar = QWidget()
-        toolbar.setFixedHeight(38)
-        toolbar.setStyleSheet(f"background:{BG_PANEL};")
-        tb = QHBoxLayout(toolbar)
-        tb.setContentsMargins(8, 4, 8, 4)
-        tb.setSpacing(6)
+        # ── Ticker strip ──────────────────────────────────────────────────────
+        self._ticker = TickerStrip()
+        root.addWidget(self._ticker)
 
-        tb.addWidget(_toolbar_label("Sym", TEXT_DIM, 11))
-        self._sym_input = QLineEdit()
-        self._sym_input.setPlaceholderText("Search symbol...")
-        self._sym_input.setFixedWidth(120)
-        self._sym_input.setStyleSheet(_INPUT_QSS)
-        self._sym_input.returnPressed.connect(self._on_sym_enter)
+        # ── Symbol chip bar ───────────────────────────────────────────────────
+        self._chip_bar = SymbolChipBar(columns=5, max_rows_per_group=2)
+        self._chip_bar.set_symbols(
+            [(s, _sec_type_for(s)) for s in self._symbols])
+        root.addWidget(self._chip_bar)
 
-        # Auto-complete from saved contracts
-        self._completer = QCompleter([], self)
-        self._completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-        self._completer.setFilterMode(Qt.MatchFlag.MatchContains)
-        self._completer.setMaxVisibleItems(12)
-        self._completer.setCompletionMode(
-            QCompleter.CompletionMode.PopupCompletion)
-        self._completer.activated.connect(self._on_completer_activated)
-        self._sym_input.setCompleter(self._completer)
+        # ── Qty chip row ──────────────────────────────────────────────────────
+        self._qty_row = QtyChipRow()
+        presets, default, popup = _presets_for_sec(self._active_sec_type)
+        self._qty_row.set_presets(presets, default, popup)
+        self._active_qty = default
+        root.addWidget(self._qty_row)
 
-        tb.addWidget(self._sym_input)
+        # ── Ladder header row: "BID SZ" | tick combo | "ASK SZ" ──────────────
+        # Persistent in-widget header (not a Qt horizontal header) so the
+        # tick-aggregation dropdown can sit centred between the two size
+        # columns, matching the Book Trader mockup.  Double-clicking the
+        # "BID SZ" label recentres the ladder on the last price (poor-
+        # man's replacement for an explicit Recenter button).
+        from PySide6.QtWidgets import QComboBox
+        hdr = QHBoxLayout()
+        hdr.setContentsMargins(0, 0, 0, 0)
+        hdr.setSpacing(0)
 
-        tb.addWidget(_toolbar_label("Qty", TEXT_DIM, 11))
-        self._qty_spin = QSpinBox()
-        self._qty_spin.setRange(1, 9999)
-        self._qty_spin.setValue(1)
-        self._qty_spin.setStyleSheet(_SPIN_QSS)
-        tb.addWidget(self._qty_spin)
-
-        tb.addWidget(_toolbar_label("Tick", TEXT_DIM, 11))
-        self._tick_combo = QComboBox()
-        self._tick_combo.addItems(
-            ["0.25", "0.50", "0.01", "0.05", "0.10", "1.00"])
-        self._tick_combo.setStyleSheet(_COMBO_QSS)
-        self._tick_combo.currentTextChanged.connect(self._on_tick_changed)
-        tb.addWidget(self._tick_combo)
-
-        tb.addSpacing(12)
-
-        self._buy_mkt_btn = _make_btn("BUY MKT", GREEN, "#FFFFFF", "#388E3C")
-        self._buy_mkt_btn.clicked.connect(self._on_buy_mkt)
-        tb.addWidget(self._buy_mkt_btn)
-
-        self._sell_mkt_btn = _make_btn("SELL MKT", RED, "#FFFFFF", "#D32F2F")
-        self._sell_mkt_btn.clicked.connect(self._on_sell_mkt)
-        tb.addWidget(self._sell_mkt_btn)
-
-        tb.addStretch()
-
-        self._centre_btn = _make_btn(
-            "Centre", "#1A2440", BLUE, "#24304A", min_w=72)
-        self._centre_btn.setStyleSheet(
-            self._centre_btn.styleSheet().replace(
-                "border:1px solid #1A2440", "border:1px solid #2A3450"))
-        self._centre_btn.clicked.connect(self._scroll_to_last)
-        tb.addWidget(self._centre_btn)
-
-        self._info_lbl = _toolbar_label("No contract", TEXT_DIM, 11)
-        tb.addWidget(self._info_lbl)
-
-        root.addWidget(toolbar)
-
-        # -- separator ---------------------------------------------------------
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setFixedHeight(1)
-        sep.setStyleSheet(f"background:{BORDER};")
-        root.addWidget(sep)
-
-        # -- price ladder table ------------------------------------------------
-        self._table = QTableView()
-        self._table.setModel(self._model)
-        self._delegate = PriceLadderDelegate(self._table)
-        self._table.setItemDelegate(self._delegate)
-        self._table.setStyleSheet(_TABLE_QSS)
-        self._table.setShowGrid(False)
-        self._table.setSelectionBehavior(
-            QAbstractItemView.SelectionBehavior.SelectRows)
-        self._table.setSelectionMode(
-            QAbstractItemView.SelectionMode.SingleSelection)
-        self._table.setVerticalScrollMode(
-            QAbstractItemView.ScrollMode.ScrollPerPixel)
-        self._table.verticalHeader().setVisible(False)
-        self._table.verticalHeader().setDefaultSectionSize(PriceLadderDelegate.ROW_H)
-
-        hh = self._table.horizontalHeader()
-        hh.setStretchLastSection(False)
-        hh.setMinimumSectionSize(40)
-        hh.setSectionResizeMode(COL_BID_ORD, QHeaderView.ResizeMode.Fixed)
-        hh.setSectionResizeMode(COL_BID_SZ, QHeaderView.ResizeMode.Stretch)
-        hh.setSectionResizeMode(COL_PRICE, QHeaderView.ResizeMode.Fixed)
-        hh.setSectionResizeMode(COL_ASK_SZ, QHeaderView.ResizeMode.Stretch)
-        hh.setSectionResizeMode(COL_ASK_ORD, QHeaderView.ResizeMode.Fixed)
-        hh.resizeSection(COL_BID_ORD, 50)
-        hh.resizeSection(COL_PRICE, 120)
-        hh.resizeSection(COL_ASK_ORD, 50)
-
-        self._table.clicked.connect(self._on_cell_click)
-        root.addWidget(self._table, stretch=1)
-
-        # -- bottom info bar ---------------------------------------------------
-        bottom = QWidget()
-        bottom.setFixedHeight(28)
-        bottom.setStyleSheet(f"background:{BG_PANEL};")
-        bl = QHBoxLayout(bottom)
-        bl.setContentsMargins(8, 2, 8, 2)
-        bl.setSpacing(16)
-
-        self._lbl_last = _toolbar_label("Last: ---", TEXT, 10, bold=True)
-        self._lbl_bid = _toolbar_label("Bid: ---", "#D4A82A", 10)
-        self._lbl_ask = _toolbar_label("Ask: ---", "#4AD080", 10)
-        self._lbl_spread = _toolbar_label("Spread: ---", TEXT_DIM, 10)
-        self._lbl_pos = _toolbar_label("Pos: flat", TEXT_DIM, 10)
-
-        bl.addWidget(self._lbl_last)
-        bl.addWidget(self._lbl_bid)
-        bl.addWidget(self._lbl_ask)
-        bl.addWidget(self._lbl_spread)
-        bl.addStretch()
-        bl.addWidget(self._lbl_pos)
-
-        root.addWidget(bottom)
-
-    # -- demo data -------------------------------------------------------------
-
-    def _load_demo_data(self) -> None:
-        centre = 21250.00
-        self._symbol = "NQ"
-        self._sym_input.setText("NQ")
-        self._model.set_tick(0.25)
-        self._model.rebuild(centre, _NUM_ROWS)
-
-        bids = {
-            21249.75: 12, 21249.50: 8,  21249.25: 15, 21249.00: 22,
-            21248.75: 6,  21248.50: 9,  21248.25: 14, 21248.00: 30,
-            21247.75: 11, 21247.50: 18, 21247.25: 7,  21247.00: 25,
-            21246.75: 5,  21246.50: 10, 21246.25: 8,  21246.00: 35,
-        }
-        asks = {
-            21250.00: 10, 21250.25: 14, 21250.50: 6,  21250.75: 9,
-            21251.00: 20, 21251.25: 4,  21251.50: 7,  21251.75: 11,
-            21252.00: 28, 21252.25: 5,  21252.50: 8,  21252.75: 3,
-            21253.00: 18, 21253.25: 6,  21253.50: 10, 21254.00: 32,
-        }
-        self._model.feed_depth(bids, asks)
-        self._model.feed_last(21250.00, size=3)
-        self._model.feed_orders(
-            bids={21248.00: 2, 21247.00: 5},
-            asks={21252.00: 1, 21253.00: 3},
+        _hdr_ss = (
+            f"color: {Theme.TEXT_DIM}; border: none; "
+            f"font-size: 10px; font-family: 'Helvetica Neue', Arial; "
+            f"font-weight: bold;"
         )
-        self._update_info_bar(21250.00, 21249.75, 12, 21250.00, 10)
-        QTimer.singleShot(120, self._scroll_to_last)
+        self._lbl_bid_hdr = QLabel("BID<br>SZ")
+        self._lbl_bid_hdr.setTextFormat(Qt.TextFormat.RichText)
+        self._lbl_bid_hdr.setStyleSheet(_hdr_ss)
+        self._lbl_bid_hdr.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self._lbl_bid_hdr.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._lbl_bid_hdr.setToolTip("Double-click to recentre ladder")
+        self._lbl_bid_hdr.mouseDoubleClickEvent = (  # type: ignore[method-assign]
+            lambda _ev: self._on_recenter_clicked())
 
-    # -- saved contracts --------------------------------------------------------
+        self._cmb_tick = QComboBox()
+        self._cmb_tick.setFixedHeight(24)
+        self._cmb_tick.setMaximumWidth(86)
+        self._cmb_tick.setStyleSheet(
+            f"QComboBox{{background:{Theme.BG_INPUT};color:{Theme.TEXT};"
+            f"border:1px solid {Theme.BORDER};border-radius:3px;"
+            f"padding:1px 6px;font-size:11px}}"
+            f"QComboBox:hover{{border-color:{Theme.ACCENT}}}"
+            f"QComboBox QAbstractItemView{{background:{Theme.BG_INPUT};"
+            f"color:{Theme.TEXT};selection-background-color:#3a3f50}}")
+        self._cmb_tick.currentTextChanged.connect(self._on_tick_changed)
 
-    def _reload_contracts(self) -> None:
-        """Reload saved contracts from config and rebuild the completer list."""
-        self._saved_contracts = config_manager.load_contracts()
-        # Build completion strings: "SYMBOL (SEC_TYPE) localSymbol"
-        completions = []
-        for c in self._saved_contracts:
-            local = c.get("local_symbol", "")
-            sym = c.get("symbol", "")
-            sec = c.get("sec_type", "")
-            label = f"{sym} ({sec})" if not local or local == sym else f"{local} ({sec}) {sym}"
-            completions.append(label)
-        from PySide6.QtCore import QStringListModel
-        model = QStringListModel(completions, self._completer)
-        self._completer.setModel(model)
-        log.info("BookTrader: loaded %d saved contracts for completer",
-                 len(completions))
+        # Lock button — when locked (default) the ladder auto-scrolls so
+        # the last-price row stays centred in the viewport on every
+        # tick.  Unlock to scroll the ladder manually without the view
+        # yanking back to the centre.
+        self._btn_lock = QPushButton("\U0001F512")   # 🔒
+        self._btn_lock.setCheckable(True)
+        self._btn_lock.setChecked(True)
+        self._btn_lock.setFixedSize(28, 24)
+        self._btn_lock.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_lock.setToolTip(
+            "Lock ladder to last price — auto-scroll keeps the last "
+            "traded price centred.  Click to release.")
+        self._btn_lock.setStyleSheet(
+            f"QPushButton{{background:{Theme.BG_INPUT};color:{Theme.TEXT};"
+            f"border:1px solid {Theme.BORDER};border-radius:3px;"
+            f"font-size:12px;padding:0}}"
+            f"QPushButton:hover{{border-color:{Theme.ACCENT}}}"
+            f"QPushButton:checked{{background:#3a3f50;"
+            f"border-color:{Theme.ACCENT}}}")
+        self._btn_lock.toggled.connect(self._on_lock_toggled)
 
-    def _find_contract_by_text(self, text: str) -> dict | None:
-        """Match user text against saved contracts.
+        self._lbl_ask_hdr = QLabel("ASK<br>SZ")
+        self._lbl_ask_hdr.setTextFormat(Qt.TextFormat.RichText)
+        self._lbl_ask_hdr.setStyleSheet(_hdr_ss)
+        self._lbl_ask_hdr.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
 
-        Tries: localSymbol exact, then symbol exact, then the completer label.
+        # Centre cell groups the tick-aggregation combo and the lock
+        # button side-by-side under a single stretch slot; outer cells
+        # hold the BID SZ / ASK SZ labels.
+        centre_box = QHBoxLayout()
+        centre_box.setContentsMargins(0, 0, 0, 0)
+        centre_box.setSpacing(4)
+        centre_box.addWidget(self._btn_lock)
+        centre_box.addWidget(self._cmb_tick)
+        hdr.addWidget(self._lbl_bid_hdr, stretch=1)
+        hdr.addLayout(centre_box, stretch=1)
+        hdr.addWidget(self._lbl_ask_hdr, stretch=1)
+        root.addLayout(hdr)
+
+        # ── DOM ladder ────────────────────────────────────────────────────────
+        self._ladder = DOMLadderView(model=self._model)
+        root.addWidget(self._ladder, stretch=1)
+        # Populate tick combo for the initial contract.
+        self._populate_tick_combo()
+
+        # ── Reverse / Flatten / Cancel ────────────────────────────────────────
+        pm_row = QHBoxLayout()
+        pm_row.setContentsMargins(0, 0, 0, 0)
+        pm_row.setSpacing(4)
+        self._btn_reverse = _make_btn("Reverse", Theme.CLR_REVERSE, 30)
+        self._btn_flatten = _make_btn("Flatten", Theme.CLR_FLATTEN, 30)
+        self._btn_cancel = _make_btn("Cancel", Theme.CLR_CANCEL, 30)
+        pm_row.addWidget(self._btn_reverse)
+        pm_row.addWidget(self._btn_flatten)
+        pm_row.addWidget(self._btn_cancel)
+        root.addLayout(pm_row)
+
+        # ── TP / SL / Trail tier sections ─────────────────────────────────────
+        self._pt_section = _TierSection(
+            "Take Profit", [], enabled=False,
+            label_color=Theme.CLR_BUY, auto_select_min=True)
+        self._sl_section = _TierSection(
+            "Stop Loss", [], enabled=False,
+            label_color=Theme.CLR_SELL, auto_select_min=True)
+        self._tr_section = _TierSection(
+            "Trail Stop", [], enabled=False,
+            label_color=Theme.CLR_FLATTEN, auto_select_min=True)
+        root.addWidget(self._pt_section)
+        root.addWidget(self._sl_section)
+        root.addWidget(self._tr_section)
+
+    def _wire_internals(self) -> None:
+        # Ticker strip "+" button → our searchable add-symbol popup.
+        self._ticker.add_symbol_clicked.connect(self._show_add_symbol_popup)
+
+        # Symbol chip clicks / removes.
+        self._chip_bar.symbol_selected.connect(self._on_symbol_selected)
+        self._chip_bar.symbol_remove_requested.connect(self._on_symbol_remove)
+
+        # Qty changes → sync tier sections.
+        self._qty_row.qty_changed.connect(self._on_qty_changed)
+
+        # Ladder click → LMT order.
+        self._ladder.ladder_clicked.connect(self._on_ladder_clicked)
+
+        # Action buttons.
+        self._btn_reverse.clicked.connect(
+            lambda: self._active_symbol and self.reverse_requested.emit(
+                self._active_symbol))
+        self._btn_flatten.clicked.connect(
+            lambda: self._active_symbol and self.flatten_requested.emit(
+                self._active_symbol))
+        self._btn_cancel.clicked.connect(
+            lambda: self._active_symbol and self.cancel_all_requested.emit(
+                self._active_symbol))
+
+        # Tier-section header-button submit → close-tier request.
+        self._pt_section.submit_requested.connect(
+            lambda: self._emit_close_tier("tp"))
+        self._sl_section.submit_requested.connect(
+            lambda: self._emit_close_tier("sl"))
+
+    # ── Public data-in methods (called from FlashTradeView) ──────────────────
+
+    def feed_price(
+        self,
+        symbol: str,
+        last: float,
+        bid: float,
+        ask: float,
+        close: float = 0.0,
+    ) -> None:
+        """Receive a background price tick.  Gated on active symbol.
+
+        The first positive last-price after an active-symbol switch
+        recentres the ladder on it (warm-start the view with data
+        instead of a blank grid).
         """
-        text_up = text.strip().upper()
-        if not text_up:
-            return None
-        # 1. exact localSymbol
-        for c in self._saved_contracts:
-            if c.get("local_symbol", "").upper() == text_up:
-                return c
-        # 2. exact symbol
-        for c in self._saved_contracts:
-            if c.get("symbol", "").upper() == text_up:
-                return c
-        # 3. completer label match (from activated signal)
-        for c in self._saved_contracts:
-            local = c.get("local_symbol", "")
-            sym = c.get("symbol", "")
-            sec = c.get("sec_type", "")
-            label = f"{sym} ({sec})" if not local or local == sym else f"{local} ({sec}) {sym}"
-            if label.upper() == text_up:
-                return c
-        return None
-
-    def _find_connected_worker(self):
-        """Return the first connected IBWorkerThread or None."""
-        for label, worker in self._active_threads.items():
-            if worker.is_ib_connected:
-                return worker
-        return None
-
-    # -- live data wiring ------------------------------------------------------
-
-    def _subscribe_live(self, contract: dict) -> None:
-        """Subscribe to market depth for *contract* using a connected worker."""
-        # Disconnect old worker signals
-        self._unsubscribe_live()
-
-        worker = self._find_connected_worker()
-        if worker is None:
-            self._info_lbl.setText("No TWS connected")
-            log.warning(
-                "BookTrader: no connected worker for depth subscription")
+        if not self._active_symbol or symbol.upper() != self._active_symbol.upper():
             return
+        if self._last_price <= 0:
+            log.info("BookTrader: first price tick for %s — last=%s bid=%s "
+                     "ask=%s close=%s", symbol, last, bid, ask, close)
+        first_tick = self._last_price <= 0 and last > 0
+        if last and last > 0:
+            self._last_price = float(last)
+            # Sync tier-section "market price" so the TP/SL Dist input
+            # ladder renders tick steps from the real market.
+            tick = self._model.tick_size
+            for section in (self._pt_section, self._sl_section,
+                            self._tr_section):
+                section.set_market_price(float(last), tick)
+        self._ticker.update_price(last, bid, ask, close)
+        if first_tick:
+            self._model.recenter(float(last))
+        if last and last > 0:
+            self._model.feed_last(float(last))
+            # Auto-scroll: when locked, keep the last-price row centred
+            # in the viewport as the market moves.  When unlocked this
+            # is a no-op — user's scroll position is preserved.
+            self._ladder.sync_to_last()
 
-        self._current_worker = worker
-        self._current_contract = contract
-
-        # Connect signals
-        worker.depth_updated.connect(self._on_depth_data)
-        worker.ticker_updated.connect(self._on_ticker_data)
-
-        # Request subscription
-        worker.request_mkt_depth(contract)
-
-        sym = contract.get("local_symbol") or contract.get("symbol", "?")
-        self._info_lbl.setText(f"Subscribing {sym}...")
-        log.info("BookTrader: subscribing depth via worker %s for %s",
-                 worker._label, sym)
-
-    def _unsubscribe_live(self) -> None:
-        """Cancel the current depth subscription and disconnect signals."""
-        if self._current_worker is not None:
-            try:
-                self._current_worker.depth_updated.disconnect(
-                    self._on_depth_data)
-                self._current_worker.ticker_updated.disconnect(
-                    self._on_ticker_data)
-            except (RuntimeError, TypeError):
-                pass
-            self._current_worker.cancel_mkt_depth()
-            self._current_worker = None
-        self._current_contract = {}
-
-    def _on_depth_data(self, bids, asks) -> None:
-        """Slot: receive live depth from the worker."""
-        bb = max(bids, default=0)          # best bid – always on a tick boundary
-        # best ask – always on a tick boundary
-        ba = min(asks, default=0)
-
-        # Use best-bid as the rebuild anchor (it's always tick-aligned)
-        anchor = float(bb or ba or 0)
-
-        if anchor > 0 and self._model._prices:
-            top = float(self._model._prices[0])
-            bot = float(self._model._prices[-1])
-            if anchor > top or anchor < bot:
-                self._model.rebuild(anchor, _NUM_ROWS)
-                log.info("BookTrader: rebuilt ladder around %.2f", anchor)
-        elif anchor > 0 and not self._model._prices:
-            self._model.rebuild(anchor, _NUM_ROWS)
-
-        self._model.feed_depth(bids, asks)
-
-        # If no ticker data has arrived yet, seed _last from the best bid
-        # so that scroll-to-last has a valid target
-        if anchor > 0 and self._model._last == Decimal("0"):
-            self._model._last = Decimal(str(anchor))
-
-        self._update_info_bar(
-            float(self._model._last),
-            bb, bids.get(bb, 0),
-            ba, asks.get(ba, 0))
-
-        if self._auto_centre and anchor > 0:
-            self._scroll_to_last()
-
-    def _on_ticker_data(self, price: float, size: int) -> None:
-        """Slot: receive live last-price from the worker."""
-        if price <= 0:
+    def feed_depth(
+        self,
+        symbol: str,
+        bids: list,
+        asks: list,
+    ) -> None:
+        """Receive a depth snapshot.  Gated on active symbol."""
+        if not self._active_symbol or symbol.upper() != self._active_symbol.upper():
             return
-        old_last = float(self._model._last)
-        self._model.feed_last(price, size)
-        self._lbl_last.setText(f"Last: {price:,.2f}")
+        if not self._model._bid and not self._model._ask and (bids or asks):
+            log.info("BookTrader: first depth snapshot for %s — "
+                     "%d bid levels, %d ask levels",
+                     symbol, len(bids or []), len(asks or []))
+        self._model.feed_depth(bids or [], asks or [])
 
-        # Rebuild the ladder if the price drifted outside the current range
-        if self._model._prices:
-            top = float(self._model._prices[0])
-            bot = float(self._model._prices[-1])
-            if price > top or price < bot:
-                self._model.rebuild(price, _NUM_ROWS)
+    # ── Internal slots ────────────────────────────────────────────────────────
 
-        if self._auto_centre:
-            self._scroll_to_last()
-
-    # -- toolbar slots ---------------------------------------------------------
-
-    def _on_sym_enter(self) -> None:
-        text = self._sym_input.text().strip()
-        if not text:
+    def _on_symbol_selected(self, sym: str, sec_type: str) -> None:
+        """User clicked a chip — switch the active symbol."""
+        if not sym:
             return
-
-        contract = self._find_contract_by_text(text)
-        if contract is None:
-            self._info_lbl.setText(f"'{text}' not in saved contracts")
-            log.info("BookTrader: no saved contract for '%s'", text)
+        if sym == self._active_symbol:
+            # Clicking the already-active chip — the symbol isn't
+            # changing, but refresh subscriptions anyway in case this
+            # is the first chip click after workers came online
+            # (covers the cold-start window where _ensure_bg_worker
+            # initially found no workers).
+            self.refresh_subscriptions()
             return
+        old = self._active_symbol
+        self._active_symbol = sym
+        self._active_sec_type = sec_type or _sec_type_for(sym)
+        self._ticker.set_symbol(sym)
+        self._chip_bar.set_active(sym)
+        presets, default, popup = _presets_for_sec(self._active_sec_type)
+        self._qty_row.set_presets(presets, default, popup)
+        self._active_qty = default
+        # New symbol → reset last price and ladder centre; real data
+        # will arrive on the next tick.
+        self._last_price = 0.0
+        self._model.set_tick_size(_tick_size_for_contract(
+            self._active_contract_cached()))
+        self._model.recenter(0.0)
+        self._populate_tick_combo()
+        self._reload_tier_sections()
 
-        self._apply_contract(contract)
+        # Swap depth subscription on the bg worker.  L1 is owned by
+        # OrderEntryPanel (which subscribes every saved chip-bar
+        # symbol); Book Trader only takes over the L2 stream for the
+        # active symbol.
+        self._ensure_bg_worker()
+        if self._bg_worker is not None:
+            if old:
+                self._bg_worker.unsubscribe_depth(old)
+            self._bg_worker.subscribe_depth(sym)
 
-    def _on_completer_activated(self, text: str) -> None:
-        """User picked an item from the completer dropdown."""
-        contract = self._find_contract_by_text(text)
-        if contract:
-            self._apply_contract(contract)
+        self.active_symbol_changed.emit(sym)
 
-    def _apply_contract(self, contract: dict) -> None:
-        """Set up the ladder for *contract* and subscribe to live data."""
-        sym = contract.get("symbol", "")
-        local = contract.get("local_symbol", "") or sym
-
-        # Guard: skip if we're already subscribed to the same symbol
-        if local == self._symbol and self._current_worker is not None:
+    def _on_symbol_remove(self, sym: str) -> None:
+        """Right-click on a chip — remove it from the bar (and the
+        persisted config)."""
+        if sym not in self._symbols:
             return
+        self._symbols.remove(sym)
+        config_manager.save_order_entry_symbols(self._symbols)
+        self._chip_bar.set_symbols(
+            [(s, _sec_type_for(s)) for s in self._symbols])
+        if self._active_symbol == sym:
+            # Pick a new active if available.
+            new_active = self._symbols[0] if self._symbols else None
+            if new_active is not None:
+                self._on_symbol_selected(
+                    new_active, _sec_type_for(new_active))
+            else:
+                self._active_symbol = None
+                self._ticker.clear()
 
-        self._symbol = local
-        self._sym_input.setText(local)
+    def _on_qty_changed(self, qty: int) -> None:
+        self._active_qty = int(qty)
+        for section in (self._pt_section, self._sl_section,
+                        self._tr_section):
+            section.set_qty(self._active_qty)
 
-        # Auto-select tick size
-        tick = self._TICK_MAP.get(sym.upper())
-        if tick is None:
-            sec = contract.get("sec_type", "")
-            tick = "0.01" if sec == "STK" else "0.25"
-        idx = self._tick_combo.findText(tick)
-        if idx >= 0:
-            self._tick_combo.setCurrentIndex(idx)
-        else:
-            self._model.set_tick(tick)
+    def _on_recenter_clicked(self) -> None:
+        if self._last_price > 0:
+            self._model.recenter(self._last_price)
 
-        # Clear stale data and reset the last-traded price
-        self._model._last = Decimal("0")
-        self._model._last_sz = 0
-        self._model.feed_depth({}, {})
-        self._model.feed_orders({}, {})
-        self._model.rebuild(0, _NUM_ROWS)
+    def _on_lock_toggled(self, locked: bool) -> None:
+        """Lock / unlock the ladder's 'keep last price centred' tracker.
 
-        self._info_lbl.setText(f"Connecting {local}...")
+        The button text flips between closed-padlock (locked) and
+        open-padlock (unlocked) so the affordance matches the state.
+        """
+        self._btn_lock.setText("\U0001F512" if locked else "\U0001F513")
+        self._ladder.set_locked(locked)
 
-        # Subscribe to live depth
-        self._subscribe_live(contract)
+    def _populate_tick_combo(self) -> None:
+        """Fill the tick-aggregation combo with common multiples of the
+        contract's minimum tick.  MVP: populates 1×, 2×, 4×, 10× but
+        only the actual contract tick is selectable (others are stubbed
+        for a future aggregation feature)."""
+        tick = _tick_size_for_contract(self._active_contract_cached())
+        self._cmb_tick.blockSignals(True)
+        self._cmb_tick.clear()
+        options = [tick, tick * 2, tick * 4, tick * 10]
+        for t in options:
+            self._cmb_tick.addItem(f"{t:g}")
+        self._cmb_tick.setCurrentText(f"{tick:g}")
+        self._cmb_tick.blockSignals(False)
 
     def _on_tick_changed(self, text: str) -> None:
         try:
-            self._model.set_tick(text)
-            if self._model._prices:
-                c = float(self._model._last) or float(
-                    self._model._prices[len(self._model._prices) // 2])
-                self._model.rebuild(c, _NUM_ROWS)
-                QTimer.singleShot(50, self._scroll_to_last)
+            t = float(text)
+        except ValueError:
+            return
+        if t <= 0 or t == self._model.tick_size:
+            return
+        self._model.set_tick_size(t)
+        # A tick change wipes depth state — force a re-subscribe so the
+        # next emit rebuilds sizes against the new grid.
+        self._ensure_bg_worker()
+        if self._bg_worker is not None and self._active_symbol:
+            self._bg_worker.unsubscribe_depth(self._active_symbol)
+            self._bg_worker.subscribe_depth(self._active_symbol)
+
+    def _on_ladder_clicked(self, action: str, price: float) -> None:
+        """Click on a bid-size or ask-size cell → emit a LMT order."""
+        if not self._active_symbol or price <= 0:
+            return
+        # Build payload in the same shape OrderEntryPanel emits for a
+        # BID_LMT / ASK_LMT order so FlashTradeView's existing
+        # `_on_order_requested` fan-out handles TP/SL/Trail children
+        # and multi-account dispatch without any changes.
+        payload: dict = {
+            "action": action,                 # "BUY" or "SELL"
+            "type": "BID_LMT" if action == "BUY" else "ASK_LMT",
+            "symbol": self._active_symbol,
+            "qty": int(self._qty_row.current_qty()),
+            "sec_type": self._active_sec_type,
+            "last_price": float(self._last_price),
+            "limit_price": float(price),
+            "profit_take": self._pt_section.get_value()
+                if hasattr(self, "_pt_section") else None,
+            "stop_loss": self._sl_section.get_value()
+                if hasattr(self, "_sl_section") else None,
+            "trailing": self._tr_section.get_value()
+                if hasattr(self, "_tr_section") else None,
+        }
+        log.info("BookTrader: ladder click → %s %s @ %.4f",
+                 action, self._active_symbol, price)
+        self.order_requested.emit(payload)
+
+    def _emit_close_tier(self, side: str) -> None:
+        section = self._pt_section if side == "tp" else self._sl_section
+        tier = section.get_value()
+        if tier is None or not self._active_symbol:
+            return
+        raw_val = float(tier.get("value", 0.0))
+        unit = tier.get("unit", "price")
+        if unit == "ticks":
+            tick = self._model.tick_size
+            offset_pts = raw_val * (tick if tick > 0 else 0.01)
+        else:
+            offset_pts = raw_val
+        if offset_pts <= 0:
+            return
+        self.close_tier_requested.emit({
+            "side": side,
+            "symbol": self._active_symbol,
+            "qty": int(self._qty_row.current_qty()),
+            "offset_pts": offset_pts,
+            "last_price": float(self._last_price),
+        })
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _active_contract_cached(self) -> dict | None:
+        if not self._active_symbol:
+            return None
+        try:
+            from src.core.reference_data import get_instance as _rd
+            return _rd().get_contract(self._active_symbol)
+        except Exception:
+            return None
+
+    def _reload_tier_sections(self) -> None:
+        """Reload TP / SL / Trail chips from ReferenceData and sync
+        qty + multiplier + market price into each section."""
+        if not self._active_symbol or not hasattr(self, "_pt_section"):
+            return
+        from src.core.reference_data import get_instance as _rd
+        rd = _rd()
+        sym = self._active_symbol
+
+        def _tiers(ot: str) -> list[dict]:
+            raw = rd.get_tiers_for_symbol(sym, ot)
+            if not raw:
+                return []
+            # Label chips with the offset value (matches OrderEntryPanel).
+            out: list[dict] = []
+            for t in raw:
+                off = t.get("offset") or t.get("value", 0.0)
+                try:
+                    off = float(off)
+                except (TypeError, ValueError):
+                    off = 0.0
+                lbl = f"{off:g}" if off > 0 else t.get("label", "")
+                out.append({**t, "label": lbl})
+            return out
+
+        self._pt_section.reload_tiers(_tiers("take_profit"))
+        self._sl_section.reload_tiers(_tiers("stop_loss"))
+        self._tr_section.reload_tiers(_tiers("trailing"))
+
+        for section in (self._pt_section, self._sl_section,
+                        self._tr_section):
+            section.set_qty(self._active_qty)
+
+        mult = rd.get_multiplier(sym) or 1.0
+        for section in (self._pt_section, self._sl_section,
+                        self._tr_section):
+            section.set_multiplier(mult)
+
+        tick = self._model.tick_size
+        for section in (self._pt_section, self._sl_section,
+                        self._tr_section):
+            section.set_market_price(self._last_price, tick)
+
+    def refresh_subscriptions(self) -> None:
+        """Re-check worker availability, wire signals, and (re)subscribe
+        depth for the active symbol.
+
+        Called from ``FlashTradeView._wire_all_workers`` once worker
+        threads finish their initial IB connection.  Without this hook
+        a panel built before workers connect would sit with
+        ``_bg_worker = None`` forever — no market-data signals wired,
+        no depth subscription → the ladder and ticker stay blank.
+
+        Note: Book Trader does NOT subscribe L1 (``bg_price_updated``)
+        — OrderEntryPanel already subscribes every saved symbol for L1
+        ticks, and Book Trader just listens to the same signal.  Book
+        Trader owns only the L2 (depth) subscription for the currently
+        active symbol, which is the one data stream OrderEntry does
+        not need.
+        """
+        self._ensure_bg_worker()
+        if self._bg_worker is None or not self._active_symbol:
+            return
+        # Worker.subscribe_depth is idempotent (skips already-subscribed
+        # symbols) so calling it on every refresh guarantees re-
+        # subscription after a reconnect.
+        self._bg_worker.subscribe_depth(self._active_symbol)
+
+    def _ensure_bg_worker(self) -> None:
+        """Pick a connected worker for L2 depth subscriptions (first match
+        wins) and wire its ``bg_price_updated`` / ``depth_updated`` signals
+        to the view's feed methods.
+
+        Depth is single-worker — TWS caps concurrent L2 streams per
+        account.  L1 (``bg_price_updated``) isn't strictly single-worker
+        but using the same worker keeps the streams aligned with the
+        depth stream.
+        """
+        current = self._bg_worker
+        current_ok = (
+            current is not None
+            and getattr(current, "isRunning", lambda: False)()
+            and getattr(current, "is_ib_connected", False)
+        )
+        if current_ok:
+            return
+        # Old worker is gone / disconnected — disconnect its signals and
+        # pick a fresh one.
+        if current is not None:
+            try:
+                current.bg_price_updated.disconnect(self.feed_price)
+            except (RuntimeError, TypeError):
+                pass
+            try:
+                current.depth_updated.disconnect(self.feed_depth)
+            except (RuntimeError, TypeError):
+                pass
+        self._bg_worker = None
+        candidates = list(self._active_threads.items())
+        log.info(
+            "BookTrader: _ensure_bg_worker scanning %d thread(s) "
+            "(active_symbol=%s)",
+            len(candidates), self._active_symbol)
+        for lbl, worker in candidates:
+            try:
+                running = worker.isRunning()
+                connected = worker.is_ib_connected
+                log.info(
+                    "BookTrader:   thread %s running=%s connected=%s",
+                    lbl, running, connected)
+                if running and connected:
+                    self._bg_worker = worker
+                    worker.bg_price_updated.connect(self.feed_price)
+                    worker.depth_updated.connect(self.feed_depth)
+                    log.info(
+                        "BookTrader: wired signals on thread %s "
+                        "(active_symbol=%s)",
+                        lbl, self._active_symbol)
+                    return
+            except Exception as exc:
+                log.warning(
+                    "BookTrader: thread %s check failed: %s", lbl, exc)
+                continue
+        log.warning(
+            "BookTrader: no connected worker available — market data "
+            "will not flow until a worker comes online")
+
+    # ── Add-symbol popup (searchable) ────────────────────────────────────────
+
+    def _show_add_symbol_popup(self) -> None:
+        """Small searchable popup listing saved contracts the user hasn't
+        added to the chip bar yet.  Same UX as OrderEntryPanel's "+"
+        button popup; not shared because it's light and self-contained.
+        """
+        from src.core.reference_data import get_instance as _rd
+        added = {s.upper() for s in self._symbols}
+        seen: set[str] = set()
+        entries: list[tuple[str, str]] = []
+        for c in sorted(_rd().contracts, key=lambda x: x.get("symbol", "")):
+            sym = c.get("symbol", "")
+            if not sym or sym.upper() in added:
+                continue
+            sec = c.get("sec_type", "")
+            local = c.get("local_symbol", "")
+            exch = c.get("exchange", "")
+            key = f"{sym}_{local}_{sec}"
+            if key in seen:
+                continue
+            seen.add(key)
+            detail = local if local and local != sym else exch
+            label = (f"{sym}  –  {detail}  ({sec})"
+                     if detail else f"{sym}  ({sec})")
+            entries.append((label, sym))
+
+        dlg = QDialog(self)
+        dlg.setWindowFlags(Qt.WindowType.Popup)
+        dlg.setFixedWidth(260)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setSpacing(4)
+
+        search = QLineEdit()
+        search.setPlaceholderText("Type to search…")
+        search.setStyleSheet(
+            f"QLineEdit{{background:{Theme.BG_INPUT};color:{Theme.TEXT};"
+            f"border:1px solid {Theme.BORDER};border-radius:3px;"
+            f"padding:4px 6px;font-size:12px}}"
+            f"QLineEdit:focus{{border-color:{Theme.ACCENT}}}")
+        lay.addWidget(search)
+
+        lst = QListWidget()
+        lst.setStyleSheet(
+            f"QListWidget{{background:{Theme.BG_INPUT};color:{Theme.TEXT};"
+            f"border:1px solid {Theme.BORDER};border-radius:3px;"
+            f"padding:2px;outline:none}}"
+            f"QListWidget::item{{padding:4px 6px;border-radius:2px}}"
+            f"QListWidget::item:selected{{background:#3a3f50}}")
+        lst.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        lay.addWidget(lst)
+
+        if not entries:
+            item = QListWidgetItem(
+                "(no more symbols — add via Contracts tab)")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            lst.addItem(item)
+        else:
+            for label, sym in entries:
+                item = QListWidgetItem(label)
+                item.setData(Qt.ItemDataRole.UserRole, sym)
+                lst.addItem(item)
+            lst.setCurrentRow(0)
+
+        def _apply_filter(text: str) -> None:
+            q = text.strip().lower()
+            first_visible = -1
+            for i in range(lst.count()):
+                it = lst.item(i)
+                if it.data(Qt.ItemDataRole.UserRole) is None:
+                    continue
+                visible = (not q) or (q in it.text().lower())
+                it.setHidden(not visible)
+                if visible and first_visible < 0:
+                    first_visible = i
+            if first_visible >= 0:
+                lst.setCurrentRow(first_visible)
+
+        def _commit_current() -> None:
+            it = lst.currentItem()
+            if it is None or it.isHidden():
+                return
+            sym = it.data(Qt.ItemDataRole.UserRole)
+            if not sym:
+                return
+            dlg.close()
+            self._add_symbol(sym)
+
+        def _step(delta: int) -> None:
+            n = lst.count()
+            if n == 0:
+                return
+            row = lst.currentRow()
+            for _ in range(n):
+                row = (row + delta) % n
+                it = lst.item(row)
+                if it is not None and not it.isHidden() \
+                        and it.data(Qt.ItemDataRole.UserRole):
+                    lst.setCurrentRow(row)
+                    return
+
+        search.textChanged.connect(_apply_filter)
+        search.returnPressed.connect(_commit_current)
+        lst.itemDoubleClicked.connect(lambda _it: _commit_current())
+
+        def _key(event) -> None:
+            if event.key() == Qt.Key.Key_Down:
+                _step(+1)
+                event.accept()
+                return
+            if event.key() == Qt.Key.Key_Up:
+                _step(-1)
+                event.accept()
+                return
+            QLineEdit.keyPressEvent(search, event)
+        search.keyPressEvent = _key  # type: ignore[method-assign]
+
+        # Anchor below the ticker's "+" button.
+        btn = self._ticker._btn_add      # noqa: SLF001 — private-ish, single-caller
+        pos = btn.mapToGlobal(btn.rect().bottomLeft())
+        dlg.move(pos)
+        dlg.show()
+        search.setFocus()
+
+    def _add_symbol(self, sym: str) -> None:
+        sym = (sym or "").strip().upper()
+        if not sym or sym in {s.upper() for s in self._symbols}:
+            return
+        self._symbols.append(sym)
+        config_manager.save_order_entry_symbols(self._symbols)
+        self._chip_bar.set_symbols(
+            [(s, _sec_type_for(s)) for s in self._symbols])
+        # Auto-activate the newly added symbol.
+        self._on_symbol_selected(sym, _sec_type_for(sym))
+
+    # ── Cleanup ───────────────────────────────────────────────────────────────
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        try:
+            if self._bg_worker is not None and self._active_symbol:
+                self._bg_worker.unsubscribe_depth(self._active_symbol)
         except Exception:
             pass
-
-    def _on_buy_mkt(self) -> None:
-        if not self._symbol:
-            return
-        qty = self._qty_spin.value()
-        self.order_requested.emit({
-            "action": "BUY", "quantity": qty,
-            "price": 0.0, "order_type": "MKT",
-            "symbol": self._symbol,
-        })
-        log.info("BookTrader BUY MKT %d %s", qty, self._symbol)
-
-    def _on_sell_mkt(self) -> None:
-        if not self._symbol:
-            return
-        qty = self._qty_spin.value()
-        self.order_requested.emit({
-            "action": "SELL", "quantity": qty,
-            "price": 0.0, "order_type": "MKT",
-            "symbol": self._symbol,
-        })
-        log.info("BookTrader SELL MKT %d %s", qty, self._symbol)
-
-    # -- ladder click -> limit order -------------------------------------------
-
-    def _on_cell_click(self, index: QModelIndex) -> None:
-        col = index.column()
-        price = self._model.price_at(index.row())
-        if price is None:
-            return
-        qty = self._qty_spin.value()
-        if col in (COL_BID_SZ, COL_BID_ORD):
-            self.order_requested.emit({
-                "action": "BUY", "quantity": qty,
-                "price": float(price), "order_type": "LMT",
-                "symbol": self._symbol,
-            })
-            log.info("BookTrader BUY LMT %d @ %s", qty, price)
-        elif col in (COL_ASK_SZ, COL_ASK_ORD):
-            self.order_requested.emit({
-                "action": "SELL", "quantity": qty,
-                "price": float(price), "order_type": "LMT",
-                "symbol": self._symbol,
-            })
-            log.info("BookTrader SELL LMT %d @ %s", qty, price)
-
-    def _scroll_to_last(self) -> None:
-        row = self._model.row_of(self._model._last)
-        if row >= 0:
-            idx = self._model.index(row, COL_PRICE)
-            self._table.scrollTo(
-                idx, QAbstractItemView.ScrollHint.PositionAtCenter)
-
-    # -- public live-data API --------------------------------------------------
-
-    def feed_depth(self, bids, asks) -> None:
-        self._model.feed_depth(bids, asks)
-        bb = max(bids, default=0)
-        ba = min(asks, default=0)
-        self._update_info_bar(
-            float(self._model._last), bb, bids.get(bb, 0), ba, asks.get(ba, 0))
-
-    def feed_last(self, price: float, size: int = 0) -> None:
-        self._model.feed_last(price, size)
-        self._lbl_last.setText(f"Last: {price:,.2f}")
-        if self._auto_centre:
-            self._scroll_to_last()
-
-    def feed_orders(self, bid_ords, ask_ords) -> None:
-        self._model.feed_orders(bid_ords, ask_ords)
-
-    # -- helpers ---------------------------------------------------------------
-
-    def _update_info_bar(self, last, bid, bid_sz, ask, ask_sz) -> None:
-        spread = ask - bid if ask and bid else 0
-        self._lbl_last.setText(f"Last: {last:,.2f}")
-        self._lbl_bid.setText(f"Bid: {bid:,.2f} [{bid_sz}]")
-        self._lbl_ask.setText(f"Ask: {ask:,.2f} [{ask_sz}]")
-        self._lbl_spread.setText(f"Spread: {spread:.2f}")
-        self._info_lbl.setText(
-            f"{self._symbol}  {last:,.2f}" if self._symbol else "No contract")
-
-    def paintEvent(self, event) -> None:
-        p = QPainter(self)
-        p.fillRect(self.rect(), QColor(BG_MAIN))
-        p.end()
+        super().closeEvent(event)
