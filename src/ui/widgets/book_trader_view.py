@@ -880,6 +880,11 @@ class BookTraderView(QWidget):
                     self.on_market_data_failed)
             except (RuntimeError, TypeError):
                 pass
+            try:
+                current.connection_status_changed.disconnect(
+                    self._on_bg_worker_status)
+            except (RuntimeError, TypeError):
+                pass
         self._bg_worker = None
         candidates = list(self._active_threads.items())
         log.info(
@@ -900,6 +905,8 @@ class BookTraderView(QWidget):
                     worker.bg_sizes_updated.connect(self.feed_sizes)
                     worker.market_data_failed.connect(
                         self.on_market_data_failed)
+                    worker.connection_status_changed.connect(
+                        self._on_bg_worker_status)
                     log.info(
                         "BookTrader: wired signals on thread %s "
                         "(active_symbol=%s)",
@@ -912,6 +919,20 @@ class BookTraderView(QWidget):
         log.warning(
             "BookTrader: no connected worker available — market data "
             "will not flow until a worker comes online")
+
+    def _on_bg_worker_status(self, label: str, is_connected: bool) -> None:
+        # On (re)connect the worker wipes ``_depth_tickers`` (ib_worker.py
+        # reconnect path), so our L2 stream is dead even though the Qt
+        # signal wiring survived.  Re-subscribe the active symbol — the
+        # worker's ``subscribe_depth`` is idempotent and thread-safe.
+        if not is_connected or not self._active_symbol:
+            return
+        if self._bg_worker is None:
+            return
+        log.info(
+            "BookTrader: worker %s reconnected — re-subscribing depth "
+            "for %s", label, self._active_symbol)
+        self._bg_worker.subscribe_depth(self._active_symbol)
 
     # ── Add-symbol popup (searchable) ────────────────────────────────────────
 

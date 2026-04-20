@@ -384,13 +384,13 @@ class DOMLadderDelegate(QStyledItemDelegate):
     price cell with above/below-last colouring plus a last-row highlight
     and tick-direction glyph."""
 
-    _ROW_H = 22
-    _NUMERIC_FONT = QFont("Menlo, Consolas, monospace", 11)
-    _PRICE_FONT = QFont("Menlo, Consolas, monospace", 11)
+    _ROW_H = 16
+    _NUMERIC_FONT = QFont("Menlo, Consolas, monospace", 9)
+    _PRICE_FONT = QFont("Menlo, Consolas, monospace", 9)
     _PRICE_FONT.setWeight(QFont.Weight.Bold)
-    _LAST_ARROW_FONT = QFont("Helvetica Neue, Arial", 11)
+    _LAST_ARROW_FONT = QFont("Helvetica Neue, Arial", 9)
     _LAST_ARROW_FONT.setWeight(QFont.Weight.Bold)
-    _TRADE_STRIPE_FONT = QFont("Helvetica Neue, Arial", 10)
+    _TRADE_STRIPE_FONT = QFont("Helvetica Neue, Arial", 9)
     _TRADE_STRIPE_FONT.setWeight(QFont.Weight.Bold)
 
     def paint(self, painter: QPainter, option, index) -> None:
@@ -630,7 +630,7 @@ class DOMLadderView(QTableView):
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.horizontalHeader().hide()
         self.verticalHeader().hide()
-        self.verticalHeader().setDefaultSectionSize(22)
+        self.verticalHeader().setDefaultSectionSize(DOMLadderDelegate._ROW_H)
         self.setShowGrid(False)
         self.setStyleSheet(
             f"QTableView{{background:{Theme.BG_PANEL};"
