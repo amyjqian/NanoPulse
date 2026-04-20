@@ -11,6 +11,7 @@ from src.ui.widgets.dom_ladder import (
     DOMLadderModel,
     AboveLastRole,
     IsLastRole,
+    LastTradeSizeRole,
     MaxSizeRole,
     PriceRole,
     SizeRole,
@@ -146,3 +147,52 @@ class TestDisplayFormatting:
         m.recenter(26700.0)
         idx = m.index(m.prices.index(26700.0), COL_PRICE)
         assert m.data(idx) == "26,700.00"
+
+
+class TestFeedLastTrade:
+    """TWS-style {size} @ {price} stripe support — drives LastTradeSizeRole."""
+
+    def test_feed_last_trade_marks_matching_row(self, qapp):
+        m = DOMLadderModel(rows_each_side=5, tick_size=0.01)
+        m.recenter(199.76)
+        m.feed_last_trade(199.76, 104)
+        idx = m.index(m.prices.index(199.76), COL_PRICE)
+        assert m.data(idx, LastTradeSizeRole) == 104.0
+        # Other rows report 0 — stripe is painted only on the matching row.
+        other = m.index(m.prices.index(199.77), COL_PRICE)
+        assert m.data(other, LastTradeSizeRole) == 0.0
+
+    def test_feed_last_trade_only_on_price_column(self, qapp):
+        m = DOMLadderModel(rows_each_side=3, tick_size=0.01)
+        m.recenter(199.76)
+        m.feed_last_trade(199.76, 50)
+        bid_idx = m.index(m.prices.index(199.76), COL_BID_SZ)
+        ask_idx = m.index(m.prices.index(199.76), COL_ASK_SZ)
+        assert m.data(bid_idx, LastTradeSizeRole) == 0.0
+        assert m.data(ask_idx, LastTradeSizeRole) == 0.0
+
+    def test_feed_last_trade_moves_to_new_row(self, qapp):
+        m = DOMLadderModel(rows_each_side=5, tick_size=0.01)
+        m.recenter(199.76)
+        m.feed_last_trade(199.76, 100)
+        m.feed_last_trade(199.77, 200)
+        old = m.index(m.prices.index(199.76), COL_PRICE)
+        new = m.index(m.prices.index(199.77), COL_PRICE)
+        assert m.data(old, LastTradeSizeRole) == 0.0
+        assert m.data(new, LastTradeSizeRole) == 200.0
+
+    def test_feed_last_trade_snaps_off_grid_price(self, qapp):
+        m = DOMLadderModel(rows_each_side=5, tick_size=0.01)
+        m.recenter(199.76)
+        m.feed_last_trade(199.763, 75)      # mid-tick → snaps to 199.76
+        idx = m.index(m.prices.index(199.76), COL_PRICE)
+        assert m.data(idx, LastTradeSizeRole) == 75.0
+
+    def test_non_positive_inputs_ignored(self, qapp):
+        m = DOMLadderModel(rows_each_side=3, tick_size=0.01)
+        m.recenter(199.76)
+        m.feed_last_trade(199.76, 0)        # zero size
+        m.feed_last_trade(0, 50)            # zero price
+        m.feed_last_trade(-1, 50)           # negative price
+        idx = m.index(m.prices.index(199.76), COL_PRICE)
+        assert m.data(idx, LastTradeSizeRole) == 0.0

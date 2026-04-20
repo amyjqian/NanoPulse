@@ -167,6 +167,12 @@ class IBWorkerThread(QThread):
     # prior-session close used by the order-entry ticker strip to compute
     # day change / %change; 0.0 when unavailable.
     bg_price_updated = Signal(str, float, float, float, float)
+    # (symbol, bid_size, ask_size, last_size) – top-of-book sizes emitted
+    # in lockstep with ``bg_price_updated``.  Surfaced for the Book Trader
+    # L1-fallback ladder (single-level book when the account has no L2
+    # entitlement) and the TWS-style "{size} @ {price}" last-trade stripe.
+    # Zero when TWS has no value (NaN / DBL_MAX sentinels are scrubbed).
+    bg_sizes_updated = Signal(str, float, float, float)
     # (symbol, bids, asks) – depth-of-market snapshot for the Book Trader.
     # bids / asks are list[tuple[price: float, size: float]], freshly
     # copied out of the ib_async Ticker so the UI thread doesn't see the
@@ -2727,6 +2733,24 @@ class IBWorkerThread(QThread):
                                          and close > 0) else 0.0
 
             self.bg_price_updated.emit(sym, last, bid_out, ask_out, close_out)
+
+            # ── Sizes (for Book Trader L1-fallback + last-trade stripe) ─
+            def _sz(val):
+                if val is None:
+                    return 0.0
+                try:
+                    v = float(val)
+                except (TypeError, ValueError):
+                    return 0.0
+                if math.isnan(v) or v < 0 or v >= _IB_DBL_MAX:
+                    return 0.0
+                return v
+            self.bg_sizes_updated.emit(
+                sym,
+                _sz(getattr(ticker, "bidSize", 0.0)),
+                _sz(getattr(ticker, "askSize", 0.0)),
+                _sz(getattr(ticker, "lastSize", 0.0)),
+            )
         except Exception:
             log.debug("Worker %s: bg price emit error for %s",
                       self._label, sym)

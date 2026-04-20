@@ -146,6 +146,26 @@ class BookTraderView(QWidget):
         self._active_qty: int = (
             _FUT_DEFAULT if self._active_sec_type == "FUT" else _STK_DEFAULT)
         self._last_price: float = 0.0
+        # L1 fallback state — set False when TWS rejects the depth
+        # subscription (no L2 entitlement, code 10090/10167).  While
+        # False, we render a single-level "book" synthesised from
+        # bg_price_updated + bg_sizes_updated, mirroring what TWS does
+        # for stocks without the L2 booster.  Reset to True on every
+        # symbol switch so a new symbol gets a fresh depth attempt.
+        self._l2_ok: bool = True
+        # Flipped True on the first non-empty ``feed_depth`` — used to
+        # drive L1 warmup rendering.  While False (no L2 has been seen
+        # yet for the active symbol) we synthesise the ladder from L1
+        # data so the user sees bid/ask immediately.  Covers the case
+        # where TWS silently accepts the depth sub but sends no ticks
+        # (common on paper accounts / no-entitlement stocks), which
+        # never triggers ``market_data_failed``.
+        self._l2_seen: bool = False
+        self._last_bid: float = 0.0
+        self._last_ask: float = 0.0
+        self._last_bid_size: float = 0.0
+        self._last_ask_size: float = 0.0
+        self._last_trade_size: float = 0.0
         self._bg_worker = None   # single worker for L2 subscription
         # Live open orders across every connected worker, keyed by
         # order_id.  Used to render order-badges on the ladder for the
@@ -380,6 +400,10 @@ class BookTraderView(QWidget):
             for section in (self._pt_section, self._sl_section,
                             self._tr_section):
                 section.set_market_price(float(last), tick)
+        if bid and bid > 0:
+            self._last_bid = float(bid)
+        if ask and ask > 0:
+            self._last_ask = float(ask)
         self._ticker.update_price(last, bid, ask, close)
         if first_tick:
             self._model.recenter(float(last))
@@ -389,6 +413,12 @@ class BookTraderView(QWidget):
             # in the viewport as the market moves.  When unlocked this
             # is a no-op — user's scroll position is preserved.
             self._ladder.sync_to_last()
+        # While in L1-fallback mode (no L2 entitlement) OR before the
+        # first real L2 snapshot has arrived, reconstruct the ladder
+        # from L1 bid/ask so the user sees quotes immediately.  Once
+        # ``_l2_seen`` flips True the real depth takes over.
+        if not self._l2_ok or not self._l2_seen:
+            self._render_l1_depth()
 
     def feed_depth(
         self,
@@ -399,11 +429,72 @@ class BookTraderView(QWidget):
         """Receive a depth snapshot.  Gated on active symbol."""
         if not self._active_symbol or symbol.upper() != self._active_symbol.upper():
             return
-        if not self._model._bid and not self._model._ask and (bids or asks):
+        has_data = bool(bids or asks)
+        # Empty snapshots before the first real L2 frame would wipe the
+        # L1 warmup render (``_l2_seen`` is still False, user would see
+        # the bid/ask flash on then disappear).  Ignore them — they
+        # happen when the worker marks the depth ticker dirty on any
+        # tick touch, not just real L2 updates.
+        if not has_data and not self._l2_seen:
+            return
+        if not self._model._bid and not self._model._ask and has_data:
             log.info("BookTrader: first depth snapshot for %s — "
                      "%d bid levels, %d ask levels",
                      symbol, len(bids or []), len(asks or []))
+        if has_data:
+            # Real L2 data has arrived — stop the L1 warmup render so
+            # the ladder shows true depth going forward.
+            self._l2_seen = True
         self._model.feed_depth(bids or [], asks or [])
+
+    def feed_sizes(
+        self,
+        symbol: str,
+        bid_size: float,
+        ask_size: float,
+        last_size: float,
+    ) -> None:
+        """Receive a size-tick.  Caches the three sizes, feeds the
+        last-trade stripe on every positive ``last_size``, and when the
+        active symbol has no L2 entitlement synthesises a single-level
+        depth snapshot from L1 bid/ask + these sizes (the TWS "no-L2"
+        look)."""
+        if not self._active_symbol or symbol.upper() != self._active_symbol.upper():
+            return
+        if bid_size > 0:
+            self._last_bid_size = float(bid_size)
+        if ask_size > 0:
+            self._last_ask_size = float(ask_size)
+        if last_size > 0 and self._last_price > 0:
+            self._last_trade_size = float(last_size)
+            self._model.feed_last_trade(self._last_price, float(last_size))
+        if not self._l2_ok or not self._l2_seen:
+            self._render_l1_depth()
+
+    def on_market_data_failed(self, symbol: str) -> None:
+        """TWS rejected a market-data request for *symbol*.  When the
+        rejection matches the active symbol we flip into L1-fallback
+        rendering and draw what we can from bg_price_updated +
+        bg_sizes_updated alone."""
+        if self._active_symbol and symbol.upper() == self._active_symbol.upper():
+            if self._l2_ok:
+                log.info("BookTrader: L2 unavailable for %s — falling "
+                         "back to L1 ladder", symbol)
+            self._l2_ok = False
+            self._render_l1_depth()
+
+    def _render_l1_depth(self) -> None:
+        """Synthesise a single-level depth snapshot from cached L1
+        bid/ask + sizes.  Called whenever we're in L1-fallback mode and
+        new price or size data arrives.  Empty sides are fine — the
+        model paints nothing for a zero-row book."""
+        bids: list[tuple[float, float]] = []
+        asks: list[tuple[float, float]] = []
+        if self._last_bid > 0 and self._last_bid_size > 0:
+            bids.append((self._last_bid, self._last_bid_size))
+        if self._last_ask > 0 and self._last_ask_size > 0:
+            asks.append((self._last_ask, self._last_ask_size))
+        self._model.feed_depth(bids, asks)
 
     def _on_order_status(self, data: dict) -> None:
         """Track every worker's order status updates so we can render
@@ -504,6 +595,16 @@ class BookTraderView(QWidget):
         # New symbol → reset last price and ladder centre; real data
         # will arrive on the next tick.
         self._last_price = 0.0
+        # New symbol gets a fresh L2 attempt — if it turns out not to
+        # have depth entitlement, ``on_market_data_failed`` will flip
+        # this back to False and the ladder falls back to L1 rendering.
+        self._l2_ok = True
+        self._l2_seen = False
+        self._last_bid = 0.0
+        self._last_ask = 0.0
+        self._last_bid_size = 0.0
+        self._last_ask_size = 0.0
+        self._last_trade_size = 0.0
         self._model.set_tick_size(_tick_size_for_contract(
             self._active_contract_cached()))
         self._model.recenter(0.0)
@@ -770,6 +871,15 @@ class BookTraderView(QWidget):
                 current.depth_updated.disconnect(self.feed_depth)
             except (RuntimeError, TypeError):
                 pass
+            try:
+                current.bg_sizes_updated.disconnect(self.feed_sizes)
+            except (RuntimeError, TypeError, AttributeError):
+                pass
+            try:
+                current.market_data_failed.disconnect(
+                    self.on_market_data_failed)
+            except (RuntimeError, TypeError):
+                pass
         self._bg_worker = None
         candidates = list(self._active_threads.items())
         log.info(
@@ -787,6 +897,9 @@ class BookTraderView(QWidget):
                     self._bg_worker = worker
                     worker.bg_price_updated.connect(self.feed_price)
                     worker.depth_updated.connect(self.feed_depth)
+                    worker.bg_sizes_updated.connect(self.feed_sizes)
+                    worker.market_data_failed.connect(
+                        self.on_market_data_failed)
                     log.info(
                         "BookTrader: wired signals on thread %s "
                         "(active_symbol=%s)",

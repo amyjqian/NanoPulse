@@ -66,6 +66,12 @@ AboveLastRole = Qt.ItemDataRole.UserRole + 6   # bool — price > last
 OrdersRole = Qt.ItemDataRole.UserRole + 7      # list[dict]: open orders at
                                                # this price (dicts carry
                                                # action/qty/type keys)
+LastTradeSizeRole = Qt.ItemDataRole.UserRole + 8   # float — size of the most
+                                                   # recent print when its
+                                                   # price matches this row,
+                                                   # 0 elsewhere.  Drives the
+                                                   # TWS-style "{size} @ {price}"
+                                                   # stripe in the delegate.
 
 
 # ── Colours (blended with Theme) ──────────────────────────────────────────────
@@ -78,6 +84,9 @@ _ASK_BAR_ALPHA = 70
 # price + arrow glyph on top.
 _LAST_ROW_BG = QColor("#242834")
 _LAST_ROW_EDGE = QColor("#2F3547")
+# TWS-style muted blue for the last-trade stripe.  Slightly lighter than
+# _LAST_ROW_BG so the band reads as a distinct, temporary highlight.
+_LAST_TRADE_STRIPE = QColor("#2a4d6d")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -116,6 +125,10 @@ class DOMLadderModel(QAbstractTableModel):
         # form {"action": "BUY"/"SELL", "qty": int, "type": str}.  Fed
         # by BookTraderView via ``set_orders``.
         self._orders: dict[float, list[dict]] = {}
+        # Most recent print — drives the TWS-style last-trade stripe on
+        # the PRICE column.  Zero means "no stripe".
+        self._last_trade_price: float = 0.0
+        self._last_trade_size: float = 0.0
         # Start with a zero-centred ladder so rowCount() > 0 before the
         # first market data tick (prevents a blank view during warmup).
         self._rebuild_prices(0.0)
@@ -159,6 +172,12 @@ class DOMLadderModel(QAbstractTableModel):
             return self._last_dir
         if role == OrdersRole:
             return self._orders.get(price, [])
+        if role == LastTradeSizeRole:
+            if (col == COL_PRICE and self._last_trade_size > 0
+                    and self._last_trade_price > 0
+                    and abs(price - self._last_trade_price) < self._tick / 2):
+                return float(self._last_trade_size)
+            return 0.0
         if role == Qt.ItemDataRole.DisplayRole:
             if col == COL_PRICE:
                 return f"{price:,.2f}"
@@ -274,6 +293,43 @@ class DOMLadderModel(QAbstractTableModel):
                 [IsLastRole, AboveLastRole, TickDirRole],
             )
 
+    def feed_last_trade(self, price: float, size: float) -> None:
+        """Record the most recent print.  The delegate paints a TWS-style
+        ``{size} @ {price}`` stripe on the PRICE cell of the matching
+        row; non-positive ``price`` or ``size`` is ignored."""
+        try:
+            price = float(price or 0.0)
+            size = float(size or 0.0)
+        except (TypeError, ValueError):
+            return
+        if price <= 0 or size <= 0:
+            return
+        tick = self._tick if self._tick > 0 else 0.01
+        snapped = round(round(price / tick) * tick, 10)
+        old_row = self._row_for_price(self._last_trade_price)
+        self._last_trade_price = snapped
+        self._last_trade_size = size
+        new_row = self._row_for_price(snapped)
+        for r in {old_row, new_row}:
+            if r is None:
+                continue
+            idx = self.index(r, COL_PRICE)
+            self.dataChanged.emit(
+                idx, idx,
+                [LastTradeSizeRole, Qt.ItemDataRole.DisplayRole],
+            )
+
+    def _row_for_price(self, price: float) -> int | None:
+        """Return the row index whose ladder price matches *price* within
+        half a tick, or ``None`` if not on the ladder."""
+        if price <= 0 or not self._prices:
+            return None
+        tol = self._tick / 2 if self._tick > 0 else 1e-9
+        for i, p in enumerate(self._prices):
+            if abs(p - price) < tol:
+                return i
+        return None
+
     def recenter(self, price: float) -> None:
         """Rebuild the ladder prices centred on *price*.  Wipes size
         dicts — caller should re-feed on the next depth tick."""
@@ -334,6 +390,8 @@ class DOMLadderDelegate(QStyledItemDelegate):
     _PRICE_FONT.setWeight(QFont.Weight.Bold)
     _LAST_ARROW_FONT = QFont("Helvetica Neue, Arial", 11)
     _LAST_ARROW_FONT.setWeight(QFont.Weight.Bold)
+    _TRADE_STRIPE_FONT = QFont("Helvetica Neue, Arial", 10)
+    _TRADE_STRIPE_FONT.setWeight(QFont.Weight.Bold)
 
     def paint(self, painter: QPainter, option, index) -> None:
         painter.save()
@@ -490,6 +548,24 @@ class DOMLadderDelegate(QStyledItemDelegate):
         text = index.data(Qt.ItemDataRole.DisplayRole) or ""
         if not text:
             return
+
+        # Last-trade stripe — when the most recent print snaps onto this
+        # row, paint a TWS-style "{size} @ {price}" band across the
+        # price cell (replacing the normal price label for this row).
+        trade_sz = float(index.data(LastTradeSizeRole) or 0.0)
+        if trade_sz > 0:
+            price_val = float(index.data(PriceRole) or 0.0)
+            painter.fillRect(rect, _LAST_TRADE_STRIPE)
+            painter.setFont(self._TRADE_STRIPE_FONT)
+            painter.setPen(QColor("#FFFFFF"))
+            painter.drawText(
+                rect,
+                int(Qt.AlignmentFlag.AlignVCenter
+                    | Qt.AlignmentFlag.AlignHCenter),
+                f"{int(trade_sz):,} @ {price_val:,.2f}",
+            )
+            return
+
         painter.setFont(self._PRICE_FONT)
         if is_last:
             # Last-price row: coloured green (prints the last-traded
