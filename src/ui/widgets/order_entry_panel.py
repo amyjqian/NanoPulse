@@ -956,6 +956,10 @@ class _TierSection(QWidget):
     """
 
     changed = Signal()
+    # Emitted when the user clicks the Take Profit / Stop Loss / Trail Stop
+    # header button.  Carries no args — the parent (OrderEntryPanel) knows
+    # which section it connected and queries get_value() for the offset.
+    submit_requested = Signal()
 
     _CHIP_H = 28
     _SS_SEL = (
@@ -1018,7 +1022,7 @@ class _TierSection(QWidget):
         # same initial width regardless of which title is shorter.
         _fm = QFontMetrics(self._dollar_lbl.font())
         self._dollar_lbl.setMinimumWidth(_fm.horizontalAdvance("Take Profit") + 24)
-        self._dollar_lbl.clicked.connect(self._on_header_clicked)
+        self._dollar_lbl.clicked.connect(self._on_header_submit)
         # Disabled until a chip is selected or a custom Dist is typed.
         self._dollar_lbl.setEnabled(False)
         hdr.addWidget(self._dollar_lbl)
@@ -1148,19 +1152,17 @@ class _TierSection(QWidget):
         self._update_dollar_display()
         self.changed.emit()
 
-    def _on_header_clicked(self) -> None:
-        """Clicking the Take Profit / Stop Loss header button clears the
-        chip selection and the custom Dist input so the section returns to
-        the 'nothing selected' state.
+    def _on_header_submit(self) -> None:
+        """Clicking the Take Profit / Stop Loss / Trail Stop header button
+        fires the section's submit_requested signal so OrderEntryPanel can
+        route it as a close-the-position order.  If no tier is selected
+        (nothing to act on) the click is a no-op — the button is also
+        disabled in that state via _update_dollar_display, so this branch
+        is defensive.
         """
-        self._selected_idx = None
-        if self._input is not None:
-            self._input.blockSignals(True)
-            self._input.clear()
-            self._input.blockSignals(False)
-        self._update_chip_styles()
-        self._update_dollar_display()
-        self.changed.emit()
+        if self.get_value() is None:
+            return
+        self.submit_requested.emit()
 
     def _on_chip_clicked(self, idx: int) -> None:
         if self._toggle and not self._toggle.is_on:
@@ -1291,6 +1293,16 @@ class OrderEntryPanel(QWidget):
     # Emitted when user clicks a partial-close button (25% / 50% / 75%):
     #   (symbol: str, pct: int) – close *pct* percent of the position.
     close_pct_requested = Signal(str, int)
+
+    # Emitted when user clicks the Take Profit / Stop Loss header button.
+    # Payload:
+    #   {"side": "tp"|"sl", "symbol": str, "qty": int,
+    #    "offset_pts": float, "last_price": float}
+    # The consumer (FlashTradeView) queries each checked account for the
+    # current position, sizes the order to min(|pos|, qty), computes the
+    # target price from last_price ± offset, and submits a LMT (tp) or
+    # STP/STP LMT (sl) exit order.  No-op for zero-position accounts.
+    close_tier_requested = Signal(dict)
 
     def __init__(self, active_threads: dict | None = None, parent=None):
         super().__init__(parent)
@@ -1540,15 +1552,21 @@ class OrderEntryPanel(QWidget):
         self._pt_section = _TierSection(
             "Take Profit", pt_tiers, enabled=False,
             label_color=Theme.CLR_BUY)
+        self._pt_section.submit_requested.connect(
+            lambda: self._on_tier_submit("tp"))
         root.addWidget(self._pt_section)
 
         # ── Stop Loss ─────────────────────────────────────────────────────────
         self._sl_section = _TierSection(
             "Stop Loss", sl_tiers, enabled=False,
             label_color=Theme.CLR_SELL)
+        self._sl_section.submit_requested.connect(
+            lambda: self._on_tier_submit("sl"))
         root.addWidget(self._sl_section)
 
         # ── Trailing ──────────────────────────────────────────────────────────
+        # Per product decision: Trail Stop header button is not wired to
+        # close-the-position (yet).  The section still resets via toggle-off.
         self._tr_section = _TierSection(
             "Trail Stop", tr_tiers, enabled=False,
             label_color=Theme.CLR_FLATTEN)
@@ -1592,6 +1610,53 @@ class OrderEntryPanel(QWidget):
         else:
             log.warning(
                 "OrderEntryPanel: Close %d%% clicked but no active symbol", pct)
+
+    def _on_tier_submit(self, side: str) -> None:
+        """Take Profit / Stop Loss header button clicked → emit
+        ``close_tier_requested`` with the active symbol, selected tier
+        offset, last price and user's qty.  FlashTradeView fans this out
+        to each checked account, reads the live position there, and
+        submits a LMT (tp) or STP/STP LMT (sl) exit order sized to
+        min(|position|, qty).  No-op for zero-position accounts.
+        """
+        sym = self._active_symbol
+        if not sym:
+            log.warning(
+                "OrderEntryPanel: %s header clicked but no active symbol",
+                side.upper())
+            return
+
+        section = self._pt_section if side == "tp" else self._sl_section
+        tier = section.get_value()
+        if tier is None:
+            # Button is disabled in this state; defensive no-op.
+            return
+
+        # Offset lives in tier["value"]; unit "price" means points directly,
+        # "ticks" means multiply by the contract's tick size.  The chip
+        # loaders tag tier dicts with unit="price" by default, so for
+        # typical usage this is just tier["value"].
+        raw_val = float(tier.get("value", 0.0))
+        unit = tier.get("unit", "price")
+        if unit == "ticks":
+            tick = self._tick_size_for_symbol(sym)
+            offset_pts = raw_val * (tick if tick > 0 else 0.01)
+        else:
+            offset_pts = raw_val
+
+        if offset_pts <= 0:
+            log.warning(
+                "OrderEntryPanel: %s submit ignored — non-positive "
+                "offset %.4f", side.upper(), offset_pts)
+            return
+
+        self.close_tier_requested.emit({
+            "side":       side,
+            "symbol":     sym,
+            "qty":        int(self._active_qty),
+            "offset_pts": offset_pts,
+            "last_price": float(self._last_price),
+        })
 
     def _refresh_combo_items(self) -> None:
         """Populate the combo dropdown with saved contracts not already added."""

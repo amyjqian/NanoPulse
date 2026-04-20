@@ -569,6 +569,31 @@ class IBWorkerThread(QThread):
         else:
             log.warning("Worker %s: reverse but loop not ready", self._label)
 
+    def close_tier(self, symbol: str, account: str, side: str,
+                   offset_pts: float, requested_qty: int,
+                   current_price: float, cap_offset: float = 0.0) -> None:
+        """Thread-safe: close the current position on *symbol*/*account*
+        using a single LMT (tp) or STP/STP LMT (sl) exit order.
+
+        * side       : "tp" (Limit at profit price) or "sl" (Stop).
+        * offset_pts : price-point distance from *current_price* for the
+                       exit price.
+        * requested_qty : user's configured qty; the order is sized to
+                          min(|position|, requested_qty).
+        * current_price : reference price (UI's last_price snapshot).
+        * cap_offset  : if >0 and side=="sl", uses STP LMT with the limit
+                        sitting cap_offset further into the loss zone than
+                        the stop trigger.
+        """
+        if self._loop is not None and not self._loop.is_closed():
+            asyncio.run_coroutine_threadsafe(
+                self._do_close_tier(symbol, account, side, offset_pts,
+                                    requested_qty, current_price,
+                                    cap_offset), self._loop)
+        else:
+            log.warning(
+                "Worker %s: close_tier but loop not ready", self._label)
+
     def close_pct(self, symbol: str, account: str, pct: int) -> None:
         """Thread-safe: close *pct* percent (25/50/75) of the position for
         *symbol*/*account* with an offsetting MKT order.  No open orders are
@@ -1851,6 +1876,215 @@ class IBWorkerThread(QThread):
                 "action":  action,
                 "qty":     qty,
             })
+
+    async def _do_close_tier(self, symbol: str, account: str, side: str,
+                             offset_pts: float, requested_qty: int,
+                             current_price: float,
+                             cap_offset: float) -> None:
+        """Read the position for *symbol*/*account* and submit a single
+        LMT (tp) / STP / STP LMT (sl) exit order.
+
+        Sizing: ``qty = min(|position|, requested_qty)``.  A zero-position
+        account is silently skipped so we never submit an empty order.
+        No open orders are cancelled — this is strictly additive.
+
+        TP price:
+          long  (pos>0): target = current + offset   (sell above current)
+          short (pos<0): target = current - offset   (buy below current)
+
+        SL trigger (auxPrice — "the stop price" TWS displays):
+          long  (pos>0): stop   = current - offset   (sell below current)
+          short (pos<0): stop   = current + offset
+        And when ``cap_offset > 0`` the limit sits that far further
+        into the loss zone from the stop, giving the post-trigger limit
+        a small execution window.
+        """
+        if self._ib is None or not self._ib.isConnected():
+            return
+        if side not in ("tp", "sl") or offset_pts <= 0 or current_price <= 0:
+            order_log.warning(
+                "[%s] ORDER-CLOSE-TIER  invalid args side=%s offset=%.4f "
+                "ref=%.4f — skipping", self._label, side, offset_pts,
+                current_price)
+            return
+
+        from ib_async import LimitOrder, StopOrder, StopLimitOrder
+
+        symbol_upper = symbol.upper()
+        try:
+            positions = self._ib.positions()
+        except Exception:
+            log.warning(
+                "Worker %s: close_tier could not read positions", self._label)
+            return
+
+        for pos in positions:
+            if getattr(pos, "account", "") != account:
+                continue
+            contract = pos.contract
+            if not _symbol_matches(contract, symbol_upper):
+                continue
+
+            net_pos = float(getattr(pos, "position", 0))
+            if net_pos == 0:
+                continue
+
+            abs_pos = abs(int(net_pos))
+            req = max(0, int(requested_qty))
+            qty = min(abs_pos, req) if req > 0 else abs_pos
+            if qty <= 0:
+                continue
+
+            is_long = net_pos > 0
+            exit_action = "SELL" if is_long else "BUY"
+            sign = 1 if is_long else -1
+
+            sec_type = getattr(contract, "secType", "") or ""
+            tick = self._tick_size_for_contract(contract)
+
+            # ib.positions() returns contracts without `exchange` populated
+            # (among other routing fields), which causes placeOrder to fail
+            # with Warning 321 "Missing order exchange".  The exchange lives
+            # in the local Contracts table already — look it up in memory
+            # via ReferenceData instead of doing a round-trip to TWS.
+            if not getattr(contract, "exchange", ""):
+                from src.core.reference_data import get_instance as _rd
+                cached = _rd().get_contract(symbol_upper)
+                if cached and cached.get("exchange"):
+                    contract.exchange = cached["exchange"]
+                else:
+                    order_log.warning(
+                        "[%s] ORDER-CLOSE-TIER  no exchange for %s in "
+                        "local contracts — IBKR will reject the order",
+                        self._label, symbol)
+
+            if side == "tp":
+                # Profit direction: long → up, short → down.
+                target = _round_to_tick(
+                    current_price + sign * offset_pts, tick)
+                if target <= 0:
+                    order_log.warning(
+                        "[%s] ORDER-CLOSE-TIER TP-SKIP  non-positive target "
+                        "%.4f (ref=%.4f offset=%.4f)",
+                        self._label, target, current_price, offset_pts)
+                    continue
+                order = LimitOrder(exit_action, qty, target)
+                tp_desc = f"LMT @ {target:.4f}"
+            else:  # side == "sl"
+                # Loss direction: long → down, short → up.
+                stop_px = _round_to_tick(
+                    current_price - sign * offset_pts, tick)
+                if stop_px <= 0:
+                    order_log.warning(
+                        "[%s] ORDER-CLOSE-TIER SL-SKIP  non-positive stop "
+                        "%.4f (ref=%.4f offset=%.4f)",
+                        self._label, stop_px, current_price, offset_pts)
+                    continue
+                if cap_offset > 0:
+                    lmt_px = _round_to_tick(
+                        stop_px - sign * cap_offset, tick)
+                    if lmt_px <= 0:
+                        order_log.warning(
+                            "[%s] ORDER-CLOSE-TIER SL-SKIP  non-positive "
+                            "lmt %.4f (stop=%.4f cap=%.4f)",
+                            self._label, lmt_px, stop_px, cap_offset)
+                        continue
+                    order = StopLimitOrder(exit_action, qty, lmt_px, stop_px)
+                    tp_desc = f"STP LMT stop={stop_px:.4f} lmt={lmt_px:.4f}"
+                else:
+                    order = StopOrder(exit_action, qty, stop_px)
+                    tp_desc = f"STP @ {stop_px:.4f}"
+
+            order.account = account
+            order.tif = "DAY"
+            order.orderRef = _generate_order_ref()
+            # Mirror STK RTH handling used by the main place_order path so
+            # exit orders don't get rejected after hours.
+            if sec_type == "STK":
+                exch = getattr(contract, "exchange", "")
+                if exch == "IBEOS":
+                    order.advancedErrorOverride = "10329"
+                else:
+                    now_et = datetime.now(_ET)
+                    h, m = now_et.hour, now_et.minute
+                    in_rth = (h > 9 or (h == 9 and m >= 30)) and h < 16
+                    order.outsideRth = not in_rth
+                    order.allowPreOpen = False
+
+            order_log.info(
+                "[%s] ORDER-CLOSE-TIER  side=%s %s %s %d (pos=%+d, "
+                "req=%d) | account=%s orderRef=%s %s",
+                self._label, side.upper(), exit_action, symbol, qty,
+                int(net_pos), req, account, order.orderRef, tp_desc)
+
+            trade = self._ib.placeOrder(contract, order)
+            order_id = f"{account}_{order.orderRef}"
+            self._trades[order_id] = trade
+            self._has_status_handler.add(order_id)
+
+            tws_log.info(
+                "[%s] API-RESP  placeOrder(close-tier) → "
+                "orderId=%s orderRef=%s",
+                self._label, trade.order.orderId, order.orderRef)
+
+            status_params = {
+                "symbol":   symbol,
+                "account":  account,
+                "action":   exit_action,
+                "qty":      qty,
+                "conid":    int(getattr(contract, "conId", 0) or 0),
+                "sec_type": sec_type,
+                "order_type": order.orderType,
+            }
+            if side == "tp":
+                status_params["limit_price"] = target
+            elif cap_offset > 0:
+                status_params["stop_price"] = stop_px
+                status_params["limit_price"] = lmt_px
+            else:
+                status_params["stop_price"] = stop_px
+
+            init_status = trade.orderStatus.status or "Submitted"
+            self._emit_order_status(trade, order_id, status_params,
+                                    init_status)
+
+            frozen_oid = order_id
+            frozen_params = dict(status_params)
+
+            def _on_tier_status(t, _oid=frozen_oid, _p=frozen_params):
+                new_status = t.orderStatus.status
+                self._emit_order_status(t, _oid, _p, new_status)
+                order_log.info(
+                    "[%s] ORDER-STATUS  %s | status=%s filled=%s "
+                    "avgFill=%s symbol=%s account=%s orderRef=%s",
+                    self._label, _oid, new_status,
+                    t.orderStatus.filled, t.orderStatus.avgFillPrice,
+                    _p.get("symbol", "?"), _p.get("account", ""),
+                    getattr(t.order, "orderRef", ""))
+                if new_status in ("Filled", "Completed"):
+                    self._apply_fill_to_position(t, _p)
+
+            trade.statusEvent += _on_tier_status
+
+    def _tick_size_for_contract(self, contract) -> float:
+        """Best-effort minimum-tick lookup for a Contract object.
+
+        Uses ``minTick`` if TWS populated it, otherwise falls back to a
+        coarse secType-based default (FUT ⇒ 0.25, everything else ⇒ 0.01).
+        Centralised here so close_tier can round child prices to the grid
+        without needing the UI-side _tick_size_for_symbol helper.
+        """
+        for attr in ("minTick", "tick_size", "min_tick"):
+            val = getattr(contract, attr, None)
+            if val:
+                try:
+                    v = float(val)
+                    if v > 0:
+                        return v
+                except (TypeError, ValueError):
+                    pass
+        sec = getattr(contract, "secType", "") or ""
+        return 0.25 if sec == "FUT" else 0.01
 
     def _on_trade_status(self, trade, order_id: str, params: dict) -> None:
         """Callback fired by trade.statusEvent – runs in the worker's event loop.

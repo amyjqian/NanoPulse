@@ -330,8 +330,7 @@ class TestBracketChildren:
         }
         children = wt._build_bracket_children(_parent("BUY"), params,
                                               ref_price=26688.75, tick=0.25)
-        # Reproduce the worker's ch_params overlay so the assertion pins
-        # the actual per-child dict the blotter will see.
+
         def _overlay(ch):
             cp = dict(params)
             cp["order_type"] = ch.orderType
@@ -355,22 +354,16 @@ class TestBracketChildren:
                                   if c.orderType == "LMT"))
         sl_params = _overlay(next(c for c in children
                                   if c.orderType == "STP"))
-        # Parent's BUY must not leak onto the exit children.
         assert tp_params["action"] == "SELL"
         assert sl_params["action"] == "SELL"
-        # And child-specific prices should be populated.
         assert tp_params["limit_price"] == 26693.75
         assert "stop_price" not in tp_params
         assert sl_params["stop_price"] == 26673.75
         assert "limit_price" not in sl_params
 
     def test_chip_label_is_direct_points_offset(self):
-        """Tier chips (loaded via ReferenceData._extract_tiers or
-        _enrich_pref_tiers) carry unit='price' because the stored offset
-        is already in price points — the StrategyEditor computes
-        ``val = offset × multiplier`` which only makes sense if offset
-        is in points.  Chip label N therefore means "N points" for TP,
-        SL and Trail alike — no tick_size multiplication anywhere."""
+        """Chip label N means N points for TP, SL, and Trail alike —
+        no tick_size multiplication."""
         wt = _make_worker()
         tier = {"value": 5, "unit": "price", "label": "5"}
         params = {
@@ -379,8 +372,6 @@ class TestBracketChildren:
             "stop_loss":   tier,
             "trailing":    tier,
         }
-
-        # BUY parent at 26695.
         out = wt._build_bracket_children(_parent("BUY"), params,
                                          ref_price=26695.0, tick=0.25)
         tp = next(o for o in out if o.orderType == "LMT")
@@ -390,7 +381,6 @@ class TestBracketChildren:
         assert sl.auxPrice == 26690.00  # 26695 - 5
         assert tr.auxPrice == 5.00      # trailing distance = 5 pts
 
-        # SELL parent mirrors TP/SL; trail distance is directionless.
         out = wt._build_bracket_children(_parent("SELL"), params,
                                          ref_price=26695.0, tick=0.25)
         tp = next(o for o in out if o.orderType == "LMT")
@@ -399,3 +389,168 @@ class TestBracketChildren:
         assert tp.lmtPrice == 26690.00  # 26695 - 5
         assert sl.auxPrice == 26700.00  # 26695 + 5
         assert tr.auxPrice == 5.00
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  close_tier — Take Profit / Stop Loss header-button path
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import asyncio as _asyncio
+
+
+def _make_position(symbol: str, secType: str, conId: int,
+                   net_pos: float, account: str,
+                   *, minTick: float = 0.25):
+    contract = SimpleNamespace(
+        symbol=symbol, localSymbol=f"{symbol}M6",
+        secType=secType, exchange="CME", currency="USD",
+        conId=conId, minTick=minTick,
+    )
+    return SimpleNamespace(
+        contract=contract, position=net_pos, account=account,
+    )
+
+
+class _FakeIBForCloseTier:
+    def __init__(self, positions):
+        self._positions = positions
+        self.placed: list = []
+
+    def isConnected(self): return True
+    def positions(self): return self._positions
+
+    def placeOrder(self, contract, order):
+        self.placed.append((contract, order))
+        trade = SimpleNamespace(
+            contract=contract, order=order,
+            orderStatus=SimpleNamespace(
+                status="PendingSubmit", filled=0.0,
+                avgFillPrice=0.0, remaining=order.totalQuantity),
+            fills=[], log=[],
+        )
+
+        class _Event:
+            def __iadd__(self, h): return self
+        trade.statusEvent = _Event()
+        return trade
+
+
+def _make_close_tier_worker(positions):
+    wt = IBWorkerThread.__new__(IBWorkerThread)
+    wt._ib = _FakeIBForCloseTier(positions)
+    wt._label = "close-tier-test"
+    wt._trades = {}
+    wt._has_status_handler = set()
+    wt._order_times = {}
+    wt._order_error_messages = {}
+    wt._portfolio_cache = {}
+    wt._emit_order_status = lambda *a, **kw: None
+    return wt
+
+
+def _run(coro):
+    return _asyncio.get_event_loop().run_until_complete(coro) \
+        if False else _asyncio.run(coro)
+
+
+class TestCloseTier:
+    def test_tp_long_position_submits_sell_limit_above_ref(self):
+        pos = _make_position("MNQ", "FUT", 111, net_pos=3,
+                             account="DU1", minTick=0.25)
+        wt = _make_close_tier_worker([pos])
+        _run(wt._do_close_tier(
+            symbol="MNQ", account="DU1", side="tp",
+            offset_pts=10.0, requested_qty=5,
+            current_price=26697.0, cap_offset=0.0,
+        ))
+        assert len(wt._ib.placed) == 1
+        _, order = wt._ib.placed[0]
+        assert order.orderType == "LMT"
+        assert order.action == "SELL"
+        assert order.totalQuantity == 3     # min(|pos|=3, req=5)
+        assert order.lmtPrice == 26707.00   # 26697 + 10
+
+    def test_tp_long_caps_qty_at_position_size(self):
+        """If position is smaller than requested_qty, close only the pos."""
+        pos = _make_position("MNQ", "FUT", 111, net_pos=2, account="DU1")
+        wt = _make_close_tier_worker([pos])
+        _run(wt._do_close_tier("MNQ", "DU1", "tp", 10.0, 5, 26697.0, 0.0))
+        assert wt._ib.placed[0][1].totalQuantity == 2
+
+    def test_tp_long_uses_requested_qty_when_position_is_larger(self):
+        """Scale-out: if pos is bigger than req, close only req, leave rest."""
+        pos = _make_position("MNQ", "FUT", 111, net_pos=10, account="DU1")
+        wt = _make_close_tier_worker([pos])
+        _run(wt._do_close_tier("MNQ", "DU1", "tp", 10.0, 3, 26697.0, 0.0))
+        assert wt._ib.placed[0][1].totalQuantity == 3
+
+    def test_tp_short_position_submits_buy_limit_below_ref(self):
+        pos = _make_position("MNQ", "FUT", 111, net_pos=-4, account="DU1")
+        wt = _make_close_tier_worker([pos])
+        _run(wt._do_close_tier("MNQ", "DU1", "tp", 10.0, 10, 26697.0, 0.0))
+        _, order = wt._ib.placed[0]
+        assert order.action == "BUY"
+        assert order.totalQuantity == 4
+        assert order.lmtPrice == 26687.00   # 26697 - 10 (profit on short)
+
+    def test_sl_long_plain_stop_when_no_cap(self):
+        pos = _make_position("MNQ", "FUT", 111, net_pos=3, account="DU1")
+        wt = _make_close_tier_worker([pos])
+        _run(wt._do_close_tier("MNQ", "DU1", "sl", 10.0, 5, 26697.0, 0.0))
+        _, order = wt._ib.placed[0]
+        assert order.orderType == "STP"
+        assert order.action == "SELL"
+        assert order.auxPrice == 26687.00   # 26697 - 10
+
+    def test_sl_long_stop_limit_with_cap(self):
+        pos = _make_position("MNQ", "FUT", 111, net_pos=3, account="DU1")
+        wt = _make_close_tier_worker([pos])
+        _run(wt._do_close_tier("MNQ", "DU1", "sl", 10.0, 5, 26697.0, 1.0))
+        _, order = wt._ib.placed[0]
+        assert order.orderType == "STP LMT"
+        assert order.auxPrice == 26687.00       # stop = ref - offset
+        assert order.lmtPrice == 26686.00       # lmt = stop - cap
+
+    def test_sl_short_stop_above_ref(self):
+        pos = _make_position("MNQ", "FUT", 111, net_pos=-3, account="DU1")
+        wt = _make_close_tier_worker([pos])
+        _run(wt._do_close_tier("MNQ", "DU1", "sl", 10.0, 5, 26697.0, 0.0))
+        _, order = wt._ib.placed[0]
+        assert order.action == "BUY"
+        assert order.auxPrice == 26707.00   # short SL is above ref
+
+    def test_zero_position_submits_no_order(self):
+        """Critical: we must never send an empty/phantom order to TWS."""
+        pos = _make_position("MNQ", "FUT", 111, net_pos=0, account="DU1")
+        wt = _make_close_tier_worker([pos])
+        _run(wt._do_close_tier("MNQ", "DU1", "tp", 10.0, 5, 26697.0, 0.0))
+        assert wt._ib.placed == []
+
+    def test_other_account_positions_are_ignored(self):
+        """Only the targeted account's position counts."""
+        mine = _make_position("MNQ", "FUT", 111, net_pos=2, account="DU1")
+        other = _make_position("MNQ", "FUT", 111, net_pos=5, account="DU2")
+        wt = _make_close_tier_worker([mine, other])
+        _run(wt._do_close_tier("MNQ", "DU1", "tp", 10.0, 9, 26697.0, 0.0))
+        assert wt._ib.placed[0][1].totalQuantity == 2  # not 5
+
+    def test_symbol_mismatch_is_ignored(self):
+        pos = _make_position("NQ", "FUT", 111, net_pos=3, account="DU1")
+        wt = _make_close_tier_worker([pos])
+        _run(wt._do_close_tier("MNQ", "DU1", "tp", 10.0, 5, 26697.0, 0.0))
+        assert wt._ib.placed == []
+
+    def test_non_positive_offset_skipped(self):
+        pos = _make_position("MNQ", "FUT", 111, net_pos=3, account="DU1")
+        wt = _make_close_tier_worker([pos])
+        _run(wt._do_close_tier("MNQ", "DU1", "tp", 0.0, 5, 26697.0, 0.0))
+        assert wt._ib.placed == []
+
+    def test_prices_snap_to_min_tick(self):
+        """Contract.minTick governs the tick grid, even if off-grid offset."""
+        pos = _make_position("MNQ", "FUT", 111, net_pos=1,
+                             account="DU1", minTick=0.25)
+        wt = _make_close_tier_worker([pos])
+        _run(wt._do_close_tier("MNQ", "DU1", "tp", 5.13, 1, 26697.0, 0.0))
+        # 26697 + 5.13 = 26702.13 → snaps to 26702.25
+        assert wt._ib.placed[0][1].lmtPrice == 26702.25
