@@ -1299,9 +1299,32 @@ class IBWorkerThread(QThread):
                     self._label, ch_trade.order.orderId, ch.orderRef)
 
                 # Bind each child's statusEvent so blotter/positions pick up
-                # fills and cancels without any extra plumbing.
+                # fills and cancels without any extra plumbing.  Start from
+                # the parent's params (symbol / account / conid / sec_type)
+                # then overlay the child's own identity — without this the
+                # blotter would show the parent's BUY/SELL action and price
+                # for every child row.
                 ch_params = dict(params)
                 ch_params["order_type"] = ch.orderType
+                ch_params["action"]     = ch.action
+                ch_params["qty"]        = int(ch.totalQuantity)
+                # Child-specific price columns for the blotter.  TRAIL's
+                # auxPrice is a *distance* not a stop level, so leave stop
+                # empty; TRAIL shows the trail distance in its own column.
+                lmt_val = getattr(ch, "lmtPrice", None)
+                aux_val = getattr(ch, "auxPrice", None)
+                if ch.orderType in ("LMT",) and lmt_val and lmt_val < _IB_DBL_MAX:
+                    ch_params["limit_price"] = lmt_val
+                else:
+                    ch_params.pop("limit_price", None)
+                if ch.orderType in ("STP", "STP LMT") and aux_val \
+                        and aux_val < _IB_DBL_MAX:
+                    ch_params["stop_price"] = aux_val
+                    if ch.orderType == "STP LMT" and lmt_val \
+                            and lmt_val < _IB_DBL_MAX:
+                        ch_params["limit_price"] = lmt_val
+                else:
+                    ch_params.pop("stop_price", None)
                 ch_frozen_oid = ch_key
 
                 def _on_child_status(t, _oid=ch_frozen_oid, _p=ch_params):

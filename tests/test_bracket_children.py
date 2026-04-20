@@ -311,6 +311,59 @@ class TestBracketChildren:
         # 17500 + 5.13 = 17505.13 → snaps to 17505.25
         assert out[0].lmtPrice == 17505.25
 
+    def test_blotter_params_overlay_child_identity(self):
+        """Regression for blotter showing parent's BUY action on every child.
+
+        The worker emits order-status dicts keyed on a `params` dict.  When
+        reused for a child, that dict must be overlaid with the child's own
+        action / qty / prices — otherwise the blotter renders all three
+        rows as BUY (or SELL) of the parent's type."""
+        from src.core.ib_worker import _IB_DBL_MAX
+
+        wt = _make_worker()
+        params = {
+            "sec_type": "FUT",
+            "action": "BUY", "qty": 1, "order_type": "LMT",
+            "limit_price": 26688.75,
+            "profit_take": {"value": 5,  "unit": "price"},
+            "stop_loss":   {"value": 15, "unit": "price"},
+        }
+        children = wt._build_bracket_children(_parent("BUY"), params,
+                                              ref_price=26688.75, tick=0.25)
+        # Reproduce the worker's ch_params overlay so the assertion pins
+        # the actual per-child dict the blotter will see.
+        def _overlay(ch):
+            cp = dict(params)
+            cp["order_type"] = ch.orderType
+            cp["action"]     = ch.action
+            cp["qty"]        = int(ch.totalQuantity)
+            lmt = getattr(ch, "lmtPrice", None)
+            aux = getattr(ch, "auxPrice", None)
+            if ch.orderType == "LMT" and lmt and lmt < _IB_DBL_MAX:
+                cp["limit_price"] = lmt
+            else:
+                cp.pop("limit_price", None)
+            if ch.orderType in ("STP", "STP LMT") and aux and aux < _IB_DBL_MAX:
+                cp["stop_price"] = aux
+                if ch.orderType == "STP LMT" and lmt and lmt < _IB_DBL_MAX:
+                    cp["limit_price"] = lmt
+            else:
+                cp.pop("stop_price", None)
+            return cp
+
+        tp_params = _overlay(next(c for c in children
+                                  if c.orderType == "LMT"))
+        sl_params = _overlay(next(c for c in children
+                                  if c.orderType == "STP"))
+        # Parent's BUY must not leak onto the exit children.
+        assert tp_params["action"] == "SELL"
+        assert sl_params["action"] == "SELL"
+        # And child-specific prices should be populated.
+        assert tp_params["limit_price"] == 26693.75
+        assert "stop_price" not in tp_params
+        assert sl_params["stop_price"] == 26673.75
+        assert "limit_price" not in sl_params
+
     def test_chip_label_is_direct_points_offset(self):
         """Tier chips (loaded via ReferenceData._extract_tiers or
         _enrich_pref_tiers) carry unit='price' because the stored offset
