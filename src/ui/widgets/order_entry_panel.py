@@ -34,6 +34,12 @@ log = logging.getLogger(__name__)
 # Qty presets per asset class
 _FUT_QTYS = [1, 2, 3, 5]
 _STK_QTYS = [10, 25, 50, 100, 500]
+
+# Symbols whose ticker-strip %change column is hidden.  The index futures
+# on CME (NQ / MNQ / ES / MES) have tiny daily % swings relative to the
+# price magnitude and the user finds the column visually noisy — their
+# absolute day change is still shown.  Stocks always show both.
+_NO_PCT_CHANGE_SYMBOLS: set[str] = {"NQ", "MNQ", "ES", "MES"}
 _FUT_DEFAULT = 1
 _STK_DEFAULT = 100
 
@@ -1331,6 +1337,9 @@ class OrderEntryPanel(QWidget):
         self._bg_worker = None         # track worker for background price streams
         # sym → (last, bid, ask)
         self._price_cache: dict[str, tuple[float, float, float]] = {}
+        # sym → prior-session close, used by the ticker strip to compute
+        # day change and %change.  Populated by bg_price_updated ticks.
+        self._close_cache: dict[str, float] = {}
         self._last_price: float = 0.0  # latest live price for limit-order calculation
         self._last_bid: float = 0.0    # latest live bid price
         self._last_ask: float = 0.0    # latest live ask price
@@ -1392,73 +1401,98 @@ class OrderEntryPanel(QWidget):
         root.setContentsMargins(10, 8, 10, 8)
         root.setSpacing(8)
 
-        # ── Title ─────────────────────────────────────────────────────────────
-        title = QLabel("Order Entry")
-        title.setFont(_TITLE_FONT)
-        title.setStyleSheet(f"color: {Theme.TEXT}; border: none;")
-        root.addWidget(title)
-
-        # ── Search combo + active symbol / price row ──────────────────────────
+        # ── Active-symbol ticker strip ────────────────────────────────────────
+        # Compact single-row strip replaces the old "Add symbol (look up)…"
+        # combo + two-line price block so the top takes minimal space:
+        #   NQ  26,698.75  26,698.25 26,699.50  -126.75 -0.47%  [+]
+        #   sym last       bid(g)    ask(r)     chg     chg%    add
+        # No stretch between the five data columns — they stay tightly
+        # packed on the left; the "+" button is pinned to the far right.
         top_row = QHBoxLayout()
-        top_row.setSpacing(10)
+        top_row.setSpacing(6)
+        top_row.setContentsMargins(0, 0, 0, 0)
 
+        _ticker_dim = f"color: {Theme.TEXT_DIM}; border: none;"
+        # Slightly smaller than _SYMBOL_FONT / _PRICE_FONT so the whole
+        # strip can fit the narrow Order Entry column without wrapping.
+        _sym_font = QFont("Helvetica Neue, Arial", 12)
+        _sym_font.setWeight(QFont.Weight.Bold)
+        _price_font = QFont("Menlo, Consolas, monospace", 12)
+        _price_font.setWeight(QFont.Weight.Bold)
+        _ticker_font = QFont("Menlo, Consolas, monospace", 11)
+        _ticker_font.setWeight(QFont.Weight.Bold)
+
+        self._lbl_symbol = QLabel("")
+        self._lbl_symbol.setFont(_sym_font)
+        self._lbl_symbol.setStyleSheet(
+            f"color: {Theme.TEXT}; border: none;")
+
+        self._lbl_price = QLabel("")
+        self._lbl_price.setFont(_price_font)
+        self._lbl_price.setStyleSheet(
+            f"color: {Theme.TEXT}; border: none;")
+
+        self._lbl_bid = QLabel("")
+        self._lbl_bid.setFont(_ticker_font)
+        self._lbl_bid.setStyleSheet(
+            f"color: {Theme.CLR_BUY}; border: none;")
+
+        self._lbl_ask = QLabel("")
+        self._lbl_ask.setFont(_ticker_font)
+        self._lbl_ask.setStyleSheet(
+            f"color: {Theme.CLR_SELL}; border: none;")
+
+        # Day change and %change vs prior-session close.  Coloured per
+        # sign in _refresh_price_change_display.
+        self._lbl_change = QLabel("")
+        self._lbl_change.setFont(_ticker_font)
+        self._lbl_change.setStyleSheet(_ticker_dim)
+
+        self._lbl_change_pct = QLabel("")
+        self._lbl_change_pct.setFont(_ticker_font)
+        self._lbl_change_pct.setStyleSheet(_ticker_dim)
+
+        # Plus button → opens a dropdown listing available contracts from
+        # ReferenceData that aren't already on the symbol-chip bar.
+        self._btn_add_symbol = QPushButton("+")
+        self._btn_add_symbol.setFixedSize(22, 22)
+        self._btn_add_symbol.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_add_symbol.setToolTip("Add symbol")
+        self._btn_add_symbol.setStyleSheet(
+            f"QPushButton{{background:{Theme.BG_INPUT};color:{Theme.TEXT};"
+            f"border:1px solid {Theme.BORDER};border-radius:4px;"
+            f"font-size:14px;font-weight:bold;padding:0}}"
+            f"QPushButton:hover{{border-color:{Theme.ACCENT}}}")
+        self._btn_add_symbol.clicked.connect(self._show_add_symbol_menu)
+
+        top_row.addWidget(self._lbl_symbol)
+        top_row.addWidget(self._lbl_price)
+        top_row.addSpacing(6)
+        top_row.addWidget(self._lbl_bid)
+        top_row.addWidget(self._lbl_ask)
+        top_row.addSpacing(6)
+        top_row.addWidget(self._lbl_change)
+        top_row.addWidget(self._lbl_change_pct)
+        top_row.addStretch(1)
+        top_row.addWidget(self._btn_add_symbol)
+        root.addLayout(top_row)
+
+        # The lookup combo is kept as a hidden child widget because other
+        # code paths still reference ``self._combo`` (TWS fallback status
+        # messages via setPlaceholderText, _add_symbol's setCurrentText
+        # reset, etc.).  It is NOT added to any layout, so it never
+        # occupies screen space.  The "+" button's QMenu is the only
+        # user-visible way to add symbols now.
         self._combo = QComboBox()
         self._combo.setEditable(True)
         self._combo.setMaxVisibleItems(20)
-        self._combo.setFixedHeight(28)
         self._combo.setStyleSheet(_COMBO_SS)
         self._combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self._combo.lineEdit().setPlaceholderText("Add symbol (look up)..")
         self._combo.activated.connect(self._on_combo_activated)
         self._combo.lineEdit().returnPressed.connect(self._on_return_pressed)
+        self._combo.hide()
         self._refresh_combo_items()
-
-        # Live filter: as user types, matching contracts appear in dropdown
-        completer = self._combo.completer()
-        if completer:
-            completer.setFilterMode(Qt.MatchFlag.MatchContains)
-            completer.setCompletionMode(
-                QCompleter.CompletionMode.PopupCompletion)
-            completer.popup().setStyleSheet(f"""
-                QAbstractItemView {{
-                    background: {Theme.BG_INPUT}; color: {Theme.TEXT};
-                    border: 1px solid {Theme.BORDER}; border-radius: 4px;
-                    selection-background-color: #3a3f50;
-                    selection-color: {Theme.TEXT};
-                    padding: 2px; outline: none;
-                }}
-            """)
-
-        self._lbl_symbol = QLabel("")
-        self._lbl_symbol.setFont(_SYMBOL_FONT)
-        self._lbl_symbol.setStyleSheet(f"color: {Theme.TEXT}; border: none;")
-
-        self._lbl_price = QLabel("")
-        self._lbl_price.setFont(_PRICE_FONT)
-        self._lbl_price.setStyleSheet(f"color: {Theme.ACCENT}; border: none;")
-
-        self._lbl_bid_ask = QLabel("")
-        self._lbl_bid_ask.setFont(QFont("Menlo, Consolas, monospace", 10))
-        self._lbl_bid_ask.setStyleSheet(
-            f"color: {Theme.TEXT_DIM}; border: none;")
-        self._lbl_bid_ask.setAlignment(Qt.AlignmentFlag.AlignRight)
-
-        # Right side: symbol + price row, then bid/ask below
-        sym_price_row = QHBoxLayout()
-        sym_price_row.setSpacing(6)
-        sym_price_row.addStretch()
-        sym_price_row.addWidget(self._lbl_symbol)
-        sym_price_row.addWidget(self._lbl_price)
-
-        right_side = QVBoxLayout()
-        right_side.setSpacing(2)
-        right_side.addLayout(sym_price_row)
-        right_side.addWidget(
-            self._lbl_bid_ask, alignment=Qt.AlignmentFlag.AlignRight)
-
-        top_row.addWidget(self._combo, stretch=1)
-        top_row.addLayout(right_side, stretch=1)
-        root.addLayout(top_row)
 
         root.addSpacing(8)
 
@@ -1881,7 +1915,7 @@ class OrderEntryPanel(QWidget):
                 self._update_bid_ask_display(bid, ask)
             else:
                 self._lbl_price.setText("")
-                self._lbl_bid_ask.setText("")
+                self._update_bid_ask_display(0.0, 0.0)
                 self._last_price = 0.0
                 self._last_bid = 0.0
                 self._last_ask = 0.0
@@ -1891,10 +1925,11 @@ class OrderEntryPanel(QWidget):
         else:
             self._lbl_symbol.setText("")
             self._lbl_price.setText("")
-            self._lbl_bid_ask.setText("")
+            self._update_bid_ask_display(0.0, 0.0)
             self._last_price = 0.0
             self._last_bid = 0.0
             self._last_ask = 0.0
+        self._refresh_price_change_display()
 
     def _remove_symbol(self, sym: str) -> None:
         """Right-click removes a symbol button."""
@@ -2545,13 +2580,18 @@ class OrderEntryPanel(QWidget):
                 }
         return None
 
-    def _on_bg_price_update(self, sym: str, last: float, bid: float, ask: float) -> None:
+    def _on_bg_price_update(self, sym: str, last: float, bid: float,
+                            ask: float, close: float = 0.0) -> None:
         """Receive a background price tick — update cache and display if active.
 
         Bid/ask are preserved from the last valid tick rather than being
         overwritten with 0 when a tick carries only a last-price update.
         IB delayed data (type 3) for futures often streams ``last`` ticks
         without bid/ask, which previously cleared the label on every tick.
+
+        ``close`` is the prior-session close used by the ticker strip's
+        day-change display (0 when the tick didn't carry one — we keep
+        whatever was previously cached).
         """
         # Retrieve the last-known cache entry so we can fall back to its
         # bid/ask when the incoming values are absent (0 or never received).
@@ -2563,6 +2603,8 @@ class OrderEntryPanel(QWidget):
         effective_ask  = ask  if ask  > 0 else cached[2]
 
         self._price_cache[sym.upper()] = (effective_last, effective_bid, effective_ask)
+        if close and close > 0:
+            self._close_cache[sym.upper()] = float(close)
 
         if sym.upper() == (self._active_symbol or "").upper():
             if last > 0:
@@ -2580,17 +2622,186 @@ class OrderEntryPanel(QWidget):
                 self._last_ask = ask
             self._update_bid_ask_display(self._last_bid, self._last_ask)
             self._update_bid_ask_buttons(self._last_bid, self._last_ask)
+            self._refresh_price_change_display()
 
     def _update_bid_ask_display(self, bid: float, ask: float) -> None:
-        """Update the bid/ask label beneath the price."""
-        if bid > 0 and ask > 0:
-            self._lbl_bid_ask.setText(f"B: {bid:,.2f}  ·  A: {ask:,.2f}")
-        elif bid > 0:
-            self._lbl_bid_ask.setText(f"B: {bid:,.2f}")
-        elif ask > 0:
-            self._lbl_bid_ask.setText(f"A: {ask:,.2f}")
+        """Refresh the bid and ask labels on the compact ticker strip."""
+        self._lbl_bid.setText(f"{bid:,.2f}" if bid > 0 else "")
+        self._lbl_ask.setText(f"{ask:,.2f}" if ask > 0 else "")
+
+    # ── Ticker-strip day-change display ──────────────────────────────────────
+
+    def _refresh_price_change_display(self) -> None:
+        """Repaint the change / %change labels against the prior-session
+        close for the active symbol.  Blank when no close is known yet
+        (cold start before first bg tick); otherwise signed text with
+        green / red / dim colour keyed to the sign of the change.
+        """
+        sym = (self._active_symbol or "").upper()
+        close = self._close_cache.get(sym, 0.0) if sym else 0.0
+        last = float(self._last_price or 0.0)
+        if not sym or close <= 0 or last <= 0:
+            self._lbl_change.setText("")
+            self._lbl_change_pct.setText("")
+            return
+        change = last - close
+        pct = (change / close) * 100.0 if close else 0.0
+        sign = "+" if change > 0 else ""
+        self._lbl_change.setText(f"{sign}{change:,.2f}")
+        # Per product request: hide %change for the CME index futures
+        # (NQ / MNQ / ES / MES) where % moves are tiny and add noise;
+        # everything else still shows it.
+        if sym in _NO_PCT_CHANGE_SYMBOLS:
+            self._lbl_change_pct.setText("")
         else:
-            self._lbl_bid_ask.setText("")
+            self._lbl_change_pct.setText(f"{sign}{pct:,.2f}%")
+        if change > 0:
+            colour = Theme.CLR_BUY
+        elif change < 0:
+            colour = Theme.CLR_SELL
+        else:
+            colour = Theme.TEXT_DIM
+        ss = f"color: {colour}; border: none;"
+        self._lbl_change.setStyleSheet(ss)
+        self._lbl_change_pct.setStyleSheet(ss)
+
+    # ── Add-Symbol dropdown (type-to-filter popup triggered by "+") ──────────
+
+    def _show_add_symbol_menu(self) -> None:
+        """Pop up a searchable list of every saved contract that isn't
+        already on the symbol-chip bar.  The search field at the top
+        filters the list case-insensitively as the user types (matching
+        against symbol, local symbol, and sec_type); Up / Down navigates
+        the list, Enter / double-click adds the symbol via the existing
+        ``_add_symbol`` path, Esc closes the popup.
+        """
+        from src.core.reference_data import get_instance as _rd
+
+        # Collect available contracts (skip ones already on the bar).
+        added_upper = {s.upper() for s in self._symbols}
+        seen_keys: set[str] = set()
+        entries: list[tuple[str, str]] = []  # (label, symbol)
+        for c in sorted(_rd().contracts, key=lambda x: x.get("symbol", "")):
+            sym = c.get("symbol", "")
+            if not sym or sym.upper() in added_upper:
+                continue
+            sec = c.get("sec_type", "")
+            local = c.get("local_symbol", "")
+            exchange = c.get("exchange", "")
+            key = f"{sym}_{local}_{sec}"
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            detail = local if local and local != sym else exchange
+            label = (f"{sym}  –  {detail}  ({sec})"
+                     if detail else f"{sym}  ({sec})")
+            entries.append((label, sym))
+
+        # Build the popup.  QDialog with Popup window flag so clicking
+        # outside closes it automatically (same affordance as QMenu).
+        from PySide6.QtWidgets import QDialog
+        dlg = QDialog(self)
+        dlg.setWindowFlags(Qt.WindowType.Popup)
+        dlg.setFixedWidth(260)
+
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setSpacing(4)
+
+        search = QLineEdit()
+        search.setPlaceholderText("Type to search…")
+        search.setStyleSheet(
+            f"QLineEdit{{background:{Theme.BG_INPUT};color:{Theme.TEXT};"
+            f"border:1px solid {Theme.BORDER};border-radius:3px;"
+            f"padding:4px 6px;font-size:12px}}"
+            f"QLineEdit:focus{{border-color:{Theme.ACCENT}}}")
+        lay.addWidget(search)
+
+        lst = QListWidget()
+        lst.setStyleSheet(
+            f"QListWidget{{background:{Theme.BG_INPUT};color:{Theme.TEXT};"
+            f"border:1px solid {Theme.BORDER};border-radius:3px;"
+            f"padding:2px;outline:none}}"
+            f"QListWidget::item{{padding:4px 6px;border-radius:2px}}"
+            f"QListWidget::item:selected{{background:#3a3f50}}")
+        lst.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        lay.addWidget(lst)
+
+        if not entries:
+            item = QListWidgetItem(
+                "(no more symbols — add via Contracts tab)")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            lst.addItem(item)
+        else:
+            for label, sym in entries:
+                item = QListWidgetItem(label)
+                item.setData(Qt.ItemDataRole.UserRole, sym)
+                lst.addItem(item)
+            lst.setCurrentRow(0)
+
+        def _apply_filter(text: str) -> None:
+            query = text.strip().lower()
+            first_visible = -1
+            for i in range(lst.count()):
+                it = lst.item(i)
+                if it.data(Qt.ItemDataRole.UserRole) is None:
+                    continue
+                visible = (not query) or (query in it.text().lower())
+                it.setHidden(not visible)
+                if visible and first_visible < 0:
+                    first_visible = i
+            if first_visible >= 0:
+                lst.setCurrentRow(first_visible)
+
+        def _commit_current() -> None:
+            it = lst.currentItem()
+            if it is None or it.isHidden():
+                return
+            sym = it.data(Qt.ItemDataRole.UserRole)
+            if not sym:
+                return
+            dlg.close()
+            self._add_symbol(sym)
+
+        def _step(delta: int) -> None:
+            n = lst.count()
+            if n == 0:
+                return
+            row = lst.currentRow()
+            for _ in range(n):
+                row = (row + delta) % n
+                it = lst.item(row)
+                if it is not None and not it.isHidden() \
+                        and it.data(Qt.ItemDataRole.UserRole):
+                    lst.setCurrentRow(row)
+                    return
+
+        # Wire search → filter, Enter → commit, Esc → close (via Popup),
+        # double-click on list → commit, Up/Down → navigate.
+        search.textChanged.connect(_apply_filter)
+        search.returnPressed.connect(_commit_current)
+        lst.itemDoubleClicked.connect(lambda _it: _commit_current())
+
+        # Capture Up/Down in the search field so the user can navigate
+        # the list without leaving the text input.
+        def _search_key_event(event) -> None:
+            if event.key() == Qt.Key.Key_Down:
+                _step(+1)
+                event.accept()
+                return
+            if event.key() == Qt.Key.Key_Up:
+                _step(-1)
+                event.accept()
+                return
+            QLineEdit.keyPressEvent(search, event)
+        search.keyPressEvent = _search_key_event  # type: ignore[method-assign]
+
+        # Anchor beneath the + button.
+        pos = self._btn_add_symbol.mapToGlobal(
+            self._btn_add_symbol.rect().bottomLeft())
+        dlg.move(pos)
+        dlg.show()
+        search.setFocus()
 
     def _update_bid_ask_buttons(self, bid: float, ask: float) -> None:
         """Keep @Bid / @Ask button labels in sync with the current quantity.

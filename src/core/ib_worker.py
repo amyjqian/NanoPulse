@@ -163,8 +163,10 @@ class IBWorkerThread(QThread):
     order_status_updated = Signal(dict)
     # list[dict] – portfolio position batch
     portfolio_updated = Signal(list)
-    # (symbol, last, bid, ask) – background cache
-    bg_price_updated = Signal(str, float, float, float)
+    # (symbol, last, bid, ask, close) – background cache.  ``close`` is the
+    # prior-session close used by the order-entry ticker strip to compute
+    # day change / %change; 0.0 when unavailable.
+    bg_price_updated = Signal(str, float, float, float, float)
     # {symbol, account, action, qty} → UI places the close order
     flatten_close_needed = Signal(dict)
     # {symbol, account, action, qty} → UI places the reverse order
@@ -2527,7 +2529,12 @@ class IBWorkerThread(QThread):
             if bid_valid or ask_valid:
                 self._bg_last_bid_ask[sym] = (bid_out, ask_out)
 
-            self.bg_price_updated.emit(sym, last, bid_out, ask_out)
+            # Prior-session close for day-change display (0 when unknown).
+            close = getattr(ticker, "close", float('nan'))
+            close_out = float(close) if (not math.isnan(close)
+                                         and close > 0) else 0.0
+
+            self.bg_price_updated.emit(sym, last, bid_out, ask_out, close_out)
         except Exception:
             log.debug("Worker %s: bg price emit error for %s",
                       self._label, sym)
