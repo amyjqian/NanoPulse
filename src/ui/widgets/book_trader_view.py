@@ -147,6 +147,14 @@ class BookTraderView(QWidget):
             _FUT_DEFAULT if self._active_sec_type == "FUT" else _STK_DEFAULT)
         self._last_price: float = 0.0
         self._bg_worker = None   # single worker for L2 subscription
+        # Live open orders across every connected worker, keyed by
+        # order_id.  Used to render order-badges on the ladder for the
+        # currently active symbol.
+        self._live_orders: dict[str, dict] = {}
+        # Workers whose ``order_status_updated`` signal is already
+        # connected to our slot.  Tracked so we don't double-connect on
+        # repeat ``_wire_order_status`` calls.
+        self._order_status_wired: set = set()
 
         # Ladder model/view (built first so _reload_tier_sections can call it).
         # ``rows_each_side`` defaults to 20 → 41-row ladder; the view scrolls
@@ -397,6 +405,80 @@ class BookTraderView(QWidget):
                      symbol, len(bids or []), len(asks or []))
         self._model.feed_depth(bids or [], asks or [])
 
+    def _on_order_status(self, data: dict) -> None:
+        """Track every worker's order status updates so we can render
+        badges on the ladder for open orders at the active symbol.
+
+        Only LMT, STP and STP LMT orders show a badge — TRAIL uses an
+        offset (no absolute price on the ladder grid) and MKT fills
+        instantly.  Orders in terminal states (Filled / Cancelled /
+        Inactive / ApiCancelled) are dropped from ``_live_orders``.
+        """
+        if not isinstance(data, dict):
+            return
+        order_id = data.get("order_id", "")
+        if not order_id:
+            return
+        status = data.get("status", "")
+        terminal = status in (
+            "Filled", "Completed", "Cancelled", "ApiCancelled", "Inactive")
+        if terminal:
+            self._live_orders.pop(order_id, None)
+        else:
+            self._live_orders[order_id] = dict(data)
+        self._refresh_ladder_orders()
+
+    def _refresh_ladder_orders(self) -> None:
+        """Project ``_live_orders`` into a list the model can render."""
+        if not self._active_symbol:
+            self._model.set_orders([])
+            return
+        active_u = self._active_symbol.upper()
+        # Pre-compute the set of acceptable symbol strings for a match
+        # — the worker emits either the bare symbol (STK) or the local
+        # symbol (FUT, e.g. "MNQM6").  We accept either.
+        accepted: set[str] = {active_u}
+        from src.core.reference_data import get_instance as _rd
+        for c in _rd().contracts_by_symbol.get(active_u, []):
+            local = (c.get("local_symbol") or "").upper()
+            if local:
+                accepted.add(local)
+
+        markers: list[dict] = []
+        for od in self._live_orders.values():
+            sym = (od.get("symbol") or "").upper()
+            if sym not in accepted:
+                continue
+            otype = (od.get("order_type") or "").upper()
+            if otype == "LMT":
+                price_str = od.get("limit_price")
+            elif otype in ("STP", "STP LMT"):
+                price_str = od.get("stop_price")
+            else:
+                continue   # MKT / TRAIL / etc. have no ladder price
+            try:
+                price = float(price_str)
+            except (TypeError, ValueError):
+                continue
+            if price <= 0:
+                continue
+            action = (od.get("action") or "").upper()
+            if action not in ("BUY", "SELL"):
+                continue
+            try:
+                qty = int(od.get("quantity") or 0)
+            except (TypeError, ValueError):
+                qty = 0
+            if qty <= 0:
+                continue
+            markers.append({
+                "action": action,
+                "qty": qty,
+                "price": price,
+                "type": otype,
+            })
+        self._model.set_orders(markers)
+
     # ── Internal slots ────────────────────────────────────────────────────────
 
     def _on_symbol_selected(self, sym: str, sec_type: str) -> None:
@@ -437,6 +519,10 @@ class BookTraderView(QWidget):
             if old:
                 self._bg_worker.unsubscribe_depth(old)
             self._bg_worker.subscribe_depth(sym)
+
+        # Different symbol → different subset of live orders is
+        # relevant.  Re-project the ladder markers.
+        self._refresh_ladder_orders()
 
         self.active_symbol_changed.emit(sym)
 
@@ -628,12 +714,32 @@ class BookTraderView(QWidget):
         not need.
         """
         self._ensure_bg_worker()
+        # Wire order_status_updated on every connected worker so we can
+        # render order badges on the ladder.  An order submitted by
+        # OrderEntry on worker A needs to appear on BookTrader too, so
+        # we fan out across all workers rather than just the bg one.
+        self._wire_order_status_on_all_workers()
         if self._bg_worker is None or not self._active_symbol:
             return
         # Worker.subscribe_depth is idempotent (skips already-subscribed
         # symbols) so calling it on every refresh guarantees re-
         # subscription after a reconnect.
         self._bg_worker.subscribe_depth(self._active_symbol)
+
+    def _wire_order_status_on_all_workers(self) -> None:
+        """Connect ``order_status_updated`` for every running worker we
+        haven't wired yet.  Idempotent — re-running a worker already in
+        ``_order_status_wired`` is a no-op."""
+        for _lbl, worker in self._active_threads.items():
+            if worker in self._order_status_wired:
+                continue
+            try:
+                if worker.isRunning():
+                    worker.order_status_updated.connect(
+                        self._on_order_status)
+                    self._order_status_wired.add(worker)
+            except Exception:
+                continue
 
     def _ensure_bg_worker(self) -> None:
         """Pick a connected worker for L2 depth subscriptions (first match

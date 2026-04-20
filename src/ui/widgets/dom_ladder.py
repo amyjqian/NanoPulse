@@ -63,6 +63,9 @@ IsLastRole = Qt.ItemDataRole.UserRole + 3      # bool — this is the last price
 TickDirRole = Qt.ItemDataRole.UserRole + 4     # "up" / "down" / "flat"
 PriceRole = Qt.ItemDataRole.UserRole + 5       # float price at this row
 AboveLastRole = Qt.ItemDataRole.UserRole + 6   # bool — price > last
+OrdersRole = Qt.ItemDataRole.UserRole + 7      # list[dict]: open orders at
+                                               # this price (dicts carry
+                                               # action/qty/type keys)
 
 
 # ── Colours (blended with Theme) ──────────────────────────────────────────────
@@ -109,6 +112,10 @@ class DOMLadderModel(QAbstractTableModel):
         self._prev_last: float = 0.0
         self._last_dir: Literal["up", "down", "flat"] = "flat"
         self._max_size: float = 0.0
+        # Open orders grouped by (snapped) price → list of dicts of the
+        # form {"action": "BUY"/"SELL", "qty": int, "type": str}.  Fed
+        # by BookTraderView via ``set_orders``.
+        self._orders: dict[float, list[dict]] = {}
         # Start with a zero-centred ladder so rowCount() > 0 before the
         # first market data tick (prevents a blank view during warmup).
         self._rebuild_prices(0.0)
@@ -150,6 +157,8 @@ class DOMLadderModel(QAbstractTableModel):
             return self._last > 0 and price > self._last
         if role == TickDirRole:
             return self._last_dir
+        if role == OrdersRole:
+            return self._orders.get(price, [])
         if role == Qt.ItemDataRole.DisplayRole:
             if col == COL_PRICE:
                 return f"{price:,.2f}"
@@ -203,6 +212,39 @@ class DOMLadderModel(QAbstractTableModel):
                 self.index(0, 0),
                 self.index(n - 1, _N_COLS - 1),
                 [Qt.ItemDataRole.DisplayRole, SizeRole, MaxSizeRole],
+            )
+
+    def set_orders(self, orders: list[dict]) -> None:
+        """Replace the open-order overlay.
+
+        *orders* is a list of dicts of the shape
+        ``{"action": "BUY"/"SELL", "qty": int, "price": float,
+           "type": "LMT"/"STP"/"STP LMT"}``.  Prices are snapped to the
+        ladder grid; orders that fall on the same snapped price are
+        grouped together (the delegate sums qtys for the badge label).
+        """
+        self._orders.clear()
+        tick = self._tick
+        for o in orders or []:
+            try:
+                price = float(o.get("price", 0))
+            except (TypeError, ValueError):
+                continue
+            if price <= 0:
+                continue
+            if tick > 0:
+                price = round(round(price / tick) * tick, 10)
+            self._orders.setdefault(price, []).append({
+                "action": o.get("action", ""),
+                "qty": int(o.get("qty", 0) or 0),
+                "type": o.get("type", ""),
+            })
+        n = self.rowCount()
+        if n:
+            self.dataChanged.emit(
+                self.index(0, 0),
+                self.index(n - 1, _N_COLS - 1),
+                [OrdersRole],
             )
 
     def feed_last(self, price: float) -> None:
@@ -329,55 +371,119 @@ class DOMLadderDelegate(QStyledItemDelegate):
     def _paint_size(self, painter, rect, index, *, is_bid: bool) -> None:
         """Paint a bid-size or ask-size cell.
 
-        Zone rule (matches the Book Trader mockup):
-          * rows ABOVE the last price show ONLY the ask-side (right col),
-            bid cell stays blank
-          * rows BELOW the last price show ONLY the bid-side (left col),
-            ask cell stays blank
-          * the last-price row never renders a size column (the whole
-            row is painted by the PRICE delegate as a single highlight)
+        Depth bar + size numeric honour the zone rule (bid only below
+        last, ask only above last — the opposite side's depth data is
+        effectively 0 anyway).  The open-order badge bypasses that
+        rule so the user still sees markers for stop-buys above last
+        or stop-sells below last.
         """
         is_last = bool(index.data(IsLastRole))
         above_last = bool(index.data(AboveLastRole))
-        if is_last:
-            return
-        if is_bid and above_last:
-            return       # bid col on an ask-zone row → blank
-        if (not is_bid) and (not above_last):
-            return       # ask col on a bid-zone row → blank
 
-        size = float(index.data(SizeRole) or 0.0)
-        max_size = float(index.data(MaxSizeRole) or 0.0)
-        if size > 0 and max_size > 0:
-            frac = max(0.02, min(1.0, size / max_size))
-            bar_w = int(rect.width() * frac)
-            if is_bid:
-                # Bid bar: anchor to the RIGHT (inner, next to the
-                # price column) edge and grow leftward toward the
-                # outer edge in proportion to size.
-                bar = rect.adjusted(rect.width() - bar_w, 2, 0, -2)
-                col = QColor(Theme.CLR_BUY)
-                col.setAlpha(_BID_BAR_ALPHA)
-            else:
-                # Ask bar: anchor to the LEFT (inner) edge of the ask
-                # column and grow rightward toward the outer edge.
-                bar = rect.adjusted(0, 2, -(rect.width() - bar_w), -2)
-                col = QColor(Theme.CLR_SELL)
-                col.setAlpha(_ASK_BAR_ALPHA)
-            painter.fillRect(bar, col)
+        draw_depth = (
+            not is_last
+            and not (is_bid and above_last)
+            and not ((not is_bid) and (not above_last))
+        )
 
-        # Numeric text.  Bid is LEFT-aligned (away from price col, i.e.
-        # outward); ask is RIGHT-aligned (outward).  Matches the mockup:
-        # size numerals hug the outer edge while the depth bar fills
-        # from the inner edge.
-        text = index.data(Qt.ItemDataRole.DisplayRole) or ""
-        if text:
-            painter.setFont(self._NUMERIC_FONT)
-            painter.setPen(QColor(Theme.TEXT))
-            flags = (Qt.AlignmentFlag.AlignVCenter |
-                     (Qt.AlignmentFlag.AlignLeft if is_bid
-                      else Qt.AlignmentFlag.AlignRight))
-            painter.drawText(rect.adjusted(6, 0, -6, 0), int(flags), text)
+        if draw_depth:
+            size = float(index.data(SizeRole) or 0.0)
+            max_size = float(index.data(MaxSizeRole) or 0.0)
+            if size > 0 and max_size > 0:
+                frac = max(0.02, min(1.0, size / max_size))
+                bar_w = int(rect.width() * frac)
+                if is_bid:
+                    # Bid bar: anchor to the RIGHT (inner, next to the
+                    # price column) edge and grow leftward toward the
+                    # outer edge in proportion to size.
+                    bar = rect.adjusted(rect.width() - bar_w, 2, 0, -2)
+                    col = QColor(Theme.CLR_BUY)
+                    col.setAlpha(_BID_BAR_ALPHA)
+                else:
+                    # Ask bar: anchor to the LEFT (inner) edge of the
+                    # ask column and grow rightward toward the outer
+                    # edge.
+                    bar = rect.adjusted(0, 2, -(rect.width() - bar_w), -2)
+                    col = QColor(Theme.CLR_SELL)
+                    col.setAlpha(_ASK_BAR_ALPHA)
+                painter.fillRect(bar, col)
+
+            # Numeric text.  Bid LEFT-aligned (outward), ask RIGHT-
+            # aligned (outward) — size numerals hug the outer edge
+            # while the depth bar fills from the inner edge.
+            text = index.data(Qt.ItemDataRole.DisplayRole) or ""
+            if text:
+                painter.setFont(self._NUMERIC_FONT)
+                painter.setPen(QColor(Theme.TEXT))
+                flags = (Qt.AlignmentFlag.AlignVCenter |
+                         (Qt.AlignmentFlag.AlignLeft if is_bid
+                          else Qt.AlignmentFlag.AlignRight))
+                painter.drawText(rect.adjusted(6, 0, -6, 0),
+                                 int(flags), text)
+
+        # Order badge — show a "B <qty>" / "S <qty>" pill at the inner
+        # edge whenever the user has a live order at this price on the
+        # matching side.  Drawn regardless of zone so stop-buys above
+        # last and stop-sells below last are still visible.
+        if not is_last:
+            orders = index.data(OrdersRole) or []
+            wanted = "BUY" if is_bid else "SELL"
+            side_orders = [o for o in orders
+                           if o.get("action") == wanted]
+            if side_orders:
+                total_qty = sum(int(o.get("qty", 0))
+                                for o in side_orders)
+                if total_qty > 0:
+                    self._paint_order_badge(
+                        painter, rect, is_bid=is_bid, qty=total_qty,
+                        order_types={o.get("type", "")
+                                     for o in side_orders})
+
+    def _paint_order_badge(self, painter, rect, *, is_bid: bool,
+                            qty: int, order_types: set[str]) -> None:
+        """Draw a small pill indicating the user has live orders at this
+        price.  Pill sits at the INNER edge of the size cell (next to
+        the price column) so badges on both sides frame the price row.
+
+        Stop-limit orders get an outlined pill (hollow) to distinguish
+        them from plain limit/market-qty orders which get a solid fill.
+        """
+        is_stop = any("STP" in t for t in order_types)
+        badge_w = 36
+        badge_h = rect.height() - 6
+        if is_bid:
+            # Inner edge of bid cell = right side
+            x = rect.right() - badge_w - 2
+        else:
+            # Inner edge of ask cell = left side
+            x = rect.left() + 2
+        y = rect.top() + 3
+        from PySide6.QtCore import QRect
+        badge = QRect(x, y, badge_w, badge_h)
+
+        colour = QColor(Theme.CLR_BUY if is_bid else Theme.CLR_SELL)
+        if is_stop:
+            # Hollow outline for stop / stop-limit
+            painter.setPen(colour)
+            painter.setBrush(QColor(0, 0, 0, 0))
+            painter.drawRoundedRect(badge, 4, 4)
+            painter.setPen(colour)
+        else:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(colour)
+            painter.drawRoundedRect(badge, 4, 4)
+            painter.setPen(QColor("white"))
+
+        painter.setFont(self._NUMERIC_FONT)
+        label = f"{'B' if is_bid else 'S'} {qty}"
+        painter.drawText(
+            badge,
+            int(Qt.AlignmentFlag.AlignVCenter
+                | Qt.AlignmentFlag.AlignHCenter),
+            label,
+        )
+        # Reset the brush so subsequent cells aren't tinted.
+        painter.setBrush(Qt.BrushStyle.NoBrush)
 
     def _paint_price(self, painter, rect, index, *,
                      is_last: bool, above_last: bool) -> None:
@@ -478,17 +584,36 @@ class DOMLadderView(QTableView):
         return self._model
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
-        idx = self.indexAt(event.position().toPoint())
+        """Route clicks to BUY / SELL limit orders:
+
+        * bid-size cell   → BUY LMT at that row's price
+        * ask-size cell   → SELL LMT at that row's price
+        * price cell      → split horizontally:
+                              left half  → BUY  LMT at that price
+                              right half → SELL LMT at that price
+
+        This mirrors what most pro DOM ladders do — a single click
+        anywhere on the ladder submits an order at the row's price,
+        and the horizontal side picks the direction.
+        """
+        pos = event.position().toPoint()
+        idx = self.indexAt(pos)
         if idx.isValid():
             row = idx.row()
             col = idx.column()
             prices = self._model.prices
             if 0 <= row < len(prices):
-                price = prices[row]
+                price = float(prices[row])
                 if col == COL_BID_SZ:
-                    self.ladder_clicked.emit("BUY", float(price))
+                    self.ladder_clicked.emit("BUY", price)
                 elif col == COL_ASK_SZ:
-                    self.ladder_clicked.emit("SELL", float(price))
+                    self.ladder_clicked.emit("SELL", price)
+                elif col == COL_PRICE:
+                    rect = self.visualRect(idx)
+                    if pos.x() < rect.center().x():
+                        self.ladder_clicked.emit("BUY", price)
+                    else:
+                        self.ladder_clicked.emit("SELL", price)
         super().mousePressEvent(event)
 
     def _scroll_to_last(self) -> None:
