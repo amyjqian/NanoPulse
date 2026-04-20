@@ -982,6 +982,8 @@ class _TierSection(QWidget):
     def __init__(self, title: str, tiers: list[dict],
                  enabled: bool = False,
                  label_color: str = Theme.ACCENT,
+                 *,
+                 auto_select_min: bool = False,
                  parent=None):
         super().__init__(parent)
         self._title_str    = title
@@ -997,6 +999,10 @@ class _TierSection(QWidget):
         self._state_lbl:         QLabel | None = None
         self._dollar_lbl:        QLabel | None = None
         self._chips_layout:      QHBoxLayout | None = None
+        # When True, turning the toggle on (with no prior chip selection
+        # and no custom Dist) auto-selects the smallest / first tier so
+        # the user gets a sensible default with a single click.
+        self._auto_select_min:   bool = auto_select_min
         self._build_ui(title, enabled)
 
     # ── Build ─────────────────────────────────────────────────────────────────
@@ -1141,7 +1147,21 @@ class _TierSection(QWidget):
 
     def _on_toggled(self, on: bool) -> None:
         self._state_lbl.setText("On" if on else "Off")
-        if not on:
+        if on:
+            # Auto-select the smallest (first) tier when the user turns
+            # the section on without any prior chip selection or custom
+            # Dist — saves an extra click for the common "default TP/SL
+            # at the closest tier" case.  Opt-in via auto_select_min so
+            # sections that shouldn't pick a default (e.g. Trail Stop)
+            # stay manual.
+            input_text = (self._input.text().strip()
+                          if self._input else "")
+            if (self._auto_select_min
+                    and self._selected_idx is None
+                    and not input_text
+                    and self._tiers):
+                self._selected_idx = 0
+        else:
             # Keep _selected_idx so the dollar label stays as an informational
             # preview even when the section is disabled.  Clear any custom text.
             if self._input:
@@ -1551,7 +1571,7 @@ class OrderEntryPanel(QWidget):
         pt_tiers, sl_tiers, tr_tiers = self._load_tiers_for_active()
         self._pt_section = _TierSection(
             "Take Profit", pt_tiers, enabled=False,
-            label_color=Theme.CLR_BUY)
+            label_color=Theme.CLR_BUY, auto_select_min=True)
         self._pt_section.submit_requested.connect(
             lambda: self._on_tier_submit("tp"))
         root.addWidget(self._pt_section)
@@ -1559,17 +1579,17 @@ class OrderEntryPanel(QWidget):
         # ── Stop Loss ─────────────────────────────────────────────────────────
         self._sl_section = _TierSection(
             "Stop Loss", sl_tiers, enabled=False,
-            label_color=Theme.CLR_SELL)
+            label_color=Theme.CLR_SELL, auto_select_min=True)
         self._sl_section.submit_requested.connect(
             lambda: self._on_tier_submit("sl"))
         root.addWidget(self._sl_section)
 
         # ── Trailing ──────────────────────────────────────────────────────────
-        # Per product decision: Trail Stop header button is not wired to
-        # close-the-position (yet).  The section still resets via toggle-off.
+        # Trail Stop header button is not wired to close-the-position
+        # (yet), but toggling on auto-selects the smallest tier like TP/SL.
         self._tr_section = _TierSection(
             "Trail Stop", tr_tiers, enabled=False,
-            label_color=Theme.CLR_FLATTEN)
+            label_color=Theme.CLR_FLATTEN, auto_select_min=True)
         root.addWidget(self._tr_section)
 
         root.addStretch(1)
