@@ -44,6 +44,18 @@ def _generate_order_ref() -> str:
     return f"nano_{now:%m%d}_{now:%H%M%S}_{tag}"
 
 
+def _round_to_tick(price: float, tick: float) -> float:
+    """Snap *price* to the nearest multiple of *tick*.
+
+    Used when deriving bracket-child limit/stop prices from a parent-fill
+    reference price and a user-supplied offset — IBKR rejects child prices
+    that aren't aligned with the contract's minimum tick.
+    """
+    if not tick or tick <= 0:
+        return round(price, 4)
+    return round(round(price / tick) * tick, 10)
+
+
 def _parse_orderref_time(order_ref: str) -> datetime | None:
     """Extract the submission timestamp embedded in a NanoPulse orderRef.
 
@@ -1113,6 +1125,38 @@ class IBWorkerThread(QThread):
                              "(ET %02d:%02d, in_rth=%s)",
                              self._label, order.outsideRth, h, m, in_rth)
 
+            # ── Bracket (TP / SL / Trail-stop attached children) ──────────
+            # A parent with any enabled tier becomes the parent of a bracket:
+            # children share parentId and are transmitted together (only the
+            # last child has transmit=True, per ib_async's documented pattern).
+            tp_tier = params.get("profit_take")
+            sl_tier = params.get("stop_loss")
+            tr_tier = params.get("trailing")
+            bracket_children: list = []
+            if any((tp_tier, sl_tier, tr_tier)):
+                # FlashTradeView sets bracket_ref_price to the expected-fill
+                # anchor — last_price for Adaptive / PEG / cap-wrapped MKT
+                # orders, limit_price only for true BID_LMT / ASK_LMT.  Fall
+                # back to last_price if the caller didn't set it, which
+                # keeps bracket children anchored to the market rather than
+                # to a cap that will not reflect the actual fill.
+                ref_price = float(params.get("bracket_ref_price")
+                                  or params.get("last_price") or 0.0)
+                if ref_price > 0:
+                    order.orderId = self._ib.client.getReqId()
+                    order.transmit = False
+                    bracket_children = self._build_bracket_children(
+                        order, params, ref_price,
+                        float(params.get("tick_size") or 0.01),
+                    )
+                else:
+                    order_log.warning(
+                        "[%s] BRACKET-SKIP  no reference price "
+                        "(bracket_ref=%s last=%s) — parent-only submit, "
+                        "orderRef=%s", self._label,
+                        params.get("bracket_ref_price"),
+                        params.get("last_price"), order.orderRef)
+
             # ── Place ─────────────────────────────────────────────────────
             # Log every parameter sent to ib_async for debugging
             log.info(
@@ -1229,6 +1273,57 @@ class IBWorkerThread(QThread):
 
             trade.statusEvent += _on_status
 
+            # ── Place bracket children (if any) ────────────────────────────
+            # Children are placed on the same contract, each with its own
+            # fresh orderRef (the time-encoded format keeps the blotter's
+            # submission-time parser working) and parentId pointing at the
+            # parent's IB orderId.  Only the last child has transmit=True,
+            # which flushes the whole bundle to TWS atomically.
+            for ch in bracket_children:
+                ch_trade = self._ib.placeOrder(c, ch)
+                ch_key = f"{account}_{ch.orderRef}"
+                self._trades[ch_key] = ch_trade
+                self._has_status_handler.add(ch_key)
+
+                order_log.info(
+                    "[%s] BRACKET-CHILD  parentRef=%s childRef=%s "
+                    "type=%s action=%s qty=%s lmt=%s aux=%s "
+                    "oca=%s transmit=%s",
+                    self._label, order.orderRef, ch.orderRef,
+                    ch.orderType, ch.action, ch.totalQuantity,
+                    getattr(ch, "lmtPrice", "N/A"),
+                    getattr(ch, "auxPrice", "N/A"),
+                    getattr(ch, "ocaGroup", ""), ch.transmit)
+                tws_log.info(
+                    "[%s] API-RESP  placeOrder(child) → orderId=%s orderRef=%s",
+                    self._label, ch_trade.order.orderId, ch.orderRef)
+
+                # Bind each child's statusEvent so blotter/positions pick up
+                # fills and cancels without any extra plumbing.
+                ch_params = dict(params)
+                ch_params["order_type"] = ch.orderType
+                ch_frozen_oid = ch_key
+
+                def _on_child_status(t, _oid=ch_frozen_oid, _p=ch_params):
+                    new_status = t.orderStatus.status
+                    self._emit_order_status(t, _oid, _p, new_status)
+                    order_log.info(
+                        "[%s] ORDER-STATUS  %s | status=%s filled=%s "
+                        "avgFill=%s symbol=%s account=%s orderRef=%s",
+                        self._label, _oid, new_status,
+                        t.orderStatus.filled, t.orderStatus.avgFillPrice,
+                        _p.get("symbol", "?"), _p.get("account", ""),
+                        getattr(t.order, "orderRef", ""))
+                    if new_status in ("Filled", "Completed"):
+                        self._apply_fill_to_position(t, _p)
+
+                ch_trade.statusEvent += _on_child_status
+
+                # Emit the child's initial status so the UI sees it right away.
+                init_status = ch_trade.orderStatus.status or "Submitted"
+                self._emit_order_status(ch_trade, ch_key, ch_params,
+                                        init_status)
+
         except Exception as exc:
             log.exception("Worker %s: place_order failed: %s",
                           self._label, exc)
@@ -1236,6 +1331,117 @@ class IBWorkerThread(QThread):
                 "[%s] API-ERR   placeOrder failed: %s", self._label, exc)
             order_log.error("[%s] ORDER-ERROR  placeOrder failed: %s | params=%s",
                             self._label, exc, params)
+
+    def _build_bracket_children(self, parent, params: dict,
+                                ref_price: float, tick: float) -> list:
+        """Construct attached TP / SL / Trail-stop children for *parent*.
+
+        Each child reverses the parent's action, shares its quantity and
+        account, gets a fresh unique ``orderId`` from the IB client and a
+        fresh ``orderRef`` (suffix-based refs would break the 4-part parser
+        used by the blotter).  All children except the last have
+        ``transmit=False``; the last has ``transmit=True`` so IB activates
+        the entire bundle atomically.
+
+        When both stop-loss and trailing are enabled, they are placed in a
+        common OCA group so one firing cancels the other — TP auto-OCAs
+        against whichever loss-side exit fills via the shared parentId.
+        """
+        from ib_async import LimitOrder, StopOrder, StopLimitOrder, Order
+
+        exit_action = "SELL" if parent.action == "BUY" else "BUY"
+        sign = 1 if parent.action == "BUY" else -1
+        qty = parent.totalQuantity
+        is_stk = params.get("sec_type") == "STK"
+        cap_offset = float(params.get("limit_cap_offset") or 0.0)
+
+        def _offset_points(tier: dict) -> float:
+            v = float(tier.get("value", 0.0))
+            return v * tick if tier.get("unit") == "ticks" else v
+
+        built: list[tuple[str, object]] = []
+
+        tp_tier = params.get("profit_take")
+        if tp_tier:
+            px = _round_to_tick(ref_price + sign * _offset_points(tp_tier),
+                                tick)
+            if px > 0:
+                built.append(("tp", LimitOrder(exit_action, qty, px)))
+            else:
+                order_log.warning(
+                    "[%s] TP-SKIP  non-positive price %.4f (ref=%.4f)",
+                    self._label, px, ref_price)
+
+        sl_tier = params.get("stop_loss")
+        if sl_tier:
+            lmt_px = _round_to_tick(
+                ref_price - sign * _offset_points(sl_tier), tick)
+            if lmt_px > 0:
+                if cap_offset > 0:
+                    # STP LMT: trigger (auxPrice) sits cap_offset *away from
+                    # the user's intended SL in the direction of the parent
+                    # fill* — so the stop fires slightly earlier than the
+                    # limit and gives the resulting limit order a cap_offset
+                    # execution window.  BUY parent ⇒ SELL STP LMT where
+                    # aux > lmt;  SELL parent ⇒ BUY STP LMT where aux < lmt.
+                    aux_px = _round_to_tick(lmt_px + sign * cap_offset, tick)
+                    if aux_px > 0:
+                        built.append(("sl", StopLimitOrder(
+                            exit_action, qty, lmt_px, aux_px)))
+                    else:
+                        order_log.warning(
+                            "[%s] SL-SKIP  non-positive stop %.4f "
+                            "(lmt=%.4f cap=%.4f)", self._label,
+                            aux_px, lmt_px, cap_offset)
+                else:
+                    # No cap preference configured → plain stop-market.
+                    built.append(("sl", StopOrder(exit_action, qty, lmt_px)))
+            else:
+                order_log.warning(
+                    "[%s] SL-SKIP  non-positive price %.4f (ref=%.4f)",
+                    self._label, lmt_px, ref_price)
+
+        tr_tier = params.get("trailing")
+        if tr_tier:
+            aux = _round_to_tick(_offset_points(tr_tier), tick)
+            if aux > 0:
+                built.append(("tr", Order(
+                    orderType="TRAIL",
+                    action=exit_action,
+                    totalQuantity=qty,
+                    auxPrice=aux,
+                )))
+            else:
+                order_log.warning(
+                    "[%s] TRAIL-SKIP  non-positive offset %.4f", self._label,
+                    aux)
+
+        if not built:
+            return []
+
+        # No explicit ocaGroup: attached children (shared parentId) are
+        # already OCA'd by IB at the bracket level — when any one fills,
+        # TWS auto-cancels the siblings.  Setting an ocaGroup on top of
+        # that is redundant AND rejected by IBKR as "OCA handling method
+        # mismatch" (confirmed against paper-account error 201).
+
+        parent_outside_rth = getattr(parent, "outsideRth", False)
+        parent_allow_pre = getattr(parent, "allowPreOpen", False)
+
+        for _tag, ch in built:
+            ch.parentId = parent.orderId
+            ch.orderId = self._ib.client.getReqId()
+            ch.account = parent.account
+            ch.tif = parent.tif
+            ch.orderRef = _generate_order_ref()
+            ch.transmit = False
+            if is_stk:
+                ch.outsideRth = parent_outside_rth
+                ch.allowPreOpen = parent_allow_pre
+
+        # Last child flushes the bundle to TWS.
+        built[-1][1].transmit = True
+        return [ch for _, ch in built]
 
     async def _do_cancel_order(self, order_id: str) -> None:
         """Cancel an open order by its *order_id*.

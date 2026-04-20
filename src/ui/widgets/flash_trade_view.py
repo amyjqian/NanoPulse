@@ -418,6 +418,36 @@ class FlashTradeView(QWidget):
                 params["adaptive_priority"] = adaptive_priority
             if peg_offset is not None:
                 params["peg_offset"] = peg_offset
+            # Forward bracket-order tiers for attached TP / SL / Trail children.
+            # `bracket_ref_price` is the expected-fill anchor point for child
+            # prices — critical because `limit_price` on Adaptive / PEG /
+            # cap-wrapped-MKT orders is a *ceiling* (BUY) or *floor* (SELL),
+            # NOT the intended fill.  Children priced off the cap land far
+            # from the real fill.  Only BID_LMT / ASK_LMT orders truly fill
+            # at their limit, so that's the one case where we anchor to it.
+            params["tick_size"] = tick
+            params["last_price"] = last_price
+            original_type = payload.get("type", "MKT")
+            if original_type in ("BID_LMT", "ASK_LMT") and limit_price:
+                params["bracket_ref_price"] = limit_price
+            else:
+                params["bracket_ref_price"] = last_price
+            # Convert the user's Limit Cap preference into a points offset.
+            # Reused for stop-loss children so they submit as STP LMT (trigger
+            # vs. limit offset by this amount) instead of plain STP — gives
+            # the resulting limit order a small execution window while still
+            # guaranteeing the stop fires at the user's intended SL price.
+            cap_raw = float(prefs.get("limit_cap", 0) or 0)
+            if cap_raw:
+                params["limit_cap_offset"] = abs(calculate_offset(
+                    cap_raw, str(prefs.get("limit_cap_unit", "ticks")),
+                    last_price if last_price > 0 else 0, tick,
+                ))
+            else:
+                params["limit_cap_offset"] = 0.0
+            params["profit_take"] = payload.get("profit_take")
+            params["stop_loss"] = payload.get("stop_loss")
+            params["trailing"] = payload.get("trailing")
             worker.place_order(params)
 
     def _find_worker_for_account(self, account: str) -> IBWorkerThread | None:
