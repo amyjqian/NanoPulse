@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, Signal
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPoint, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -654,12 +654,49 @@ class DOMLadderView(QTableView):
     def is_locked(self) -> bool:
         return self._locked
 
-    def sync_to_last(self) -> None:
-        """Ask the view to re-centre on the last price if locked.
+    # Safety valve: when unlocked, if the last-price row drifts this
+    # many rows past the centre of the viewport, we recentre anyway so
+    # the user doesn't completely lose sight of the market.
+    _DRIFT_LIMIT_ROWS = 20
 
-        BookTraderView calls this after every ``feed_last`` so the
-        viewport tracks the market in real time.  A no-op when
-        unlocked — the user has taken manual control.
+    def sync_to_last(self) -> None:
+        """Ask the view to re-centre on the last price.
+
+        * Locked   → always recentre the viewport on the last price.
+        * Unlocked → only recentre if the last-price row has drifted
+          further than ``_DRIFT_LIMIT_ROWS`` from the middle of the
+          currently-visible viewport.  Normal ticks leave the user's
+          scroll position untouched; a runaway market still pulls the
+          ladder back into view.
         """
         if self._locked:
             self._scroll_to_last()
+            return
+        drift = self._last_row_drift()
+        if drift is not None and drift > self._DRIFT_LIMIT_ROWS:
+            self._scroll_to_last()
+
+    def _last_row_drift(self) -> int | None:
+        """Return the absolute row-distance between the last-price row
+        and the row currently showing in the middle of the viewport,
+        or ``None`` if either can't be determined yet."""
+        prices = self._model.prices
+        last = self._model.last_price
+        if not prices or last <= 0:
+            return None
+        last_row = -1
+        for i, p in enumerate(prices):
+            if abs(p - last) < self._model.tick_size / 2:
+                last_row = i
+                break
+        if last_row < 0:
+            # Last price has moved entirely off the ladder grid — treat
+            # that as "max drift" so we snap back to show it.
+            return self._DRIFT_LIMIT_ROWS + 1
+        # Middle of the visible viewport in viewport coordinates.
+        vp = self.viewport()
+        mid_y = vp.height() // 2
+        mid_idx = self.indexAt(vp.rect().topLeft() + QPoint(0, mid_y))
+        if not mid_idx.isValid():
+            return None
+        return abs(last_row - mid_idx.row())
