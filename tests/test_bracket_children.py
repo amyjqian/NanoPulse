@@ -129,8 +129,10 @@ class TestBracketChildren:
     def test_sl_with_cap_becomes_stop_limit_buy_parent(self):
         """BUY parent + cap_offset → SELL STP LMT with aux > lmt.
 
-        User sees LMT = user's intended SL, aux = LMT + cap so the trigger
-        fires slightly earlier than the limit (valid SELL STP LMT shape).
+        Chip offset maps to the stop TRIGGER (auxPrice) so what TWS
+        displays as the stop matches what the user configured.  The
+        limit sits cap_offset further below the stop to bound the
+        execution slippage after the stop fires.
         """
         wt = _make_worker()
         params = {
@@ -143,8 +145,8 @@ class TestBracketChildren:
         sl = out[0]
         assert sl.orderType == "STP LMT"
         assert sl.action == "SELL"
-        assert sl.lmtPrice == 17495.00    # ref - 5 (user's SL)
-        assert sl.auxPrice == 17496.00    # lmt + cap (stop above limit)
+        assert sl.auxPrice == 17495.00    # ref - 5 (user's stop = chip offset)
+        assert sl.lmtPrice == 17494.00    # stop - cap (limit below stop)
 
     def test_sl_with_cap_becomes_stop_limit_sell_parent(self):
         """SELL parent + cap_offset → BUY STP LMT with aux < lmt."""
@@ -159,8 +161,8 @@ class TestBracketChildren:
         sl = out[0]
         assert sl.orderType == "STP LMT"
         assert sl.action == "BUY"
-        assert sl.lmtPrice == 17505.00    # ref + 5 (user's SL)
-        assert sl.auxPrice == 17504.00    # lmt - cap (stop below limit)
+        assert sl.auxPrice == 17505.00    # ref + 5 (user's stop = chip offset)
+        assert sl.lmtPrice == 17506.00    # stop + cap (limit above stop)
 
     def test_sl_cap_zero_falls_back_to_plain_stp(self):
         """Explicit cap=0 behaves the same as no cap — plain STP."""
@@ -185,8 +187,8 @@ class TestBracketChildren:
         out = wt._build_bracket_children(_parent("BUY"), params,
                                          ref_price=17500.0, tick=0.25)
         sl = out[0]
-        assert sl.lmtPrice == 17495.00
-        assert sl.auxPrice == 17495.25  # +0.30 rounded to nearest 0.25
+        assert sl.auxPrice == 17495.00  # ref - 5 (stop trigger)
+        assert sl.lmtPrice == 17494.75  # stop - 0.30 rounded to 0.25 grid
 
     def test_trailing_uses_unsigned_offset(self):
         wt = _make_worker()
@@ -308,3 +310,39 @@ class TestBracketChildren:
                                          ref_price=17500.0, tick=0.25)
         # 17500 + 5.13 = 17505.13 → snaps to 17505.25
         assert out[0].lmtPrice == 17505.25
+
+    def test_chip_label_is_direct_points_offset(self):
+        """Tier chips (loaded via ReferenceData._extract_tiers or
+        _enrich_pref_tiers) carry unit='price' because the stored offset
+        is already in price points — the StrategyEditor computes
+        ``val = offset × multiplier`` which only makes sense if offset
+        is in points.  Chip label N therefore means "N points" for TP,
+        SL and Trail alike — no tick_size multiplication anywhere."""
+        wt = _make_worker()
+        tier = {"value": 5, "unit": "price", "label": "5"}
+        params = {
+            "sec_type": "FUT",
+            "profit_take": tier,
+            "stop_loss":   tier,
+            "trailing":    tier,
+        }
+
+        # BUY parent at 26695.
+        out = wt._build_bracket_children(_parent("BUY"), params,
+                                         ref_price=26695.0, tick=0.25)
+        tp = next(o for o in out if o.orderType == "LMT")
+        sl = next(o for o in out if o.orderType == "STP")
+        tr = next(o for o in out if o.orderType == "TRAIL")
+        assert tp.lmtPrice == 26700.00  # 26695 + 5
+        assert sl.auxPrice == 26690.00  # 26695 - 5
+        assert tr.auxPrice == 5.00      # trailing distance = 5 pts
+
+        # SELL parent mirrors TP/SL; trail distance is directionless.
+        out = wt._build_bracket_children(_parent("SELL"), params,
+                                         ref_price=26695.0, tick=0.25)
+        tp = next(o for o in out if o.orderType == "LMT")
+        sl = next(o for o in out if o.orderType == "STP")
+        tr = next(o for o in out if o.orderType == "TRAIL")
+        assert tp.lmtPrice == 26690.00  # 26695 - 5
+        assert sl.auxPrice == 26700.00  # 26695 + 5
+        assert tr.auxPrice == 5.00

@@ -944,30 +944,6 @@ class _QtyInput(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  _ChipButton
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class _ChipButton(QPushButton):
-    """QPushButton that also emits ``doubleClicked`` on a mouse double-click.
-
-    We intentionally do NOT call ``super().mouseDoubleClickEvent``.  The default
-    QAbstractButton implementation re-enters ``emitPressed()``, which sets the
-    button's internal ``down`` flag so the following mouse release would fire a
-    second ``clicked`` — which would re-select the chip right after our
-    double-click handler cleared it.
-    """
-
-    doubleClicked = Signal()
-
-    def mouseDoubleClickEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.doubleClicked.emit()
-            event.accept()
-            return
-        super().mouseDoubleClickEvent(event)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 #  _TierSection
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1083,13 +1059,12 @@ class _TierSection(QWidget):
 
         for i, tier in enumerate(self._tiers):
             label = tier.get("label", f"Tier {i + 1}")
-            btn = _ChipButton(label)
+            btn = QPushButton(label)
             btn.setFixedHeight(self._CHIP_H)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setSizePolicy(
                 QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             btn.clicked.connect(lambda chk, idx=i: self._on_chip_clicked(idx))
-            btn.doubleClicked.connect(self._on_chip_double_clicked)
             self._chip_buttons.append(btn)
             lay.addWidget(btn)
 
@@ -1196,25 +1171,6 @@ class _TierSection(QWidget):
             self._input.blockSignals(True)
             self._input.clear()
             self._input.blockSignals(False)
-        self._update_chip_styles()
-        self._update_dollar_display()
-        self.changed.emit()
-
-    def _on_chip_double_clicked(self) -> None:
-        """Double-clicking a chip resets the section: chip deselected, toggle
-        off, Dist input cleared, and the header button disabled (via the
-        standard _update_dollar_display rules)."""
-        self._selected_idx = None
-        if self._input is not None:
-            self._input.blockSignals(True)
-            self._input.clear()
-            self._input.blockSignals(False)
-        if self._toggle and self._toggle.is_on:
-            self._toggle.blockSignals(True)
-            self._toggle.set_on(False)
-            self._toggle.blockSignals(False)
-        if self._state_lbl is not None:
-            self._state_lbl.setText("Off")
         self._update_chip_styles()
         self._update_dollar_display()
         self.changed.emit()
@@ -1999,10 +1955,10 @@ class OrderEntryPanel(QWidget):
     # ── Tier helpers ──────────────────────────────────────────────────────────
 
     _TIER_FALLBACK = [
-        {"label": "Tier 1", "value": 20,  "unit": "ticks"},
-        {"label": "Tier 2", "value": 40,  "unit": "ticks"},
-        {"label": "Tier 3", "value": 80,  "unit": "ticks"},
-        {"label": "Tier 4", "value": 160, "unit": "ticks"},
+        {"label": "Tier 1", "value": 20,  "unit": "price"},
+        {"label": "Tier 2", "value": 40,  "unit": "price"},
+        {"label": "Tier 3", "value": 80,  "unit": "price"},
+        {"label": "Tier 4", "value": 160, "unit": "price"},
     ]
 
     def _load_tiers_for_active(self) -> tuple[list[dict], list[dict], list[dict]]:
@@ -2083,16 +2039,17 @@ class OrderEntryPanel(QWidget):
                            tick_size: float = 0.01) -> list[dict]:
         """Add ``offset`` and ``dollar`` fields to preference-sourced tiers.
 
-        Preference tiers store the number of ticks in ``value``.  The
-        per-unit dollar value is:
+        Preference tiers store the *price-point* offset in ``value`` (matching
+        the StrategyEditor's "val = offset × multiplier" semantics — the
+        stored number is points, not ticks).  Dollar per contract is:
 
-            dollar = offset_ticks × tick_size × multiplier
+            dollar = offset_points × multiplier
 
         Examples
         --------
-        NVDA  (tick=0.01, mult=1):   20 ticks → 20×0.01×1  = $0.20 / share
-        NQ    (tick=0.25, mult=20):  20 ticks → 20×0.25×20 = $100  / contract
-        MNQ   (tick=0.25, mult=2):   20 ticks → 20×0.25×2  = $10   / contract
+        NVDA  (mult=1):   20 pts → 20 × 1  = $20  / share (notional distance)
+        NQ    (mult=20):  20 pts → 20 × 20 = $400 / contract
+        MNQ   (mult=2):   20 pts → 20 × 2  = $40  / contract
         """
         result = []
         for t in tiers:
@@ -2101,7 +2058,7 @@ class OrderEntryPanel(QWidget):
                 offset = float(raw)
             except (TypeError, ValueError):
                 offset = 0.0
-            dollar = round(offset * tick_size * multiplier, 4)
+            dollar = round(offset * multiplier, 4)
             result.append({**t, "offset": offset, "dollar": dollar})
         return result
 

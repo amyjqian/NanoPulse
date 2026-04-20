@@ -1374,32 +1374,35 @@ class IBWorkerThread(QThread):
 
         sl_tier = params.get("stop_loss")
         if sl_tier:
-            lmt_px = _round_to_tick(
+            # auxPrice is the stop trigger — what traders and TWS call
+            # "the stop price".  The chip's offset applies here so the
+            # displayed stop matches the user's intent (chip 10 ⇒ stop
+            # 10 pts from ref).  When a cap_offset is configured we
+            # upgrade to STP LMT and place the limit cap_offset *further
+            # into the loss zone* from the stop, giving the resulting
+            # limit order a small execution window.
+            #   BUY parent  (SELL STP LMT): aux > lmt  (stop above floor)
+            #   SELL parent (BUY  STP LMT): aux < lmt  (stop below ceiling)
+            aux_px = _round_to_tick(
                 ref_price - sign * _offset_points(sl_tier), tick)
-            if lmt_px > 0:
+            if aux_px > 0:
                 if cap_offset > 0:
-                    # STP LMT: trigger (auxPrice) sits cap_offset *away from
-                    # the user's intended SL in the direction of the parent
-                    # fill* — so the stop fires slightly earlier than the
-                    # limit and gives the resulting limit order a cap_offset
-                    # execution window.  BUY parent ⇒ SELL STP LMT where
-                    # aux > lmt;  SELL parent ⇒ BUY STP LMT where aux < lmt.
-                    aux_px = _round_to_tick(lmt_px + sign * cap_offset, tick)
-                    if aux_px > 0:
+                    lmt_px = _round_to_tick(aux_px - sign * cap_offset, tick)
+                    if lmt_px > 0:
                         built.append(("sl", StopLimitOrder(
                             exit_action, qty, lmt_px, aux_px)))
                     else:
                         order_log.warning(
-                            "[%s] SL-SKIP  non-positive stop %.4f "
-                            "(lmt=%.4f cap=%.4f)", self._label,
-                            aux_px, lmt_px, cap_offset)
+                            "[%s] SL-SKIP  non-positive lmt %.4f "
+                            "(stop=%.4f cap=%.4f)", self._label,
+                            lmt_px, aux_px, cap_offset)
                 else:
                     # No cap preference configured → plain stop-market.
-                    built.append(("sl", StopOrder(exit_action, qty, lmt_px)))
+                    built.append(("sl", StopOrder(exit_action, qty, aux_px)))
             else:
                 order_log.warning(
-                    "[%s] SL-SKIP  non-positive price %.4f (ref=%.4f)",
-                    self._label, lmt_px, ref_price)
+                    "[%s] SL-SKIP  non-positive stop %.4f (ref=%.4f)",
+                    self._label, aux_px, ref_price)
 
         tr_tier = params.get("trailing")
         if tr_tier:
