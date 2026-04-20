@@ -44,6 +44,18 @@ def _generate_order_ref() -> str:
     return f"nano_{now:%m%d}_{now:%H%M%S}_{tag}"
 
 
+def _round_to_tick(price: float, tick: float) -> float:
+    """Snap *price* to the nearest multiple of *tick*.
+
+    Used when deriving bracket-child limit/stop prices from a parent-fill
+    reference price and a user-supplied offset — IBKR rejects child prices
+    that aren't aligned with the contract's minimum tick.
+    """
+    if not tick or tick <= 0:
+        return round(price, 4)
+    return round(round(price / tick) * tick, 10)
+
+
 def _parse_orderref_time(order_ref: str) -> datetime | None:
     """Extract the submission timestamp embedded in a NanoPulse orderRef.
 
@@ -151,8 +163,10 @@ class IBWorkerThread(QThread):
     order_status_updated = Signal(dict)
     # list[dict] – portfolio position batch
     portfolio_updated = Signal(list)
-    # (symbol, last, bid, ask) – background cache
-    bg_price_updated = Signal(str, float, float, float)
+    # (symbol, last, bid, ask, close) – background cache.  ``close`` is the
+    # prior-session close used by the order-entry ticker strip to compute
+    # day change / %change; 0.0 when unavailable.
+    bg_price_updated = Signal(str, float, float, float, float)
     # {symbol, account, action, qty} → UI places the close order
     flatten_close_needed = Signal(dict)
     # {symbol, account, action, qty} → UI places the reverse order
@@ -556,6 +570,31 @@ class IBWorkerThread(QThread):
                 self._do_reverse(symbol, account), self._loop)
         else:
             log.warning("Worker %s: reverse but loop not ready", self._label)
+
+    def close_tier(self, symbol: str, account: str, side: str,
+                   offset_pts: float, requested_qty: int,
+                   current_price: float, cap_offset: float = 0.0) -> None:
+        """Thread-safe: close the current position on *symbol*/*account*
+        using a single LMT (tp) or STP/STP LMT (sl) exit order.
+
+        * side       : "tp" (Limit at profit price) or "sl" (Stop).
+        * offset_pts : price-point distance from *current_price* for the
+                       exit price.
+        * requested_qty : user's configured qty; the order is sized to
+                          min(|position|, requested_qty).
+        * current_price : reference price (UI's last_price snapshot).
+        * cap_offset  : if >0 and side=="sl", uses STP LMT with the limit
+                        sitting cap_offset further into the loss zone than
+                        the stop trigger.
+        """
+        if self._loop is not None and not self._loop.is_closed():
+            asyncio.run_coroutine_threadsafe(
+                self._do_close_tier(symbol, account, side, offset_pts,
+                                    requested_qty, current_price,
+                                    cap_offset), self._loop)
+        else:
+            log.warning(
+                "Worker %s: close_tier but loop not ready", self._label)
 
     def close_pct(self, symbol: str, account: str, pct: int) -> None:
         """Thread-safe: close *pct* percent (25/50/75) of the position for
@@ -1113,6 +1152,38 @@ class IBWorkerThread(QThread):
                              "(ET %02d:%02d, in_rth=%s)",
                              self._label, order.outsideRth, h, m, in_rth)
 
+            # ── Bracket (TP / SL / Trail-stop attached children) ──────────
+            # A parent with any enabled tier becomes the parent of a bracket:
+            # children share parentId and are transmitted together (only the
+            # last child has transmit=True, per ib_async's documented pattern).
+            tp_tier = params.get("profit_take")
+            sl_tier = params.get("stop_loss")
+            tr_tier = params.get("trailing")
+            bracket_children: list = []
+            if any((tp_tier, sl_tier, tr_tier)):
+                # FlashTradeView sets bracket_ref_price to the expected-fill
+                # anchor — last_price for Adaptive / PEG / cap-wrapped MKT
+                # orders, limit_price only for true BID_LMT / ASK_LMT.  Fall
+                # back to last_price if the caller didn't set it, which
+                # keeps bracket children anchored to the market rather than
+                # to a cap that will not reflect the actual fill.
+                ref_price = float(params.get("bracket_ref_price")
+                                  or params.get("last_price") or 0.0)
+                if ref_price > 0:
+                    order.orderId = self._ib.client.getReqId()
+                    order.transmit = False
+                    bracket_children = self._build_bracket_children(
+                        order, params, ref_price,
+                        float(params.get("tick_size") or 0.01),
+                    )
+                else:
+                    order_log.warning(
+                        "[%s] BRACKET-SKIP  no reference price "
+                        "(bracket_ref=%s last=%s) — parent-only submit, "
+                        "orderRef=%s", self._label,
+                        params.get("bracket_ref_price"),
+                        params.get("last_price"), order.orderRef)
+
             # ── Place ─────────────────────────────────────────────────────
             # Log every parameter sent to ib_async for debugging
             log.info(
@@ -1229,6 +1300,80 @@ class IBWorkerThread(QThread):
 
             trade.statusEvent += _on_status
 
+            # ── Place bracket children (if any) ────────────────────────────
+            # Children are placed on the same contract, each with its own
+            # fresh orderRef (the time-encoded format keeps the blotter's
+            # submission-time parser working) and parentId pointing at the
+            # parent's IB orderId.  Only the last child has transmit=True,
+            # which flushes the whole bundle to TWS atomically.
+            for ch in bracket_children:
+                ch_trade = self._ib.placeOrder(c, ch)
+                ch_key = f"{account}_{ch.orderRef}"
+                self._trades[ch_key] = ch_trade
+                self._has_status_handler.add(ch_key)
+
+                order_log.info(
+                    "[%s] BRACKET-CHILD  parentRef=%s childRef=%s "
+                    "type=%s action=%s qty=%s lmt=%s aux=%s "
+                    "oca=%s transmit=%s",
+                    self._label, order.orderRef, ch.orderRef,
+                    ch.orderType, ch.action, ch.totalQuantity,
+                    getattr(ch, "lmtPrice", "N/A"),
+                    getattr(ch, "auxPrice", "N/A"),
+                    getattr(ch, "ocaGroup", ""), ch.transmit)
+                tws_log.info(
+                    "[%s] API-RESP  placeOrder(child) → orderId=%s orderRef=%s",
+                    self._label, ch_trade.order.orderId, ch.orderRef)
+
+                # Bind each child's statusEvent so blotter/positions pick up
+                # fills and cancels without any extra plumbing.  Start from
+                # the parent's params (symbol / account / conid / sec_type)
+                # then overlay the child's own identity — without this the
+                # blotter would show the parent's BUY/SELL action and price
+                # for every child row.
+                ch_params = dict(params)
+                ch_params["order_type"] = ch.orderType
+                ch_params["action"]     = ch.action
+                ch_params["qty"]        = int(ch.totalQuantity)
+                # Child-specific price columns for the blotter.  TRAIL's
+                # auxPrice is a *distance* not a stop level, so leave stop
+                # empty; TRAIL shows the trail distance in its own column.
+                lmt_val = getattr(ch, "lmtPrice", None)
+                aux_val = getattr(ch, "auxPrice", None)
+                if ch.orderType in ("LMT",) and lmt_val and lmt_val < _IB_DBL_MAX:
+                    ch_params["limit_price"] = lmt_val
+                else:
+                    ch_params.pop("limit_price", None)
+                if ch.orderType in ("STP", "STP LMT") and aux_val \
+                        and aux_val < _IB_DBL_MAX:
+                    ch_params["stop_price"] = aux_val
+                    if ch.orderType == "STP LMT" and lmt_val \
+                            and lmt_val < _IB_DBL_MAX:
+                        ch_params["limit_price"] = lmt_val
+                else:
+                    ch_params.pop("stop_price", None)
+                ch_frozen_oid = ch_key
+
+                def _on_child_status(t, _oid=ch_frozen_oid, _p=ch_params):
+                    new_status = t.orderStatus.status
+                    self._emit_order_status(t, _oid, _p, new_status)
+                    order_log.info(
+                        "[%s] ORDER-STATUS  %s | status=%s filled=%s "
+                        "avgFill=%s symbol=%s account=%s orderRef=%s",
+                        self._label, _oid, new_status,
+                        t.orderStatus.filled, t.orderStatus.avgFillPrice,
+                        _p.get("symbol", "?"), _p.get("account", ""),
+                        getattr(t.order, "orderRef", ""))
+                    if new_status in ("Filled", "Completed"):
+                        self._apply_fill_to_position(t, _p)
+
+                ch_trade.statusEvent += _on_child_status
+
+                # Emit the child's initial status so the UI sees it right away.
+                init_status = ch_trade.orderStatus.status or "Submitted"
+                self._emit_order_status(ch_trade, ch_key, ch_params,
+                                        init_status)
+
         except Exception as exc:
             log.exception("Worker %s: place_order failed: %s",
                           self._label, exc)
@@ -1236,6 +1381,130 @@ class IBWorkerThread(QThread):
                 "[%s] API-ERR   placeOrder failed: %s", self._label, exc)
             order_log.error("[%s] ORDER-ERROR  placeOrder failed: %s | params=%s",
                             self._label, exc, params)
+
+    def _build_bracket_children(self, parent, params: dict,
+                                ref_price: float, tick: float) -> list:
+        """Construct attached TP / SL / Trail-stop children for *parent*.
+
+        Each child reverses the parent's action, shares its quantity and
+        account, gets a fresh unique ``orderId`` from the IB client and a
+        fresh ``orderRef`` (suffix-based refs would break the 4-part parser
+        used by the blotter).  All children except the last have
+        ``transmit=False``; the last has ``transmit=True`` so IB activates
+        the entire bundle atomically.
+
+        When both stop-loss and trailing are enabled, they are placed in a
+        common OCA group so one firing cancels the other — TP auto-OCAs
+        against whichever loss-side exit fills via the shared parentId.
+        """
+        from ib_async import LimitOrder, StopOrder, StopLimitOrder, Order
+
+        exit_action = "SELL" if parent.action == "BUY" else "BUY"
+        sign = 1 if parent.action == "BUY" else -1
+        qty = parent.totalQuantity
+        is_stk = params.get("sec_type") == "STK"
+        cap_offset = float(params.get("limit_cap_offset") or 0.0)
+
+        def _offset_points(tier: dict) -> float:
+            v = float(tier.get("value", 0.0))
+            return v * tick if tier.get("unit") == "ticks" else v
+
+        built: list[tuple[str, object]] = []
+
+        tp_tier = params.get("profit_take")
+        if tp_tier:
+            px = _round_to_tick(ref_price + sign * _offset_points(tp_tier),
+                                tick)
+            if px > 0:
+                built.append(("tp", LimitOrder(exit_action, qty, px)))
+            else:
+                order_log.warning(
+                    "[%s] TP-SKIP  non-positive price %.4f (ref=%.4f)",
+                    self._label, px, ref_price)
+
+        sl_tier = params.get("stop_loss")
+        if sl_tier:
+            # auxPrice is the stop trigger — what traders and TWS call
+            # "the stop price".  The chip's offset applies here so the
+            # displayed stop matches the user's intent (chip 10 ⇒ stop
+            # 10 pts from ref).  When a cap_offset is configured we
+            # upgrade to STP LMT and place the limit cap_offset *further
+            # into the loss zone* from the stop, giving the resulting
+            # limit order a small execution window.
+            #   BUY parent  (SELL STP LMT): aux > lmt  (stop above floor)
+            #   SELL parent (BUY  STP LMT): aux < lmt  (stop below ceiling)
+            aux_px = _round_to_tick(
+                ref_price - sign * _offset_points(sl_tier), tick)
+            if aux_px > 0:
+                if cap_offset > 0:
+                    lmt_px = _round_to_tick(aux_px - sign * cap_offset, tick)
+                    if lmt_px > 0:
+                        built.append(("sl", StopLimitOrder(
+                            exit_action, qty, lmt_px, aux_px)))
+                    else:
+                        order_log.warning(
+                            "[%s] SL-SKIP  non-positive lmt %.4f "
+                            "(stop=%.4f cap=%.4f)", self._label,
+                            lmt_px, aux_px, cap_offset)
+                else:
+                    # No cap preference configured → plain stop-market.
+                    built.append(("sl", StopOrder(exit_action, qty, aux_px)))
+            else:
+                order_log.warning(
+                    "[%s] SL-SKIP  non-positive stop %.4f (ref=%.4f)",
+                    self._label, aux_px, ref_price)
+
+        tr_tier = params.get("trailing")
+        if tr_tier:
+            aux = _round_to_tick(_offset_points(tr_tier), tick)
+            if aux > 0:
+                built.append(("tr", Order(
+                    orderType="TRAIL",
+                    action=exit_action,
+                    totalQuantity=qty,
+                    auxPrice=aux,
+                )))
+            else:
+                order_log.warning(
+                    "[%s] TRAIL-SKIP  non-positive offset %.4f", self._label,
+                    aux)
+
+        if not built:
+            return []
+
+        # No explicit ocaGroup: attached children (shared parentId) are
+        # already OCA'd by IB at the bracket level — when any one fills,
+        # TWS auto-cancels the siblings.  Setting an ocaGroup on top of
+        # that is redundant AND rejected by IBKR as "OCA handling method
+        # mismatch" (confirmed against paper-account error 201).
+
+        parent_outside_rth = getattr(parent, "outsideRth", False)
+        parent_allow_pre = getattr(parent, "allowPreOpen", False)
+
+        for _tag, ch in built:
+            ch.parentId = parent.orderId
+            ch.orderId = self._ib.client.getReqId()
+            ch.account = parent.account
+            ch.tif = parent.tif
+            ch.orderRef = _generate_order_ref()
+            ch.transmit = False
+            if is_stk:
+                ch.outsideRth = parent_outside_rth
+                ch.allowPreOpen = parent_allow_pre
+            else:
+                # Futures: STP / STP LMT / TRAIL orders are held by TWS
+                # until the next RTH open by default (Warning 399 /
+                # "placed at the exchange until 08:30 US/Central").  For
+                # CME products that trade ~23 hours this leaves a stop
+                # dormant overnight — long enough for the market to blow
+                # past it before the flag un-holds.  outsideRth=True keeps
+                # the child armed during extended hours.  Stocks keep
+                # their existing RTH semantics (see parent_outside_rth).
+                ch.outsideRth = True
+
+        # Last child flushes the bundle to TWS.
+        built[-1][1].transmit = True
+        return [ch for _, ch in built]
 
     async def _do_cancel_order(self, order_id: str) -> None:
         """Cancel an open order by its *order_id*.
@@ -1619,6 +1888,224 @@ class IBWorkerThread(QThread):
                 "action":  action,
                 "qty":     qty,
             })
+
+    async def _do_close_tier(self, symbol: str, account: str, side: str,
+                             offset_pts: float, requested_qty: int,
+                             current_price: float,
+                             cap_offset: float) -> None:
+        """Read the position for *symbol*/*account* and submit a single
+        LMT (tp) / STP / STP LMT (sl) exit order.
+
+        Sizing: ``qty = min(|position|, requested_qty)``.  A zero-position
+        account is silently skipped so we never submit an empty order.
+        No open orders are cancelled — this is strictly additive.
+
+        TP price:
+          long  (pos>0): target = current + offset   (sell above current)
+          short (pos<0): target = current - offset   (buy below current)
+
+        SL trigger (auxPrice — "the stop price" TWS displays):
+          long  (pos>0): stop   = current - offset   (sell below current)
+          short (pos<0): stop   = current + offset
+        And when ``cap_offset > 0`` the limit sits that far further
+        into the loss zone from the stop, giving the post-trigger limit
+        a small execution window.
+        """
+        if self._ib is None or not self._ib.isConnected():
+            return
+        if side not in ("tp", "sl") or offset_pts <= 0 or current_price <= 0:
+            order_log.warning(
+                "[%s] ORDER-CLOSE-TIER  invalid args side=%s offset=%.4f "
+                "ref=%.4f — skipping", self._label, side, offset_pts,
+                current_price)
+            return
+
+        from ib_async import LimitOrder, StopOrder, StopLimitOrder
+
+        symbol_upper = symbol.upper()
+        try:
+            positions = self._ib.positions()
+        except Exception:
+            log.warning(
+                "Worker %s: close_tier could not read positions", self._label)
+            return
+
+        for pos in positions:
+            if getattr(pos, "account", "") != account:
+                continue
+            contract = pos.contract
+            if not _symbol_matches(contract, symbol_upper):
+                continue
+
+            net_pos = float(getattr(pos, "position", 0))
+            if net_pos == 0:
+                continue
+
+            abs_pos = abs(int(net_pos))
+            req = max(0, int(requested_qty))
+            qty = min(abs_pos, req) if req > 0 else abs_pos
+            if qty <= 0:
+                continue
+
+            is_long = net_pos > 0
+            exit_action = "SELL" if is_long else "BUY"
+            sign = 1 if is_long else -1
+
+            sec_type = getattr(contract, "secType", "") or ""
+            tick = self._tick_size_for_contract(contract)
+
+            # ib.positions() returns contracts without `exchange` populated
+            # (among other routing fields), which causes placeOrder to fail
+            # with Warning 321 "Missing order exchange".  The exchange lives
+            # in the local Contracts table already — look it up in memory
+            # via ReferenceData instead of doing a round-trip to TWS.
+            if not getattr(contract, "exchange", ""):
+                from src.core.reference_data import get_instance as _rd
+                cached = _rd().get_contract(symbol_upper)
+                if cached and cached.get("exchange"):
+                    contract.exchange = cached["exchange"]
+                else:
+                    order_log.warning(
+                        "[%s] ORDER-CLOSE-TIER  no exchange for %s in "
+                        "local contracts — IBKR will reject the order",
+                        self._label, symbol)
+
+            if side == "tp":
+                # Profit direction: long → up, short → down.
+                target = _round_to_tick(
+                    current_price + sign * offset_pts, tick)
+                if target <= 0:
+                    order_log.warning(
+                        "[%s] ORDER-CLOSE-TIER TP-SKIP  non-positive target "
+                        "%.4f (ref=%.4f offset=%.4f)",
+                        self._label, target, current_price, offset_pts)
+                    continue
+                order = LimitOrder(exit_action, qty, target)
+                tp_desc = f"LMT @ {target:.4f}"
+            else:  # side == "sl"
+                # Loss direction: long → down, short → up.
+                stop_px = _round_to_tick(
+                    current_price - sign * offset_pts, tick)
+                if stop_px <= 0:
+                    order_log.warning(
+                        "[%s] ORDER-CLOSE-TIER SL-SKIP  non-positive stop "
+                        "%.4f (ref=%.4f offset=%.4f)",
+                        self._label, stop_px, current_price, offset_pts)
+                    continue
+                if cap_offset > 0:
+                    lmt_px = _round_to_tick(
+                        stop_px - sign * cap_offset, tick)
+                    if lmt_px <= 0:
+                        order_log.warning(
+                            "[%s] ORDER-CLOSE-TIER SL-SKIP  non-positive "
+                            "lmt %.4f (stop=%.4f cap=%.4f)",
+                            self._label, lmt_px, stop_px, cap_offset)
+                        continue
+                    order = StopLimitOrder(exit_action, qty, lmt_px, stop_px)
+                    tp_desc = f"STP LMT stop={stop_px:.4f} lmt={lmt_px:.4f}"
+                else:
+                    order = StopOrder(exit_action, qty, stop_px)
+                    tp_desc = f"STP @ {stop_px:.4f}"
+
+            order.account = account
+            order.tif = "DAY"
+            order.orderRef = _generate_order_ref()
+            # Mirror STK RTH handling used by the main place_order path so
+            # exit orders don't get rejected after hours.
+            if sec_type == "STK":
+                exch = getattr(contract, "exchange", "")
+                if exch == "IBEOS":
+                    order.advancedErrorOverride = "10329"
+                else:
+                    now_et = datetime.now(_ET)
+                    h, m = now_et.hour, now_et.minute
+                    in_rth = (h > 9 or (h == 9 and m >= 30)) and h < 16
+                    order.outsideRth = not in_rth
+                    order.allowPreOpen = False
+            else:
+                # Futures: keep STP / STP LMT exits armed during extended
+                # hours.  Without this flag TWS holds the order until the
+                # next 08:30 CT open, so a stop placed overnight won't
+                # trigger even if the price reaches it.  Safe for LMT
+                # exits too — CME honours outsideRth=True across all
+                # order types.  See _build_bracket_children for the
+                # matching logic on attached bracket children.
+                order.outsideRth = True
+
+            order_log.info(
+                "[%s] ORDER-CLOSE-TIER  side=%s %s %s %d (pos=%+d, "
+                "req=%d) | account=%s orderRef=%s %s",
+                self._label, side.upper(), exit_action, symbol, qty,
+                int(net_pos), req, account, order.orderRef, tp_desc)
+
+            trade = self._ib.placeOrder(contract, order)
+            order_id = f"{account}_{order.orderRef}"
+            self._trades[order_id] = trade
+            self._has_status_handler.add(order_id)
+
+            tws_log.info(
+                "[%s] API-RESP  placeOrder(close-tier) → "
+                "orderId=%s orderRef=%s",
+                self._label, trade.order.orderId, order.orderRef)
+
+            status_params = {
+                "symbol":   symbol,
+                "account":  account,
+                "action":   exit_action,
+                "qty":      qty,
+                "conid":    int(getattr(contract, "conId", 0) or 0),
+                "sec_type": sec_type,
+                "order_type": order.orderType,
+            }
+            if side == "tp":
+                status_params["limit_price"] = target
+            elif cap_offset > 0:
+                status_params["stop_price"] = stop_px
+                status_params["limit_price"] = lmt_px
+            else:
+                status_params["stop_price"] = stop_px
+
+            init_status = trade.orderStatus.status or "Submitted"
+            self._emit_order_status(trade, order_id, status_params,
+                                    init_status)
+
+            frozen_oid = order_id
+            frozen_params = dict(status_params)
+
+            def _on_tier_status(t, _oid=frozen_oid, _p=frozen_params):
+                new_status = t.orderStatus.status
+                self._emit_order_status(t, _oid, _p, new_status)
+                order_log.info(
+                    "[%s] ORDER-STATUS  %s | status=%s filled=%s "
+                    "avgFill=%s symbol=%s account=%s orderRef=%s",
+                    self._label, _oid, new_status,
+                    t.orderStatus.filled, t.orderStatus.avgFillPrice,
+                    _p.get("symbol", "?"), _p.get("account", ""),
+                    getattr(t.order, "orderRef", ""))
+                if new_status in ("Filled", "Completed"):
+                    self._apply_fill_to_position(t, _p)
+
+            trade.statusEvent += _on_tier_status
+
+    def _tick_size_for_contract(self, contract) -> float:
+        """Best-effort minimum-tick lookup for a Contract object.
+
+        Uses ``minTick`` if TWS populated it, otherwise falls back to a
+        coarse secType-based default (FUT ⇒ 0.25, everything else ⇒ 0.01).
+        Centralised here so close_tier can round child prices to the grid
+        without needing the UI-side _tick_size_for_symbol helper.
+        """
+        for attr in ("minTick", "tick_size", "min_tick"):
+            val = getattr(contract, attr, None)
+            if val:
+                try:
+                    v = float(val)
+                    if v > 0:
+                        return v
+                except (TypeError, ValueError):
+                    pass
+        sec = getattr(contract, "secType", "") or ""
+        return 0.25 if sec == "FUT" else 0.01
 
     def _on_trade_status(self, trade, order_id: str, params: dict) -> None:
         """Callback fired by trade.statusEvent – runs in the worker's event loop.
@@ -2042,7 +2529,12 @@ class IBWorkerThread(QThread):
             if bid_valid or ask_valid:
                 self._bg_last_bid_ask[sym] = (bid_out, ask_out)
 
-            self.bg_price_updated.emit(sym, last, bid_out, ask_out)
+            # Prior-session close for day-change display (0 when unknown).
+            close = getattr(ticker, "close", float('nan'))
+            close_out = float(close) if (not math.isnan(close)
+                                         and close > 0) else 0.0
+
+            self.bg_price_updated.emit(sym, last, bid_out, ask_out, close_out)
         except Exception:
             log.debug("Worker %s: bg price emit error for %s",
                       self._label, sym)

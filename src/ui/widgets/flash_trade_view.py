@@ -176,6 +176,8 @@ class FlashTradeView(QWidget):
         self._order_entry.reverse_requested.connect(self._on_reverse_requested)
         self._order_entry.close_pct_requested.connect(
             self._on_close_pct_requested)
+        self._order_entry.close_tier_requested.connect(
+            self._on_close_tier_requested)
 
         # ── Wire order status cancel button → cancel logic ───────────────────
         self._order_status.cancel_requested.connect(self._on_cancel_requested)
@@ -418,6 +420,36 @@ class FlashTradeView(QWidget):
                 params["adaptive_priority"] = adaptive_priority
             if peg_offset is not None:
                 params["peg_offset"] = peg_offset
+            # Forward bracket-order tiers for attached TP / SL / Trail children.
+            # `bracket_ref_price` is the expected-fill anchor point for child
+            # prices — critical because `limit_price` on Adaptive / PEG /
+            # cap-wrapped-MKT orders is a *ceiling* (BUY) or *floor* (SELL),
+            # NOT the intended fill.  Children priced off the cap land far
+            # from the real fill.  Only BID_LMT / ASK_LMT orders truly fill
+            # at their limit, so that's the one case where we anchor to it.
+            params["tick_size"] = tick
+            params["last_price"] = last_price
+            original_type = payload.get("type", "MKT")
+            if original_type in ("BID_LMT", "ASK_LMT") and limit_price:
+                params["bracket_ref_price"] = limit_price
+            else:
+                params["bracket_ref_price"] = last_price
+            # Convert the user's Limit Cap preference into a points offset.
+            # Reused for stop-loss children so they submit as STP LMT (trigger
+            # vs. limit offset by this amount) instead of plain STP — gives
+            # the resulting limit order a small execution window while still
+            # guaranteeing the stop fires at the user's intended SL price.
+            cap_raw = float(prefs.get("limit_cap", 0) or 0)
+            if cap_raw:
+                params["limit_cap_offset"] = abs(calculate_offset(
+                    cap_raw, str(prefs.get("limit_cap_unit", "ticks")),
+                    last_price if last_price > 0 else 0, tick,
+                ))
+            else:
+                params["limit_cap_offset"] = 0.0
+            params["profit_take"] = payload.get("profit_take")
+            params["stop_loss"] = payload.get("stop_loss")
+            params["trailing"] = payload.get("trailing")
             worker.place_order(params)
 
     def _find_worker_for_account(self, account: str) -> IBWorkerThread | None:
@@ -850,6 +882,91 @@ class FlashTradeView(QWidget):
                 count += 1
         log.info("FlashTrade: close_%d%% '%s' → %d worker(s) accounts=%s",
                  pct, symbol, count, sorted(checked))
+
+    def _on_close_tier_requested(self, data: dict) -> None:
+        """Take Profit / Stop Loss header button clicked → submit an exit
+        order sized to the current position on every checked account.
+
+        * TP → LMT at last_price ± offset_pts (profit direction).
+        * SL → STP or STP LMT (if limit_cap set) at last_price ∓ offset_pts.
+        * qty = min(|position|, payload.qty).  Zero-position accounts are
+          silently skipped so we never submit an empty / phantom order.
+        """
+        symbol = data.get("symbol", "")
+        side = data.get("side", "")
+        if not symbol or side not in ("tp", "sl"):
+            log.warning("FlashTrade: close_tier invalid payload: %s", data)
+            return
+        if not isinstance(self._account_list, AccountListPanel):
+            log.warning(
+                "FlashTrade: close_tier blocked — AccountListPanel not available")
+            return
+
+        checked: set[str] = set(self._account_list.get_selected_accounts())
+        if not checked:
+            log.warning(
+                "FlashTrade: close_tier %s blocked for '%s' — "
+                "no accounts checked", side, symbol)
+            return
+
+        # Use the UI's cached last_price (same source the order-entry panel
+        # shows); fall back to the payload's snapshot if the cache is cold.
+        last_price = 0.0
+        cached = self._order_entry._price_cache.get(symbol.upper())
+        if cached:
+            last_price = float(cached[0])
+        if last_price <= 0:
+            last_price = float(data.get("last_price") or 0.0)
+        if last_price <= 0:
+            log.warning(
+                "FlashTrade: close_tier %s '%s' blocked — no live price yet",
+                side, symbol)
+            return
+
+        # Limit cap offset (points) reused to build STP LMT children for SL
+        # where the limit sits cap_offset further into the loss zone from
+        # the stop trigger.  TP uses a plain LMT so this is ignored.
+        from src.utils.helpers import calculate_offset, tick_size_for_contract
+        from src.core.trading_prefs import trading_prefs
+        from src.core.reference_data import get_instance as _rd
+
+        contracts = _rd().contracts_by_symbol.get(symbol.upper(), [])
+        sec_type = contracts[0].get("sec_type", "") if contracts else ""
+        tick = tick_size_for_contract(
+            sec_type,
+            symbol=contracts[0].get("symbol", "") if contracts else "",
+            local_symbol=contracts[0].get("local_symbol", "") if contracts else "",
+        ) if contracts else 0.25
+        prefs = trading_prefs.get(sec_type)
+        cap_raw = float(prefs.get("limit_cap", 0) or 0) if prefs else 0.0
+        cap_offset = abs(calculate_offset(
+            cap_raw, str(prefs.get("limit_cap_unit", "ticks")),
+            last_price, tick,
+        )) if cap_raw else 0.0
+
+        offset_pts = float(data.get("offset_pts") or 0.0)
+        req_qty = int(data.get("qty") or 0)
+
+        count = 0
+        for label, worker in self._active_threads.items():
+            if worker.isRunning() and worker.is_ib_connected:
+                self._ensure_worker_connected(worker)
+                for acct in checked:
+                    worker.close_tier(
+                        symbol=symbol,
+                        account=acct,
+                        side=side,
+                        offset_pts=offset_pts,
+                        requested_qty=req_qty,
+                        current_price=last_price,
+                        cap_offset=cap_offset,
+                    )
+                count += 1
+        log.info(
+            "FlashTrade: close_tier %s '%s' offset=%.4f qty=%d "
+            "ref=%.4f cap=%.4f → %d worker(s) accounts=%s",
+            side, symbol, offset_pts, req_qty, last_price, cap_offset,
+            count, sorted(checked))
 
     def _on_refresh_requested(self) -> None:
         """Refresh button clicked → ask every connected worker to re-snapshot."""

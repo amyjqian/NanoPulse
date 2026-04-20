@@ -204,7 +204,8 @@ class ReferenceData(QObject):
                 "offset": offset,
                 "value":  offset,   # price-offset used in order submission
                 "dollar": value,    # per-contract dollar (offset × multiplier)
-                "unit":   "ticks",
+                "unit":   "price",  # offset is in price points, not ticks
+                                    # (StrategyEditor stores val = offset * mult)
                 "label":  f"T{tier}",   # caller renders "${dollar*qty}-{offset}"
             })
         return result

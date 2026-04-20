@@ -34,6 +34,12 @@ log = logging.getLogger(__name__)
 # Qty presets per asset class
 _FUT_QTYS = [1, 2, 3, 5]
 _STK_QTYS = [10, 25, 50, 100, 500]
+
+# Symbols whose ticker-strip %change column is hidden.  The index futures
+# on CME (NQ / MNQ / ES / MES) have tiny daily % swings relative to the
+# price magnitude and the user finds the column visually noisy — their
+# absolute day change is still shown.  Stocks always show both.
+_NO_PCT_CHANGE_SYMBOLS: set[str] = {"NQ", "MNQ", "ES", "MES"}
 _FUT_DEFAULT = 1
 _STK_DEFAULT = 100
 
@@ -944,30 +950,6 @@ class _QtyInput(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  _ChipButton
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class _ChipButton(QPushButton):
-    """QPushButton that also emits ``doubleClicked`` on a mouse double-click.
-
-    We intentionally do NOT call ``super().mouseDoubleClickEvent``.  The default
-    QAbstractButton implementation re-enters ``emitPressed()``, which sets the
-    button's internal ``down`` flag so the following mouse release would fire a
-    second ``clicked`` — which would re-select the chip right after our
-    double-click handler cleared it.
-    """
-
-    doubleClicked = Signal()
-
-    def mouseDoubleClickEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.doubleClicked.emit()
-            event.accept()
-            return
-        super().mouseDoubleClickEvent(event)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 #  _TierSection
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -980,6 +962,10 @@ class _TierSection(QWidget):
     """
 
     changed = Signal()
+    # Emitted when the user clicks the Take Profit / Stop Loss / Trail Stop
+    # header button.  Carries no args — the parent (OrderEntryPanel) knows
+    # which section it connected and queries get_value() for the offset.
+    submit_requested = Signal()
 
     _CHIP_H = 28
     _SS_SEL = (
@@ -1002,6 +988,8 @@ class _TierSection(QWidget):
     def __init__(self, title: str, tiers: list[dict],
                  enabled: bool = False,
                  label_color: str = Theme.ACCENT,
+                 *,
+                 auto_select_min: bool = False,
                  parent=None):
         super().__init__(parent)
         self._title_str    = title
@@ -1017,6 +1005,10 @@ class _TierSection(QWidget):
         self._state_lbl:         QLabel | None = None
         self._dollar_lbl:        QLabel | None = None
         self._chips_layout:      QHBoxLayout | None = None
+        # When True, turning the toggle on (with no prior chip selection
+        # and no custom Dist) auto-selects the smallest / first tier so
+        # the user gets a sensible default with a single click.
+        self._auto_select_min:   bool = auto_select_min
         self._build_ui(title, enabled)
 
     # ── Build ─────────────────────────────────────────────────────────────────
@@ -1042,7 +1034,7 @@ class _TierSection(QWidget):
         # same initial width regardless of which title is shorter.
         _fm = QFontMetrics(self._dollar_lbl.font())
         self._dollar_lbl.setMinimumWidth(_fm.horizontalAdvance("Take Profit") + 24)
-        self._dollar_lbl.clicked.connect(self._on_header_clicked)
+        self._dollar_lbl.clicked.connect(self._on_header_submit)
         # Disabled until a chip is selected or a custom Dist is typed.
         self._dollar_lbl.setEnabled(False)
         hdr.addWidget(self._dollar_lbl)
@@ -1083,13 +1075,12 @@ class _TierSection(QWidget):
 
         for i, tier in enumerate(self._tiers):
             label = tier.get("label", f"Tier {i + 1}")
-            btn = _ChipButton(label)
+            btn = QPushButton(label)
             btn.setFixedHeight(self._CHIP_H)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setSizePolicy(
                 QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             btn.clicked.connect(lambda chk, idx=i: self._on_chip_clicked(idx))
-            btn.doubleClicked.connect(self._on_chip_double_clicked)
             self._chip_buttons.append(btn)
             lay.addWidget(btn)
 
@@ -1162,7 +1153,21 @@ class _TierSection(QWidget):
 
     def _on_toggled(self, on: bool) -> None:
         self._state_lbl.setText("On" if on else "Off")
-        if not on:
+        if on:
+            # Auto-select the smallest (first) tier when the user turns
+            # the section on without any prior chip selection or custom
+            # Dist — saves an extra click for the common "default TP/SL
+            # at the closest tier" case.  Opt-in via auto_select_min so
+            # sections that shouldn't pick a default (e.g. Trail Stop)
+            # stay manual.
+            input_text = (self._input.text().strip()
+                          if self._input else "")
+            if (self._auto_select_min
+                    and self._selected_idx is None
+                    and not input_text
+                    and self._tiers):
+                self._selected_idx = 0
+        else:
             # Keep _selected_idx so the dollar label stays as an informational
             # preview even when the section is disabled.  Clear any custom text.
             if self._input:
@@ -1173,19 +1178,17 @@ class _TierSection(QWidget):
         self._update_dollar_display()
         self.changed.emit()
 
-    def _on_header_clicked(self) -> None:
-        """Clicking the Take Profit / Stop Loss header button clears the
-        chip selection and the custom Dist input so the section returns to
-        the 'nothing selected' state.
+    def _on_header_submit(self) -> None:
+        """Clicking the Take Profit / Stop Loss / Trail Stop header button
+        fires the section's submit_requested signal so OrderEntryPanel can
+        route it as a close-the-position order.  If no tier is selected
+        (nothing to act on) the click is a no-op — the button is also
+        disabled in that state via _update_dollar_display, so this branch
+        is defensive.
         """
-        self._selected_idx = None
-        if self._input is not None:
-            self._input.blockSignals(True)
-            self._input.clear()
-            self._input.blockSignals(False)
-        self._update_chip_styles()
-        self._update_dollar_display()
-        self.changed.emit()
+        if self.get_value() is None:
+            return
+        self.submit_requested.emit()
 
     def _on_chip_clicked(self, idx: int) -> None:
         if self._toggle and not self._toggle.is_on:
@@ -1196,25 +1199,6 @@ class _TierSection(QWidget):
             self._input.blockSignals(True)
             self._input.clear()
             self._input.blockSignals(False)
-        self._update_chip_styles()
-        self._update_dollar_display()
-        self.changed.emit()
-
-    def _on_chip_double_clicked(self) -> None:
-        """Double-clicking a chip resets the section: chip deselected, toggle
-        off, Dist input cleared, and the header button disabled (via the
-        standard _update_dollar_display rules)."""
-        self._selected_idx = None
-        if self._input is not None:
-            self._input.blockSignals(True)
-            self._input.clear()
-            self._input.blockSignals(False)
-        if self._toggle and self._toggle.is_on:
-            self._toggle.blockSignals(True)
-            self._toggle.set_on(False)
-            self._toggle.blockSignals(False)
-        if self._state_lbl is not None:
-            self._state_lbl.setText("Off")
         self._update_chip_styles()
         self._update_dollar_display()
         self.changed.emit()
@@ -1336,6 +1320,16 @@ class OrderEntryPanel(QWidget):
     #   (symbol: str, pct: int) – close *pct* percent of the position.
     close_pct_requested = Signal(str, int)
 
+    # Emitted when user clicks the Take Profit / Stop Loss header button.
+    # Payload:
+    #   {"side": "tp"|"sl", "symbol": str, "qty": int,
+    #    "offset_pts": float, "last_price": float}
+    # The consumer (FlashTradeView) queries each checked account for the
+    # current position, sizes the order to min(|pos|, qty), computes the
+    # target price from last_price ± offset, and submits a LMT (tp) or
+    # STP/STP LMT (sl) exit order.  No-op for zero-position accounts.
+    close_tier_requested = Signal(dict)
+
     def __init__(self, active_threads: dict | None = None, parent=None):
         super().__init__(parent)
         self._active_threads: dict = active_threads if active_threads is not None else {}
@@ -1343,6 +1337,9 @@ class OrderEntryPanel(QWidget):
         self._bg_worker = None         # track worker for background price streams
         # sym → (last, bid, ask)
         self._price_cache: dict[str, tuple[float, float, float]] = {}
+        # sym → prior-session close, used by the ticker strip to compute
+        # day change and %change.  Populated by bg_price_updated ticks.
+        self._close_cache: dict[str, float] = {}
         self._last_price: float = 0.0  # latest live price for limit-order calculation
         self._last_bid: float = 0.0    # latest live bid price
         self._last_ask: float = 0.0    # latest live ask price
@@ -1367,6 +1364,7 @@ class OrderEntryPanel(QWidget):
         # they start with _qty=1.  Push the real default here (e.g. 100 for STK).
         self._pt_section.set_qty(self._active_qty)
         self._sl_section.set_qty(self._active_qty)
+        self._tr_section.set_qty(self._active_qty)
 
         # Push the contract multiplier + tick size for the initial active symbol
         # so the custom Dist input calculates dollars correctly before the user
@@ -1376,9 +1374,11 @@ class OrderEntryPanel(QWidget):
         _init_mult = _rd().get_multiplier(self._active_symbol or "") or 1.0
         self._pt_section.set_multiplier(_init_mult)
         self._sl_section.set_multiplier(_init_mult)
+        self._tr_section.set_multiplier(_init_mult)
         _init_ts = self._tick_size_for_symbol(self._active_symbol or "")
         self._pt_section.set_market_price(self._last_price, _init_ts)
         self._sl_section.set_market_price(self._last_price, _init_ts)
+        self._tr_section.set_market_price(self._last_price, _init_ts)
 
         # Auto-refresh when reference data changes (contract added/removed or
         # strategy tiers saved from the StrategyEditor tab).
@@ -1401,73 +1401,98 @@ class OrderEntryPanel(QWidget):
         root.setContentsMargins(10, 8, 10, 8)
         root.setSpacing(8)
 
-        # ── Title ─────────────────────────────────────────────────────────────
-        title = QLabel("Order Entry")
-        title.setFont(_TITLE_FONT)
-        title.setStyleSheet(f"color: {Theme.TEXT}; border: none;")
-        root.addWidget(title)
-
-        # ── Search combo + active symbol / price row ──────────────────────────
+        # ── Active-symbol ticker strip ────────────────────────────────────────
+        # Compact single-row strip replaces the old "Add symbol (look up)…"
+        # combo + two-line price block so the top takes minimal space:
+        #   NQ  26,698.75  26,698.25 26,699.50  -126.75 -0.47%  [+]
+        #   sym last       bid(g)    ask(r)     chg     chg%    add
+        # No stretch between the five data columns — they stay tightly
+        # packed on the left; the "+" button is pinned to the far right.
         top_row = QHBoxLayout()
-        top_row.setSpacing(10)
+        top_row.setSpacing(6)
+        top_row.setContentsMargins(0, 0, 0, 0)
 
+        _ticker_dim = f"color: {Theme.TEXT_DIM}; border: none;"
+        # Slightly smaller than _SYMBOL_FONT / _PRICE_FONT so the whole
+        # strip can fit the narrow Order Entry column without wrapping.
+        _sym_font = QFont("Helvetica Neue, Arial", 12)
+        _sym_font.setWeight(QFont.Weight.Bold)
+        _price_font = QFont("Menlo, Consolas, monospace", 12)
+        _price_font.setWeight(QFont.Weight.Bold)
+        _ticker_font = QFont("Menlo, Consolas, monospace", 11)
+        _ticker_font.setWeight(QFont.Weight.Bold)
+
+        self._lbl_symbol = QLabel("")
+        self._lbl_symbol.setFont(_sym_font)
+        self._lbl_symbol.setStyleSheet(
+            f"color: {Theme.TEXT}; border: none;")
+
+        self._lbl_price = QLabel("")
+        self._lbl_price.setFont(_price_font)
+        self._lbl_price.setStyleSheet(
+            f"color: {Theme.TEXT}; border: none;")
+
+        self._lbl_bid = QLabel("")
+        self._lbl_bid.setFont(_ticker_font)
+        self._lbl_bid.setStyleSheet(
+            f"color: {Theme.CLR_BUY}; border: none;")
+
+        self._lbl_ask = QLabel("")
+        self._lbl_ask.setFont(_ticker_font)
+        self._lbl_ask.setStyleSheet(
+            f"color: {Theme.CLR_SELL}; border: none;")
+
+        # Day change and %change vs prior-session close.  Coloured per
+        # sign in _refresh_price_change_display.
+        self._lbl_change = QLabel("")
+        self._lbl_change.setFont(_ticker_font)
+        self._lbl_change.setStyleSheet(_ticker_dim)
+
+        self._lbl_change_pct = QLabel("")
+        self._lbl_change_pct.setFont(_ticker_font)
+        self._lbl_change_pct.setStyleSheet(_ticker_dim)
+
+        # Plus button → opens a dropdown listing available contracts from
+        # ReferenceData that aren't already on the symbol-chip bar.
+        self._btn_add_symbol = QPushButton("+")
+        self._btn_add_symbol.setFixedSize(22, 22)
+        self._btn_add_symbol.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_add_symbol.setToolTip("Add symbol")
+        self._btn_add_symbol.setStyleSheet(
+            f"QPushButton{{background:{Theme.BG_INPUT};color:{Theme.TEXT};"
+            f"border:1px solid {Theme.BORDER};border-radius:4px;"
+            f"font-size:14px;font-weight:bold;padding:0}}"
+            f"QPushButton:hover{{border-color:{Theme.ACCENT}}}")
+        self._btn_add_symbol.clicked.connect(self._show_add_symbol_menu)
+
+        top_row.addWidget(self._lbl_symbol)
+        top_row.addWidget(self._lbl_price)
+        top_row.addSpacing(6)
+        top_row.addWidget(self._lbl_bid)
+        top_row.addWidget(self._lbl_ask)
+        top_row.addSpacing(6)
+        top_row.addWidget(self._lbl_change)
+        top_row.addWidget(self._lbl_change_pct)
+        top_row.addStretch(1)
+        top_row.addWidget(self._btn_add_symbol)
+        root.addLayout(top_row)
+
+        # The lookup combo is kept as a hidden child widget because other
+        # code paths still reference ``self._combo`` (TWS fallback status
+        # messages via setPlaceholderText, _add_symbol's setCurrentText
+        # reset, etc.).  It is NOT added to any layout, so it never
+        # occupies screen space.  The "+" button's QMenu is the only
+        # user-visible way to add symbols now.
         self._combo = QComboBox()
         self._combo.setEditable(True)
         self._combo.setMaxVisibleItems(20)
-        self._combo.setFixedHeight(28)
         self._combo.setStyleSheet(_COMBO_SS)
         self._combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self._combo.lineEdit().setPlaceholderText("Add symbol (look up)..")
         self._combo.activated.connect(self._on_combo_activated)
         self._combo.lineEdit().returnPressed.connect(self._on_return_pressed)
+        self._combo.hide()
         self._refresh_combo_items()
-
-        # Live filter: as user types, matching contracts appear in dropdown
-        completer = self._combo.completer()
-        if completer:
-            completer.setFilterMode(Qt.MatchFlag.MatchContains)
-            completer.setCompletionMode(
-                QCompleter.CompletionMode.PopupCompletion)
-            completer.popup().setStyleSheet(f"""
-                QAbstractItemView {{
-                    background: {Theme.BG_INPUT}; color: {Theme.TEXT};
-                    border: 1px solid {Theme.BORDER}; border-radius: 4px;
-                    selection-background-color: #3a3f50;
-                    selection-color: {Theme.TEXT};
-                    padding: 2px; outline: none;
-                }}
-            """)
-
-        self._lbl_symbol = QLabel("")
-        self._lbl_symbol.setFont(_SYMBOL_FONT)
-        self._lbl_symbol.setStyleSheet(f"color: {Theme.TEXT}; border: none;")
-
-        self._lbl_price = QLabel("")
-        self._lbl_price.setFont(_PRICE_FONT)
-        self._lbl_price.setStyleSheet(f"color: {Theme.ACCENT}; border: none;")
-
-        self._lbl_bid_ask = QLabel("")
-        self._lbl_bid_ask.setFont(QFont("Menlo, Consolas, monospace", 10))
-        self._lbl_bid_ask.setStyleSheet(
-            f"color: {Theme.TEXT_DIM}; border: none;")
-        self._lbl_bid_ask.setAlignment(Qt.AlignmentFlag.AlignRight)
-
-        # Right side: symbol + price row, then bid/ask below
-        sym_price_row = QHBoxLayout()
-        sym_price_row.setSpacing(6)
-        sym_price_row.addStretch()
-        sym_price_row.addWidget(self._lbl_symbol)
-        sym_price_row.addWidget(self._lbl_price)
-
-        right_side = QVBoxLayout()
-        right_side.setSpacing(2)
-        right_side.addLayout(sym_price_row)
-        right_side.addWidget(
-            self._lbl_bid_ask, alignment=Qt.AlignmentFlag.AlignRight)
-
-        top_row.addWidget(self._combo, stretch=1)
-        top_row.addLayout(right_side, stretch=1)
-        root.addLayout(top_row)
 
         root.addSpacing(8)
 
@@ -1577,17 +1602,29 @@ class OrderEntryPanel(QWidget):
         root.addSpacing(8)
 
         # ── Take Profit ───────────────────────────────────────────────────────
-        pt_tiers, sl_tiers = self._load_tiers_for_active()
+        pt_tiers, sl_tiers, tr_tiers = self._load_tiers_for_active()
         self._pt_section = _TierSection(
             "Take Profit", pt_tiers, enabled=False,
-            label_color=Theme.CLR_BUY)
+            label_color=Theme.CLR_BUY, auto_select_min=True)
+        self._pt_section.submit_requested.connect(
+            lambda: self._on_tier_submit("tp"))
         root.addWidget(self._pt_section)
 
         # ── Stop Loss ─────────────────────────────────────────────────────────
         self._sl_section = _TierSection(
             "Stop Loss", sl_tiers, enabled=False,
-            label_color=Theme.CLR_SELL)
+            label_color=Theme.CLR_SELL, auto_select_min=True)
+        self._sl_section.submit_requested.connect(
+            lambda: self._on_tier_submit("sl"))
         root.addWidget(self._sl_section)
+
+        # ── Trailing ──────────────────────────────────────────────────────────
+        # Trail Stop header button is not wired to close-the-position
+        # (yet), but toggling on auto-selects the smallest tier like TP/SL.
+        self._tr_section = _TierSection(
+            "Trail Stop", tr_tiers, enabled=False,
+            label_color=Theme.CLR_FLATTEN, auto_select_min=True)
+        root.addWidget(self._tr_section)
 
         root.addStretch(1)
 
@@ -1627,6 +1664,53 @@ class OrderEntryPanel(QWidget):
         else:
             log.warning(
                 "OrderEntryPanel: Close %d%% clicked but no active symbol", pct)
+
+    def _on_tier_submit(self, side: str) -> None:
+        """Take Profit / Stop Loss header button clicked → emit
+        ``close_tier_requested`` with the active symbol, selected tier
+        offset, last price and user's qty.  FlashTradeView fans this out
+        to each checked account, reads the live position there, and
+        submits a LMT (tp) or STP/STP LMT (sl) exit order sized to
+        min(|position|, qty).  No-op for zero-position accounts.
+        """
+        sym = self._active_symbol
+        if not sym:
+            log.warning(
+                "OrderEntryPanel: %s header clicked but no active symbol",
+                side.upper())
+            return
+
+        section = self._pt_section if side == "tp" else self._sl_section
+        tier = section.get_value()
+        if tier is None:
+            # Button is disabled in this state; defensive no-op.
+            return
+
+        # Offset lives in tier["value"]; unit "price" means points directly,
+        # "ticks" means multiply by the contract's tick size.  The chip
+        # loaders tag tier dicts with unit="price" by default, so for
+        # typical usage this is just tier["value"].
+        raw_val = float(tier.get("value", 0.0))
+        unit = tier.get("unit", "price")
+        if unit == "ticks":
+            tick = self._tick_size_for_symbol(sym)
+            offset_pts = raw_val * (tick if tick > 0 else 0.01)
+        else:
+            offset_pts = raw_val
+
+        if offset_pts <= 0:
+            log.warning(
+                "OrderEntryPanel: %s submit ignored — non-positive "
+                "offset %.4f", side.upper(), offset_pts)
+            return
+
+        self.close_tier_requested.emit({
+            "side":       side,
+            "symbol":     sym,
+            "qty":        int(self._active_qty),
+            "offset_pts": offset_pts,
+            "last_price": float(self._last_price),
+        })
 
     def _refresh_combo_items(self) -> None:
         """Populate the combo dropdown with saved contracts not already added."""
@@ -1825,12 +1909,13 @@ class OrderEntryPanel(QWidget):
                         ts = self._tick_size_for_symbol(self._active_symbol)
                         self._pt_section.set_market_price(last, ts)
                         self._sl_section.set_market_price(last, ts)
+                        self._tr_section.set_market_price(last, ts)
                 else:
                     self._lbl_price.setText("")
                 self._update_bid_ask_display(bid, ask)
             else:
                 self._lbl_price.setText("")
-                self._lbl_bid_ask.setText("")
+                self._update_bid_ask_display(0.0, 0.0)
                 self._last_price = 0.0
                 self._last_bid = 0.0
                 self._last_ask = 0.0
@@ -1840,10 +1925,11 @@ class OrderEntryPanel(QWidget):
         else:
             self._lbl_symbol.setText("")
             self._lbl_price.setText("")
-            self._lbl_bid_ask.setText("")
+            self._update_bid_ask_display(0.0, 0.0)
             self._last_price = 0.0
             self._last_bid = 0.0
             self._last_ask = 0.0
+        self._refresh_price_change_display()
 
     def _remove_symbol(self, sym: str) -> None:
         """Right-click removes a symbol button."""
@@ -1905,6 +1991,8 @@ class OrderEntryPanel(QWidget):
             self._pt_section.set_qty(self._active_qty)
         if hasattr(self, "_sl_section"):
             self._sl_section.set_qty(self._active_qty)
+        if hasattr(self, "_tr_section"):
+            self._tr_section.set_qty(self._active_qty)
 
     def _on_qty_preset(self, qty: int) -> None:
         self._active_qty = qty
@@ -1918,6 +2006,8 @@ class OrderEntryPanel(QWidget):
             self._pt_section.set_qty(qty)
         if hasattr(self, "_sl_section"):
             self._sl_section.set_qty(qty)
+        if hasattr(self, "_tr_section"):
+            self._tr_section.set_qty(qty)
 
     def _on_custom_qty(self, text: str) -> None:
         text = text.strip()
@@ -1934,6 +2024,8 @@ class OrderEntryPanel(QWidget):
                     self._pt_section.set_qty(qty)
                 if hasattr(self, "_sl_section"):
                     self._sl_section.set_qty(qty)
+                if hasattr(self, "_tr_section"):
+                    self._tr_section.set_qty(qty)
                 return
         except ValueError:
             pass
@@ -1952,6 +2044,8 @@ class OrderEntryPanel(QWidget):
             self._pt_section.set_qty(default)
         if hasattr(self, "_sl_section"):
             self._sl_section.set_qty(default)
+        if hasattr(self, "_tr_section"):
+            self._tr_section.set_qty(default)
 
     def _on_custom_qty_enter(self) -> None:
         """Clear the custom qty field on Enter if its content is invalid."""
@@ -1981,20 +2075,22 @@ class OrderEntryPanel(QWidget):
     # ── Tier helpers ──────────────────────────────────────────────────────────
 
     _TIER_FALLBACK = [
-        {"label": "Tier 1", "value": 20,  "unit": "ticks"},
-        {"label": "Tier 2", "value": 40,  "unit": "ticks"},
-        {"label": "Tier 3", "value": 80,  "unit": "ticks"},
-        {"label": "Tier 4", "value": 160, "unit": "ticks"},
+        {"label": "Tier 1", "value": 20,  "unit": "price"},
+        {"label": "Tier 2", "value": 40,  "unit": "price"},
+        {"label": "Tier 3", "value": 80,  "unit": "price"},
+        {"label": "Tier 4", "value": 160, "unit": "price"},
     ]
 
-    def _load_tiers_for_active(self) -> tuple[list[dict], list[dict]]:
-        """Return (profit_take_tiers, stop_loss_tiers) for the active symbol.
+    def _load_tiers_for_active(self) -> tuple[list[dict], list[dict], list[dict]]:
+        """Return (profit_take_tiers, stop_loss_tiers, trailing_tiers) for the
+        active symbol.
 
         Lookup order
         ------------
         1. Exact symbol rows in strategy_tiers.db  (e.g. "NQ")
         2. Asset-class fallback rows ("FUT" or "STK") in strategy_tiers.db
-        3. Preferences-based tiers (global per asset-class, set in Settings)
+        3. Preferences-based tiers (global per asset-class, set in Settings).
+           Trailing has no preferences entry — falls back to ``_TIER_FALLBACK``.
 
         Chip labels show the raw offset only (e.g. "5").
         The dollar amount is displayed in the section header by _TierSection.
@@ -2005,15 +2101,18 @@ class OrderEntryPanel(QWidget):
 
         pt = rd.get_tiers_for_symbol(sym, "take_profit")
         sl = rd.get_tiers_for_symbol(sym, "stop_loss")
+        tr = rd.get_tiers_for_symbol(sym, "trailing")
 
         # Set offset-only chip labels for DB-sourced tiers
         if pt is not None:
             pt = self._format_tier_labels(pt)
         if sl is not None:
             sl = self._format_tier_labels(sl)
+        if tr is not None:
+            tr = self._format_tier_labels(tr)
 
         # Fall back to preferences when ReferenceData has no rows
-        if pt is None or sl is None:
+        if pt is None or sl is None or tr is None:
             sec  = _sec_type_for(sym)
             key  = "trading_futures" if sec == "FUT" else "trading_stocks"
             prefs = config_manager.load_preferences()
@@ -2026,8 +2125,12 @@ class OrderEntryPanel(QWidget):
             if sl is None:
                 raw = section.get("stop_loss",   self._TIER_FALLBACK)
                 sl  = self._format_tier_labels(self._enrich_pref_tiers(raw, mult, tick))
+            if tr is None:
+                # Trailing has no preferences key; use the generic fallback.
+                tr  = self._format_tier_labels(
+                    self._enrich_pref_tiers(self._TIER_FALLBACK, mult, tick))
 
-        return pt, sl
+        return pt, sl, tr
 
     @staticmethod
     def _format_tier_labels(tiers: list[dict]) -> list[dict]:
@@ -2056,16 +2159,17 @@ class OrderEntryPanel(QWidget):
                            tick_size: float = 0.01) -> list[dict]:
         """Add ``offset`` and ``dollar`` fields to preference-sourced tiers.
 
-        Preference tiers store the number of ticks in ``value``.  The
-        per-unit dollar value is:
+        Preference tiers store the *price-point* offset in ``value`` (matching
+        the StrategyEditor's "val = offset × multiplier" semantics — the
+        stored number is points, not ticks).  Dollar per contract is:
 
-            dollar = offset_ticks × tick_size × multiplier
+            dollar = offset_points × multiplier
 
         Examples
         --------
-        NVDA  (tick=0.01, mult=1):   20 ticks → 20×0.01×1  = $0.20 / share
-        NQ    (tick=0.25, mult=20):  20 ticks → 20×0.25×20 = $100  / contract
-        MNQ   (tick=0.25, mult=2):   20 ticks → 20×0.25×2  = $10   / contract
+        NVDA  (mult=1):   20 pts → 20 × 1  = $20  / share (notional distance)
+        NQ    (mult=20):  20 pts → 20 × 20 = $400 / contract
+        MNQ   (mult=2):   20 pts → 20 × 2  = $40  / contract
         """
         result = []
         for t in tiers:
@@ -2074,25 +2178,29 @@ class OrderEntryPanel(QWidget):
                 offset = float(raw)
             except (TypeError, ValueError):
                 offset = 0.0
-            dollar = round(offset * tick_size * multiplier, 4)
+            dollar = round(offset * multiplier, 4)
             result.append({**t, "offset": offset, "dollar": dollar})
         return result
 
     def _reload_tier_sections(self) -> None:
-        """Reload PT/SL tier chips when the active symbol or preferences change."""
+        """Reload PT/SL/Trailing tier chips when the active symbol or
+        preferences change."""
         if not hasattr(self, "_pt_section"):
             return
-        pt_tiers, sl_tiers = self._load_tiers_for_active()
+        pt_tiers, sl_tiers, tr_tiers = self._load_tiers_for_active()
         self._pt_section.reload_tiers(pt_tiers)
         self._sl_section.reload_tiers(sl_tiers)
+        self._tr_section.reload_tiers(tr_tiers)
         # Sync current qty so the dollar display is correct on next chip click
         self._pt_section.set_qty(self._active_qty)
         self._sl_section.set_qty(self._active_qty)
+        self._tr_section.set_qty(self._active_qty)
         # Push contract multiplier for custom-distance dollar math
         from src.core.reference_data import get_instance as _rd
         mult = _rd().get_multiplier(self._active_symbol or "") or 1.0
         self._pt_section.set_multiplier(mult)
         self._sl_section.set_multiplier(mult)
+        self._tr_section.set_multiplier(mult)
         # Sync live price + tick size into the TickPriceInput (and its Dist
         # ladder popup).  Tick size must be pushed even before the first price
         # tick arrives so the popup shows multiples of the *selected* symbol's
@@ -2100,6 +2208,7 @@ class OrderEntryPanel(QWidget):
         ts = self._tick_size_for_symbol(self._active_symbol or "")
         self._pt_section.set_market_price(self._last_price, ts)
         self._sl_section.set_market_price(self._last_price, ts)
+        self._tr_section.set_market_price(self._last_price, ts)
 
     def _tick_size_for_symbol(self, sym: str) -> float:
         """Return the minimum tick size for *sym*.
@@ -2159,6 +2268,7 @@ class OrderEntryPanel(QWidget):
             "last_price": self._last_price,
             "profit_take": self._pt_section.get_value() if hasattr(self, "_pt_section") else None,
             "stop_loss":   self._sl_section.get_value() if hasattr(self, "_sl_section") else None,
+            "trailing":    self._tr_section.get_value() if hasattr(self, "_tr_section") else None,
         }
         log.info("Order requested: %s", payload)
         self.order_requested.emit(payload)
@@ -2210,6 +2320,12 @@ class OrderEntryPanel(QWidget):
             "sec_type": sec,
             "last_price": self._last_price,
             "limit_price": price,
+            # Same bracket payload the MKT/BID/ASK/MID path emits — without
+            # these the LMT parent goes out naked and FlashTradeView has
+            # nothing to forward as children.
+            "profit_take": self._pt_section.get_value() if hasattr(self, "_pt_section") else None,
+            "stop_loss":   self._sl_section.get_value() if hasattr(self, "_sl_section") else None,
+            "trailing":    self._tr_section.get_value() if hasattr(self, "_tr_section") else None,
         }
         log.info("Order requested (%s): %s @ %.4f",
                  order_type, self._active_symbol, price)
@@ -2464,13 +2580,18 @@ class OrderEntryPanel(QWidget):
                 }
         return None
 
-    def _on_bg_price_update(self, sym: str, last: float, bid: float, ask: float) -> None:
+    def _on_bg_price_update(self, sym: str, last: float, bid: float,
+                            ask: float, close: float = 0.0) -> None:
         """Receive a background price tick — update cache and display if active.
 
         Bid/ask are preserved from the last valid tick rather than being
         overwritten with 0 when a tick carries only a last-price update.
         IB delayed data (type 3) for futures often streams ``last`` ticks
         without bid/ask, which previously cleared the label on every tick.
+
+        ``close`` is the prior-session close used by the ticker strip's
+        day-change display (0 when the tick didn't carry one — we keep
+        whatever was previously cached).
         """
         # Retrieve the last-known cache entry so we can fall back to its
         # bid/ask when the incoming values are absent (0 or never received).
@@ -2482,6 +2603,8 @@ class OrderEntryPanel(QWidget):
         effective_ask  = ask  if ask  > 0 else cached[2]
 
         self._price_cache[sym.upper()] = (effective_last, effective_bid, effective_ask)
+        if close and close > 0:
+            self._close_cache[sym.upper()] = float(close)
 
         if sym.upper() == (self._active_symbol or "").upper():
             if last > 0:
@@ -2491,6 +2614,7 @@ class OrderEntryPanel(QWidget):
                     ts = self._tick_size_for_symbol(sym)
                     self._pt_section.set_market_price(last, ts)
                     self._sl_section.set_market_price(last, ts)
+                    self._tr_section.set_market_price(last, ts)
             # Preserve last known bid/ask — only replace when newly valid
             if bid > 0:
                 self._last_bid = bid
@@ -2498,17 +2622,186 @@ class OrderEntryPanel(QWidget):
                 self._last_ask = ask
             self._update_bid_ask_display(self._last_bid, self._last_ask)
             self._update_bid_ask_buttons(self._last_bid, self._last_ask)
+            self._refresh_price_change_display()
 
     def _update_bid_ask_display(self, bid: float, ask: float) -> None:
-        """Update the bid/ask label beneath the price."""
-        if bid > 0 and ask > 0:
-            self._lbl_bid_ask.setText(f"B: {bid:,.2f}  ·  A: {ask:,.2f}")
-        elif bid > 0:
-            self._lbl_bid_ask.setText(f"B: {bid:,.2f}")
-        elif ask > 0:
-            self._lbl_bid_ask.setText(f"A: {ask:,.2f}")
+        """Refresh the bid and ask labels on the compact ticker strip."""
+        self._lbl_bid.setText(f"{bid:,.2f}" if bid > 0 else "")
+        self._lbl_ask.setText(f"{ask:,.2f}" if ask > 0 else "")
+
+    # ── Ticker-strip day-change display ──────────────────────────────────────
+
+    def _refresh_price_change_display(self) -> None:
+        """Repaint the change / %change labels against the prior-session
+        close for the active symbol.  Blank when no close is known yet
+        (cold start before first bg tick); otherwise signed text with
+        green / red / dim colour keyed to the sign of the change.
+        """
+        sym = (self._active_symbol or "").upper()
+        close = self._close_cache.get(sym, 0.0) if sym else 0.0
+        last = float(self._last_price or 0.0)
+        if not sym or close <= 0 or last <= 0:
+            self._lbl_change.setText("")
+            self._lbl_change_pct.setText("")
+            return
+        change = last - close
+        pct = (change / close) * 100.0 if close else 0.0
+        sign = "+" if change > 0 else ""
+        self._lbl_change.setText(f"{sign}{change:,.2f}")
+        # Per product request: hide %change for the CME index futures
+        # (NQ / MNQ / ES / MES) where % moves are tiny and add noise;
+        # everything else still shows it.
+        if sym in _NO_PCT_CHANGE_SYMBOLS:
+            self._lbl_change_pct.setText("")
         else:
-            self._lbl_bid_ask.setText("")
+            self._lbl_change_pct.setText(f"{sign}{pct:,.2f}%")
+        if change > 0:
+            colour = Theme.CLR_BUY
+        elif change < 0:
+            colour = Theme.CLR_SELL
+        else:
+            colour = Theme.TEXT_DIM
+        ss = f"color: {colour}; border: none;"
+        self._lbl_change.setStyleSheet(ss)
+        self._lbl_change_pct.setStyleSheet(ss)
+
+    # ── Add-Symbol dropdown (type-to-filter popup triggered by "+") ──────────
+
+    def _show_add_symbol_menu(self) -> None:
+        """Pop up a searchable list of every saved contract that isn't
+        already on the symbol-chip bar.  The search field at the top
+        filters the list case-insensitively as the user types (matching
+        against symbol, local symbol, and sec_type); Up / Down navigates
+        the list, Enter / double-click adds the symbol via the existing
+        ``_add_symbol`` path, Esc closes the popup.
+        """
+        from src.core.reference_data import get_instance as _rd
+
+        # Collect available contracts (skip ones already on the bar).
+        added_upper = {s.upper() for s in self._symbols}
+        seen_keys: set[str] = set()
+        entries: list[tuple[str, str]] = []  # (label, symbol)
+        for c in sorted(_rd().contracts, key=lambda x: x.get("symbol", "")):
+            sym = c.get("symbol", "")
+            if not sym or sym.upper() in added_upper:
+                continue
+            sec = c.get("sec_type", "")
+            local = c.get("local_symbol", "")
+            exchange = c.get("exchange", "")
+            key = f"{sym}_{local}_{sec}"
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            detail = local if local and local != sym else exchange
+            label = (f"{sym}  –  {detail}  ({sec})"
+                     if detail else f"{sym}  ({sec})")
+            entries.append((label, sym))
+
+        # Build the popup.  QDialog with Popup window flag so clicking
+        # outside closes it automatically (same affordance as QMenu).
+        from PySide6.QtWidgets import QDialog
+        dlg = QDialog(self)
+        dlg.setWindowFlags(Qt.WindowType.Popup)
+        dlg.setFixedWidth(260)
+
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setSpacing(4)
+
+        search = QLineEdit()
+        search.setPlaceholderText("Type to search…")
+        search.setStyleSheet(
+            f"QLineEdit{{background:{Theme.BG_INPUT};color:{Theme.TEXT};"
+            f"border:1px solid {Theme.BORDER};border-radius:3px;"
+            f"padding:4px 6px;font-size:12px}}"
+            f"QLineEdit:focus{{border-color:{Theme.ACCENT}}}")
+        lay.addWidget(search)
+
+        lst = QListWidget()
+        lst.setStyleSheet(
+            f"QListWidget{{background:{Theme.BG_INPUT};color:{Theme.TEXT};"
+            f"border:1px solid {Theme.BORDER};border-radius:3px;"
+            f"padding:2px;outline:none}}"
+            f"QListWidget::item{{padding:4px 6px;border-radius:2px}}"
+            f"QListWidget::item:selected{{background:#3a3f50}}")
+        lst.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        lay.addWidget(lst)
+
+        if not entries:
+            item = QListWidgetItem(
+                "(no more symbols — add via Contracts tab)")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            lst.addItem(item)
+        else:
+            for label, sym in entries:
+                item = QListWidgetItem(label)
+                item.setData(Qt.ItemDataRole.UserRole, sym)
+                lst.addItem(item)
+            lst.setCurrentRow(0)
+
+        def _apply_filter(text: str) -> None:
+            query = text.strip().lower()
+            first_visible = -1
+            for i in range(lst.count()):
+                it = lst.item(i)
+                if it.data(Qt.ItemDataRole.UserRole) is None:
+                    continue
+                visible = (not query) or (query in it.text().lower())
+                it.setHidden(not visible)
+                if visible and first_visible < 0:
+                    first_visible = i
+            if first_visible >= 0:
+                lst.setCurrentRow(first_visible)
+
+        def _commit_current() -> None:
+            it = lst.currentItem()
+            if it is None or it.isHidden():
+                return
+            sym = it.data(Qt.ItemDataRole.UserRole)
+            if not sym:
+                return
+            dlg.close()
+            self._add_symbol(sym)
+
+        def _step(delta: int) -> None:
+            n = lst.count()
+            if n == 0:
+                return
+            row = lst.currentRow()
+            for _ in range(n):
+                row = (row + delta) % n
+                it = lst.item(row)
+                if it is not None and not it.isHidden() \
+                        and it.data(Qt.ItemDataRole.UserRole):
+                    lst.setCurrentRow(row)
+                    return
+
+        # Wire search → filter, Enter → commit, Esc → close (via Popup),
+        # double-click on list → commit, Up/Down → navigate.
+        search.textChanged.connect(_apply_filter)
+        search.returnPressed.connect(_commit_current)
+        lst.itemDoubleClicked.connect(lambda _it: _commit_current())
+
+        # Capture Up/Down in the search field so the user can navigate
+        # the list without leaving the text input.
+        def _search_key_event(event) -> None:
+            if event.key() == Qt.Key.Key_Down:
+                _step(+1)
+                event.accept()
+                return
+            if event.key() == Qt.Key.Key_Up:
+                _step(-1)
+                event.accept()
+                return
+            QLineEdit.keyPressEvent(search, event)
+        search.keyPressEvent = _search_key_event  # type: ignore[method-assign]
+
+        # Anchor beneath the + button.
+        pos = self._btn_add_symbol.mapToGlobal(
+            self._btn_add_symbol.rect().bottomLeft())
+        dlg.move(pos)
+        dlg.show()
+        search.setFocus()
 
     def _update_bid_ask_buttons(self, bid: float, ask: float) -> None:
         """Keep @Bid / @Ask button labels in sync with the current quantity.
