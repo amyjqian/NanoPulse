@@ -260,17 +260,26 @@ class TestBracketChildren:
         assert out[0].outsideRth is True
         assert out[0].allowPreOpen is True
 
-    def test_fut_does_not_set_rth_flags(self):
+    def test_fut_forces_outside_rth_on_children(self):
+        """Futures: STP / STP LMT / TRAIL children sit dormant outside
+        RTH unless outsideRth=True is set explicitly.  Pin that the
+        helper forces the flag on for FUT bracket children regardless
+        of what the parent carries.  STK path is unaffected (see the
+        STK-specific test above)."""
         wt = _make_worker()
         params = {
             "sec_type": "FUT",
             "profit_take": {"value": 20, "unit": "ticks"},
+            "stop_loss":   {"value": 10, "unit": "ticks"},
+            "trailing":    {"value": 5,  "unit": "ticks"},
         }
         out = wt._build_bracket_children(
-            _parent(outside_rth=True, allow_pre_open=True),
+            _parent(outside_rth=False, allow_pre_open=False),
             params, ref_price=17500.0, tick=0.25)
-        # Futures shouldn't have STK-only RTH flags set by the helper.
-        assert not hasattr(out[0], "outsideRth") or out[0].outsideRth is False
+        for ch in out:
+            assert ch.outsideRth is True
+            # allowPreOpen is STK-only; FUT path shouldn't touch it.
+            assert not getattr(ch, "allowPreOpen", False)
 
     def test_negative_tp_price_is_skipped_not_raised(self):
         wt = _make_worker()
@@ -554,3 +563,15 @@ class TestCloseTier:
         _run(wt._do_close_tier("MNQ", "DU1", "tp", 5.13, 1, 26697.0, 0.0))
         # 26697 + 5.13 = 26702.13 → snaps to 26702.25
         assert wt._ib.placed[0][1].lmtPrice == 26702.25
+
+    def test_fut_close_tier_orders_force_outside_rth(self):
+        """FUT close-tier exits (TP LMT and SL STP/STP LMT) must carry
+        outsideRth=True so CME holds the stop active overnight.  Stocks
+        keep their time-of-day logic."""
+        pos = _make_position("MNQ", "FUT", 111, net_pos=2, account="DU1")
+        for side in ("tp", "sl"):
+            wt = _make_close_tier_worker([pos])
+            _run(wt._do_close_tier("MNQ", "DU1", side, 10.0, 5, 26697.0, 0.0))
+            order = wt._ib.placed[0][1]
+            assert order.outsideRth is True, \
+                f"{side}: expected outsideRth=True on FUT exit, got False"

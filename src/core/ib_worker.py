@@ -1489,6 +1489,16 @@ class IBWorkerThread(QThread):
             if is_stk:
                 ch.outsideRth = parent_outside_rth
                 ch.allowPreOpen = parent_allow_pre
+            else:
+                # Futures: STP / STP LMT / TRAIL orders are held by TWS
+                # until the next RTH open by default (Warning 399 /
+                # "placed at the exchange until 08:30 US/Central").  For
+                # CME products that trade ~23 hours this leaves a stop
+                # dormant overnight — long enough for the market to blow
+                # past it before the flag un-holds.  outsideRth=True keeps
+                # the child armed during extended hours.  Stocks keep
+                # their existing RTH semantics (see parent_outside_rth).
+                ch.outsideRth = True
 
         # Last child flushes the bundle to TWS.
         built[-1][1].transmit = True
@@ -2010,6 +2020,15 @@ class IBWorkerThread(QThread):
                     in_rth = (h > 9 or (h == 9 and m >= 30)) and h < 16
                     order.outsideRth = not in_rth
                     order.allowPreOpen = False
+            else:
+                # Futures: keep STP / STP LMT exits armed during extended
+                # hours.  Without this flag TWS holds the order until the
+                # next 08:30 CT open, so a stop placed overnight won't
+                # trigger even if the price reaches it.  Safe for LMT
+                # exits too — CME honours outsideRth=True across all
+                # order types.  See _build_bracket_children for the
+                # matching logic on attached bracket children.
+                order.outsideRth = True
 
             order_log.info(
                 "[%s] ORDER-CLOSE-TIER  side=%s %s %s %d (pos=%+d, "

@@ -2265,6 +2265,12 @@ class OrderEntryPanel(QWidget):
             "sec_type": sec,
             "last_price": self._last_price,
             "limit_price": price,
+            # Same bracket payload the MKT/BID/ASK/MID path emits — without
+            # these the LMT parent goes out naked and FlashTradeView has
+            # nothing to forward as children.
+            "profit_take": self._pt_section.get_value() if hasattr(self, "_pt_section") else None,
+            "stop_loss":   self._sl_section.get_value() if hasattr(self, "_sl_section") else None,
+            "trailing":    self._tr_section.get_value() if hasattr(self, "_tr_section") else None,
         }
         log.info("Order requested (%s): %s @ %.4f",
                  order_type, self._active_symbol, price)
