@@ -50,6 +50,14 @@ S_COL_KEYS: list[str] = [
     "realized_pnl", "exchanges",
 ]
 
+# Fill-level fields the search box matches against before aggregation.
+# Mirrors the flat view's key set so typing ``U123`` (an account) or
+# ``NASDAQ`` (an exchange) works the same way in both views — the
+# summary just folds the matching subset into symbol aggregates.
+_FILL_SEARCH_KEYS: tuple[str, ...] = (
+    "symbol", "side", "account", "sec_type", "exchange", "order_ref",
+)
+
 _S_NUM_COLS = len(S_HEADERS)
 
 _S_RIGHT_ALIGN_COLS = {
@@ -96,6 +104,18 @@ class TradesSummaryModel(QAbstractTableModel):
         # datetime).  When set, it *overrides* the date window — the
         # user is being explicit about which moment forward to include.
         self._time_threshold: datetime | None = None
+        # Lowercased substring the panel pushes from the search box.
+        # Aggregation is done over only the matching subset of fills,
+        # so typing an account like ``U123`` shows that account's
+        # symbol totals — the flat proxy can't search aggregate rows
+        # on per-fill fields, so the filter lives here instead.
+        self._search_text: str = ""
+        # Symbols the user has temporarily hidden from the view via the
+        # context menu / Delete key.  The underlying aggregate stays in
+        # ``_agg`` so a later ``restore_hidden`` can bring it back, and
+        # the total row iterates over ``_order`` (visible only) so hides
+        # recompute the footer.  Cleared on any filter-driven rebuild.
+        self._hidden_symbols: set[str] = set()
 
         self._symbol_font = QFont("Helvetica Neue, Arial", 11)
         self._symbol_font.setWeight(QFont.Weight.DemiBold)
@@ -192,29 +212,37 @@ class TradesSummaryModel(QAbstractTableModel):
                        | Qt.AlignmentFlag.AlignVCenter)
         return None
 
+    def _visible_aggs(self) -> list[dict]:
+        """Aggregates that are currently shown (hidden symbols excluded).
+        The totals footer folds over these so hiding a row recomputes
+        the footer immediately."""
+        return [self._agg[s] for s in self._order if s in self._agg]
+
     def _total_cell_text(self, col: int) -> str:
         if col == S_COL_SYMBOL:
             return "TOTAL"
+        visible = self._visible_aggs()
         if col == S_COL_TRANS_TOTAL:
             return self._fmt_compact(
-                sum(self._trans_total(a) for a in self._agg.values()))
+                sum(self._trans_total(a) for a in visible))
         if col == S_COL_NET_TOTAL:
             return self._fmt_signed(
-                sum(self._net_total(a) for a in self._agg.values()))
+                sum(self._net_total(a) for a in visible))
         if col == S_COL_COMMISSION:
-            s = sum(a.get("commission", 0.0) for a in self._agg.values())
+            s = sum(a.get("commission", 0.0) for a in visible)
             return f"{s:,.2f}" if s else ""
         if col == S_COL_NET_INCL_COMM:
             s = sum(self._net_total(a) - a.get("commission", 0.0)
-                    for a in self._agg.values())
+                    for a in visible)
             return self._fmt_signed(s)
         return ""
 
     def _total_cell_color(self, col: int) -> QColor | None:
         if col == S_COL_SYMBOL:
             return QColor(TEXT_BOLD)
+        visible = self._visible_aggs()
         if col == S_COL_NET_TOTAL:
-            v = sum(self._net_total(a) for a in self._agg.values())
+            v = sum(self._net_total(a) for a in visible)
             if v > 0:
                 return QColor(CLR_BUY)
             if v < 0:
@@ -222,7 +250,7 @@ class TradesSummaryModel(QAbstractTableModel):
             return QColor(TEXT_DIM)
         if col == S_COL_NET_INCL_COMM:
             v = sum(self._net_total(a) - a.get("commission", 0.0)
-                    for a in self._agg.values())
+                    for a in visible)
             if v > 0:
                 return QColor(CLR_BUY)
             if v < 0:
@@ -419,9 +447,12 @@ class TradesSummaryModel(QAbstractTableModel):
 
         self._add_to_agg(symbol, fill)
 
-        # Refresh the updated row *and* the totals footer (which always
-        # changes when an aggregate changes).
-        if symbol in self._agg:
+        # Refresh the updated row *and* the totals footer.  When the
+        # symbol is user-hidden the row isn't in ``_order`` — we update
+        # the stored aggregate but emit nothing because neither the
+        # hidden row nor the totals (which exclude hidden rows) change
+        # visually.
+        if symbol in self._order:
             row = self._order.index(symbol)
             self.dataChanged.emit(
                 self.index(row, 0),
@@ -449,16 +480,66 @@ class TradesSummaryModel(QAbstractTableModel):
         self._time_threshold = threshold
         self._rebuild_from_fills()
 
+    def set_search_text(self, text: str) -> None:
+        """Substring filter applied to the fill stream before
+        aggregation.  Callers should pass the raw substring (datetime
+        queries are routed through ``set_time_threshold`` instead)."""
+        new_search = (text or "").strip().lower()
+        if new_search == self._search_text:
+            return
+        self._search_text = new_search
+        self._rebuild_from_fills()
+
     def clear(self) -> None:
-        if not self._order:
+        if not self._order and not self._fills:
             return
         self.beginResetModel()
         self._agg.clear()
         self._order.clear()
         self._fills.clear()
+        self._hidden_symbols.clear()
         self._latest_fill_date = None
         self._anchor_date = None
         self.endResetModel()
+
+    # ── Hide / restore (user-driven, temporary) ────────────────────────────
+
+    def hide_symbol(self, symbol: str) -> None:
+        """Temporarily remove *symbol*'s row from the view and
+        recalculate the totals footer without it.  The aggregate stays
+        in ``_agg`` so ``restore_hidden`` can bring it back; the hide
+        is cleared on any filter-driven rebuild."""
+        if not symbol or symbol in self._hidden_symbols:
+            return
+        if symbol not in self._order:
+            return
+        row = self._order.index(symbol)
+        self.beginRemoveRows(QModelIndex(), row, row)
+        self._order.pop(row)
+        self._hidden_symbols.add(symbol)
+        self.endRemoveRows()
+        # Totals footer shifted up by one and its values changed.
+        if self._order:
+            total_row = len(self._order)
+            self.dataChanged.emit(
+                self.index(total_row, 0),
+                self.index(total_row, _S_NUM_COLS - 1))
+
+    def restore_hidden(self) -> None:
+        """Un-hide every user-hidden symbol.  Order after restore is
+        not guaranteed to match the original — restored symbols land
+        at the tail of ``_order``."""
+        if not self._hidden_symbols:
+            return
+        self.beginResetModel()
+        for s in list(self._hidden_symbols):
+            if s in self._agg and s not in self._order:
+                self._order.append(s)
+        self._hidden_symbols.clear()
+        self.endResetModel()
+
+    def hidden_count(self) -> int:
+        return len(self._hidden_symbols)
 
     # ── Date-filter helpers ─────────────────────────────────────────────────
 
@@ -487,6 +568,13 @@ class TradesSummaryModel(QAbstractTableModel):
         return self._latest_fill_date if self._latest_fill_date < today else today
 
     def _passes_filter(self, fill: dict) -> bool:
+        if not self._passes_time_filter(fill):
+            return False
+        if not self._passes_search_filter(fill):
+            return False
+        return True
+
+    def _passes_time_filter(self, fill: dict) -> bool:
         # Time-threshold overrides the date window — when a user types
         # a specific moment into the search box we want the aggregates
         # to reflect exactly that cutoff (match what the flat view is
@@ -511,14 +599,27 @@ class TradesSummaryModel(QAbstractTableModel):
         cutoff = self._anchor_date - timedelta(days=self._days_back - 1)
         return local_date >= cutoff
 
+    def _passes_search_filter(self, fill: dict) -> bool:
+        if not self._search_text:
+            return True
+        needle = self._search_text
+        for k in _FILL_SEARCH_KEYS:
+            v = fill.get(k, "")
+            if v and needle in str(v).lower():
+                return True
+        return False
+
     def _rebuild_from_fills(self) -> None:
         """Replace aggregates with a fresh fold over every stored fill,
         honouring the current date filter.  Called when the filter
         window or anchor changes — incremental add_fill is used the rest
-        of the time."""
+        of the time.  User-hides are cleared here because the dataset
+        changed: keeping a hide across filter windows would silently
+        exclude rows the user may not realize are gone."""
         self.beginResetModel()
         self._agg.clear()
         self._order.clear()
+        self._hidden_symbols.clear()
         for fill in self._fills.values():
             if not self._passes_filter(fill):
                 continue
@@ -608,6 +709,13 @@ class TradesSummaryModel(QAbstractTableModel):
         # routed through NYSE still shows NYSE in its exchange list.
 
     def _drop_symbol_row(self, symbol: str) -> None:
+        # Hidden symbols aren't in ``_order`` but still have a stored
+        # aggregate — drop from internal state only; no row signals
+        # needed because the view isn't showing them.
+        if symbol in self._hidden_symbols:
+            self._hidden_symbols.discard(symbol)
+            self._agg.pop(symbol, None)
+            return
         if symbol not in self._order:
             return
         row = self._order.index(symbol)
