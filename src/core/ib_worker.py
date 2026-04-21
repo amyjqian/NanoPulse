@@ -123,6 +123,19 @@ def _safe_pnl(val) -> float:
     return v
 
 
+def _parse_multiplier(raw) -> float:
+    """IB returns ``contract.multiplier`` as a string (e.g. ``"20"`` for
+    NQ, ``"2"`` for MNQ) — or empty for stocks.  Return a float, with
+    1.0 as the fallback so per-point notionals round-trip for stocks."""
+    if raw is None or raw == "":
+        return 1.0
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return 1.0
+    return v if v > 0 else 1.0
+
+
 try:
     from ib_async import IB, AccountValue
 except ImportError:  # allow UI dev without TWS dependency installed
@@ -167,6 +180,18 @@ class IBWorkerThread(QThread):
     # prior-session close used by the order-entry ticker strip to compute
     # day change / %change; 0.0 when unavailable.
     bg_price_updated = Signal(str, float, float, float, float)
+    # (symbol, bid_size, ask_size, last_size) – top-of-book sizes emitted
+    # in lockstep with ``bg_price_updated``.  Surfaced for the Book Trader
+    # L1-fallback ladder (single-level book when the account has no L2
+    # entitlement) and the TWS-style "{size} @ {price}" last-trade stripe.
+    # Zero when TWS has no value (NaN / DBL_MAX sentinels are scrubbed).
+    bg_sizes_updated = Signal(str, float, float, float)
+    # (symbol, bids, asks) – depth-of-market snapshot for the Book Trader.
+    # bids / asks are list[tuple[price: float, size: float]], freshly
+    # copied out of the ib_async Ticker so the UI thread doesn't see the
+    # in-place mutation that ib_async performs on every L2 tick.  Emitted
+    # by the 100 ms ``_depth_flush_loop``.
+    depth_updated = Signal(str, list, list)
     # {symbol, account, action, qty} → UI places the close order
     flatten_close_needed = Signal(dict)
     # {symbol, account, action, qty} → UI places the reverse order
@@ -224,6 +249,16 @@ class IBWorkerThread(QThread):
         # Last valid bid/ask per background symbol so "last-price-only" ticks
         # (common with IB delayed data for futures) don't blank out the display.
         self._bg_last_bid_ask: dict[str, tuple[float, float]] = {}  # sym → (bid, ask)
+
+        # Depth-of-market (L2) subscription state for the Book Trader.
+        #   _depth_tickers       : symbol → ib_async Ticker returned by reqMktDepth
+        #   _ticker_to_depth_sym : id(ticker) → symbol reverse index used by
+        #                          _on_pending_tickers to O(1)-mark dirty
+        #   _depth_dirty         : symbols whose domBids/domAsks have changed
+        #                          since the last _depth_flush_loop tick
+        self._depth_tickers: dict[str, object] = {}
+        self._ticker_to_depth_sym: dict[int, str] = {}
+        self._depth_dirty: set[str] = set()
 
         # Order tracking: order_id → Trade
         self._trades: dict[str, object] = {}
@@ -645,6 +680,37 @@ class IBWorkerThread(QThread):
             asyncio.run_coroutine_threadsafe(
                 self._do_unsubscribe_all_bg(), self._loop)
 
+    # ── Depth of market (L2) subscriptions ────────────────────────────────────
+
+    def subscribe_depth(self, symbol: str, num_rows: int = 10) -> None:
+        """Thread-safe: subscribe to IBKR Level-2 depth for *symbol*.
+
+        The Book Trader typically keeps exactly one depth subscription
+        active at a time — the currently-active ticker — so TWS's
+        ~3-concurrent-L2 limit without "Level 2 booster" isn't hit.
+        """
+        if self._loop is not None and not self._loop.is_closed():
+            asyncio.run_coroutine_threadsafe(
+                self._do_subscribe_depth(symbol, num_rows), self._loop)
+        else:
+            log.warning(
+                "Worker %s: subscribe_depth but loop not ready", self._label)
+
+    def unsubscribe_depth(self, symbol: str) -> None:
+        """Thread-safe: unsubscribe a Level-2 depth stream."""
+        if self._loop is not None and not self._loop.is_closed():
+            asyncio.run_coroutine_threadsafe(
+                self._do_unsubscribe_depth(symbol), self._loop)
+        else:
+            log.warning(
+                "Worker %s: unsubscribe_depth but loop not ready", self._label)
+
+    def unsubscribe_all_depth(self) -> None:
+        """Thread-safe: unsubscribe every live L2 stream."""
+        if self._loop is not None and not self._loop.is_closed():
+            asyncio.run_coroutine_threadsafe(
+                self._do_unsubscribe_all_depth(), self._loop)
+
     # ── Thread entry-point ────────────────────────────────────────────────────
 
     def run(self) -> None:  # noqa: D401 – Qt override
@@ -722,11 +788,13 @@ class IBWorkerThread(QThread):
         results = await asyncio.gather(
             self._reconnect_loop(),
             self._throttler_loop(),
+            self._depth_flush_loop(),
             return_exceptions=True,
         )
         for i, result in enumerate(results):
             if isinstance(result, Exception):
-                coro_name = ("_reconnect_loop", "_throttler_loop")[i]
+                coro_name = ("_reconnect_loop", "_throttler_loop",
+                             "_depth_flush_loop")[i]
                 log.exception("Worker %s: %s crashed: %s",
                               self._label, coro_name, result,
                               exc_info=result)
@@ -793,6 +861,12 @@ class IBWorkerThread(QThread):
                 self._bg_tickers.clear()
                 self._bg_last_bid_ask.clear()   # bid/ask cache stale after reconnect
                 self._ticker_to_sym.clear()         # RC #6: clear reverse index
+                # Depth-of-market state (BookTrader) — IB drops L2 subs on
+                # disconnect so the local state becomes stale.  UI will
+                # re-subscribe on the next active-symbol change.
+                self._depth_tickers.clear()
+                self._ticker_to_depth_sym.clear()
+                self._depth_dirty.clear()
                 # Clear pnlSingle subscriptions so they are re-established
                 # after reconnect (IB drops all subscriptions on disconnect).
                 self._pnl_single_subs.clear()
@@ -2338,6 +2412,14 @@ class IBWorkerThread(QThread):
                 if sym:
                     self._emit_bg_price(sym, ticker)
 
+            # Depth-of-market hot path: mark dirty, don't emit here — the
+            # 100 ms ``_depth_flush_loop`` coalesces bursts so we don't
+            # flood the Qt main thread with one signal per L2 tick.
+            if self._ticker_to_depth_sym:
+                d_sym = self._ticker_to_depth_sym.get(id(ticker))
+                if d_sym:
+                    self._depth_dirty.add(d_sym)
+
     async def _do_market_data(self, params: dict) -> None:
         """Subscribe to live top-of-book data for the contract in *params*."""
         if self._ib is None or not self._ib.isConnected():
@@ -2492,6 +2574,135 @@ class IBWorkerThread(QThread):
         log.debug("Worker %s: all %d bg subscriptions cleared",
                   self._label, count)
 
+    # ── Depth-of-market (L2) subscription helpers ─────────────────────────────
+
+    async def _do_subscribe_depth(self, symbol: str, num_rows: int) -> None:
+        """Resolve a contract for *symbol* via ReferenceData and issue
+        ``reqMktDepth``.  Errors (TWS code 101 — too many subs, 10090 /
+        10167 — no L2 entitlement) are caught and surfaced via
+        ``market_data_failed`` so the UI can render the ladder using
+        L1-only data.
+        """
+        if self._ib is None or not self._ib.isConnected():
+            log.debug("Worker %s: depth subscribe skipped (no IB)", self._label)
+            return
+        sym = (symbol or "").strip()
+        if not sym:
+            return
+        if sym in self._depth_tickers:
+            return   # already subscribed
+
+        # Resolve contract from the local ReferenceData cache.  This
+        # mirrors what OrderEntryPanel already does for L1 subscriptions
+        # and avoids a round-trip to TWS for contract-details.
+        try:
+            from src.core.reference_data import get_instance as _rd
+            cached = _rd().get_contract(sym)
+        except Exception:
+            cached = None
+        if not cached:
+            log.warning("Worker %s: depth subscribe — no local contract for %s",
+                        self._label, sym)
+            self.market_data_failed.emit(sym)
+            return
+
+        try:
+            from ib_async import Contract
+        except ImportError:
+            return
+        c = Contract(
+            conId=int(cached.get("conid") or 0),
+            symbol=cached.get("symbol", sym),
+            secType=cached.get("sec_type", "") or "",
+            exchange=cached.get("exchange", "") or "SMART",
+            currency=cached.get("currency", "USD") or "USD",
+            localSymbol=cached.get("local_symbol", "") or "",
+            lastTradeDateOrContractMonth=cached.get("expiry", "") or "",
+            multiplier=cached.get("multiplier", "") or "",
+        )
+
+        try:
+            ticker = self._ib.reqMktDepth(
+                c, numRows=int(num_rows or 10), isSmartDepth=False)
+        except Exception as exc:
+            log.warning("Worker %s: reqMktDepth(%s) raised: %s",
+                        self._label, sym, exc)
+            self.market_data_failed.emit(sym)
+            return
+
+        self._depth_tickers[sym] = ticker
+        self._ticker_to_depth_sym[id(ticker)] = sym
+        log.info("Worker %s: depth subscribed %s (numRows=%d)",
+                 self._label, sym, num_rows)
+
+    async def _do_unsubscribe_depth(self, symbol: str) -> None:
+        sym = (symbol or "").strip()
+        if not sym:
+            return
+        ticker = self._depth_tickers.pop(sym, None)
+        self._depth_dirty.discard(sym)
+        if ticker is None:
+            return
+        self._ticker_to_depth_sym.pop(id(ticker), None)
+        if self._ib is not None and self._ib.isConnected():
+            try:
+                self._ib.cancelMktDepth(ticker.contract, isSmartDepth=False)
+            except Exception as exc:
+                log.debug("Worker %s: cancelMktDepth(%s) error: %s",
+                          self._label, sym, exc)
+        log.debug("Worker %s: depth unsubscribed %s", self._label, sym)
+
+    async def _do_unsubscribe_all_depth(self) -> None:
+        if self._ib is not None and self._ib.isConnected():
+            for sym, ticker in list(self._depth_tickers.items()):
+                try:
+                    self._ib.cancelMktDepth(
+                        ticker.contract, isSmartDepth=False)
+                except Exception:
+                    pass
+        count = len(self._depth_tickers)
+        self._depth_tickers.clear()
+        self._ticker_to_depth_sym.clear()
+        self._depth_dirty.clear()
+        log.debug("Worker %s: all %d depth subscriptions cleared",
+                  self._label, count)
+
+    async def _depth_flush_loop(self) -> None:
+        """Every 100 ms, emit a ``depth_updated`` signal for each symbol
+        whose L2 ticker was marked dirty by ``_on_pending_tickers``.
+
+        The hot path (``_on_pending_tickers``) only adds to ``_depth_dirty``
+        — no allocation, no emit.  The flush reads ``ticker.domBids`` /
+        ``ticker.domAsks`` (ib_async mutates these lists in place on each
+        tick) and copies them into plain ``list[tuple[price, size]]``
+        before emitting, so the UI thread never sees partial mutations.
+
+        A separate 100 ms loop is used instead of reusing the 250 ms
+        ``_throttler_loop`` because DOM feels laggy above ~150 ms and we
+        don't want to couple PnL/summary batching cadence to DOM cadence.
+        """
+        while self._running:
+            await asyncio.sleep(0.1)
+            if not self._depth_dirty:
+                continue
+            for sym in list(self._depth_dirty):
+                ticker = self._depth_tickers.get(sym)
+                if ticker is None:
+                    continue
+                # Snapshot into plain tuples BEFORE emit so ib_async's
+                # in-place mutation of the lists can't race the UI.
+                try:
+                    bids = [(float(l.price), float(l.size))
+                            for l in getattr(ticker, "domBids", [])]
+                    asks = [(float(l.price), float(l.size))
+                            for l in getattr(ticker, "domAsks", [])]
+                except Exception as exc:
+                    log.debug("Worker %s: depth snapshot error (%s): %s",
+                              self._label, sym, exc)
+                    continue
+                self.depth_updated.emit(sym, bids, asks)
+            self._depth_dirty.clear()
+
     def _emit_bg_price(self, sym: str, ticker) -> None:
         """Extract last/bid/ask from a background ticker and emit ``bg_price_updated``.
 
@@ -2535,6 +2746,24 @@ class IBWorkerThread(QThread):
                                          and close > 0) else 0.0
 
             self.bg_price_updated.emit(sym, last, bid_out, ask_out, close_out)
+
+            # ── Sizes (for Book Trader L1-fallback + last-trade stripe) ─
+            def _sz(val):
+                if val is None:
+                    return 0.0
+                try:
+                    v = float(val)
+                except (TypeError, ValueError):
+                    return 0.0
+                if math.isnan(v) or v < 0 or v >= _IB_DBL_MAX:
+                    return 0.0
+                return v
+            self.bg_sizes_updated.emit(
+                sym,
+                _sz(getattr(ticker, "bidSize", 0.0)),
+                _sz(getattr(ticker, "askSize", 0.0)),
+                _sz(getattr(ticker, "lastSize", 0.0)),
+            )
         except Exception:
             log.debug("Worker %s: bg price emit error for %s",
                       self._label, sym)
@@ -3120,6 +3349,11 @@ class IBWorkerThread(QThread):
             "time_sort":     et_time.isoformat() if et_time else "",
             "symbol":        getattr(contract, "symbol", "") if contract else "",
             "sec_type":      getattr(contract, "secType", "") if contract else "",
+            # Contract multiplier (e.g. "20" for NQ, "2" for MNQ, "" or
+            # "1" for stocks).  Stored as float so downstream consumers
+            # can scale per-point notionals into dollar P&L for futures.
+            "multiplier":    _parse_multiplier(
+                getattr(contract, "multiplier", "") if contract else ""),
             "side":          getattr(ex, "side", "") if ex is not None else "",
             "shares":        float(getattr(ex, "shares", 0) or 0) if ex is not None else 0.0,
             "price":         float(getattr(ex, "price", 0) or 0) if ex is not None else 0.0,

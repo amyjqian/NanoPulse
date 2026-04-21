@@ -104,7 +104,11 @@ class FlashTradeView(QWidget):
         )
 
         # ── Middle 1/5 — Book Trading ─────────────────────────────────────────
-        self._book_trading = _titled_panel("Book Trading")
+        from .book_trader_view import BookTraderView
+        self._book_trading = BookTraderView(
+            active_threads=self._active_threads,
+            parent=self,
+        )
 
         # ── Right 3/5 — Account List full-height on right; left side split top/bottom
         self._right_splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -179,6 +183,21 @@ class FlashTradeView(QWidget):
         self._order_entry.close_tier_requested.connect(
             self._on_close_tier_requested)
 
+        # ── Wire book trader (mirrors order-entry signal surface) ────────────
+        # BookTraderView submits through the same handlers so TP/SL/Trail
+        # children, multi-account fan-out, and close-tier routing all
+        # behave identically whether the click came from OrderEntry or
+        # a ladder row.
+        self._book_trading.order_requested.connect(self._on_order_requested)
+        self._book_trading.cancel_all_requested.connect(
+            self._on_cancel_all_for_symbol)
+        self._book_trading.cancel_order_requested.connect(
+            self._on_cancel_requested)
+        self._book_trading.flatten_requested.connect(self._on_flatten_requested)
+        self._book_trading.reverse_requested.connect(self._on_reverse_requested)
+        self._book_trading.close_tier_requested.connect(
+            self._on_close_tier_requested)
+
         # ── Wire order status cancel button → cancel logic ───────────────────
         self._order_status.cancel_requested.connect(self._on_cancel_requested)
         self._order_status.refresh_requested.connect(
@@ -230,6 +249,11 @@ class FlashTradeView(QWidget):
                 self._ensure_worker_connected(worker)
         # Ensure background price subscriptions are active
         self._order_entry.refresh_price_subscription()
+        # Book Trader needs the same cold-start retry — it's built before
+        # workers connect and would otherwise never wire its signals or
+        # subscribe depth.
+        if hasattr(self._book_trading, "refresh_subscriptions"):
+            self._book_trading.refresh_subscriptions()
 
     def _on_order_requested(self, payload: dict) -> None:
         """Handle Buy/Sell button click from OrderEntryPanel.

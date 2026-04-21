@@ -320,7 +320,11 @@ class AccountListPanel(QWidget):
         header.addWidget(title)
         header.addStretch(1)
 
-        for label_text, slot in [("All", self._select_all), ("None", self._select_none)]:
+        for label_text, slot in [
+            ("All", self._select_all),
+            ("None", self._select_none),
+            ("Mgn", self._select_mgn),
+        ]:
             b = QPushButton(label_text)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             b.setStyleSheet(f"""
@@ -457,6 +461,7 @@ class AccountListPanel(QWidget):
             self._remove_account_row(acct)
 
         self._refresh_add_combo(model_accounts)
+        self._reorder_rows()
 
     def _add_account_row(self, account: str, alias: str,
                          balance: str, acct_type: str) -> None:
@@ -497,6 +502,7 @@ class AccountListPanel(QWidget):
 
     def _on_model_data_changed(self, topLeft: QModelIndex,
                                bottomRight: QModelIndex, roles=None) -> None:
+        net_liq_touched = False
         for row_idx in range(topLeft.row(), bottomRight.row() + 1):
             if row_idx >= len(self._model._table_data):
                 continue
@@ -505,6 +511,11 @@ class AccountListPanel(QWidget):
             if r:
                 r.set_balance(rd[COL_NET_LIQ])
                 r.set_name(rd[COL_ALIAS] if rd[COL_ALIAS] else rd[COL_ACCOUNT])
+                net_liq_touched = True
+        # Balances just changed — re-sort so the account with the most
+        # money bubbles to the top (within its selected/unselected group).
+        if net_liq_touched:
+            self._reorder_rows()
 
     def _on_rows_changed(self, *args) -> None:
         self._sync_rows()
@@ -518,6 +529,7 @@ class AccountListPanel(QWidget):
             self._unchecked.add(account)
         self._persist_selection()
         self._emit_selection_changed()
+        self._reorder_rows()
 
     def _on_row_removed(self, account: str) -> None:
         self._remove_account_row(account)
@@ -542,6 +554,7 @@ class AccountListPanel(QWidget):
                 break
         self._refresh_add_combo()
         self._emit_selection_changed()
+        self._reorder_rows()
         log.info("AccountList: user re-added %s", acct)
 
     def get_selected_count(self) -> int:
@@ -562,6 +575,7 @@ class AccountListPanel(QWidget):
         self._unchecked.clear()
         self._persist_selection()
         self._emit_selection_changed()
+        self._reorder_rows()
 
     def _select_none(self) -> None:
         for r in self._account_rows.values():
@@ -569,6 +583,60 @@ class AccountListPanel(QWidget):
         self._unchecked = set(self._account_rows.keys())
         self._persist_selection()
         self._emit_selection_changed()
+        self._reorder_rows()
+
+    def _select_mgn(self) -> None:
+        """Check every row whose alias (or account id, if no alias)
+        contains ``mgn`` (case-insensitive); uncheck all others."""
+        needle = "mgn"
+        new_unchecked: set[str] = set()
+        for acct, r in self._account_rows.items():
+            alias = self._model._aliases.get(acct, "") or ""
+            name = alias if alias else acct
+            match = needle in name.lower()
+            r.set_checked(match)
+            if not match:
+                new_unchecked.add(acct)
+        self._unchecked = new_unchecked
+        self._persist_selection()
+        self._emit_selection_changed()
+        self._reorder_rows()
+
+    # ── Row ordering ──────────────────────────────────────────────────────────
+
+    def _net_liq_for(self, account: str) -> float:
+        """Parse the raw NetLiquidation string for *account* into a float;
+        returns 0.0 when the value is missing or unparseable."""
+        for rd in self._model._table_data:
+            if rd[COL_ACCOUNT] == account:
+                raw = rd[COL_NET_LIQ] or ""
+                try:
+                    return float(str(raw).replace(",", ""))
+                except (TypeError, ValueError):
+                    return 0.0
+        return 0.0
+
+    def _reorder_rows(self) -> None:
+        """Re-arrange the account rows: selected accounts first, then by
+        descending Net Liquidation, then alphabetically by account id as
+        a tiebreaker.  Keeps the trailing ``addStretch`` entry at the end."""
+        if not self._account_rows:
+            return
+        ordered = sorted(
+            self._account_rows.items(),
+            key=lambda kv: (
+                not kv[1].is_checked,          # False (selected) sorts first
+                -self._net_liq_for(kv[0]),     # larger balance first
+                kv[0],                         # stable tiebreaker
+            ),
+        )
+        # Detach every row (without deleting) then re-insert in new order
+        # just before the trailing addStretch slot.
+        for _acct, row in ordered:
+            self._rows_layout.removeWidget(row)
+        # After removal the only child is the stretch (count() == 1).
+        for i, (_acct, row) in enumerate(ordered):
+            self._rows_layout.insertWidget(i, row)
 
     def _emit_action(self, action: str) -> None:
         selected = [a for a, r in self._account_rows.items() if r.is_checked]

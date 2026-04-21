@@ -3,9 +3,13 @@ TradesFilterProxy – shared QSortFilterProxyModel for the flat trades
 and summary views.
 
 Filters on two axes:
-  * Text search — case-insensitive substring match against a fixed set
-    of underlying row keys (symbol / side / account / sec_type for the
-    flat model; symbol only for the summary model).
+  * Text search — interpreted in one of two modes:
+      - If the input parses as a datetime (e.g. ``Apr21 11:44:40``,
+        ``11:44``, ``Apr21``) it becomes a "fills at or after this
+        moment" threshold on the flat view.
+      - Otherwise it's a case-insensitive substring match against the
+        per-view key set (symbol / side / account / sec_type / exchange
+        / order_ref for flat; symbol / exchanges for summary).
   * Date range — keep rows whose ``time_sort`` ISO timestamp is within
     the last *N* trading days (ET).  The summary model has no per-fill
     timestamp, so date filtering is a no-op on it; the flat view is the
@@ -23,10 +27,61 @@ log = logging.getLogger(__name__)
 
 _ET = ZoneInfo("America/New_York")
 
+# Datetime formats accepted in the search box for the time-threshold
+# mode.  Ordered so longer / more specific patterns match first (strptime
+# is strict — "Apr21 11:44:40" won't match "%b%d" alone).
+_TIME_FORMATS = (
+    "%b%d %H:%M:%S",
+    "%b %d %H:%M:%S",
+    "%b%d %H:%M",
+    "%b %d %H:%M",
+    "%b%d",
+    "%b %d",
+    "%H:%M:%S",
+    "%H:%M",
+)
+
+
+def _try_parse_time_query(text: str) -> datetime | None:
+    """Return an ET-aware datetime if *text* looks like a time/date
+    query, else ``None``.
+
+    Fills in missing pieces from the current ET clock: month/day-only
+    inputs get the current year at 00:00 ET; time-only inputs get
+    today's ET date.  Month abbreviations are accepted case-insensitively
+    (``APR21``, ``apr21``, ``Apr21`` all work)."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    # Normalize the month abbreviation's case so strptime's %b accepts
+    # any casing the user types.  Only the first three chars — we don't
+    # want to touch the rest of the input.
+    if len(raw) >= 3 and raw[:3].isalpha():
+        normalized = raw[:3].title() + raw[3:]
+    else:
+        normalized = raw
+    now = datetime.now(_ET)
+    for fmt in _TIME_FORMATS:
+        try:
+            dt = datetime.strptime(normalized, fmt)
+        except ValueError:
+            continue
+        # Fill in missing fields from the current ET moment.
+        if "%Y" not in fmt:
+            dt = dt.replace(year=now.year)
+        if "%b" not in fmt and "%m" not in fmt:
+            dt = dt.replace(month=now.month, day=now.day)
+        return dt.replace(tzinfo=_ET)
+    return None
+
 # Keys the search box matches, per underlying model type.
 # The proxy asks the source model for ``row_data(row)`` and matches these.
-_SEARCH_KEYS_FLAT = ("symbol", "side", "account", "sec_type")
-_SEARCH_KEYS_SUMMARY = ("symbol",)
+# Flat view: every common identifying column a user might type.
+# Summary view: symbol + the exchanges set (so "nasdaq" / "cme" filter).
+_SEARCH_KEYS_FLAT = (
+    "symbol", "side", "account", "sec_type", "exchange", "order_ref",
+)
+_SEARCH_KEYS_SUMMARY = ("symbol", "exchanges")
 
 
 class TradesFilterProxy(QSortFilterProxyModel):
@@ -37,6 +92,10 @@ class TradesFilterProxy(QSortFilterProxyModel):
         super().__init__(parent)
         self._is_summary = is_summary
         self._search: str = ""
+        # When the user types a parseable datetime, the proxy switches
+        # into "time threshold" mode: flat rows are kept only if their
+        # ``time_sort`` is ≥ this moment.  ``None`` means substring mode.
+        self._time_threshold: datetime | None = None
         self._days_back: int = 1  # "Today" by default
         # Anchor date used by the date filter.  Defined as
         # ``max(today_ET, latest_fill_date)`` so opening the app on a
@@ -65,10 +124,23 @@ class TradesFilterProxy(QSortFilterProxyModel):
         self._recompute_anchor()
 
     def setSearchText(self, text: str) -> None:
-        new_val = (text or "").strip().lower()
-        if new_val == self._search:
+        raw = (text or "").strip()
+        parsed = _try_parse_time_query(raw) if raw else None
+        # Time-threshold input clears substring mode on both proxies: on
+        # the flat view we apply the threshold directly; on the summary
+        # view the threshold is handled by the underlying model (via
+        # TradesSummaryModel.set_time_threshold from TradesPanel), so
+        # the proxy just needs to not filter by the raw text.
+        if parsed is not None:
+            new_search = ""
+            new_threshold = parsed if not self._is_summary else None
+        else:
+            new_search = raw.lower()
+            new_threshold = None
+        if new_search == self._search and new_threshold == self._time_threshold:
             return
-        self._search = new_val
+        self._search = new_search
+        self._time_threshold = new_threshold
         self.invalidateFilter()
 
     def setDaysBack(self, days: int) -> None:
@@ -92,15 +164,50 @@ class TradesFilterProxy(QSortFilterProxyModel):
         if data is None:
             return True
 
-        # Search filter
-        if self._search:
+        # Time-threshold search — show only fills at or after the parsed
+        # moment.  Rows with no time_sort are left visible (safer default
+        # than dropping them silently).  Flat view only.
+        if self._time_threshold is not None:
+            time_sort = data.get("time_sort", "")
+            if time_sort:
+                try:
+                    ts = datetime.fromisoformat(time_sort)
+                except ValueError:
+                    ts = None
+                if ts is not None:
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=_ET)
+                    if ts < self._time_threshold:
+                        return False
+
+        # Substring search — match across the per-view key set.  Keys
+        # whose value is a set/list (e.g. summary "exchanges") are
+        # flattened to a space-joined lowercase string so substring
+        # matching still works ("cme" matches {"CME"}).
+        elif self._search:
             keys = _SEARCH_KEYS_SUMMARY if self._is_summary else _SEARCH_KEYS_FLAT
-            if not any(self._search in str(data.get(k, "") or "").lower()
-                       for k in keys):
+            matched = False
+            for k in keys:
+                v = data.get(k)
+                if v is None or v == "":
+                    continue
+                if isinstance(v, (set, list, tuple)):
+                    s = " ".join(str(x) for x in v).lower()
+                else:
+                    s = str(v).lower()
+                if s and self._search in s:
+                    matched = True
+                    break
+            if not matched:
                 return False
 
-        # Date filter – flat model only
-        if not self._is_summary and self._days_back > 0:
+        # Date filter – flat model only.  Skipped when the user is in
+        # time-threshold mode (typing an explicit moment overrides the
+        # relative "last N days" window so e.g. ``Apr21`` still matches
+        # fills on Apr21 even when "Today" is selected).
+        if (not self._is_summary
+                and self._days_back > 0
+                and self._time_threshold is None):
             time_sort = data.get("time_sort", "")
             if time_sort and not self._within_days(time_sort, self._days_back):
                 return False

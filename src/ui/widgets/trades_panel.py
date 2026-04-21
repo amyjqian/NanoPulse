@@ -35,7 +35,7 @@ from typing import Callable
 
 from src.core import config_manager
 from .trades_control_bar import TradesControlBar
-from .trades_filter_proxy import TradesFilterProxy
+from .trades_filter_proxy import TradesFilterProxy, _try_parse_time_query
 from .trades_model import (
     TradesModel,
     COL_TIME, COL_SYMBOL, COL_SECTYPE, COL_SIDE, COL_QTY, COL_PRICE, COL_EXCH,
@@ -45,7 +45,7 @@ from .trades_model import (
 from .trades_summary_model import (
     TradesSummaryModel,
     S_COL_SYMBOL, S_COL_BUYS, S_COL_SELLS, S_COL_NET,
-    S_COL_AVG_BUY, S_COL_AVG_SELL, S_COL_NET_TOTAL,
+    S_COL_AVG_BUY, S_COL_AVG_SELL, S_COL_TRANS_TOTAL, S_COL_NET_TOTAL,
     S_COL_COMMISSION, S_COL_NET_INCL_COMM, S_COL_REALIZED, S_COL_EXCHANGES,
 )
 
@@ -120,7 +120,8 @@ _DEFAULT_FLAT_VISIBLE = [
 ]
 _DEFAULT_SUMMARY_VISIBLE = [
     "symbol", "buys", "sells", "net", "avg_buy", "avg_sell",
-    "net_total", "commission", "net_incl_comm", "realized_pnl", "exchanges",
+    "trans_total", "net_total", "commission", "net_incl_comm",
+    "realized_pnl", "exchanges",
 ]
 
 
@@ -153,6 +154,16 @@ class TradesPanel(QWidget):
             "visible", list(_DEFAULT_FLAT_VISIBLE))
         self._visible_summary = persisted["summary"].get(
             "visible", list(_DEFAULT_SUMMARY_VISIBLE))
+        # Migration: surface newly-introduced columns to users whose
+        # persisted visible-list predates them.  Without this, upgrade
+        # → new column hidden forever until the user opens Preferences.
+        for new_key, after_key in (("trans_total", "avg_sell"),):
+            if new_key not in self._visible_summary:
+                try:
+                    i = self._visible_summary.index(after_key)
+                    self._visible_summary.insert(i + 1, new_key)
+                except ValueError:
+                    self._visible_summary.append(new_key)
         self._saved_widths_flat: dict[str, int] = dict(
             persisted["flat"].get("widths", {}))
         self._saved_widths_summary: dict[str, int] = dict(
@@ -259,8 +270,9 @@ class TradesPanel(QWidget):
             S_COL_BUYS:          "99999",
             S_COL_SELLS:         "99999",
             S_COL_NET:           "+99999",
-            S_COL_AVG_BUY:       "9999.9999",
-            S_COL_AVG_SELL:      "9999.9999",
+            S_COL_AVG_BUY:       "99,999.99",
+            S_COL_AVG_SELL:      "99,999.99",
+            S_COL_TRANS_TOTAL:   "999.99m",
             S_COL_NET_TOTAL:     "+9,999,999.99",
             S_COL_COMMISSION:    "9,999.99",
             S_COL_NET_INCL_COMM: "+9,999,999.99",
@@ -277,12 +289,19 @@ class TradesPanel(QWidget):
 
     def _on_date_changed(self, days: int) -> None:
         self._flat_proxy.setDaysBack(days)
-        # Summary proxy ignores date; folding across dates would require
-        # re-aggregation which is out of scope for the "instant filter" path.
+        # Re-aggregate the summary over the same window so its totals
+        # match the filtered flat view (no point showing "Today" in the
+        # flat list while the summary sums across every session).
+        self._summary_model.set_days_back(days)
 
     def _on_search_changed(self, text: str) -> None:
         self._flat_proxy.setSearchText(text)
         self._summary_proxy.setSearchText(text)
+        # When the search text parses as a datetime, push it into the
+        # summary model so its aggregates re-fold over only fills at or
+        # after the threshold.  Passing ``None`` drops the override and
+        # the model falls back to the normal date-window filter.
+        self._summary_model.set_time_threshold(_try_parse_time_query(text))
 
     # ── Column visibility + order ───────────────────────────────────────────
 
