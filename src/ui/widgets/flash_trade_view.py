@@ -191,6 +191,8 @@ class FlashTradeView(QWidget):
         self._book_trading.order_requested.connect(self._on_order_requested)
         self._book_trading.cancel_all_requested.connect(
             self._on_cancel_all_for_symbol)
+        self._book_trading.cancel_order_requested.connect(
+            self._on_cancel_requested)
         self._book_trading.flatten_requested.connect(self._on_flatten_requested)
         self._book_trading.reverse_requested.connect(self._on_reverse_requested)
         self._book_trading.close_tier_requested.connect(

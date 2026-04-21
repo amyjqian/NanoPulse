@@ -118,6 +118,7 @@ class BookTraderView(QWidget):
 
     order_requested = Signal(dict)
     cancel_all_requested = Signal(str)
+    cancel_order_requested = Signal(str)   # order_id
     flatten_requested = Signal(str)
     reverse_requested = Signal(str)
     close_tier_requested = Signal(dict)
@@ -695,9 +696,73 @@ class BookTraderView(QWidget):
             self._bg_worker.subscribe_depth(self._active_symbol)
 
     def _on_ladder_clicked(self, action: str, price: float) -> None:
-        """Click on a bid-size or ask-size cell → emit a LMT order."""
+        """Click on a bid-size or ask-size cell.
+
+        Behaviour mirrors pro DOM ladders:
+        * Click on a price where the user has no open same-side LMT →
+          place a new LMT at that price.
+        * Click on a price where the user already has a same-side LMT →
+          cancel that resting order (toggle off).
+        * Click on a different price while a same-side LMT is resting
+          → cancel the old order and place a new one at the click
+          (move the order).
+
+        Only plain LMT orders are considered — STP / STP LMT protective
+        orders are left alone so a casual click doesn't drop a stop.
+        """
         if not self._active_symbol or price <= 0:
             return
+        tick = self._model.tick_size
+        tol = (tick / 2) if tick > 0 else 0.01
+
+        # Match the active symbol against both bare and local symbols
+        # (futures' order blotter uses the local symbol, e.g. "MNQM6").
+        accepted: set[str] = {self._active_symbol.upper()}
+        try:
+            from src.core.reference_data import get_instance as _rd
+            for c in _rd().contracts_by_symbol.get(
+                    self._active_symbol.upper(), []):
+                local = (c.get("local_symbol") or "").upper()
+                if local:
+                    accepted.add(local)
+        except Exception:
+            pass
+
+        # Collect resting same-side LMTs for this symbol — keeping
+        # (order_id, price) so we can match against the click.
+        same_side_lmt: list[tuple[str, float]] = []
+        for oid, od in self._live_orders.items():
+            if (od.get("symbol") or "").upper() not in accepted:
+                continue
+            if (od.get("action") or "").upper() != action:
+                continue
+            if (od.get("order_type") or "").upper() != "LMT":
+                continue
+            try:
+                op = float(od.get("limit_price") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if op <= 0:
+                continue
+            same_side_lmt.append((oid, op))
+
+        # Click on existing order's price → cancel-only (toggle off).
+        for oid, op in same_side_lmt:
+            if abs(op - price) < tol:
+                log.info("BookTrader: click on resting %s LMT %s @ %.4f "
+                         "— cancelling", action, self._active_symbol, price)
+                self.cancel_order_requested.emit(oid)
+                return
+
+        # Click on different price while a same-side LMT rests → cancel
+        # the old order(s) before placing the new one.  Cancels fire
+        # first; TWS handles the two operations independently.
+        for oid, op in same_side_lmt:
+            log.info("BookTrader: move %s LMT for %s from %.4f to %.4f "
+                     "— cancelling old order", action,
+                     self._active_symbol, op, price)
+            self.cancel_order_requested.emit(oid)
+
         # Build payload in the same shape OrderEntryPanel emits for a
         # BID_LMT / ASK_LMT order so FlashTradeView's existing
         # `_on_order_requested` fan-out handles TP/SL/Trail children

@@ -15,12 +15,18 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QStackedWidget, QTabWidget, QWidget
 
 # ── Theme tokens ──────────────────────────────────────────────────────────────
-ACCENT   = "#CC6600"
-BG_PANEL = "#1e2230"
-TEXT     = "#C9D1D9"
-TEXT_DIM = "#8B949E"
+ACCENT    = "#CC6600"
+BG_PANEL  = "#1e2230"
+# Matches BG_HEADER used by the Positions and Trades column-header rows
+# so the tab strip and the header row directly below it read as one band.
+BG_HEADER = "#14171D"
+TEXT      = "#C9D1D9"
+TEXT_DIM  = "#8B949E"
 
 _TAB_QSS = f"""
+    QTabWidget {{
+        background: {BG_HEADER};
+    }}
     QTabWidget::pane {{
         border: none;
         background: {BG_PANEL};
@@ -32,7 +38,7 @@ _TAB_QSS = f"""
     }}
     QTabBar {{
         qproperty-drawBase: 0;
-        background: {BG_PANEL};
+        background: {BG_HEADER};
     }}
     QTabBar::tab {{
         background: transparent;
@@ -74,6 +80,12 @@ class PositionsTradesTabs(QTabWidget):
         self.setDocumentMode(True)
         self.setTabPosition(QTabWidget.TabPosition.North)
         self.setStyleSheet(_TAB_QSS)
+        # Kill the left/right scroll arrows that appear when the corner
+        # widget + tabs don't fit.  With only two short tab labels it's
+        # much better to let the text elide than to hide tabs behind
+        # scroll buttons (which themselves also eat horizontal space).
+        self.tabBar().setUsesScrollButtons(False)
+        self.setElideMode(Qt.TextElideMode.ElideRight)
         self.addTab(positions_widget, "POSITIONS")
         self.addTab(trades_widget, "TRADES")
 

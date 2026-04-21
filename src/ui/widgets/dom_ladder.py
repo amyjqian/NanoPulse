@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPoint, Qt, Signal
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -104,6 +104,13 @@ class DOMLadderModel(QAbstractTableModel):
     prices when the last drifts too far from the ladder center.
     """
 
+    # Auto-recenter when the last price drifts more than this many
+    # rows from the ladder's centre — but only after the drift has
+    # persisted for ``_RECENTER_DEBOUNCE_MS`` so the user has a chance
+    # to click a row far from last without the grid yanking away.
+    _RECENTER_DRIFT_ROWS = 10
+    _RECENTER_DEBOUNCE_MS = 3000
+
     def __init__(
         self,
         parent=None,
@@ -132,6 +139,14 @@ class DOMLadderModel(QAbstractTableModel):
         # Start with a zero-centred ladder so rowCount() > 0 before the
         # first market data tick (prevents a blank view during warmup).
         self._rebuild_prices(0.0)
+        # Debounce timer for auto-recenter.  Starts when drift first
+        # exceeds _RECENTER_DRIFT_ROWS; if still drifted when it fires,
+        # the ladder rebuilds around the current last.  Cancelled if the
+        # market walks back inside the threshold before the timeout.
+        self._recenter_timer = QTimer(self)
+        self._recenter_timer.setSingleShot(True)
+        self._recenter_timer.setInterval(self._RECENTER_DEBOUNCE_MS)
+        self._recenter_timer.timeout.connect(self._on_recenter_timeout)
 
     # ── Qt model plumbing ─────────────────────────────────────────────────────
 
@@ -282,6 +297,18 @@ class DOMLadderModel(QAbstractTableModel):
                 pass
         self._prev_last = self._last
         self._last = price
+
+        # Debounced auto-rebuild: start a single-shot timer when drift
+        # first exceeds the threshold; if still drifted when it fires,
+        # recenter.  Cancel on recovery.  The delay gives the user a
+        # window to click a distant row without the grid yanking away.
+        drift_rows = self._drift_from_centre(price)
+        if drift_rows > self._RECENTER_DRIFT_ROWS:
+            if not self._recenter_timer.isActive():
+                self._recenter_timer.start()
+        elif self._recenter_timer.isActive():
+            self._recenter_timer.stop()
+
         # Narrow emit over the whole price column plus the two size
         # columns (so the above/below colour may change on cells that
         # crossed the new last price).
@@ -333,12 +360,30 @@ class DOMLadderModel(QAbstractTableModel):
     def recenter(self, price: float) -> None:
         """Rebuild the ladder prices centred on *price*.  Wipes size
         dicts — caller should re-feed on the next depth tick."""
+        # A manual recenter (or one from outside feed_last) supersedes
+        # any pending debounced auto-recenter.
+        if self._recenter_timer.isActive():
+            self._recenter_timer.stop()
         self.beginResetModel()
         self._rebuild_prices(price)
         self._bid.clear()
         self._ask.clear()
         self._max_size = 0.0
         self.endResetModel()
+
+    def _drift_from_centre(self, price: float) -> float:
+        """Rows between *price* and the ladder's current centre price."""
+        if not self._prices or self._tick <= 0 or price <= 0:
+            return 0.0
+        mid_price = self._prices[len(self._prices) // 2]
+        return abs(price - mid_price) / self._tick
+
+    def _on_recenter_timeout(self) -> None:
+        """Debounce fired — recenter only if the last is still drifted."""
+        if self._last <= 0:
+            return
+        if self._drift_from_centre(self._last) > self._RECENTER_DRIFT_ROWS:
+            self.recenter(self._last)
 
     def set_tick_size(self, tick: float) -> None:
         tick = float(tick)
@@ -386,7 +431,7 @@ class DOMLadderDelegate(QStyledItemDelegate):
 
     _ROW_H = 16
     _NUMERIC_FONT = QFont("Menlo, Consolas, monospace", 9)
-    _PRICE_FONT = QFont("Menlo, Consolas, monospace", 9)
+    _PRICE_FONT = QFont("Menlo, Consolas, monospace", 10)
     _PRICE_FONT.setWeight(QFont.Weight.Bold)
     _LAST_ARROW_FONT = QFont("Helvetica Neue, Arial", 9)
     _LAST_ARROW_FONT.setWeight(QFont.Weight.Bold)
@@ -738,16 +783,14 @@ class DOMLadderView(QTableView):
     def sync_to_last(self) -> None:
         """Ask the view to re-centre on the last price.
 
-        * Locked   → always recentre the viewport on the last price.
-        * Unlocked → only recentre if the last-price row has drifted
-          further than ``_DRIFT_LIMIT_ROWS`` from the middle of the
-          currently-visible viewport.  Normal ticks leave the user's
-          scroll position untouched; a runaway market still pulls the
-          ladder back into view.
+        No longer yanks the viewport on every tick — the model owns a
+        debounced auto-recenter that fires on drift > 10 rows after a
+        3-second delay, and its ``modelReset`` snaps the viewport
+        automatically.  This method is kept as a safety valve: if the
+        last-price row has drifted more than ``_DRIFT_LIMIT_ROWS`` from
+        the viewport centre (e.g. user scrolled way off), pull it back
+        into view so the market doesn't disappear entirely.
         """
-        if self._locked:
-            self._scroll_to_last()
-            return
         drift = self._last_row_drift()
         if drift is not None and drift > self._DRIFT_LIMIT_ROWS:
             self._scroll_to_last()
