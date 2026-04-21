@@ -123,6 +123,19 @@ def _safe_pnl(val) -> float:
     return v
 
 
+def _parse_multiplier(raw) -> float:
+    """IB returns ``contract.multiplier`` as a string (e.g. ``"20"`` for
+    NQ, ``"2"`` for MNQ) — or empty for stocks.  Return a float, with
+    1.0 as the fallback so per-point notionals round-trip for stocks."""
+    if raw is None or raw == "":
+        return 1.0
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return 1.0
+    return v if v > 0 else 1.0
+
+
 try:
     from ib_async import IB, AccountValue
 except ImportError:  # allow UI dev without TWS dependency installed
@@ -3336,6 +3349,11 @@ class IBWorkerThread(QThread):
             "time_sort":     et_time.isoformat() if et_time else "",
             "symbol":        getattr(contract, "symbol", "") if contract else "",
             "sec_type":      getattr(contract, "secType", "") if contract else "",
+            # Contract multiplier (e.g. "20" for NQ, "2" for MNQ, "" or
+            # "1" for stocks).  Stored as float so downstream consumers
+            # can scale per-point notionals into dollar P&L for futures.
+            "multiplier":    _parse_multiplier(
+                getattr(contract, "multiplier", "") if contract else ""),
             "side":          getattr(ex, "side", "") if ex is not None else "",
             "shares":        float(getattr(ex, "shares", 0) or 0) if ex is not None else 0.0,
             "price":         float(getattr(ex, "price", 0) or 0) if ex is not None else 0.0,
