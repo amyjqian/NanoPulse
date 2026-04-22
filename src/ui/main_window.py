@@ -195,17 +195,19 @@ class MainWindow(QWidget):
         Columns → Positions / Trades / Summary without a second click.
         """
         class _CombinedProvider:
+            _POS_KINDS = ("positions", "positions_summary")
+
             def __init__(self, trades_panel, position_panel):
                 self._trades = trades_panel
                 self._positions = position_panel
 
             def column_state(self, kind):
-                if kind == "positions":
+                if kind in self._POS_KINDS:
                     return self._positions.column_state(kind)
                 return self._trades.column_state(kind)
 
             def apply_columns(self, kind, keys):
-                if kind == "positions":
+                if kind in self._POS_KINDS:
                     self._positions.apply_columns(kind, keys)
                 else:
                     self._trades.apply_columns(kind, keys)

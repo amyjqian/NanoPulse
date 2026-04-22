@@ -1,9 +1,10 @@
 """
 Columns section used inside ``PreferencesDialog``.
 
-Three pages swapped via a ``QStackedWidget``:
+Two page kinds swapped via a ``QStackedWidget``:
 
-* ``_ColumnsOverview`` – two rows: Trades / Summary of Trades (Image #4).
+* ``_ColumnsOverview`` – four rows: Positions / Positions Summary /
+  Trades / Summary of Trades (Image #4).
 * ``_ColumnsEditor`` – per-view Selected / Available two-pane editor with
   drag-drop reorder, per-row +/- buttons, and search (Images #5 and #6).
 
@@ -13,7 +14,8 @@ supplied by ``PreferencesDialog``:
     column_state(kind) -> (all_keys, all_headers, visible_keys)
     apply_columns(kind, visible_keys)
 
-Where ``kind`` is ``"flat"`` or ``"summary"``.
+Where ``kind`` is one of ``"positions"``, ``"positions_summary"``,
+``"flat"``, or ``"summary"``.
 """
 from __future__ import annotations
 
@@ -48,10 +50,11 @@ TEXT_BOLD  = "#E6EDF3"
 TEXT_DIM   = "#8B949E"
 LINK       = "#4C9AFF"
 
-SUBVIEW_OVERVIEW   = "overview"
-SUBVIEW_POSITIONS  = "positions"
-SUBVIEW_FLAT       = "flat"
-SUBVIEW_SUMMARY    = "summary"
+SUBVIEW_OVERVIEW          = "overview"
+SUBVIEW_POSITIONS         = "positions"
+SUBVIEW_POSITIONS_SUMMARY = "positions_summary"
+SUBVIEW_FLAT              = "flat"
+SUBVIEW_SUMMARY           = "summary"
 
 
 class ColumnsProvider(Protocol):
@@ -198,12 +201,12 @@ class _OverviewRow(QFrame):
 
 
 class _ColumnsOverview(QWidget):
-    """Top-level overview page – three rows that open an editor."""
+    """Top-level overview page – four rows that open an editor."""
 
-    rowSelected = Signal(str)   # "positions", "flat", or "summary"
+    rowSelected = Signal(str)   # positions | positions_summary | flat | summary
 
-    def __init__(self, pos_summary: str, flat_summary: str,
-                 summary_summary: str, parent=None):
+    def __init__(self, pos_summary: str, pos_sum_summary: str,
+                 flat_summary: str, summary_summary: str, parent=None):
         super().__init__(parent)
         self.setStyleSheet(_OVERVIEW_QSS)
 
@@ -249,6 +252,11 @@ class _ColumnsOverview(QWidget):
             kind="positions", title="Positions", subtitle=pos_summary,
             icon_char="\u25A3", active=True, parent=card,   # ▣
         )
+        pos_sum_row = _OverviewRow(
+            kind="positions_summary", title="Summary of Positions",
+            subtitle=pos_sum_summary, icon_char="\u25A4",    # ▤
+            active=False, parent=card,
+        )
         flat_row = _OverviewRow(
             kind="flat", title="Trades", subtitle=flat_summary,
             icon_char="\u2714", active=True, parent=card,   # ✔ check
@@ -259,12 +267,9 @@ class _ColumnsOverview(QWidget):
             active=False, parent=card,
         )
         summary_row.setProperty("last", "true")
-        pos_row.clicked.connect(self.rowSelected.emit)
-        flat_row.clicked.connect(self.rowSelected.emit)
-        summary_row.clicked.connect(self.rowSelected.emit)
-        card_lay.addWidget(pos_row)
-        card_lay.addWidget(flat_row)
-        card_lay.addWidget(summary_row)
+        for r in (pos_row, pos_sum_row, flat_row, summary_row):
+            r.clicked.connect(self.rowSelected.emit)
+            card_lay.addWidget(r)
 
         root.addWidget(card)
         root.addStretch(1)
@@ -572,8 +577,10 @@ class _ColumnsEditor(QWidget):
 class ColumnsPage(QWidget):
     """Owns an internal stack: overview → flat editor / summary editor.
 
-    ``navigate_to(subview)`` jumps to ``"overview"``, ``"flat"``, or
-    ``"summary"`` and refreshes the editor from the provider.
+    ``navigate_to(subview)`` jumps to ``"overview"`` or any of the
+    editor subview kinds (``"positions"``, ``"positions_summary"``,
+    ``"flat"``, ``"summary"``) and refreshes the editor from the
+    provider.
     """
 
     def __init__(self, columns_provider: ColumnsProvider | None,
@@ -589,6 +596,7 @@ class ColumnsPage(QWidget):
 
         self._overview = _ColumnsOverview(
             pos_summary=self._summary_line("positions"),
+            pos_sum_summary=self._summary_line("positions_summary"),
             flat_summary=self._summary_line("flat"),
             summary_summary=self._summary_line("summary"),
             parent=self,
@@ -601,15 +609,22 @@ class ColumnsPage(QWidget):
         self._editor_positions.back.connect(lambda: self.navigate_to("overview"))
         self._stack.addWidget(self._editor_positions)  # 1
 
+        self._editor_positions_summary = _ColumnsEditor(
+            "positions_summary", self)
+        self._editor_positions_summary.applied.connect(self._on_applied)
+        self._editor_positions_summary.back.connect(
+            lambda: self.navigate_to("overview"))
+        self._stack.addWidget(self._editor_positions_summary)  # 2
+
         self._editor_flat = _ColumnsEditor("flat", self)
         self._editor_flat.applied.connect(self._on_applied)
         self._editor_flat.back.connect(lambda: self.navigate_to("overview"))
-        self._stack.addWidget(self._editor_flat)     # 2
+        self._stack.addWidget(self._editor_flat)     # 3
 
         self._editor_summary = _ColumnsEditor("summary", self)
         self._editor_summary.applied.connect(self._on_applied)
         self._editor_summary.back.connect(lambda: self.navigate_to("overview"))
-        self._stack.addWidget(self._editor_summary)  # 3
+        self._stack.addWidget(self._editor_summary)  # 4
 
     # ── Public API ──────────────────────────────────────────────────────────
 
@@ -618,13 +633,18 @@ class ColumnsPage(QWidget):
             self._load_editor(self._editor_positions, "positions",
                               "Positions Columns")
             self._stack.setCurrentIndex(1)
+        elif subview == SUBVIEW_POSITIONS_SUMMARY:
+            self._load_editor(self._editor_positions_summary,
+                              "positions_summary",
+                              "Summary of Positions Columns")
+            self._stack.setCurrentIndex(2)
         elif subview == SUBVIEW_FLAT:
             self._load_editor(self._editor_flat, "flat", "Trades Columns")
-            self._stack.setCurrentIndex(2)
+            self._stack.setCurrentIndex(3)
         elif subview == SUBVIEW_SUMMARY:
             self._load_editor(self._editor_summary, "summary",
                               "Summary of Trades Columns")
-            self._stack.setCurrentIndex(3)
+            self._stack.setCurrentIndex(4)
         else:
             self._refresh_overview_subtitles()
             self._stack.setCurrentIndex(0)
@@ -661,6 +681,7 @@ class ColumnsPage(QWidget):
         self._overview.deleteLater()
         self._overview = _ColumnsOverview(
             pos_summary=self._summary_line("positions"),
+            pos_sum_summary=self._summary_line("positions_summary"),
             flat_summary=self._summary_line("flat"),
             summary_summary=self._summary_line("summary"),
             parent=self,
