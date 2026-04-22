@@ -702,6 +702,17 @@ class DOMLadderView(QTableView):
         # the interesting prices visible without manual scrolling.
         self._model.modelReset.connect(self._scroll_to_last)
 
+        # Debounce timer for the scroll-drift safety valve in
+        # sync_to_last().  Mirrors the model-side debounce so a user
+        # who scrolls deep gets the same 3-second grace period before
+        # the view yanks back, instead of an immediate snap on the
+        # next price tick.
+        self._scroll_recenter_timer = QTimer(self)
+        self._scroll_recenter_timer.setSingleShot(True)
+        self._scroll_recenter_timer.setInterval(self._DRIFT_LIMIT_MS)
+        self._scroll_recenter_timer.timeout.connect(
+            self._on_scroll_recenter_timeout)
+
         # ── Hover-side badge ─────────────────────────────────────────────────
         # Pre-click intent indicator: a small green BUY / red SELL chip
         # follows the cursor while hovering over the ladder so the
@@ -826,6 +837,12 @@ class DOMLadderView(QTableView):
         scroll).  Falls back to the middle row index when there is no
         last price yet (cold start).
         """
+        # Any explicit (or model-driven) scroll back to the last
+        # supersedes a pending view-side debounce — otherwise the
+        # timer could fire later and re-center over fresh user scroll.
+        if hasattr(self, "_scroll_recenter_timer") \
+                and self._scroll_recenter_timer.isActive():
+            self._scroll_recenter_timer.stop()
         prices = self._model.prices
         if not prices:
             return
@@ -857,8 +874,11 @@ class DOMLadderView(QTableView):
 
     # Safety valve: when unlocked, if the last-price row drifts this
     # many rows past the centre of the viewport, we recentre anyway so
-    # the user doesn't completely lose sight of the market.
+    # the user doesn't completely lose sight of the market.  Mirrors
+    # the model-side ``_RECENTER_DEBOUNCE_MS`` so the user's deep
+    # scroll gets the same 3-second grace period before any snap.
     _DRIFT_LIMIT_ROWS = 20
+    _DRIFT_LIMIT_MS = 3000
 
     def sync_to_last(self) -> None:
         """Ask the view to re-centre on the last price.
@@ -869,8 +889,23 @@ class DOMLadderView(QTableView):
         automatically.  This method is kept as a safety valve: if the
         last-price row has drifted more than ``_DRIFT_LIMIT_ROWS`` from
         the viewport centre (e.g. user scrolled way off), pull it back
-        into view so the market doesn't disappear entirely.
+        into view so the market doesn't disappear entirely — but only
+        after ``_DRIFT_LIMIT_MS`` of sustained drift, so a brief
+        scroll into deep territory doesn't yank back on the next tick.
         """
+        drift = self._last_row_drift()
+        drifted = drift is not None and drift > self._DRIFT_LIMIT_ROWS
+        if drifted:
+            if not self._scroll_recenter_timer.isActive():
+                self._scroll_recenter_timer.start()
+        elif self._scroll_recenter_timer.isActive():
+            # User scrolled back inside the threshold before the
+            # debounce fired — cancel and let them keep their view.
+            self._scroll_recenter_timer.stop()
+
+    def _on_scroll_recenter_timeout(self) -> None:
+        """Debounce fired — snap back only if the viewport is still
+        drifted off the last."""
         drift = self._last_row_drift()
         if drift is not None and drift > self._DRIFT_LIMIT_ROWS:
             self._scroll_to_last()
