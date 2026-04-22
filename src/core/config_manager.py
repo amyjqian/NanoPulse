@@ -281,6 +281,58 @@ def save_hidden_accounts(
     log.debug("Saved %d hidden account(s) to %s", len(accounts), p)
 
 
+def load_account_groups(
+    path: Path | str | None = None,
+) -> list[dict[str, Any]]:
+    """Load named account groups for the Accounts panel's quick-select
+    pills.  Returns an ordered list of ``{"name": str, "accounts":
+    list[str]}`` dicts.  Invalid entries (non-string names, empty
+    account lists, duplicate names) are dropped silently — the UI
+    rebuilds persistence on every mutation so a corrupt entry won't
+    round-trip."""
+    p = Path(path) if path else _default_path()
+    data = _read_json(p)
+    raw = data.get("account_groups", [])
+    if not isinstance(raw, list):
+        return []
+    cleaned: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        accounts = entry.get("accounts")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if name in seen:
+            continue
+        if not isinstance(accounts, list):
+            continue
+        acct_list = [str(a) for a in accounts if isinstance(a, str) and a]
+        if not acct_list:
+            continue
+        cleaned.append({"name": name, "accounts": acct_list})
+        seen.add(name)
+    return cleaned
+
+
+def save_account_groups(
+    groups: list[dict[str, Any]],
+    path: Path | str | None = None,
+) -> None:
+    """Persist named account groups.  Order is preserved — the caller
+    controls pill order in the Accounts panel."""
+    p = Path(path) if path else _default_path()
+    data = _read_json(p)
+    data["account_groups"] = [
+        {"name": g["name"], "accounts": list(g.get("accounts", []))}
+        for g in groups
+        if isinstance(g, dict) and g.get("name")
+    ]
+    _write_json(p, data)
+    log.debug("Saved %d account group(s) to %s", len(data["account_groups"]), p)
+
+
 # ── Preferences persistence ──────────────────────────────────────────────────
 
 
