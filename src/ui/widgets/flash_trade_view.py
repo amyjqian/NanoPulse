@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter
 
 from src.core import config_manager
@@ -42,6 +42,7 @@ _SPLITTER_SS = f"QSplitter::handle {{ background: {BORDER}; }}"
 _K_MAIN      = "flash_main_splitter"
 _K_RIGHT_H   = "flash_right_h_splitter"   # horizontal: left-content | accounts
 _K_LEFT_V    = "flash_left_v_splitter"    # vertical:   orders | positions-trades
+_K_ACCT_VIS  = "accounts_panel_visible"   # bool — false = panel hidden
 
 
 def _titled_panel(title: str) -> QWidget:
@@ -68,6 +69,12 @@ def _titled_panel(title: str) -> QWidget:
 class FlashTradeView(QWidget):
     """Skeleton layout for the FlashTrade page — section titles only."""
 
+    # Emitted whenever ``set_accounts_panel_visible`` flips the panel.
+    # Payload is the new visibility (True = panel shown).  MainWindow
+    # listens so it can flip the "Show Account" pill in the top bar
+    # opposite the panel state.
+    accounts_panel_visibility_changed = Signal(bool)
+
     def __init__(self, active_threads: dict[str, IBWorkerThread] | None = None,
                  accounts_model: AccountsTableModel | None = None, parent=None,
                  *, open_preferences=None):
@@ -85,6 +92,10 @@ class FlashTradeView(QWidget):
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(300)          # debounce 300 ms
         self._save_timer.timeout.connect(self._persist_layout)
+        # Snapshot of _right_splitter sizes captured the moment we
+        # hide the AccountListPanel; restored on the next show so the
+        # user gets back the same column width.  None until first hide.
+        self._right_splitter_saved_sizes: list[int] | None = None
         self._setup_ui()
         self._restore_layout()
 
@@ -1197,8 +1208,17 @@ class FlashTradeView(QWidget):
     def _persist_layout(self) -> None:
         layout = config_manager.load_layout()
         layout[_K_MAIN]    = self._main_splitter.sizes()
-        layout[_K_RIGHT_H] = self._right_splitter.sizes()
+        # Only snapshot _right_splitter sizes when the panel is
+        # visible — otherwise the AccountListPanel slot is collapsed
+        # to 0 and persisting that wipes the user's column width.
+        if isinstance(self._account_list, AccountListPanel) \
+                and self._account_list.isVisible():
+            layout[_K_RIGHT_H] = self._right_splitter.sizes()
         layout[_K_LEFT_V]  = self._top_right_splitter.sizes()
+        layout[_K_ACCT_VIS] = (
+            self._account_list.isVisible()
+            if isinstance(self._account_list, AccountListPanel)
+            else True)
         config_manager.save_layout(layout)
         log.debug("FlashTrade layout saved")
 
@@ -1208,7 +1228,49 @@ class FlashTradeView(QWidget):
         self._main_splitter.setSizes(layout.get(_K_MAIN, [265, 285, 950]))
         self._right_splitter.setSizes(layout.get(_K_RIGHT_H, [760, 190]))
         self._top_right_splitter.setSizes(layout.get(_K_LEFT_V, [380, 340]))
+        # Restore accounts-panel visibility; default True for
+        # backwards-compatibility with users who never hid it.
+        if isinstance(self._account_list, AccountListPanel):
+            visible = bool(layout.get(_K_ACCT_VIS, True))
+            if not visible:
+                self.set_accounts_panel_visible(False)
         log.debug("FlashTrade layout restored")
+
+    # ── Accounts-panel show/hide ──────────────────────────────────────────────
+
+    def is_accounts_panel_visible(self) -> bool:
+        if not isinstance(self._account_list, AccountListPanel):
+            return False
+        return self._account_list.isVisible()
+
+    def set_accounts_panel_visible(self, visible: bool) -> None:
+        """Show or hide the AccountListPanel inside the right
+        splitter.  Snapshots the current splitter sizes on hide and
+        restores them on show so the user keeps their column width.
+        Persists the new state and emits
+        ``accounts_panel_visibility_changed`` so the host can flip
+        the 'Show Account' pill in the top bar."""
+        if not isinstance(self._account_list, AccountListPanel):
+            return
+        currently = self._account_list.isVisible()
+        if currently == bool(visible):
+            return
+        if not visible:
+            # Capture sizes before the hide so the next show can put
+            # the splitter back exactly where it was.
+            self._right_splitter_saved_sizes = (
+                self._right_splitter.sizes())
+            self._account_list.hide()
+        else:
+            self._account_list.show()
+            if self._right_splitter_saved_sizes:
+                self._right_splitter.setSizes(
+                    self._right_splitter_saved_sizes)
+        self.accounts_panel_visibility_changed.emit(bool(visible))
+        # Persist immediately rather than waiting for the splitter
+        # debounce — visibility changes are explicit user actions
+        # and should survive an immediate restart.
+        self._persist_layout()
 
     # ── Paint ─────────────────────────────────────────────────────────────────
 

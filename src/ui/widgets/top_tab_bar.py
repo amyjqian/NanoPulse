@@ -6,7 +6,7 @@ dark background, icon + label per tab, accent underline on the active tab.
 """
 from __future__ import annotations
 
-from PySide6.QtWidgets import QWidget, QHBoxLayout, QSizePolicy, QLabel
+from PySide6.QtWidgets import QWidget, QHBoxLayout, QSizePolicy, QLabel, QPushButton
 from PySide6.QtCore import Qt, Signal, QSize
 from PySide6.QtGui import QPainter, QColor, QFont, QPen
 
@@ -120,6 +120,10 @@ class TopTabBar(QWidget):
     nav_changed = Signal(str)
     # Emits tab name for ALL tabs (including Settings)
     tabBarClicked = Signal(str)
+    # User clicked the "Account" pill — host should toggle the
+    # Account Management panel (and switch to the Nano tab when the
+    # current tab is something else).
+    accountsToggleRequested = Signal()
 
     _TABS = ["Connect", "Contracts", "Nano", "StrategyEditor", "Executions", "Settings"]
 
@@ -160,6 +164,26 @@ class TopTabBar(QWidget):
         self._group_label.hide()
         layout.addWidget(self._group_label)
 
+        # "Account" pill — always visible.  Click toggles the
+        # AccountListPanel inside the Nano tab.  When clicked from a
+        # different tab, the host switches to Nano first.  Same blue
+        # chip styling as the active-group chip so they read as part
+        # of the same affordance family.
+        self._accounts_pill = QPushButton("Account", self)
+        self._accounts_pill.setFont(_FONT_NORMAL)
+        self._accounts_pill.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._accounts_pill.setStyleSheet(
+            "QPushButton {"
+            " background: #0071e3; color: white;"
+            " border: none; border-radius: 4px;"
+            " padding: 2px 12px; margin-right: 12px;"
+            " font-weight: bold;"
+            "}"
+            "QPushButton:hover { background: #0077ed; }")
+        self._accounts_pill.clicked.connect(
+            self.accountsToggleRequested.emit)
+        layout.addWidget(self._accounts_pill)
+
         self._status_label = QLabel(self)
         self._status_label.setFont(_FONT_NORMAL)
         self._status_label.setStyleSheet(f"QLabel {{ color: {TEXT_PRIMARY}; padding-right: 20px; }}")
@@ -194,6 +218,7 @@ class TopTabBar(QWidget):
             return
         self._group_label.setText(name)
         self._group_label.show()
+
 
     def _on_tab_click(self, name: str) -> None:
         for label, btn in self._buttons.items():

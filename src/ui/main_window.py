@@ -160,6 +160,12 @@ class MainWindow(QWidget):
             self._flash_trade._order_entry._refresh_combo_items
         )
 
+        # ── Account pill toggles the Account Management panel ───────────────
+        # The pill is always visible.  Click toggles the panel; when
+        # the user is on a non-Nano tab, the click also switches to
+        # the Nano tab so the toggle is visible.
+        self._tab_bar.accountsToggleRequested.connect(self._toggle_accounts)
+
         self._pages.addWidget(self._connections_view)
         self._pages.addWidget(self._contracts_view)
         self._pages.addWidget(self._flash_trade)
@@ -182,6 +188,23 @@ class MainWindow(QWidget):
         if idx is not None:
             log.debug("Nav → %s (page %d)", name, idx)
             self._pages.setCurrentIndex(idx)
+
+    def _toggle_accounts(self) -> None:
+        """Pill click handler — toggle the Account Management panel.
+        When the user is on a non-Nano tab, navigate there first so
+        the toggle is observable."""
+        if self._pages.currentIndex() != _PAGE_INDEX["Nano"]:
+            for label, btn in self._tab_bar._buttons.items():
+                btn.set_active(label == "Nano")
+            self._on_nav_changed("Nano")
+            # When we just switched to Nano, force-show the panel
+            # rather than toggling — otherwise the user clicked
+            # "Account" intending to see it and got nothing visible.
+            self._flash_trade.set_accounts_panel_visible(True)
+            return
+        # Already on Nano — pure toggle.
+        self._flash_trade.set_accounts_panel_visible(
+            not self._flash_trade.is_accounts_panel_visible())
 
     def _on_tab_clicked(self, name: str) -> None:
         """Handle tab bar clicks - intercept Settings tab and launch modeless dialog."""

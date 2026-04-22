@@ -417,9 +417,10 @@ class AccountListPanel(QWidget):
         root.setContentsMargins(10, 8, 10, 8)
         root.setSpacing(6)
 
-        # ── Header: "Accounts" title only.  All / None / Mgn and the
-        # group pills live in the filter strip below so long group
-        # lists don't squeeze the title.
+        # ── Header: title only.  All / None and the group pills live
+        # in the filter strip below so long group lists don't squeeze
+        # the title.  The Account pill in the top bar handles
+        # show/hide; no in-panel close button needed.
         header = QHBoxLayout()
         header.setSpacing(0)
 
