@@ -231,8 +231,17 @@ class TradesModel(QAbstractTableModel):
     # ── Public mutation API ─────────────────────────────────────────────────
 
     def add_fill(self, fill: dict) -> None:
-        """Insert a new fill at row 0, or refresh in place if its execId
-        is already present (dedupe across startup re-snapshots)."""
+        """Insert a new fill into its time-sorted slot (newest first),
+        or refresh in place if its execId is already present (dedupe
+        across startup re-snapshots).
+
+        Live ticks arrive in chronological order so the insertion
+        point is always row 0 — no different from the earlier
+        unconditional ``insert(0, …)``.  Snapshot replay after a
+        reconnect can emit fills in worker-thread order rather than
+        time order, though; inserting by ``time_sort`` ensures the
+        flat view always reads newest-first regardless of arrival
+        order."""
         exec_id = fill.get("exec_id", "")
 
         if exec_id and exec_id in self._index:
@@ -243,12 +252,28 @@ class TradesModel(QAbstractTableModel):
             self.dataChanged.emit(top_left, bottom_right)
             return
 
-        self.beginInsertRows(QModelIndex(), 0, 0)
-        self._rows.insert(0, fill)
+        # Descending-time insertion: find the first existing row whose
+        # time_sort is strictly older than the incoming fill's.
+        # time_sort is an ISO-style string, so lexicographic compare
+        # matches chronological order.  Blank time_sort sorts oldest
+        # (ends up at the tail).
+        ts = fill.get("time_sort", "") or ""
+        idx = 0
+        for existing in self._rows:
+            if (existing.get("time_sort", "") or "") < ts:
+                break
+            idx += 1
+
+        self.beginInsertRows(QModelIndex(), idx, idx)
+        self._rows.insert(idx, fill)
+        # Every existing row with index >= idx shifted down by one.
         if self._index:
-            self._index = {eid: r + 1 for eid, r in self._index.items()}
+            self._index = {
+                eid: (r + 1 if r >= idx else r)
+                for eid, r in self._index.items()
+            }
         if exec_id:
-            self._index[exec_id] = 0
+            self._index[exec_id] = idx
         self.endInsertRows()
 
     def clear(self) -> None:
