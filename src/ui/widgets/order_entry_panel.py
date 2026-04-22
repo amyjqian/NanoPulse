@@ -1401,24 +1401,6 @@ class OrderEntryPanel(QWidget):
         root.setContentsMargins(10, 8, 10, 8)
         root.setSpacing(8)
 
-        # ── Order-target banner ────────────────────────────────────────────────
-        # Always-visible, color-keyed line showing which accounts a BUY/SELL
-        # will hit.  Stands in for a pre-submit confirmation dialog — the
-        # trader reads the banner, then clicks.  Populated by the host
-        # (FlashTradeView) via ``set_order_target`` whenever the account-list
-        # selection or active group changes.
-        self._lbl_order_target = QLabel("NO TARGET — orders will fail")
-        self._lbl_order_target.setObjectName("orderTargetBanner")
-        _target_font = QFont("Helvetica Neue, Arial", 10)
-        _target_font.setWeight(QFont.Weight.Bold)
-        self._lbl_order_target.setFont(_target_font)
-        self._lbl_order_target.setMinimumHeight(22)
-        self._lbl_order_target.setAlignment(
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        # Styled by set_order_target() via a dynamic ``badge`` QSS property.
-        self._apply_order_target_style("NONE")
-        root.addWidget(self._lbl_order_target)
-
         # ── Active-symbol ticker strip ────────────────────────────────────────
         # Compact single-row strip replaces the old "Add symbol (look up)…"
         # combo + two-line price block so the top takes minimal space:
@@ -1645,56 +1627,6 @@ class OrderEntryPanel(QWidget):
         root.addWidget(self._tr_section)
 
         root.addStretch(1)
-
-    # ── Order-target banner API ───────────────────────────────────────────────
-
-    # Badge → (bg color, text color, prefix label).  Keyed by the
-    # classification the host computes from the selected-account set.
-    _ORDER_TARGET_PALETTE = {
-        "LIVE":  ("#3A1818", "#FF5E5E", "LIVE"),
-        "PAPER": ("#14263B", "#6FA8FF", "PAPER"),
-        "MIXED": ("#3A2A14", "#FFB347", "MIXED"),
-        "NONE":  ("#3A1818", "#FF5E5E", "NONE"),
-    }
-
-    def _apply_order_target_style(self, badge: str) -> None:
-        bg, fg, _ = self._ORDER_TARGET_PALETTE.get(
-            badge, self._ORDER_TARGET_PALETTE["NONE"])
-        self._lbl_order_target.setStyleSheet(f"""
-            QLabel#orderTargetBanner {{
-                background: {bg};
-                color: {fg};
-                border: 1px solid {fg}40;
-                border-radius: 3px;
-                padding: 2px 8px;
-            }}
-        """)
-
-    def set_order_target(self, group_name: str | None,
-                         label: str,
-                         badge: str,
-                         count: int) -> None:
-        """Host-driven banner update.  Called whenever the checked-
-        account set or active group changes in the Accounts panel.
-
-        ``group_name`` is the active group or ``None``; ``label`` is
-        a preformatted description of the target (single alias, group
-        name, or bare count); ``badge`` is one of
-        ``"LIVE"`` / ``"PAPER"`` / ``"MIXED"`` / ``"NONE"``; ``count``
-        is the number of target accounts.
-        """
-        badge = (badge or "NONE").upper()
-        if count <= 0:
-            text = "NO TARGET — orders will fail"
-        elif group_name:
-            noun = "acct" if count == 1 else "accts"
-            text = f"TARGET: {group_name} · {count} {noun} · {badge}"
-        else:
-            # ``label`` already encodes the target — alias/id for a
-            # single account, "N accounts" for multi.
-            text = f"TARGET: {label} · {badge}"
-        self._lbl_order_target.setText(text)
-        self._apply_order_target_style(badge)
 
     # ── Combo / symbol search ─────────────────────────────────────────────────
 

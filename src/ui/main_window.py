@@ -83,6 +83,15 @@ class MainWindow(QWidget):
         except AttributeError:
             selected_count = 0
         self._tab_bar.set_status(conn_count, acct_count, selected_count)
+        # Active filter → blue chip left of the status text.  Shows
+        # the active group's name when one is set, otherwise "All" /
+        # "None" when the selection matches those bulk states, else
+        # hidden for a custom subset.
+        try:
+            label = self._flash_trade._account_list.active_filter_label()
+        except AttributeError:
+            label = None
+        self._tab_bar.set_active_group(label)
 
     # ── Window geometry persistence ───────────────────────────────────────────
 

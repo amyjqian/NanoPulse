@@ -143,6 +143,23 @@ class TopTabBar(QWidget):
 
         layout.addStretch(1)
 
+        # Active trading-group chip — sits left of the Conn/Accts/
+        # Selected status text.  Same blue + bold styling as the
+        # selected chips in the AccountListPanel filter strip so the
+        # two read as the same affordance.  Hidden when no group is
+        # active.
+        self._group_label = QLabel(self)
+        self._group_label.setFont(_FONT_NORMAL)
+        self._group_label.setStyleSheet(
+            "QLabel {"
+            " background: #0071e3; color: white;"
+            " border-radius: 4px;"
+            " padding: 2px 10px; margin-right: 12px;"
+            " font-weight: bold;"
+            "}")
+        self._group_label.hide()
+        layout.addWidget(self._group_label)
+
         self._status_label = QLabel(self)
         self._status_label.setFont(_FONT_NORMAL)
         self._status_label.setStyleSheet(f"QLabel {{ color: {TEXT_PRIMARY}; padding-right: 20px; }}")
@@ -167,6 +184,16 @@ class TopTabBar(QWidget):
                 f"  |  Accts: {acct_count}"
                 f"  |  Selected: {selected_count}")
         self._status_label.setText(text)
+
+    def set_active_group(self, name: str | None) -> None:
+        """Show / hide the blue active-group chip just left of the
+        Conn / Accts / Selected status text.  Hidden when *name* is
+        ``None`` or empty."""
+        if not name:
+            self._group_label.hide()
+            return
+        self._group_label.setText(name)
+        self._group_label.show()
 
     def _on_tab_click(self, name: str) -> None:
         for label, btn in self._buttons.items():

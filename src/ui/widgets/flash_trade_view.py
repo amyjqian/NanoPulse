@@ -18,7 +18,7 @@ from .order_entry_panel import OrderEntryPanel
 from .order_status_panel import OrderStatusPanel
 from .account_list_panel import AccountListPanel
 from .account_position_panel import AccountPositionPanel
-from .accounts_model import AccountsTableModel, detect_account_type
+from .accounts_model import AccountsTableModel
 from .trades_panel import TradesPanel
 from .positions_trades_tabs import PositionsTradesTabs
 
@@ -207,19 +207,14 @@ class FlashTradeView(QWidget):
         self._account_position.refresh_requested.connect(
             self._on_position_refresh_requested)
 
-        # ── Wire account list → positions filter + order-target banner ───────
+        # ── Wire account list → positions filter ──────────────────────────────
         if isinstance(self._account_list, AccountListPanel):
             self._account_list.selection_changed.connect(
                 self._account_position.set_selected_accounts)
-            self._account_list.selection_changed.connect(
-                self._refresh_order_target)
-            self._account_list.active_group_changed.connect(
-                self._refresh_order_target)
             # Push the initial persisted selection so the view is correct
             # before the user clicks anything.
             self._account_position.set_selected_accounts(
                 self._account_list.get_selected_accounts())
-            self._refresh_order_target()
 
         # ── Wire position panel action buttons ───────────────────────────────
         # Header-row Flatten: flatten every open position for that account
@@ -1006,52 +1001,6 @@ class FlashTradeView(QWidget):
                 worker.request_portfolio_refresh()
                 count += 1
         log.info("FlashTrade: refresh triggered for %d worker(s)", count)
-
-    def _refresh_order_target(self, *_args) -> None:
-        """Push the current target (group + account set + live/paper
-        badge) into the OrderEntryPanel banner.  Wired to both
-        ``selection_changed`` and ``active_group_changed``; accepts
-        ``*_args`` because the two signals emit with different
-        payloads but this method re-reads state from the panel."""
-        if not isinstance(self._account_list, AccountListPanel):
-            return
-        accounts = set(self._account_list.get_selected_accounts())
-        group = self._account_list.active_group()
-
-        # Classify live/paper so the banner's background communicates
-        # risk at a glance.  Unknown-prefix accounts count as neither;
-        # if every non-unknown is Live → LIVE, all Paper → PAPER, a
-        # mix of both → MIXED.
-        has_live = has_paper = False
-        for acct in accounts:
-            t = detect_account_type(acct)
-            if t == "Live":
-                has_live = True
-            elif t == "Paper":
-                has_paper = True
-        if not accounts:
-            badge = "NONE"
-        elif has_live and has_paper:
-            badge = "MIXED"
-        elif has_live:
-            badge = "LIVE"
-        elif has_paper:
-            badge = "PAPER"
-        else:
-            # All unknown prefixes — treat as LIVE for safety (better
-            # to over-warn than under-warn).
-            badge = "LIVE"
-
-        count = len(accounts)
-        if count == 1:
-            acct = next(iter(accounts))
-            alias = self._accounts_model._aliases.get(acct, "") \
-                if self._accounts_model is not None else ""
-            label = alias if alias else acct
-        else:
-            label = f"{count} accounts"
-
-        self._order_entry.set_order_target(group, label, badge, count)
 
     def _on_position_refresh_requested(self) -> None:
         """Refresh button clicked in AccountPositionPanel.

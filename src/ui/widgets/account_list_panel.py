@@ -981,6 +981,27 @@ class AccountListPanel(QWidget):
         doesn't match any saved group."""
         return self._active_group
 
+    def active_filter_label(self) -> str | None:
+        """Top-bar chip label for the current selection state.
+
+        Priority (most specific first):
+          * active group name
+          * ``"All"`` when every visible account is checked
+          * ``"None"`` when nothing is checked
+          * ``None`` for a hand-picked subset (the chip hides)
+        """
+        if self._active_group is not None:
+            return self._active_group
+        visible = set(self._account_rows.keys())
+        if not visible:
+            return None
+        checked = self.get_checked_accounts()
+        if checked == visible:
+            return "All"
+        if not checked:
+            return "None"
+        return None
+
     def _select_all(self) -> None:
         for r in self._account_rows.values():
             r.set_checked(True)
