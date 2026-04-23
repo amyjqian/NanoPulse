@@ -747,12 +747,19 @@ class BookTraderView(QWidget):
             same_side_lmt.append((oid, op))
 
         # Click on existing order's price → cancel-only (toggle off).
-        for oid, op in same_side_lmt:
-            if abs(op - price) < tol:
-                log.info("BookTrader: click on resting %s LMT %s @ %.4f "
-                         "— cancelling", action, self._active_symbol, price)
+        # Collect every matching order before returning — multi-account
+        # fan-out leaves one resting LMT per account at the same price,
+        # and the user expects a single click to cancel the whole batch
+        # (otherwise the toggle takes N clicks to clear N accounts).
+        matches = [oid for oid, op in same_side_lmt
+                   if abs(op - price) < tol]
+        if matches:
+            log.info("BookTrader: click on resting %s LMT %s @ %.4f "
+                     "— cancelling %d order(s)", action,
+                     self._active_symbol, price, len(matches))
+            for oid in matches:
                 self.cancel_order_requested.emit(oid)
-                return
+            return
 
         # Click on different price while a same-side LMT rests → cancel
         # the old order(s) before placing the new one.  Cancels fire

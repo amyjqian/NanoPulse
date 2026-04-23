@@ -83,6 +83,15 @@ class MainWindow(QWidget):
         except AttributeError:
             selected_count = 0
         self._tab_bar.set_status(conn_count, acct_count, selected_count)
+        # Active filter → blue chip left of the status text.  Shows
+        # the active group's name when one is set, otherwise "All" /
+        # "None" when the selection matches those bulk states, else
+        # hidden for a custom subset.
+        try:
+            label = self._flash_trade._account_list.active_filter_label()
+        except AttributeError:
+            label = None
+        self._tab_bar.set_active_group(label)
 
     # ── Window geometry persistence ───────────────────────────────────────────
 
@@ -151,6 +160,12 @@ class MainWindow(QWidget):
             self._flash_trade._order_entry._refresh_combo_items
         )
 
+        # ── Account pill toggles the Account Management panel ───────────────
+        # The pill is always visible.  Click toggles the panel; when
+        # the user is on a non-Nano tab, the click also switches to
+        # the Nano tab so the toggle is visible.
+        self._tab_bar.accountsToggleRequested.connect(self._toggle_accounts)
+
         self._pages.addWidget(self._connections_view)
         self._pages.addWidget(self._contracts_view)
         self._pages.addWidget(self._flash_trade)
@@ -174,6 +189,23 @@ class MainWindow(QWidget):
             log.debug("Nav → %s (page %d)", name, idx)
             self._pages.setCurrentIndex(idx)
 
+    def _toggle_accounts(self) -> None:
+        """Pill click handler — toggle the Account Management panel.
+        When the user is on a non-Nano tab, navigate there first so
+        the toggle is observable."""
+        if self._pages.currentIndex() != _PAGE_INDEX["Nano"]:
+            for label, btn in self._tab_bar._buttons.items():
+                btn.set_active(label == "Nano")
+            self._on_nav_changed("Nano")
+            # When we just switched to Nano, force-show the panel
+            # rather than toggling — otherwise the user clicked
+            # "Account" intending to see it and got nothing visible.
+            self._flash_trade.set_accounts_panel_visible(True)
+            return
+        # Already on Nano — pure toggle.
+        self._flash_trade.set_accounts_panel_visible(
+            not self._flash_trade.is_accounts_panel_visible())
+
     def _on_tab_clicked(self, name: str) -> None:
         """Handle tab bar clicks - intercept Settings tab and launch modeless dialog."""
         if name == "Settings":
@@ -195,17 +227,19 @@ class MainWindow(QWidget):
         Columns → Positions / Trades / Summary without a second click.
         """
         class _CombinedProvider:
+            _POS_KINDS = ("positions", "positions_summary")
+
             def __init__(self, trades_panel, position_panel):
                 self._trades = trades_panel
                 self._positions = position_panel
 
             def column_state(self, kind):
-                if kind == "positions":
+                if kind in self._POS_KINDS:
                     return self._positions.column_state(kind)
                 return self._trades.column_state(kind)
 
             def apply_columns(self, kind, keys):
-                if kind == "positions":
+                if kind in self._POS_KINDS:
                     self._positions.apply_columns(kind, keys)
                 else:
                     self._trades.apply_columns(kind, keys)

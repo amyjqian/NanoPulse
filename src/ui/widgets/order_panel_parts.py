@@ -143,9 +143,13 @@ class TickerStrip(QWidget):
     def set_symbol(self, sym: str | None) -> None:
         """Update the symbol label; clears the price/bid/ask until the next
         ``update_price`` call.  Pass empty string / None to blank the row."""
-        self._symbol = (sym or "").strip()
+        new_sym = (sym or "").strip()
+        changed = new_sym != self._symbol
+        self._symbol = new_sym
         self._lbl_symbol.setText(self._symbol)
-        if not self._symbol:
+        if changed:
+            # Reset cached state so ``update_price``'s "preserve last valid"
+            # logic can't carry the previous symbol's bid/ask into the new one.
             self._last = self._bid = self._ask = self._close = 0.0
             self._lbl_price.setText("")
             self._lbl_bid.setText("")

@@ -12,7 +12,6 @@ Pure view layer: emits Qt signals; holds no state beyond widget values.
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -20,7 +19,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
-    QStyle,
     QWidget,
 )
 
@@ -47,6 +45,15 @@ _BAR_QSS = f"""
         font-weight: 600;
         letter-spacing: 0.04em;
     }}
+    QLabel#tbTradeCount {{
+        color: {TEXT_DIM};
+        font-family: "Helvetica Neue", Arial, sans-serif;
+        font-size: 11px;
+        font-weight: 500;
+    }}
+    QLabel#tbTradeCount[hasTrades="true"] {{
+        color: {TEXT};
+    }}
     QCheckBox#tbSummaryToggle {{
         spacing: 0;
     }}
@@ -69,8 +76,8 @@ _BAR_QSS = f"""
         color: {TEXT};
         border: 1px solid {BORDER};
         border-radius: 4px;
-        padding: 2px 8px;
-        min-width: 120px;
+        padding: 2px 6px;
+        min-width: 90px;
         font-family: "Helvetica Neue", Arial, sans-serif;
         font-size: 11px;
     }}
@@ -90,10 +97,10 @@ _BAR_QSS = f"""
         color: {TEXT};
         border: 1px solid {BORDER};
         border-radius: 4px;
-        padding: 3px 8px 3px 24px;
+        padding: 3px 8px;
         font-family: "Helvetica Neue", Arial, sans-serif;
         font-size: 11px;
-        min-width: 180px;
+        min-width: 120px;
     }}
     QLineEdit#tbSearch:focus {{
         border-color: {ACCENT};
@@ -122,13 +129,14 @@ class TradesControlBar(QWidget):
     Signals
     -------
     summaryToggled(bool)
-    dateFilterChanged(int)   # 1 = Today, 2..7 = Last N Days
+    dateFilterChanged(str)   # preset key: evening / afternoon / morning
+                              # / today / last_2 … last_7
     searchTextChanged(str)
     settingsClicked()
     """
 
     summaryToggled       = Signal(bool)
-    dateFilterChanged    = Signal(int)
+    dateFilterChanged    = Signal(str)
     searchTextChanged    = Signal(str)
     settingsClicked      = Signal()
 
@@ -146,6 +154,16 @@ class TradesControlBar(QWidget):
         # Stretch first so the controls cluster on the right side of the
         # tab-bar corner (the stack can be wider than our content).
         lay.addStretch(1)
+
+        # Visible-trade count.  Host panel updates this whenever the
+        # flat proxy's rowCount changes (fills arrive, filter/search
+        # changes).  Sits left of the Summary toggle.
+        self._trades_count_label = QLabel("0 trades", self)
+        self._trades_count_label.setObjectName("tbTradeCount")
+        self._trades_count_label.setProperty("hasTrades", False)
+        lay.addWidget(self._trades_count_label)
+
+        lay.addSpacing(10)
 
         # Summary toggle + label (pair, label after switch)
         self._summary_toggle = QCheckBox(self)
@@ -166,31 +184,34 @@ class TradesControlBar(QWidget):
         # Spacer
         lay.addSpacing(12)
 
-        # Date filter
+        # Date / time-of-day filter.  Session-of-day presets sit at the
+        # top because they're the most common quick filters during live
+        # trading; the multi-day windows follow.  Items store string
+        # keys as itemData — the panel maps them to (days_back,
+        # time_of_day) when applying the filter.
         self._date_combo = QComboBox(self)
         self._date_combo.setObjectName("tbDateCombo")
-        self._date_combo.addItem("Today", 1)
+        self._date_combo.addItem("Evening",   "evening")
+        self._date_combo.addItem("Afternoon", "afternoon")
+        self._date_combo.addItem("Morning",   "morning")
+        self._date_combo.addItem("Today",     "today")
         for n in range(2, 8):
-            self._date_combo.addItem(f"Last {n} Days", n)
+            self._date_combo.addItem(f"Last {n} Days", f"last_{n}")
+        # Default to Today so first-run doesn't hide fills behind a
+        # time-of-day cutoff.  Set before wiring the signal to avoid
+        # firing a spurious dateFilterChanged during construction.
+        self._date_combo.setCurrentIndex(
+            self._date_combo.findData("today"))
         self._date_combo.currentIndexChanged.connect(self._on_date_changed)
         lay.addWidget(self._date_combo)
 
         lay.addSpacing(8)
 
-        # Search with overlaid magnifier
+        # Search field (plain text input; no leading icon).
         self._search = QLineEdit(self)
         self._search.setObjectName("tbSearch")
         self._search.setPlaceholderText("Search")
         self._search.textChanged.connect(self.searchTextChanged.emit)
-        # Icon inside the left padding
-        style = self.style()
-        try:
-            search_icon = style.standardIcon(
-                QStyle.StandardPixmap.SP_FileDialogContentsView)
-        except Exception:
-            search_icon = QIcon()
-        if not search_icon.isNull():
-            self._search.addAction(search_icon, QLineEdit.ActionPosition.LeadingPosition)
         lay.addWidget(self._search)
 
         lay.addSpacing(4)
@@ -211,14 +232,23 @@ class TradesControlBar(QWidget):
     def setSummary(self, on: bool) -> None:
         self._summary_toggle.setChecked(bool(on))
 
-    def daysBack(self) -> int:
-        return int(self._date_combo.currentData() or 1)
+    def setTradeCount(self, n: int) -> None:
+        n = max(0, int(n))
+        self._trades_count_label.setText(
+            f"{n:,} trade" + ("s" if n != 1 else ""))
+        # Trigger QSS re-evaluation so the color pops when there are
+        # trades and dims back to muted grey when the view is empty.
+        self._trades_count_label.setProperty("hasTrades", n > 0)
+        self._trades_count_label.style().unpolish(self._trades_count_label)
+        self._trades_count_label.style().polish(self._trades_count_label)
 
-    def setDaysBack(self, days: int) -> None:
-        for i in range(self._date_combo.count()):
-            if self._date_combo.itemData(i) == days:
-                self._date_combo.setCurrentIndex(i)
-                return
+    def filterKey(self) -> str:
+        return str(self._date_combo.currentData() or "today")
+
+    def setFilterKey(self, key: str) -> None:
+        idx = self._date_combo.findData(key)
+        if idx >= 0:
+            self._date_combo.setCurrentIndex(idx)
 
     def searchText(self) -> str:
         return self._search.text()
@@ -226,7 +256,7 @@ class TradesControlBar(QWidget):
     # ── Internal slots ──────────────────────────────────────────────────────
 
     def _on_date_changed(self, _idx: int) -> None:
-        self.dateFilterChanged.emit(self.daysBack())
+        self.dateFilterChanged.emit(self.filterKey())
 
     def _toggle_from_label(self, _event) -> None:
         self._summary_toggle.toggle()

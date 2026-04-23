@@ -21,13 +21,18 @@ import math
 
 from PySide6.QtCore import QEvent, QRect, QSettings, QSize, Qt, Signal
 from src.core import config_manager
-from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainter, QPen
+from PySide6.QtGui import (
+    QBrush, QColor, QFont, QFontMetrics, QKeySequence, QPainter, QPen,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QMenu,
     QPushButton,
+    QStackedWidget,
     QStyle,
     QStyledItemDelegate,
     QStyleOptionViewItem,
@@ -48,6 +53,11 @@ from .account_position_model import (
     NUM_COLS, TEXT_DIM,
     BG_HEADER_ROW,
     _fmt_pnl, _fmt_money, _pnl_color,
+)
+from .positions_summary_model import (
+    PositionsSummaryModel,
+    S_COL_KEYS as PS_COL_KEYS,
+    S_HEADERS as PS_COL_HEADERS,
 )
 from .connections_view import _ToggleSwitch
 
@@ -512,9 +522,19 @@ class AccountPositionPanel(QWidget):
         self._open_preferences_callback = open_preferences
         self._model = AccountPositionModel(
             get_alias=self._get_alias, parent=self)
+        self._summary_model = PositionsSummaryModel(self)
         self._setup_ui()
-        # Sync model with persisted toggle state (model defaults to True)
-        self._model.set_show_zero(self._zero_pos_toggle.isChecked())
+        # Sync both models with persisted Zero-Pos toggle state (model
+        # default is True; summary mirrors).
+        zero_pos = self._zero_pos_toggle.isChecked()
+        self._model.set_show_zero(zero_pos)
+        self._summary_model.set_show_zero(zero_pos)
+        # Restore persisted Summary-mode toggle.  Applied after the
+        # stack is built so the correct index is showing on launch.
+        saved_summary = QSettings("NanoPulse", "Dashboard").value(
+            "AccountPositionPanel/summaryMode", False, type=bool)
+        if saved_summary:
+            self._summary_toggle.setChecked(True)
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -581,7 +601,49 @@ class AccountPositionPanel(QWidget):
         # Apply column spans whenever model is rebuilt
         self._model.modelReset.connect(self._apply_spans)
 
-        root.addWidget(self._table, stretch=1)
+        # ── Summary table (one row per con_id, totals footer) ─────────────
+        self._summary_table = QTableView()
+        self._summary_table.setModel(self._summary_model)
+        self._summary_table.setAlternatingRowColors(True)
+        self._summary_table.setShowGrid(False)
+        self._summary_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self._summary_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection)
+        self._summary_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._summary_table.verticalHeader().setVisible(False)
+        self._summary_table.setFont(_TABLE_FONT)
+        self._summary_table.setStyleSheet(_TABLE_STYLE)
+        self._summary_table.verticalHeader().setDefaultSectionSize(28)
+
+        sh = self._summary_table.horizontalHeader()
+        sh.setDefaultAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        sh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        sh.setStretchLastSection(True)
+        self._apply_summary_default_col_widths()
+        self._restore_summary_col_widths()
+        self._apply_summary_column_visibility(
+            self._load_visible_summary_keys())
+        sh.sectionResized.connect(self._on_summary_section_resized)
+
+        # Context menu + Delete shortcut for hide/restore (summary only).
+        self._summary_table.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self._summary_table.customContextMenuRequested.connect(
+            self._on_summary_context_menu)
+        delete_sc = QShortcut(
+            QKeySequence(Qt.Key.Key_Delete), self._summary_table)
+        delete_sc.setContext(Qt.ShortcutContext.WidgetShortcut)
+        delete_sc.activated.connect(self._hide_current_summary_row)
+
+        # ── Stack: index 0 = flat account-grouped; index 1 = summary ──
+        self._stack = QStackedWidget()
+        self._stack.addWidget(self._table)          # index 0
+        self._stack.addWidget(self._summary_table)  # index 1
+
+        root.addWidget(self._stack, stretch=1)
 
     # ── Column spans ─────────────────────────────────────────────────────────
 
@@ -644,10 +706,17 @@ class AccountPositionPanel(QWidget):
 
     def update_positions(self, batch: list[dict]) -> None:
         self._model.update_positions(batch)
+        self._summary_model.update_positions(batch)
 
     def update_pnl_single(self, account: str, con_id: int,
                           daily_pnl: float, realized_pnl: float,
                           unrealized_pnl: float) -> None:
+        # Intentionally NOT fanned out to the summary model.  The
+        # pnl_single channel is a mid-tick per-(account, con_id) refresh
+        # that makes the flat view feel snappy; the summary rebuilds
+        # wholesale on the next portfolio_updated batch anyway, so
+        # threading deltas through aggregate state isn't worth the
+        # complexity.
         self._model.update_pnl_single(
             account, con_id, daily_pnl, realized_pnl, unrealized_pnl)
 
@@ -665,6 +734,7 @@ class AccountPositionPanel(QWidget):
 
     def clear_positions(self) -> None:
         self._model.clear()
+        self._summary_model.clear()
 
     def get_position_keys(self) -> list[tuple[str, int]]:
         return self._model.get_position_keys()
@@ -680,6 +750,7 @@ class AccountPositionPanel(QWidget):
         Called whenever the Account List panel's checked state changes.
         """
         self._model.set_selected_accounts(accounts)
+        self._summary_model.set_selected_accounts(accounts)
 
     # ── Control-bar builder ──────────────────────────────────────────────────
 
@@ -693,6 +764,18 @@ class AccountPositionPanel(QWidget):
         # Stretch first so the buttons cluster on the right side of the
         # tab-bar corner (the stack can be much wider than our content).
         lay.addStretch(1)
+
+        # Summary toggle + label — sits leftmost in the controls
+        # cluster.  Flipping it swaps the stack between the flat
+        # account-grouped view and the per-contract aggregate view.
+        summary_lbl = QLabel("Summary")
+        summary_lbl.setStyleSheet(
+            f"color: {TEXT_DIM_PNL}; font-size: 10px; border: none;")
+        self._summary_toggle = _ToggleSwitch(checked=False)
+        self._summary_toggle.toggled.connect(self._on_summary_toggled)
+        lay.addWidget(self._summary_toggle)
+        lay.addWidget(summary_lbl)
+        lay.addSpacing(6)
 
         btn = QPushButton("⟳")
         btn.setToolTip("Refresh positions")
@@ -753,12 +836,20 @@ class AccountPositionPanel(QWidget):
 
     def _on_zero_pos_toggled(self, checked: bool) -> None:
         self._model.set_show_zero(checked)
+        self._summary_model.set_show_zero(checked)
         QSettings("NanoPulse", "Dashboard").setValue(
             "AccountPositionPanel/showZeroPos", checked)
 
+    def _on_summary_toggled(self, on: bool) -> None:
+        self._stack.setCurrentIndex(1 if on else 0)
+        QSettings("NanoPulse", "Dashboard").setValue(
+            "AccountPositionPanel/summaryMode", bool(on))
+
     def _on_gear_clicked(self) -> None:
         if self._open_preferences_callback:
-            self._open_preferences_callback("positions")
+            kind = ("positions_summary"
+                    if self._stack.currentIndex() == 1 else "positions")
+            self._open_preferences_callback(kind)
 
     def _on_flatten_clicked(self, account: str) -> None:
         log.info("Portfolio: flatten requested for %s", account)
@@ -773,23 +864,153 @@ class AccountPositionPanel(QWidget):
     # ── Column management (ColumnsProvider protocol) ──────────────────────────
 
     def column_state(self, kind: str) -> tuple[list, list, list]:
-        visible = self._load_visible_pos_keys()
-        return list(_POS_COL_KEYS), list(_POS_COL_HEADERS), visible
+        if kind == "positions_summary":
+            return (list(PS_COL_KEYS), list(PS_COL_HEADERS),
+                    self._load_visible_summary_keys())
+        return (list(_POS_COL_KEYS), list(_POS_COL_HEADERS),
+                self._load_visible_pos_keys())
 
     def apply_columns(self, kind: str, visible_keys: list[str]) -> None:
         prefs = config_manager.load_preferences()
-        prefs.setdefault("positions_columns", {})["visible"] = visible_keys
+        self._migrate_positions_columns(prefs)
+        sub = "summary" if kind == "positions_summary" else "flat"
+        prefs.setdefault("positions_columns", {}).setdefault(sub, {})[
+            "visible"] = visible_keys
         config_manager.save_preferences(prefs)
-        self._apply_column_visibility(visible_keys)
+        if kind == "positions_summary":
+            self._apply_summary_column_visibility(visible_keys)
+        else:
+            self._apply_column_visibility(visible_keys)
 
     def _load_visible_pos_keys(self) -> list[str]:
         prefs = config_manager.load_preferences()
-        return prefs.get("positions_columns", {}).get(
+        self._migrate_positions_columns(prefs)
+        return prefs.get("positions_columns", {}).get("flat", {}).get(
             "visible", list(_POS_COL_KEYS))
+
+    def _load_visible_summary_keys(self) -> list[str]:
+        prefs = config_manager.load_preferences()
+        self._migrate_positions_columns(prefs)
+        return prefs.get("positions_columns", {}).get("summary", {}).get(
+            "visible", list(PS_COL_KEYS))
 
     def _apply_column_visibility(self, visible_keys: list[str]) -> None:
         for key, col in _POS_KEY_TO_COL.items():
             self._table.setColumnHidden(col, key not in visible_keys)
+
+    def _apply_summary_column_visibility(self, visible_keys: list[str]) -> None:
+        visible = set(visible_keys)
+        for col, key in enumerate(PS_COL_KEYS):
+            self._summary_table.setColumnHidden(col, key not in visible)
+
+    @staticmethod
+    def _migrate_positions_columns(prefs: dict) -> None:
+        """Old shape stored ``positions_columns["visible"] = [...]``
+        directly; new shape is nested under ``["flat"|"summary"]`` so
+        the two views can persist independently.  Mutates *prefs* in
+        place on the first encounter with the old shape.  Idempotent
+        for already-migrated configs."""
+        pc = prefs.get("positions_columns")
+        if not isinstance(pc, dict):
+            return
+        if "visible" in pc and "flat" not in pc:
+            old_visible = pc.pop("visible")
+            pc.setdefault("flat", {})["visible"] = old_visible
+            # Also accept a top-level "widths" that belonged to flat.
+            if "widths" in pc:
+                pc["flat"]["widths"] = pc.pop("widths")
+
+    # ── Summary table column widths (QSettings, same pattern as flat) ─────────
+
+    _SUMMARY_COL_SAMPLES = {
+        0: "WWWWWWW",     # symbol
+        1: "FUT",         # sec_type
+        2: "999999",      # position
+        3: "99999.99",    # avg_cost
+        4: "99999.99",    # market_price
+        5: "-9999.99",    # unrealized
+        6: "-9999.99",    # realized
+        7: "$999,999",    # market_value
+        8: "99",          # accounts count
+        9: "NASDAQW",     # exchange
+    }
+
+    _SUMMARY_SETTINGS_KEY = "AccountPositionPanel/summaryHeaderState"
+
+    def _apply_summary_default_col_widths(self) -> None:
+        fm  = QFontMetrics(self._summary_table.font())
+        pad = fm.horizontalAdvance("W")
+        for col, sample in self._SUMMARY_COL_SAMPLES.items():
+            self._summary_table.setColumnWidth(
+                col, fm.horizontalAdvance(sample) + pad)
+
+    def _restore_summary_col_widths(self) -> None:
+        settings = QSettings("NanoPulse", "Dashboard")
+        state = settings.value(self._SUMMARY_SETTINGS_KEY)
+        if state is not None:
+            if self._summary_table.horizontalHeader().restoreState(state):
+                return
+        self._apply_summary_default_col_widths()
+
+    def _save_summary_col_widths(self) -> None:
+        settings = QSettings("NanoPulse", "Dashboard")
+        state = self._summary_table.horizontalHeader().saveState()
+        settings.setValue(self._SUMMARY_SETTINGS_KEY, state)
+
+    def _on_summary_section_resized(self, _logical: int, _old: int,
+                                    _new: int) -> None:
+        self._save_summary_col_widths()
+
+    # ── Summary hide / restore ────────────────────────────────────────────────
+
+    def _con_id_at_summary_index(self, idx) -> tuple[int | None, str]:
+        """Map a summary-table view index to ``(con_id, label)``.
+        Returns ``(None, "")`` for invalid indices or the TOTAL row."""
+        if not idx.isValid():
+            return None, ""
+        agg = self._summary_model.row_data(idx.row())
+        if agg is None:
+            return None, ""
+        con_id = agg.get("con_id")
+        label = (agg.get("local_symbol") or agg.get("symbol") or "").strip()
+        if con_id is None:
+            return None, label
+        return int(con_id), label
+
+    def _on_summary_context_menu(self, pos) -> None:
+        menu = QMenu(self._summary_table)
+        idx = self._summary_table.indexAt(pos)
+        con_id, label = self._con_id_at_summary_index(idx)
+
+        hide_action = None
+        if con_id is not None:
+            hide_action = menu.addAction(
+                f"Hide {label}" if label else "Hide row")
+
+        restore_action = None
+        n_hidden = self._summary_model.hidden_count()
+        if n_hidden:
+            suffix = "s" if n_hidden > 1 else ""
+            restore_action = menu.addAction(
+                f"Restore {n_hidden} hidden row{suffix}")
+
+        if not menu.actions():
+            return
+        chosen = menu.exec(
+            self._summary_table.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen is hide_action and con_id is not None:
+            self._summary_model.hide_con_id(con_id)
+        elif chosen is restore_action:
+            self._summary_model.restore_hidden()
+
+    def _hide_current_summary_row(self) -> None:
+        """Delete-key handler: hide the focused summary row."""
+        con_id, _ = self._con_id_at_summary_index(
+            self._summary_table.currentIndex())
+        if con_id is not None:
+            self._summary_model.hide_con_id(con_id)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

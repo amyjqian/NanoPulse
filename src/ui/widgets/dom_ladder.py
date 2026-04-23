@@ -31,6 +31,7 @@ from PySide6.QtGui import QColor, QFont, QPainter
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHeaderView,
+    QLabel,
     QStyledItemDelegate,
     QTableView,
 )
@@ -701,8 +702,98 @@ class DOMLadderView(QTableView):
         # the interesting prices visible without manual scrolling.
         self._model.modelReset.connect(self._scroll_to_last)
 
+        # Debounce timer for the scroll-drift safety valve in
+        # sync_to_last().  Mirrors the model-side debounce so a user
+        # who scrolls deep gets the same 3-second grace period before
+        # the view yanks back, instead of an immediate snap on the
+        # next price tick.
+        self._scroll_recenter_timer = QTimer(self)
+        self._scroll_recenter_timer.setSingleShot(True)
+        self._scroll_recenter_timer.setInterval(self._DRIFT_LIMIT_MS)
+        self._scroll_recenter_timer.timeout.connect(
+            self._on_scroll_recenter_timeout)
+
+        # ── Hover-side badge ─────────────────────────────────────────────────
+        # Pre-click intent indicator: a small green BUY / red SELL chip
+        # follows the cursor while hovering over the ladder so the
+        # trader sees what a click here would submit *before* clicking.
+        # Mirrors the same side rule mousePressEvent uses.
+        self.viewport().setMouseTracking(True)
+        self.setMouseTracking(True)
+        self._hover_badge = QLabel(self.viewport())
+        self._hover_badge.setObjectName("ladderHoverBadge")
+        self._hover_badge.setFont(QFont("Helvetica Neue, Arial", 10, QFont.Weight.Bold))
+        self._hover_badge.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._hover_badge.hide()
+
     def model(self) -> DOMLadderModel:  # type: ignore[override]
         return self._model
+
+    # ── Hover-side helpers ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _side_at(pos, col: int, cell_rect) -> str | None:
+        """Return ``"BUY"`` / ``"SELL"`` for *pos* over a cell at
+        *col* with bounding *cell_rect*, mirroring the click logic.
+        ``None`` for cells/positions that don't trade."""
+        if col == COL_BID_SZ:
+            return "BUY"
+        if col == COL_ASK_SZ:
+            return "SELL"
+        if col == COL_PRICE:
+            return "BUY" if pos.x() < cell_rect.center().x() else "SELL"
+        return None
+
+    def _show_hover_badge(self, side: str, anchor) -> None:
+        """Render the badge at *side* (BUY / SELL) and reposition it
+        next to *anchor* (a QPoint in viewport coordinates).  Offset
+        slightly so the badge doesn't sit under the cursor."""
+        if side == "BUY":
+            bg, fg = "#1A2A1A", "#3FB950"
+            text = "BUY"
+        else:
+            bg, fg = "#2A1818", "#F85149"
+            text = "SELL"
+        self._hover_badge.setText(text)
+        self._hover_badge.setStyleSheet(
+            f"QLabel#ladderHoverBadge {{"
+            f"background:{bg};color:{fg};"
+            f"border:1px solid {fg};border-radius:3px;"
+            f"padding:1px 6px}}")
+        self._hover_badge.adjustSize()
+        x = anchor.x() + 14
+        y = anchor.y() + 2
+        # Keep the badge inside the viewport so it doesn't get clipped
+        # at the right/bottom edges.
+        vp = self.viewport().rect()
+        bw = self._hover_badge.width()
+        bh = self._hover_badge.height()
+        if x + bw > vp.right():
+            x = anchor.x() - bw - 6
+        if y + bh > vp.bottom():
+            y = vp.bottom() - bh
+        self._hover_badge.move(x, y)
+        self._hover_badge.show()
+        self._hover_badge.raise_()
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        pos = event.position().toPoint()
+        idx = self.indexAt(pos)
+        if idx.isValid():
+            rect = self.visualRect(idx)
+            side = self._side_at(pos, idx.column(), rect)
+            if side is not None:
+                self._show_hover_badge(side, pos)
+            else:
+                self._hover_badge.hide()
+        else:
+            self._hover_badge.hide()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self._hover_badge.hide()
+        super().leaveEvent(event)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         """Route clicks to BUY / SELL limit orders:
@@ -746,6 +837,12 @@ class DOMLadderView(QTableView):
         scroll).  Falls back to the middle row index when there is no
         last price yet (cold start).
         """
+        # Any explicit (or model-driven) scroll back to the last
+        # supersedes a pending view-side debounce — otherwise the
+        # timer could fire later and re-center over fresh user scroll.
+        if hasattr(self, "_scroll_recenter_timer") \
+                and self._scroll_recenter_timer.isActive():
+            self._scroll_recenter_timer.stop()
         prices = self._model.prices
         if not prices:
             return
@@ -777,8 +874,11 @@ class DOMLadderView(QTableView):
 
     # Safety valve: when unlocked, if the last-price row drifts this
     # many rows past the centre of the viewport, we recentre anyway so
-    # the user doesn't completely lose sight of the market.
+    # the user doesn't completely lose sight of the market.  Mirrors
+    # the model-side ``_RECENTER_DEBOUNCE_MS`` so the user's deep
+    # scroll gets the same 3-second grace period before any snap.
     _DRIFT_LIMIT_ROWS = 20
+    _DRIFT_LIMIT_MS = 3000
 
     def sync_to_last(self) -> None:
         """Ask the view to re-centre on the last price.
@@ -789,8 +889,23 @@ class DOMLadderView(QTableView):
         automatically.  This method is kept as a safety valve: if the
         last-price row has drifted more than ``_DRIFT_LIMIT_ROWS`` from
         the viewport centre (e.g. user scrolled way off), pull it back
-        into view so the market doesn't disappear entirely.
+        into view so the market doesn't disappear entirely — but only
+        after ``_DRIFT_LIMIT_MS`` of sustained drift, so a brief
+        scroll into deep territory doesn't yank back on the next tick.
         """
+        drift = self._last_row_drift()
+        drifted = drift is not None and drift > self._DRIFT_LIMIT_ROWS
+        if drifted:
+            if not self._scroll_recenter_timer.isActive():
+                self._scroll_recenter_timer.start()
+        elif self._scroll_recenter_timer.isActive():
+            # User scrolled back inside the threshold before the
+            # debounce fired — cancel and let them keep their view.
+            self._scroll_recenter_timer.stop()
+
+    def _on_scroll_recenter_timeout(self) -> None:
+        """Debounce fired — snap back only if the viewport is still
+        drifted off the last."""
         drift = self._last_row_drift()
         if drift is not None and drift > self._DRIFT_LIMIT_ROWS:
             self._scroll_to_last()

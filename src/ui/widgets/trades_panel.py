@@ -19,12 +19,15 @@ visible-keys order onto the table via ``setColumnHidden`` +
 from __future__ import annotations
 
 import logging
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QFont, QFontMetrics
+from PySide6.QtGui import QFont, QFontMetrics, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHeaderView,
+    QMenu,
     QStackedWidget,
     QTableView,
     QVBoxLayout,
@@ -44,12 +47,32 @@ from .trades_model import (
 )
 from .trades_summary_model import (
     TradesSummaryModel,
-    S_COL_SYMBOL, S_COL_BUYS, S_COL_SELLS, S_COL_NET,
+    S_COL_SYMBOL, S_COL_TYPE, S_COL_BUYS, S_COL_SELLS, S_COL_NET,
     S_COL_AVG_BUY, S_COL_AVG_SELL, S_COL_TRANS_TOTAL, S_COL_NET_TOTAL,
     S_COL_COMMISSION, S_COL_NET_INCL_COMM, S_COL_REALIZED, S_COL_EXCHANGES,
 )
 
 log = logging.getLogger(__name__)
+
+_ET = ZoneInfo("America/New_York")
+
+# Control-bar combo key → (days_back, session-open time-of-day in ET).
+# ``None`` time means no preset threshold; just the rolling N-day
+# window.  Morning uses 09:30 (US equities open); Afternoon 12:00;
+# Evening 18:00 (after the US cash session close, covering the evening
+# futures re-open and overnight trades).
+_FILTER_PRESETS: dict[str, tuple[int, tuple[int, int] | None]] = {
+    "evening":   (1, (18, 0)),
+    "afternoon": (1, (12, 0)),
+    "morning":   (1, (9, 30)),
+    "today":     (1, None),
+    "last_2":    (2, None),
+    "last_3":    (3, None),
+    "last_4":    (4, None),
+    "last_5":    (5, None),
+    "last_6":    (6, None),
+    "last_7":    (7, None),
+}
 
 # ── Theme tokens ──────────────────────────────────────────────────────────────
 BG_TABLE     = "#1A1D24"
@@ -119,7 +142,7 @@ _DEFAULT_FLAT_VISIBLE = [
     "commission", "realized_pnl", "submitter",
 ]
 _DEFAULT_SUMMARY_VISIBLE = [
-    "symbol", "buys", "sells", "net", "avg_buy", "avg_sell",
+    "symbol", "sec_type", "buys", "sells", "net", "avg_buy", "avg_sell",
     "trans_total", "net_total", "commission", "net_incl_comm",
     "realized_pnl", "exchanges",
 ]
@@ -157,7 +180,10 @@ class TradesPanel(QWidget):
         # Migration: surface newly-introduced columns to users whose
         # persisted visible-list predates them.  Without this, upgrade
         # → new column hidden forever until the user opens Preferences.
-        for new_key, after_key in (("trans_total", "avg_sell"),):
+        for new_key, after_key in (
+                ("trans_total", "avg_sell"),
+                ("sec_type", "symbol"),
+        ):
             if new_key not in self._visible_summary:
                 try:
                     i = self._visible_summary.index(after_key)
@@ -206,6 +232,15 @@ class TradesPanel(QWidget):
         self._control_bar.searchTextChanged.connect(self._on_search_changed)
         self._control_bar.settingsClicked.connect(self._on_gear_clicked)
 
+        # Keep the visible-trade counter in sync with the flat proxy.
+        # invalidateFilter() (from search/date changes) emits layoutChanged;
+        # incremental add_fill() emits rowsInserted; clear() → modelReset.
+        self._flat_proxy.layoutChanged.connect(self._refresh_trade_count)
+        self._flat_proxy.rowsInserted.connect(self._refresh_trade_count)
+        self._flat_proxy.rowsRemoved.connect(self._refresh_trade_count)
+        self._flat_proxy.modelReset.connect(self._refresh_trade_count)
+        self._refresh_trade_count()
+
         self._stack = QStackedWidget(self)
         self._flat_table = self._make_table(self._flat_proxy)
         self._summary_table = self._make_table(self._summary_proxy)
@@ -215,6 +250,17 @@ class TradesPanel(QWidget):
 
         self._apply_flat_default_widths()
         self._apply_summary_default_widths()
+
+        # Summary-only: right-click menu + Delete-key shortcut to
+        # temporarily hide rows from the totals footer.
+        self._summary_table.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self._summary_table.customContextMenuRequested.connect(
+            self._on_summary_context_menu)
+        delete_sc = QShortcut(
+            QKeySequence(Qt.Key.Key_Delete), self._summary_table)
+        delete_sc.setContext(Qt.ShortcutContext.WidgetShortcut)
+        delete_sc.activated.connect(self._hide_current_summary_row)
 
     def _make_table(self, proxy) -> QTableView:
         t = QTableView(self)
@@ -267,6 +313,7 @@ class TradesPanel(QWidget):
         pad = fm.horizontalAdvance("W")
         samples = {
             S_COL_SYMBOL:        "WWWWWW",
+            S_COL_TYPE:          "WWWW",
             S_COL_BUYS:          "99999",
             S_COL_SELLS:         "99999",
             S_COL_NET:           "+99999",
@@ -287,21 +334,108 @@ class TradesPanel(QWidget):
     def _on_summary_toggled(self, on: bool) -> None:
         self._stack.setCurrentIndex(1 if on else 0)
 
-    def _on_date_changed(self, days: int) -> None:
+    def _on_date_changed(self, key: str) -> None:
+        days, hm = _FILTER_PRESETS.get(key, (1, None))
+        threshold: datetime | None = None
+        if hm is not None:
+            anchor = self._flat_proxy.anchorDate()
+            h, m = hm
+            threshold = datetime(
+                anchor.year, anchor.month, anchor.day, h, m,
+                tzinfo=_ET,
+            )
         self._flat_proxy.setDaysBack(days)
-        # Re-aggregate the summary over the same window so its totals
-        # match the filtered flat view (no point showing "Today" in the
-        # flat list while the summary sums across every session).
         self._summary_model.set_days_back(days)
+        self._flat_proxy.setPresetThreshold(threshold)
+        self._summary_proxy.setPresetThreshold(threshold)
+        self._refresh_summary_threshold()
 
     def _on_search_changed(self, text: str) -> None:
         self._flat_proxy.setSearchText(text)
-        self._summary_proxy.setSearchText(text)
-        # When the search text parses as a datetime, push it into the
-        # summary model so its aggregates re-fold over only fills at or
-        # after the threshold.  Passing ``None`` drops the override and
-        # the model falls back to the normal date-window filter.
-        self._summary_model.set_time_threshold(_try_parse_time_query(text))
+        # Summary filtering happens at the fill level inside the model
+        # — the proxy matches aggregate rows only and would hide every
+        # row whenever the user types a per-fill field (e.g. account).
+        # Route substring text to the model; datetime queries go
+        # through ``_refresh_summary_threshold``.
+        parsed = _try_parse_time_query(text)
+        self._summary_model.set_search_text(
+            "" if parsed is not None else text)
+        self._refresh_summary_threshold()
+
+    def _refresh_trade_count(self, *_args) -> None:
+        """Push the flat proxy's visible-row count to the control bar.
+        The *_args absorb whatever signal payload Qt passes in
+        (rowsInserted/rowsRemoved carry parent/first/last)."""
+        self._control_bar.setTradeCount(self._flat_proxy.rowCount())
+
+    def _refresh_summary_threshold(self) -> None:
+        """Summary model has a single ``_time_threshold`` slot; mirror
+        the proxy's "preset beats search-parsed" priority so the flat
+        view and summary totals stay in sync."""
+        threshold = self._flat_proxy.presetThreshold()
+        if threshold is None:
+            threshold = _try_parse_time_query(self._control_bar.searchText())
+        self._summary_model.set_time_threshold(threshold)
+
+    # ── Summary row hide / restore ──────────────────────────────────────────
+
+    def _row_key_at_summary_index(self, idx) -> tuple | None:
+        """Map a view-index on the summary table to its aggregate key
+        ``(symbol, sec_type)``, or ``None`` if the index is invalid or
+        points at the totals row."""
+        if not idx.isValid():
+            return None
+        src = self._summary_proxy.mapToSource(idx)
+        agg = self._summary_model.row_data(src.row())
+        if agg is None:
+            return None
+        sym = agg.get("symbol", "")
+        if not sym:
+            return None
+        return (sym, agg.get("sec_type", "") or "")
+
+    @staticmethod
+    def _key_label(key: tuple) -> str:
+        """Human-readable label for a ``(symbol, sec_type)`` key.
+        Matches the Symbol column so the context menu reads as
+        "Hide TSLA" for stocks and "Hide TSLA OPT" for options."""
+        sym, sec = key
+        if sec and sec != "STK":
+            return f"{sym} {sec}"
+        return sym
+
+    def _on_summary_context_menu(self, pos) -> None:
+        menu = QMenu(self._summary_table)
+        idx = self._summary_table.indexAt(pos)
+        key = self._row_key_at_summary_index(idx)
+
+        hide_action = (menu.addAction(f"Hide {self._key_label(key)}")
+                       if key else None)
+
+        restore_action = None
+        n_hidden = self._summary_model.hidden_count()
+        if n_hidden:
+            suffix = "s" if n_hidden > 1 else ""
+            restore_action = menu.addAction(
+                f"Restore {n_hidden} hidden row{suffix}")
+
+        if not menu.actions():
+            return
+        chosen = menu.exec(
+            self._summary_table.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen is hide_action and key:
+            self._summary_model.hide_symbol(key)
+        elif chosen is restore_action:
+            self._summary_model.restore_hidden()
+
+    def _hide_current_summary_row(self) -> None:
+        """Delete-key handler: hide the focused row."""
+        key = self._row_key_at_summary_index(
+            self._summary_table.currentIndex())
+        if key:
+            self._summary_model.hide_symbol(key)
 
     # ── Column visibility + order ───────────────────────────────────────────
 

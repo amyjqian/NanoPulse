@@ -81,7 +81,7 @@ def _try_parse_time_query(text: str) -> datetime | None:
 _SEARCH_KEYS_FLAT = (
     "symbol", "side", "account", "sec_type", "exchange", "order_ref",
 )
-_SEARCH_KEYS_SUMMARY = ("symbol", "exchanges")
+_SEARCH_KEYS_SUMMARY = ("symbol", "sec_type", "exchanges")
 
 
 class TradesFilterProxy(QSortFilterProxyModel):
@@ -96,6 +96,10 @@ class TradesFilterProxy(QSortFilterProxyModel):
         # into "time threshold" mode: flat rows are kept only if their
         # ``time_sort`` is ≥ this moment.  ``None`` means substring mode.
         self._time_threshold: datetime | None = None
+        # Set by the control-bar combo's session-of-day presets
+        # (Morning / Afternoon / Evening).  Takes priority over the
+        # search-text-parsed threshold above.
+        self._preset_threshold: datetime | None = None
         self._days_back: int = 1  # "Today" by default
         # Anchor date used by the date filter.  Defined as
         # ``max(today_ET, latest_fill_date)`` so opening the app on a
@@ -151,6 +155,24 @@ class TradesFilterProxy(QSortFilterProxyModel):
         self._days_back = days
         self.invalidateFilter()
 
+    def setPresetThreshold(self, dt: datetime | None) -> None:
+        """Set the session-of-day preset threshold (Morning / Afternoon /
+        Evening).  ``None`` clears it."""
+        if dt == self._preset_threshold:
+            return
+        self._preset_threshold = dt
+        self.invalidateFilter()
+
+    def presetThreshold(self) -> datetime | None:
+        return self._preset_threshold
+
+    def anchorDate(self) -> date:
+        """Session day the date filter is anchored to — ``today_ET``
+        during live trading, rolled back to the most recent fill date
+        on weekends / holidays.  Exposed so the panel can compute the
+        preset threshold against the same day the Today window uses."""
+        return self._anchor_date
+
     # ── Core filter ─────────────────────────────────────────────────────────
 
     def filterAcceptsRow(self, src_row: int,
@@ -164,10 +186,16 @@ class TradesFilterProxy(QSortFilterProxyModel):
         if data is None:
             return True
 
-        # Time-threshold search — show only fills at or after the parsed
-        # moment.  Rows with no time_sort are left visible (safer default
-        # than dropping them silently).  Flat view only.
-        if self._time_threshold is not None:
+        # Time-threshold filter — show only fills at or after this
+        # moment.  The session-of-day preset (from the combo) beats the
+        # search-parsed threshold so substring search can stay active
+        # alongside a Morning/Afternoon/Evening selection.  Rows with
+        # no time_sort are left visible (safer default than dropping
+        # them silently).
+        effective_threshold = (self._preset_threshold
+                               if self._preset_threshold is not None
+                               else self._time_threshold)
+        if effective_threshold is not None:
             time_sort = data.get("time_sort", "")
             if time_sort:
                 try:
@@ -177,14 +205,16 @@ class TradesFilterProxy(QSortFilterProxyModel):
                 if ts is not None:
                     if ts.tzinfo is None:
                         ts = ts.replace(tzinfo=_ET)
-                    if ts < self._time_threshold:
+                    if ts < effective_threshold:
                         return False
 
         # Substring search — match across the per-view key set.  Keys
         # whose value is a set/list (e.g. summary "exchanges") are
         # flattened to a space-joined lowercase string so substring
-        # matching still works ("cme" matches {"CME"}).
-        elif self._search:
+        # matching still works ("cme" matches {"CME"}).  Runs alongside
+        # the preset threshold so the user can narrow by symbol while a
+        # session filter is active.
+        if self._search:
             keys = _SEARCH_KEYS_SUMMARY if self._is_summary else _SEARCH_KEYS_FLAT
             matched = False
             for k in keys:
@@ -201,13 +231,13 @@ class TradesFilterProxy(QSortFilterProxyModel):
             if not matched:
                 return False
 
-        # Date filter – flat model only.  Skipped when the user is in
-        # time-threshold mode (typing an explicit moment overrides the
-        # relative "last N days" window so e.g. ``Apr21`` still matches
-        # fills on Apr21 even when "Today" is selected).
+        # Date filter – flat model only.  Skipped when either threshold
+        # is active (a preset or a typed moment is strictly more
+        # restrictive than the relative "last N days" window, so
+        # applying both would just double-filter the same rows).
         if (not self._is_summary
                 and self._days_back > 0
-                and self._time_threshold is None):
+                and effective_threshold is None):
             time_sort = data.get("time_sort", "")
             if time_sort and not self._within_days(time_sort, self._days_back):
                 return False
