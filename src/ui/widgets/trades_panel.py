@@ -47,7 +47,7 @@ from .trades_model import (
 )
 from .trades_summary_model import (
     TradesSummaryModel,
-    S_COL_SYMBOL, S_COL_BUYS, S_COL_SELLS, S_COL_NET,
+    S_COL_SYMBOL, S_COL_TYPE, S_COL_BUYS, S_COL_SELLS, S_COL_NET,
     S_COL_AVG_BUY, S_COL_AVG_SELL, S_COL_TRANS_TOTAL, S_COL_NET_TOTAL,
     S_COL_COMMISSION, S_COL_NET_INCL_COMM, S_COL_REALIZED, S_COL_EXCHANGES,
 )
@@ -142,7 +142,7 @@ _DEFAULT_FLAT_VISIBLE = [
     "commission", "realized_pnl", "submitter",
 ]
 _DEFAULT_SUMMARY_VISIBLE = [
-    "symbol", "buys", "sells", "net", "avg_buy", "avg_sell",
+    "symbol", "sec_type", "buys", "sells", "net", "avg_buy", "avg_sell",
     "trans_total", "net_total", "commission", "net_incl_comm",
     "realized_pnl", "exchanges",
 ]
@@ -180,7 +180,10 @@ class TradesPanel(QWidget):
         # Migration: surface newly-introduced columns to users whose
         # persisted visible-list predates them.  Without this, upgrade
         # → new column hidden forever until the user opens Preferences.
-        for new_key, after_key in (("trans_total", "avg_sell"),):
+        for new_key, after_key in (
+                ("trans_total", "avg_sell"),
+                ("sec_type", "symbol"),
+        ):
             if new_key not in self._visible_summary:
                 try:
                     i = self._visible_summary.index(after_key)
@@ -310,6 +313,7 @@ class TradesPanel(QWidget):
         pad = fm.horizontalAdvance("W")
         samples = {
             S_COL_SYMBOL:        "WWWWWW",
+            S_COL_TYPE:          "WWWW",
             S_COL_BUYS:          "99999",
             S_COL_SELLS:         "99999",
             S_COL_NET:           "+99999",
@@ -375,9 +379,10 @@ class TradesPanel(QWidget):
 
     # ── Summary row hide / restore ──────────────────────────────────────────
 
-    def _symbol_at_summary_index(self, idx) -> str | None:
-        """Map a view-index on the summary table to its symbol, or
-        ``None`` if the index is invalid or points at the totals row."""
+    def _row_key_at_summary_index(self, idx) -> tuple | None:
+        """Map a view-index on the summary table to its aggregate key
+        ``(symbol, sec_type)``, or ``None`` if the index is invalid or
+        points at the totals row."""
         if not idx.isValid():
             return None
         src = self._summary_proxy.mapToSource(idx)
@@ -385,15 +390,27 @@ class TradesPanel(QWidget):
         if agg is None:
             return None
         sym = agg.get("symbol", "")
-        return sym or None
+        if not sym:
+            return None
+        return (sym, agg.get("sec_type", "") or "")
+
+    @staticmethod
+    def _key_label(key: tuple) -> str:
+        """Human-readable label for a ``(symbol, sec_type)`` key.
+        Matches the Symbol column so the context menu reads as
+        "Hide TSLA" for stocks and "Hide TSLA OPT" for options."""
+        sym, sec = key
+        if sec and sec != "STK":
+            return f"{sym} {sec}"
+        return sym
 
     def _on_summary_context_menu(self, pos) -> None:
         menu = QMenu(self._summary_table)
         idx = self._summary_table.indexAt(pos)
-        symbol = self._symbol_at_summary_index(idx)
+        key = self._row_key_at_summary_index(idx)
 
-        hide_action = (menu.addAction(f"Hide {symbol}")
-                       if symbol else None)
+        hide_action = (menu.addAction(f"Hide {self._key_label(key)}")
+                       if key else None)
 
         restore_action = None
         n_hidden = self._summary_model.hidden_count()
@@ -408,17 +425,17 @@ class TradesPanel(QWidget):
             self._summary_table.viewport().mapToGlobal(pos))
         if chosen is None:
             return
-        if chosen is hide_action and symbol:
-            self._summary_model.hide_symbol(symbol)
+        if chosen is hide_action and key:
+            self._summary_model.hide_symbol(key)
         elif chosen is restore_action:
             self._summary_model.restore_hidden()
 
     def _hide_current_summary_row(self) -> None:
         """Delete-key handler: hide the focused row."""
-        symbol = self._symbol_at_summary_index(
+        key = self._row_key_at_summary_index(
             self._summary_table.currentIndex())
-        if symbol:
-            self._summary_model.hide_symbol(symbol)
+        if key:
+            self._summary_model.hide_symbol(key)
 
     # ── Column visibility + order ───────────────────────────────────────────
 

@@ -81,7 +81,7 @@ def _try_parse_time_query(text: str) -> datetime | None:
 _SEARCH_KEYS_FLAT = (
     "symbol", "side", "account", "sec_type", "exchange", "order_ref",
 )
-_SEARCH_KEYS_SUMMARY = ("symbol", "exchanges")
+_SEARCH_KEYS_SUMMARY = ("symbol", "sec_type", "exchanges")
 
 
 class TradesFilterProxy(QSortFilterProxyModel):

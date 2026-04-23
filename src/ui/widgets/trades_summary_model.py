@@ -25,27 +25,28 @@ _ET = ZoneInfo("America/New_York")
 
 # ── Column indices ────────────────────────────────────────────────────────────
 S_COL_SYMBOL        = 0
-S_COL_BUYS          = 1
-S_COL_SELLS         = 2
-S_COL_NET           = 3
-S_COL_AVG_BUY       = 4
-S_COL_AVG_SELL      = 5
-S_COL_TRANS_TOTAL   = 6
-S_COL_NET_TOTAL     = 7
-S_COL_COMMISSION    = 8
-S_COL_NET_INCL_COMM = 9
-S_COL_REALIZED      = 10
-S_COL_EXCHANGES     = 11
+S_COL_TYPE          = 1
+S_COL_BUYS          = 2
+S_COL_SELLS         = 3
+S_COL_NET           = 4
+S_COL_AVG_BUY       = 5
+S_COL_AVG_SELL      = 6
+S_COL_TRANS_TOTAL   = 7
+S_COL_NET_TOTAL     = 8
+S_COL_COMMISSION    = 9
+S_COL_NET_INCL_COMM = 10
+S_COL_REALIZED      = 11
+S_COL_EXCHANGES     = 12
 
 S_HEADERS: list[str] = [
-    "Symbol", "Buys", "Sells", "Net",
+    "Symbol", "Type", "Buys", "Sells", "Net",
     "Avg buy price", "Avg sell price", "Trans total",
     "P&L", "Comm", "Net P&L", "Rlz P&L", "Exchanges",
 ]
 
 # Column key used by the preferences dialog / column visibility state
 S_COL_KEYS: list[str] = [
-    "symbol", "buys", "sells", "net", "avg_buy", "avg_sell",
+    "symbol", "sec_type", "buys", "sells", "net", "avg_buy", "avg_sell",
     "trans_total", "net_total", "commission", "net_incl_comm",
     "realized_pnl", "exchanges",
 ]
@@ -80,14 +81,17 @@ BG_TOTAL   = "#242834"
 
 class TradesSummaryModel(QAbstractTableModel):
     """Symbol-grouped aggregate view of the same fill stream feeding
-    ``TradesModel``.  One row per symbol."""
+    ``TradesModel``.  One row per (symbol, sec_type) — so TSLA stock and
+    TSLA options aggregate separately even though they share the root."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        # symbol → aggregate dict
-        self._agg: dict[str, dict] = {}
-        # ordered list of symbols as presented (insertion order of first fill)
-        self._order: list[str] = []
+        # (symbol, sec_type) → aggregate dict.  Keyed as a tuple so the
+        # same root symbol under different instrument types (STK vs OPT
+        # vs FUT) keeps its own bucket.
+        self._agg: dict[tuple[str, str], dict] = {}
+        # ordered list of keys as presented (insertion order of first fill)
+        self._order: list[tuple[str, str]] = []
         # execId → raw fill dict — keeps the last flattened fill per execId so
         # a re-snapshot that re-emits the same fill doesn't double-count it
         self._fills: dict[str, dict] = {}
@@ -110,12 +114,12 @@ class TradesSummaryModel(QAbstractTableModel):
         # symbol totals — the flat proxy can't search aggregate rows
         # on per-fill fields, so the filter lives here instead.
         self._search_text: str = ""
-        # Symbols the user has temporarily hidden from the view via the
+        # Keys the user has temporarily hidden from the view via the
         # context menu / Delete key.  The underlying aggregate stays in
         # ``_agg`` so a later ``restore_hidden`` can bring it back, and
         # the total row iterates over ``_order`` (visible only) so hides
         # recompute the footer.  Cleared on any filter-driven rebuild.
-        self._hidden_symbols: set[str] = set()
+        self._hidden_symbols: set[tuple[str, str]] = set()
 
         self._symbol_font = QFont("Helvetica Neue, Arial", 11)
         self._symbol_font.setWeight(QFont.Weight.DemiBold)
@@ -297,6 +301,8 @@ class TradesSummaryModel(QAbstractTableModel):
     def _cell_text(self, agg: dict, col: int) -> str:
         if col == S_COL_SYMBOL:
             return agg.get("symbol", "")
+        if col == S_COL_TYPE:
+            return agg.get("sec_type", "") or ""
         if col == S_COL_BUYS:
             return self._fmt_qty(agg.get("buys_qty", 0.0))
         if col == S_COL_SELLS:
@@ -374,11 +380,18 @@ class TradesSummaryModel(QAbstractTableModel):
             if pnl < 0:
                 return QColor(CLR_SELL)
             return QColor(TEXT_DIM)
-        if col in (S_COL_EXCHANGES,):
+        if col in (S_COL_TYPE, S_COL_EXCHANGES):
             return QColor(TEXT_DIM)
         return QColor(TEXT)
 
     # ── Public mutation API ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _agg_key(fill: dict) -> tuple[str, str]:
+        """Aggregation key: (symbol, sec_type).  A root symbol traded as
+        both a stock and an option (e.g. TSLA) produces two keys so the
+        summary doesn't combine unrelated instruments into one row."""
+        return (fill.get("symbol", "") or "—", fill.get("sec_type", "") or "")
 
     def add_fill(self, fill: dict) -> None:
         """Fold a flattened fill into its symbol aggregate, or refresh in
@@ -390,7 +403,7 @@ class TradesSummaryModel(QAbstractTableModel):
         they fall inside the current window.
         """
         exec_id = fill.get("exec_id", "")
-        symbol = fill.get("symbol", "") or "—"
+        key = self._agg_key(fill)
 
         # Detect an anchor advance (e.g. a fresh session's first fill
         # arrives and pushes "today" forward).  A full rebuild is the
@@ -412,10 +425,10 @@ class TradesSummaryModel(QAbstractTableModel):
         # fill was actually counted (i.e. it passed the filter).
         prev = self._fills.get(exec_id) if exec_id else None
         if prev is not None and self._passes_filter(prev):
-            prev_symbol = prev.get("symbol", "") or "—"
-            self._subtract_from_agg(prev_symbol, prev)
-            if self._agg.get(prev_symbol, {}).get("fill_count", 0) == 0:
-                self._drop_symbol_row(prev_symbol)
+            prev_key = self._agg_key(prev)
+            self._subtract_from_agg(prev_key, prev)
+            if self._agg.get(prev_key, {}).get("fill_count", 0) == 0:
+                self._drop_symbol_row(prev_key)
 
         if exec_id:
             self._fills[exec_id] = fill
@@ -431,8 +444,8 @@ class TradesSummaryModel(QAbstractTableModel):
         if not self._passes_filter(fill):
             return
 
-        # Add to aggregate.  Insert a new row if this symbol is new.
-        if symbol not in self._agg:
+        # Add to aggregate.  Insert a new row if this key is new.
+        if key not in self._agg:
             n = len(self._order)
             if n == 0:
                 # First aggregate materialises the totals row too, so we
@@ -441,19 +454,19 @@ class TradesSummaryModel(QAbstractTableModel):
                 self.beginInsertRows(QModelIndex(), 0, 1)
             else:
                 self.beginInsertRows(QModelIndex(), n, n)
-            self._agg[symbol] = self._empty_agg(symbol)
-            self._order.append(symbol)
+            self._agg[key] = self._empty_agg(key)
+            self._order.append(key)
             self.endInsertRows()
 
-        self._add_to_agg(symbol, fill)
+        self._add_to_agg(key, fill)
 
         # Refresh the updated row *and* the totals footer.  When the
         # symbol is user-hidden the row isn't in ``_order`` — we update
         # the stored aggregate but emit nothing because neither the
         # hidden row nor the totals (which exclude hidden rows) change
         # visually.
-        if symbol in self._order:
-            row = self._order.index(symbol)
+        if key in self._order:
+            row = self._order.index(key)
             self.dataChanged.emit(
                 self.index(row, 0),
                 self.index(row, _S_NUM_COLS - 1))
@@ -504,19 +517,19 @@ class TradesSummaryModel(QAbstractTableModel):
 
     # ── Hide / restore (user-driven, temporary) ────────────────────────────
 
-    def hide_symbol(self, symbol: str) -> None:
-        """Temporarily remove *symbol*'s row from the view and
-        recalculate the totals footer without it.  The aggregate stays
-        in ``_agg`` so ``restore_hidden`` can bring it back; the hide
-        is cleared on any filter-driven rebuild."""
-        if not symbol or symbol in self._hidden_symbols:
+    def hide_symbol(self, key: tuple[str, str]) -> None:
+        """Temporarily remove *key*'s row from the view and recalculate
+        the totals footer without it.  The aggregate stays in ``_agg``
+        so ``restore_hidden`` can bring it back; the hide is cleared on
+        any filter-driven rebuild."""
+        if not key or key in self._hidden_symbols:
             return
-        if symbol not in self._order:
+        if key not in self._order:
             return
-        row = self._order.index(symbol)
+        row = self._order.index(key)
         self.beginRemoveRows(QModelIndex(), row, row)
         self._order.pop(row)
-        self._hidden_symbols.add(symbol)
+        self._hidden_symbols.add(key)
         self.endRemoveRows()
         # Totals footer shifted up by one and its values changed.
         if self._order:
@@ -526,15 +539,15 @@ class TradesSummaryModel(QAbstractTableModel):
                 self.index(total_row, _S_NUM_COLS - 1))
 
     def restore_hidden(self) -> None:
-        """Un-hide every user-hidden symbol.  Order after restore is
-        not guaranteed to match the original — restored symbols land
-        at the tail of ``_order``."""
+        """Un-hide every user-hidden row.  Order after restore is not
+        guaranteed to match the original — restored keys land at the
+        tail of ``_order``."""
         if not self._hidden_symbols:
             return
         self.beginResetModel()
-        for s in list(self._hidden_symbols):
-            if s in self._agg and s not in self._order:
-                self._order.append(s)
+        for k in list(self._hidden_symbols):
+            if k in self._agg and k not in self._order:
+                self._order.append(k)
         self._hidden_symbols.clear()
         self.endResetModel()
 
@@ -623,19 +636,21 @@ class TradesSummaryModel(QAbstractTableModel):
         for fill in self._fills.values():
             if not self._passes_filter(fill):
                 continue
-            symbol = fill.get("symbol", "") or "—"
-            if symbol not in self._agg:
-                self._agg[symbol] = self._empty_agg(symbol)
-                self._order.append(symbol)
-            self._add_to_agg(symbol, fill)
+            key = self._agg_key(fill)
+            if key not in self._agg:
+                self._agg[key] = self._empty_agg(key)
+                self._order.append(key)
+            self._add_to_agg(key, fill)
         self.endResetModel()
 
     # ── Internal aggregation helpers ────────────────────────────────────────
 
     @staticmethod
-    def _empty_agg(symbol: str) -> dict:
+    def _empty_agg(key: tuple[str, str]) -> dict:
+        symbol, sec_type = key
         return {
             "symbol": symbol,
+            "sec_type": sec_type,
             "buys_qty": 0.0,
             "sells_qty": 0.0,
             # Price-weighted notionals — kept in per-point terms so
@@ -655,8 +670,8 @@ class TradesSummaryModel(QAbstractTableModel):
             "fill_count": 0,
         }
 
-    def _add_to_agg(self, symbol: str, fill: dict) -> None:
-        agg = self._agg[symbol]
+    def _add_to_agg(self, key: tuple[str, str], fill: dict) -> None:
+        agg = self._agg[key]
         side = fill.get("side", "")
         shares = float(fill.get("shares", 0.0) or 0.0)
         price = float(fill.get("price", 0.0) or 0.0)
@@ -687,8 +702,8 @@ class TradesSummaryModel(QAbstractTableModel):
             agg["exchanges"].add(exch)
         agg["fill_count"] += 1
 
-    def _subtract_from_agg(self, symbol: str, fill: dict) -> None:
-        agg = self._agg.get(symbol)
+    def _subtract_from_agg(self, key: tuple[str, str], fill: dict) -> None:
+        agg = self._agg.get(key)
         if agg is None:
             return
         side = fill.get("side", "")
@@ -708,17 +723,17 @@ class TradesSummaryModel(QAbstractTableModel):
         # Exchange membership isn't reversed — harmless; a symbol that once
         # routed through NYSE still shows NYSE in its exchange list.
 
-    def _drop_symbol_row(self, symbol: str) -> None:
-        # Hidden symbols aren't in ``_order`` but still have a stored
+    def _drop_symbol_row(self, key: tuple[str, str]) -> None:
+        # Hidden rows aren't in ``_order`` but still have a stored
         # aggregate — drop from internal state only; no row signals
         # needed because the view isn't showing them.
-        if symbol in self._hidden_symbols:
-            self._hidden_symbols.discard(symbol)
-            self._agg.pop(symbol, None)
+        if key in self._hidden_symbols:
+            self._hidden_symbols.discard(key)
+            self._agg.pop(key, None)
             return
-        if symbol not in self._order:
+        if key not in self._order:
             return
-        row = self._order.index(symbol)
+        row = self._order.index(key)
         if len(self._order) == 1:
             # Dropping the last aggregate also hides the totals footer
             # so the view goes back to empty — remove both rows in one
@@ -727,5 +742,5 @@ class TradesSummaryModel(QAbstractTableModel):
         else:
             self.beginRemoveRows(QModelIndex(), row, row)
         self._order.pop(row)
-        self._agg.pop(symbol, None)
+        self._agg.pop(key, None)
         self.endRemoveRows()
