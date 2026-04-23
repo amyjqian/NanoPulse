@@ -76,7 +76,7 @@ class MainWindow(QWidget):
             1 for w in self.active_threads.values()
             if w._ib and w._ib.isConnected()
         )
-        acct_count = self._accounts_model.rowCount()
+        acct_count = self._accounts_model.account_count()
         # Selected = checked accounts in the Account List panel
         try:
             selected_count = self._flash_trade._account_list.get_selected_count()
