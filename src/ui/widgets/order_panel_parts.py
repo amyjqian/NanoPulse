@@ -19,8 +19,8 @@ from __future__ import annotations
 
 from typing import Iterable, Sequence
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QMimeData, Qt, Signal
+from PySide6.QtGui import QDrag, QFont, QMouseEvent
 from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
@@ -252,17 +252,117 @@ def _apply_chip_style(btn: QPushButton, selected: bool) -> None:
             "QPushButton:hover{background:#4a4a5a}")
 
 
+CHIP_MIME_TYPE = "application/x-nanopulse-symbol"
+
+
+class DraggableChip(QPushButton):
+    """Symbol chip that can be dragged to another chip in the same group.
+
+    The drag payload carries ``"{symbol}|{sec_type}"``; drop targets only
+    accept a payload whose sec-type matches their own.  A user-supplied
+    ``on_drop`` callback runs when a valid drop lands — the host uses it
+    to reorder its backing list and rebuild the grid.
+    """
+
+    _DRAG_PX = 6   # pixels of movement before a drag is initiated
+
+    def __init__(
+        self,
+        sym: str,
+        sec_type: str,
+        on_drop,
+        parent=None,
+    ) -> None:
+        super().__init__(sym, parent)
+        self._sym = sym
+        self._sec_type = sec_type
+        self._on_drop = on_drop
+        self._press_pos = None
+        self.setAcceptDrops(True)
+
+    def mousePressEvent(self, e: QMouseEvent) -> None:  # noqa: N802
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._press_pos = e.position().toPoint()
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e: QMouseEvent) -> None:  # noqa: N802
+        if (not (e.buttons() & Qt.MouseButton.LeftButton)
+                or self._press_pos is None):
+            super().mouseMoveEvent(e)
+            return
+        if ((e.position().toPoint() - self._press_pos).manhattanLength()
+                < self._DRAG_PX):
+            super().mouseMoveEvent(e)
+            return
+
+        mime = QMimeData()
+        mime.setData(
+            CHIP_MIME_TYPE,
+            f"{self._sym}|{self._sec_type}".encode("utf-8"))
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        pm = self.grab()
+        drag.setPixmap(pm)
+        drag.setHotSpot(e.position().toPoint())
+        # Clearing _press_pos suppresses a late-arriving click when the
+        # cursor returns to this chip without a drop.
+        self._press_pos = None
+        drag.exec(Qt.DropAction.MoveAction)
+
+    def dragEnterEvent(self, e) -> None:  # noqa: N802
+        md = e.mimeData()
+        if not md.hasFormat(CHIP_MIME_TYPE):
+            e.ignore()
+            return
+        try:
+            payload = bytes(md.data(CHIP_MIME_TYPE)).decode("utf-8")
+            src_sym, src_sec = payload.split("|", 1)
+        except (UnicodeDecodeError, ValueError):
+            e.ignore()
+            return
+        # Same-group only, and ignore drops back on the source chip itself.
+        if src_sec == self._sec_type and src_sym != self._sym:
+            e.acceptProposedAction()
+        else:
+            e.ignore()
+
+    def dragMoveEvent(self, e) -> None:  # noqa: N802
+        if e.mimeData().hasFormat(CHIP_MIME_TYPE):
+            e.acceptProposedAction()
+
+    def dropEvent(self, e) -> None:  # noqa: N802
+        md = e.mimeData()
+        if not md.hasFormat(CHIP_MIME_TYPE):
+            e.ignore()
+            return
+        try:
+            payload = bytes(md.data(CHIP_MIME_TYPE)).decode("utf-8")
+            src_sym, src_sec = payload.split("|", 1)
+        except (UnicodeDecodeError, ValueError):
+            e.ignore()
+            return
+        if src_sec != self._sec_type or src_sym == self._sym:
+            e.ignore()
+            return
+        e.acceptProposedAction()
+        if self._on_drop is not None:
+            self._on_drop(src_sym, self._sym)
+
+
 class SymbolChipBar(QWidget):
     """Grid of symbol chips, arranged STK rows on top, FUT rows underneath.
 
     Host calls ``set_symbols`` after loading the persisted symbol list; the
     widget rebuilds the chip grid.  Left-click a chip → ``symbol_selected``;
-    right-click → ``symbol_remove_requested``.  The widget does NOT persist
-    the list or trigger subscriptions; that's the host's job.
+    right-click → ``symbol_remove_requested``.  Drag a chip onto another
+    chip in the same sec-type group → ``symbols_reordered`` with the new
+    symbol order.  The widget does NOT persist the list or trigger
+    subscriptions; that's the host's job.
     """
 
     symbol_selected = Signal(str, str)       # (symbol, sec_type)
     symbol_remove_requested = Signal(str)    # symbol
+    symbols_reordered = Signal(list)         # list[str] — new symbol order
 
     _CHIP_HEIGHT = 28
 
@@ -340,23 +440,23 @@ class SymbolChipBar(QWidget):
         fut = fut[:cap]
 
         row = 0
-        for i, (sym, _sec) in enumerate(stk):
+        for i, (sym, sec) in enumerate(stk):
             r = row + i // self._columns
             c = i % self._columns
-            self._grid.addWidget(self._make_chip(sym), r, c)
+            self._grid.addWidget(self._make_chip(sym, sec), r, c)
         if stk:
             row += (len(stk) - 1) // self._columns + 1
 
-        for i, (sym, _sec) in enumerate(fut):
+        for i, (sym, sec) in enumerate(fut):
             r = row + i // self._columns
             c = i % self._columns
-            self._grid.addWidget(self._make_chip(sym), r, c)
+            self._grid.addWidget(self._make_chip(sym, sec), r, c)
 
         # Apply active highlight after chips are built.
         self.set_active(self._active)
 
-    def _make_chip(self, sym: str) -> QPushButton:
-        btn = QPushButton(sym)
+    def _make_chip(self, sym: str, sec_type: str) -> QPushButton:
+        btn = DraggableChip(sym, sec_type, self._on_drop)
         btn.setFixedHeight(self._CHIP_HEIGHT)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         _apply_chip_style(btn, sym == self._active)
@@ -372,6 +472,25 @@ class SymbolChipBar(QWidget):
             (sec for (s, sec) in self._entries if s == sym), "")
         self.set_active(sym)
         self.symbol_selected.emit(sym, sec)
+
+    def _on_drop(self, src_sym: str, dst_sym: str) -> None:
+        """Move *src_sym* immediately before *dst_sym* in the entry list
+        and emit ``symbols_reordered`` with the new order.  Same-group
+        enforcement is already handled by DraggableChip — we trust the
+        callback payload here."""
+        entries = list(self._entries)
+        src_entry = next((e for e in entries if e[0] == src_sym), None)
+        if src_entry is None:
+            return
+        entries.remove(src_entry)
+        try:
+            dst_idx = next(i for i, (s, _) in enumerate(entries) if s == dst_sym)
+        except StopIteration:
+            return
+        entries.insert(dst_idx, src_entry)
+        self._entries = entries
+        self._rebuild_grid()
+        self.symbols_reordered.emit([s for (s, _) in entries])
 
 
 # ══════════════════════════════════════════════════════════════════════════════

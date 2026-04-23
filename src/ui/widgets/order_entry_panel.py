@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.core import config_manager
+from src.ui.widgets.order_panel_parts import DraggableChip
 
 log = logging.getLogger(__name__)
 
@@ -1494,8 +1495,6 @@ class OrderEntryPanel(QWidget):
         self._combo.hide()
         self._refresh_combo_items()
 
-        root.addSpacing(8)
-
         # ── Symbol toggle buttons (grid: 6 cols, STK rows then FUT rows) ────────
         self._sym_grid = QGridLayout()
         self._sym_grid.setSpacing(4)
@@ -1854,7 +1853,7 @@ class OrderEntryPanel(QWidget):
         for i, sym in enumerate(stk_syms):
             r = row + i // self._CHIP_COLS
             c = i % self._CHIP_COLS
-            btn = self._make_chip(sym)
+            btn = self._make_chip(sym, "STK")
             self._sym_grid.addWidget(btn, r, c)
         if stk_syms:
             row += (len(stk_syms) - 1) // self._CHIP_COLS + 1
@@ -1863,14 +1862,14 @@ class OrderEntryPanel(QWidget):
         for i, sym in enumerate(fut_syms):
             r = row + i // self._CHIP_COLS
             c = i % self._CHIP_COLS
-            btn = self._make_chip(sym)
+            btn = self._make_chip(sym, "FUT")
             self._sym_grid.addWidget(btn, r, c)
 
         self._update_symbol_display()
 
-    def _make_chip(self, sym: str) -> QPushButton:
-        """Create a symbol chip button."""
-        btn = QPushButton(sym)
+    def _make_chip(self, sym: str, sec_type: str) -> QPushButton:
+        """Create a symbol chip button (draggable within its own group)."""
+        btn = DraggableChip(sym, sec_type, self._on_chip_drop)
         btn.setFixedHeight(self._CHIP_HEIGHT)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         _apply_chip_style(btn, sym == self._active_symbol)
@@ -1881,6 +1880,23 @@ class OrderEntryPanel(QWidget):
         )
         self._sym_buttons[sym] = btn
         return btn
+
+    def _on_chip_drop(self, src_sym: str, dst_sym: str) -> None:
+        """Move *src_sym* immediately before *dst_sym* in self._symbols,
+        persist, and rebuild the grid.  DraggableChip already enforces the
+        same-group constraint, so STK chips stay in the STK rows and FUT
+        chips stay in the FUT rows after rebuild."""
+        if src_sym not in self._symbols or dst_sym not in self._symbols:
+            return
+        syms = list(self._symbols)
+        syms.remove(src_sym)
+        dst_idx = syms.index(dst_sym)
+        syms.insert(dst_idx, src_sym)
+        if syms == self._symbols:
+            return
+        self._symbols = syms
+        config_manager.save_order_entry_symbols(self._symbols)
+        self._rebuild_symbol_buttons()
 
     def _on_symbol_clicked(self, sym: str) -> None:
         self._active_symbol = sym

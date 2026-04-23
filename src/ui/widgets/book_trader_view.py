@@ -223,6 +223,8 @@ class BookTraderView(QWidget):
             [(s, _sec_type_for(s)) for s in self._symbols])
         root.addWidget(self._chip_bar)
 
+        root.addSpacing(12)
+
         # ── Qty chip row ──────────────────────────────────────────────────────
         self._qty_row = QtyChipRow()
         presets, default, popup = _presets_for_sec(self._active_sec_type)
@@ -344,9 +346,10 @@ class BookTraderView(QWidget):
         # Ticker strip "+" button → our searchable add-symbol popup.
         self._ticker.add_symbol_clicked.connect(self._show_add_symbol_popup)
 
-        # Symbol chip clicks / removes.
+        # Symbol chip clicks / removes / drag-reorder.
         self._chip_bar.symbol_selected.connect(self._on_symbol_selected)
         self._chip_bar.symbol_remove_requested.connect(self._on_symbol_remove)
+        self._chip_bar.symbols_reordered.connect(self._on_symbols_reordered)
 
         # Qty changes → sync tier sections.
         self._qty_row.qty_changed.connect(self._on_qty_changed)
@@ -627,6 +630,15 @@ class BookTraderView(QWidget):
         self._refresh_ladder_orders()
 
         self.active_symbol_changed.emit(sym)
+
+    def _on_symbols_reordered(self, new_order: list[str]) -> None:
+        """Chip bar finished a drag-reorder — sync our cached list and
+        persist.  Same-group enforcement is handled by the chip widget."""
+        # Preserve any symbols not present in the reordered list (defensive;
+        # the chip bar should always emit the full list).
+        self._symbols = list(new_order) + [
+            s for s in self._symbols if s not in new_order]
+        config_manager.save_order_entry_symbols(self._symbols)
 
     def _on_symbol_remove(self, sym: str) -> None:
         """Right-click on a chip — remove it from the bar (and the
