@@ -240,6 +240,56 @@ def save_active_order_entry_symbol(
     log.debug("Saved active order-entry symbol %r to %s", symbol, p)
 
 
+# ── Book Trader symbol list persistence ───────────────────────────────────────
+
+
+def load_book_trader_symbols(path: Path | str | None = None) -> list[str]:
+    """Load the list of symbols pinned to the Book Trader panel.
+
+    The Book Trader panel keeps its own chip list independent of the
+    Trade (Order Entry) panel.  On first launch (no ``book_trader_symbols``
+    key in config), seed from the existing Order Entry list so upgrading
+    users don't lose their chips; if that's also empty, default to ``["MNQ"]``.
+    """
+    p = Path(path) if path else _default_path()
+    data = _read_json(p)
+    if "book_trader_symbols" in data:
+        return list(data.get("book_trader_symbols", []))
+    seeded = list(data.get("order_entry_symbols", []))
+    return seeded if seeded else ["MNQ"]
+
+
+def save_book_trader_symbols(
+    symbols: list[str],
+    path: Path | str | None = None,
+) -> None:
+    """Persist Book Trader symbol list. Merges with existing config."""
+    p = Path(path) if path else _default_path()
+    data = _read_json(p)
+    data["book_trader_symbols"] = symbols
+    _write_json(p, data)
+    log.debug("Saved %d book-trader symbol(s) to %s", len(symbols), p)
+
+
+def load_book_trader_active_symbol(path: Path | str | None = None) -> str:
+    """Return the last-active symbol in the Book Trader panel, or ``""``."""
+    p = Path(path) if path else _default_path()
+    data = _read_json(p)
+    return str(data.get("book_trader_active_symbol", ""))
+
+
+def save_book_trader_active_symbol(
+    symbol: str,
+    path: Path | str | None = None,
+) -> None:
+    """Persist the currently-active Book Trader symbol."""
+    p = Path(path) if path else _default_path()
+    data = _read_json(p)
+    data["book_trader_active_symbol"] = symbol
+    _write_json(p, data)
+    log.debug("Saved active book-trader symbol %r to %s", symbol, p)
+
+
 # ── Account-list panel state persistence ──────────────────────────────────────
 
 

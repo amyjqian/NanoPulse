@@ -139,9 +139,13 @@ class BookTraderView(QWidget):
             active_threads if active_threads is not None else {})
 
         # State
-        self._symbols: list[str] = config_manager.load_order_entry_symbols()
-        self._active_symbol: str | None = (
-            self._symbols[0] if self._symbols else None)
+        self._symbols: list[str] = config_manager.load_book_trader_symbols()
+        # Restore last-active symbol; fall back to first saved symbol.
+        _saved_active = config_manager.load_book_trader_active_symbol()
+        if _saved_active and _saved_active in self._symbols:
+            self._active_symbol: str | None = _saved_active
+        else:
+            self._active_symbol = self._symbols[0] if self._symbols else None
         self._active_sec_type: str = (
             _sec_type_for(self._active_symbol) if self._active_symbol else "")
         self._active_qty: int = (
@@ -591,6 +595,7 @@ class BookTraderView(QWidget):
         old = self._active_symbol
         self._active_symbol = sym
         self._active_sec_type = sec_type or _sec_type_for(sym)
+        config_manager.save_book_trader_active_symbol(sym)
         self._ticker.set_symbol(sym)
         self._chip_bar.set_active(sym)
         presets, default, popup = _presets_for_sec(self._active_sec_type)
@@ -638,7 +643,7 @@ class BookTraderView(QWidget):
         # the chip bar should always emit the full list).
         self._symbols = list(new_order) + [
             s for s in self._symbols if s not in new_order]
-        config_manager.save_order_entry_symbols(self._symbols)
+        config_manager.save_book_trader_symbols(self._symbols)
 
     def _on_symbol_remove(self, sym: str) -> None:
         """Right-click on a chip — remove it from the bar (and the
@@ -646,7 +651,7 @@ class BookTraderView(QWidget):
         if sym not in self._symbols:
             return
         self._symbols.remove(sym)
-        config_manager.save_order_entry_symbols(self._symbols)
+        config_manager.save_book_trader_symbols(self._symbols)
         self._chip_bar.set_symbols(
             [(s, _sec_type_for(s)) for s in self._symbols])
         if self._active_symbol == sym:
@@ -657,6 +662,7 @@ class BookTraderView(QWidget):
                     new_active, _sec_type_for(new_active))
             else:
                 self._active_symbol = None
+                config_manager.save_book_trader_active_symbol("")
                 self._ticker.clear()
 
     def _on_qty_changed(self, qty: int) -> None:
@@ -1148,7 +1154,7 @@ class BookTraderView(QWidget):
         if not sym or sym in {s.upper() for s in self._symbols}:
             return
         self._symbols.append(sym)
-        config_manager.save_order_entry_symbols(self._symbols)
+        config_manager.save_book_trader_symbols(self._symbols)
         self._chip_bar.set_symbols(
             [(s, _sec_type_for(s)) for s in self._symbols])
         # Auto-activate the newly added symbol.
