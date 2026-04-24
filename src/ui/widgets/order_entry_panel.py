@@ -2656,7 +2656,13 @@ class OrderEntryPanel(QWidget):
         sym = (self._active_symbol or "").upper()
         close = self._close_cache.get(sym, 0.0) if sym else 0.0
         last = float(self._last_price or 0.0)
-        if not sym or close <= 0 or last <= 0:
+        # Gate the change badges on the price label being populated so
+        # the user never sees a change number hovering above a blank
+        # price/bid/ask row (would happen if a stale ``_last_price``
+        # lingered after a symbol switch while real ticks haven't
+        # arrived yet).
+        if (not sym or close <= 0 or last <= 0
+                or not self._lbl_price.text()):
             self._lbl_change.setText("")
             self._lbl_change_pct.setText("")
             return

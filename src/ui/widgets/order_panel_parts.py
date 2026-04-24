@@ -207,7 +207,12 @@ class TickerStrip(QWidget):
         sym = self._symbol.upper()
         close = self._close
         last = self._last
-        if not sym or close <= 0 or last <= 0:
+        # Gate the change badges on the price label being populated.
+        # If last has been reset (symbol switch, worker disconnect) but
+        # a stale ``_last`` slipped through, we don't want the user to
+        # see a change number floating over an empty price/bid/ask row.
+        if (not sym or close <= 0 or last <= 0
+                or not self._lbl_price.text()):
             self._lbl_change.setText("")
             self._lbl_change_pct.setText("")
             return

@@ -102,7 +102,12 @@ _TITLE_FONT.setWeight(QFont.Weight.Bold)
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _make_btn(text: str, colour: str, min_h: int = 30) -> QPushButton:
-    """Flat action button – identical style to order_entry_panel."""
+    """Flat action button – similar to order_entry_panel but tuned
+    tighter so the 2×3 action grid barely constrains the panel's
+    minimum width.  Horizontal padding and font size are both pulled
+    in step-by-step (orig 11/8, then 10/3, now 8/2) to let the
+    AccountListPanel splitter drag further left without touching the
+    button labels."""
     btn = QPushButton(text)
     btn.setMinimumHeight(min_h)
     btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -113,7 +118,7 @@ def _make_btn(text: str, colour: str, min_h: int = 30) -> QPushButton:
             color: #ffffff;
             border: none;
             border-radius: 4px;
-            padding: 4px 8px;
+            padding: 4px 2px;
             font-weight: bold;
             font-size: 11px;
         }}
@@ -347,12 +352,12 @@ class _GroupPill(QPushButton):
         self.customContextMenuRequested.connect(self._show_menu)
         self.clicked.connect(lambda: self.activated.emit(self._name))
         self.setAcceptDrops(on_drop is not None)
+        # Expand horizontally with the grid column so the pill scales
+        # with the panel width rather than hugging its text.
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         _apply_filter_chip_style(self, False)
 
-    def set_count(self, count: int) -> None:
-        """Render the pill as ``"<name> <count>"`` so the user can see
-        at a glance how many accounts are selected inside this group."""
-        self.setText(f"{self._name} {int(count)}")
 
     @property
     def group_name(self) -> str:
@@ -636,7 +641,11 @@ class AccountListPanel(QWidget):
         grid = QGridLayout(strip)
         grid.setContentsMargins(0, 0, 0, 0)
         grid.setSpacing(4)
-        grid.setColumnStretch(_GROUP_COLS, 1)
+        # Equal stretch on every column so the pills divide the
+        # available width evenly and grow / shrink with the panel
+        # instead of hugging their content size.
+        for c in range(_GROUP_COLS):
+            grid.setColumnStretch(c, 1)
         self._pills_layout = grid
         self._pills_container = strip
 
@@ -644,6 +653,8 @@ class AccountListPanel(QWidget):
         self._all_pill = QPushButton("All")
         self._all_pill.setCursor(Qt.CursorShape.PointingHandCursor)
         self._all_pill.setToolTip("Select every account.")
+        self._all_pill.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         _apply_filter_chip_style(self._all_pill, False)
         self._all_pill.clicked.connect(
             lambda: self._select_default_group("All"))
@@ -652,6 +663,8 @@ class AccountListPanel(QWidget):
         self._none_pill = QPushButton("None")
         self._none_pill.setCursor(Qt.CursorShape.PointingHandCursor)
         self._none_pill.setToolTip("Deselect every account.")
+        self._none_pill.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         _apply_filter_chip_style(self._none_pill, False)
         self._none_pill.clicked.connect(
             lambda: self._select_default_group("None"))
@@ -688,27 +701,6 @@ class AccountListPanel(QWidget):
             pill.set_active(name == self._active_group)
             self._pills_layout.addWidget(pill, row, col)
             self._group_pills[name] = pill
-        self._refresh_pill_counts()
-
-    def _refresh_pill_counts(self) -> None:
-        """Re-render every pill's label as ``"<name> <count>"``.
-
-          * ``All``    → total model accounts (what clicking it would select).
-          * ``None``   → 0.
-          * user pill  → ``len(group["selected"])``.
-
-        Called after any group mutation or account-set change so the
-        badges stay in sync with what's actually checked.
-        """
-        total = self._model.account_count() if self._model is not None else 0
-        if self._all_pill is not None:
-            self._all_pill.setText(f"All {total}")
-        if self._none_pill is not None:
-            self._none_pill.setText("None 0")
-        for g in self._groups:
-            pill = self._group_pills.get(g["name"])
-            if pill is not None:
-                pill.set_count(len(g.get("selected", [])))
 
     def _on_group_drop(self, src_name: str, dst_name: str) -> None:
         """Pill ``src_name`` was dropped onto ``dst_name`` — reorder
@@ -1047,9 +1039,6 @@ class AccountListPanel(QWidget):
 
     def _on_rows_changed(self, *args) -> None:
         self._sync_rows()
-        # "All" pill label depends on the total account count, which
-        # just changed — refresh the badges.
-        self._refresh_pill_counts()
         self._emit_selection_changed()
 
     def _on_row_toggled(self, account: str, checked: bool) -> None:
@@ -1070,10 +1059,6 @@ class AccountListPanel(QWidget):
                     selected = [a for a in selected if a != account]
                 g["selected"] = selected
                 config_manager.save_account_groups(self._groups)
-                # Pill badge tracks ``len(selected)`` so it needs to
-                # refresh every time the user group's check state
-                # shifts.
-                self._refresh_pill_counts()
         else:
             # No user group active (or one of All / None) — fall back
             # to the global ``_unchecked`` tracking which survives
@@ -1138,11 +1123,6 @@ class AccountListPanel(QWidget):
         config_manager.save_account_groups(self._groups)
         if pills_need_rebuild:
             self._rebuild_pills()
-        else:
-            # Group still exists but its ``selected`` shrank — refresh
-            # the count badge.  (``_rebuild_pills`` already does this
-            # in the empty-group branch above.)
-            self._refresh_pill_counts()
 
         # Re-sync rows: when the group still exists the deleted account
         # is no longer a member and its row is dropped; when the group
@@ -1175,7 +1155,6 @@ class AccountListPanel(QWidget):
                     selected.append(acct)
                     g["selected"] = selected
                 config_manager.save_account_groups(self._groups)
-                self._refresh_pill_counts()
         else:
             # No user group active — make sure the freshly-visible row
             # starts checked by removing it from the global _unchecked.
