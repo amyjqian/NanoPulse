@@ -137,6 +137,12 @@ class AccountsTableModel(QAbstractTableModel):
                 return self._format_financial(raw)
             return raw
 
+        if role == Qt.ItemDataRole.EditRole:
+            # When Qt opens the inline editor for the Alias column, it asks
+            # for EditRole — return the current text so the user can modify
+            # it instead of starting from an empty field.
+            return raw
+
         if role == Qt.ItemDataRole.TextAlignmentRole:
             if col in _FINANCIAL_COLS:
                 return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)

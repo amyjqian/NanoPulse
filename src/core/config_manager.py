@@ -336,10 +336,12 @@ def load_account_groups(
 ) -> list[dict[str, Any]]:
     """Load named account groups for the Accounts panel's quick-select
     pills.  Returns an ordered list of ``{"name": str, "accounts":
-    list[str]}`` dicts.  Invalid entries (non-string names, empty
-    account lists, duplicate names) are dropped silently — the UI
-    rebuilds persistence on every mutation so a corrupt entry won't
-    round-trip."""
+    list[str], "selected": list[str] | None}`` dicts.  ``selected`` is
+    the per-group checked subset (absent in legacy configs — the UI
+    migrates those to ``selected = accounts``).  Invalid entries
+    (non-string names, empty account lists, duplicate names) are
+    dropped silently — the UI rebuilds persistence on every mutation
+    so a corrupt entry won't round-trip."""
     p = Path(path) if path else _default_path()
     data = _read_json(p)
     raw = data.get("account_groups", [])
@@ -361,7 +363,15 @@ def load_account_groups(
         acct_list = [str(a) for a in accounts if isinstance(a, str) and a]
         if not acct_list:
             continue
-        cleaned.append({"name": name, "accounts": acct_list})
+        out: dict[str, Any] = {"name": name, "accounts": acct_list}
+        sel = entry.get("selected")
+        if isinstance(sel, list):
+            # Keep only strings that are actual members.
+            out["selected"] = [
+                str(a) for a in sel
+                if isinstance(a, str) and a in acct_list
+            ]
+        cleaned.append(out)
         seen.add(name)
     return cleaned
 
@@ -371,16 +381,49 @@ def save_account_groups(
     path: Path | str | None = None,
 ) -> None:
     """Persist named account groups.  Order is preserved — the caller
-    controls pill order in the Accounts panel."""
+    controls pill order in the Accounts panel.  Each group's
+    ``selected`` list (the per-group checked subset) is written when
+    present so check-state survives a restart."""
     p = Path(path) if path else _default_path()
     data = _read_json(p)
-    data["account_groups"] = [
-        {"name": g["name"], "accounts": list(g.get("accounts", []))}
-        for g in groups
-        if isinstance(g, dict) and g.get("name")
-    ]
+    serialised: list[dict[str, Any]] = []
+    for g in groups:
+        if not (isinstance(g, dict) and g.get("name")):
+            continue
+        entry: dict[str, Any] = {
+            "name": g["name"],
+            "accounts": list(g.get("accounts", [])),
+        }
+        if "selected" in g and isinstance(g["selected"], list):
+            entry["selected"] = list(g["selected"])
+        serialised.append(entry)
+    data["account_groups"] = serialised
     _write_json(p, data)
-    log.debug("Saved %d account group(s) to %s", len(data["account_groups"]), p)
+    log.debug("Saved %d account group(s) to %s", len(serialised), p)
+
+
+def load_last_account_group(path: Path | str | None = None) -> str:
+    """Return the name of the last-active account group, or ``""``
+    when nothing has been persisted yet.  ``"All"`` and ``"None"`` are
+    valid values (the built-in quick-select pills) alongside any
+    user-defined group name."""
+    p = Path(path) if path else _default_path()
+    data = _read_json(p)
+    name = data.get("last_account_group", "")
+    return str(name) if isinstance(name, str) else ""
+
+
+def save_last_account_group(
+    name: str | None,
+    path: Path | str | None = None,
+) -> None:
+    """Persist the currently-active account group so the next launch
+    can restore it.  ``None`` or ``""`` clears the preference."""
+    p = Path(path) if path else _default_path()
+    data = _read_json(p)
+    data["last_account_group"] = str(name) if name else ""
+    _write_json(p, data)
+    log.debug("Saved last active account group %r to %s", name, p)
 
 
 # ── Preferences persistence ──────────────────────────────────────────────────
