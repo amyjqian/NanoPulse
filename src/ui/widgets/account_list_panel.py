@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import Qt, Signal, QModelIndex, QRect, QTimer
-from PySide6.QtGui import QFont, QPainter, QPen, QColor, QPainterPath
+from PySide6.QtCore import Qt, Signal, QMimeData, QModelIndex, QRect, QTimer
+from PySide6.QtGui import QDrag, QFont, QPainter, QPen, QColor, QPainterPath
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QFrame,
     QGridLayout,
@@ -78,13 +79,35 @@ def _apply_filter_chip_style(btn: QPushButton, selected: bool) -> None:
             "QPushButton:hover{background:" + _CHIP_IDLE_HOVER + "}")
 
 _TITLE_FONT = QFont("Helvetica Neue, Arial", 11)
+
+# Group-pill grid layout: 3 rows × 4 columns.  The first two slots
+# (row 0, cols 0 and 1) are reserved for the built-in All / None
+# quick-select pills, so user-defined groups get the remaining 10.
+_GROUP_COLS = 4
+_GROUP_ROWS = 3
+_GROUP_DEFAULT_SLOTS = 2
+_GROUP_MAX = _GROUP_COLS * _GROUP_ROWS - _GROUP_DEFAULT_SLOTS
+
+# MIME type for drag-to-reorder of trading-group pills.
+_GROUP_MIME = "application/x-nanopulse-group"
+
+# Built-in quick-select groups rendered in the panel header.  Their
+# names are reserved — user-defined groups may not shadow them.
+# "All"  → every model account, every row checked.
+# "None" → every model account, every row unchecked.
+_DEFAULT_GROUPS: tuple[str, ...] = ("All", "None")
 _TITLE_FONT.setWeight(QFont.Weight.Bold)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _make_btn(text: str, colour: str, min_h: int = 30) -> QPushButton:
-    """Flat action button – identical style to order_entry_panel."""
+    """Flat action button – similar to order_entry_panel but tuned
+    tighter so the 2×3 action grid barely constrains the panel's
+    minimum width.  Horizontal padding and font size are both pulled
+    in step-by-step (orig 11/8, then 10/3, now 8/2) to let the
+    AccountListPanel splitter drag further left without touching the
+    button labels."""
     btn = QPushButton(text)
     btn.setMinimumHeight(min_h)
     btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -95,7 +118,7 @@ def _make_btn(text: str, colour: str, min_h: int = 30) -> QPushButton:
             color: #ffffff;
             border: none;
             border-radius: 4px;
-            padding: 4px 8px;
+            padding: 4px 2px;
             font-weight: bold;
             font-size: 11px;
         }}
@@ -307,6 +330,8 @@ class _GroupPill(QPushButton):
 
     Left-click = activate group (emits ``activated``).
     Right-click = open a small context menu with Rename / Delete.
+    Left-click + drag = reorder pills (invokes host-supplied ``on_drop``,
+    mirroring the ``DraggableChip`` pattern in ``order_panel_parts.py``).
 
     Group membership auto-updates from individual checkbox toggles
     while the pill is active; there is no explicit "Update" action.
@@ -316,15 +341,23 @@ class _GroupPill(QPushButton):
     rename_requested = Signal(str)
     delete_requested = Signal(str)
 
-    def __init__(self, name: str, parent=None):
+    def __init__(self, name: str, parent=None, *, on_drop=None):
         super().__init__(name, parent)
         self._name = name
         self._active = False
+        self._on_drop = on_drop
+        self._press_pos = None
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_menu)
         self.clicked.connect(lambda: self.activated.emit(self._name))
+        self.setAcceptDrops(on_drop is not None)
+        # Expand horizontally with the grid column so the pill scales
+        # with the panel width rather than hugging its text.
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         _apply_filter_chip_style(self, False)
+
 
     @property
     def group_name(self) -> str:
@@ -350,6 +383,56 @@ class _GroupPill(QPushButton):
         elif chosen is delete_act:
             self.delete_requested.emit(self._name)
 
+    # ── Drag-to-reorder ──────────────────────────────────────────────────────
+
+    def mousePressEvent(self, event):  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._press_pos = event.pos()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):  # noqa: N802
+        if (self._on_drop is not None
+                and self._press_pos is not None
+                and (event.buttons() & Qt.MouseButton.LeftButton)
+                and (event.pos() - self._press_pos).manhattanLength()
+                >= QApplication.startDragDistance()):
+            self._press_pos = None
+            drag = QDrag(self)
+            mime = QMimeData()
+            mime.setData(_GROUP_MIME, self._name.encode("utf-8"))
+            drag.setMimeData(mime)
+            drag.exec(Qt.DropAction.MoveAction)
+            return
+        super().mouseMoveEvent(event)
+
+    def dragEnterEvent(self, event):  # noqa: N802
+        if (event.mimeData().hasFormat(_GROUP_MIME)
+                and event.source() is not self):
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):  # noqa: N802
+        if (event.mimeData().hasFormat(_GROUP_MIME)
+                and event.source() is not self):
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event):  # noqa: N802
+        mime = event.mimeData()
+        if not (mime.hasFormat(_GROUP_MIME) and event.source() is not self):
+            super().dropEvent(event)
+            return
+        try:
+            src = bytes(mime.data(_GROUP_MIME)).decode("utf-8")
+        except UnicodeDecodeError:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        if self._on_drop is not None and src and src != self._name:
+            self._on_drop(src, self._name)
+
 
 # ── Main Panel ────────────────────────────────────────────────────────────────
 
@@ -374,16 +457,23 @@ class AccountListPanel(QWidget):
             config_manager.load_unchecked_accounts())
         self._hidden: set[str] = set(config_manager.load_hidden_accounts())
         # Named groups persisted to app_config.json.  List (not dict)
-        # to preserve pill order in the filter strip.
+        # to preserve pill order in the filter strip.  Each group dict
+        # is ``{name, accounts, selected}`` — ``accounts`` is the full
+        # member set, ``selected`` is the subset currently checked
+        # while the group is active.  Legacy configs lacking
+        # ``selected`` are migrated to ``selected = accounts`` so the
+        # prior "every member checked" behavior is preserved.
         self._groups: list[dict] = config_manager.load_account_groups()
+        for _g in self._groups:
+            if "selected" not in _g:
+                _g["selected"] = list(_g.get("accounts", []))
         self._active_group: str | None = None
-        # Suppresses the "manual toggle clears active group" behaviour
-        # while we drive the checkbox state from _select_group itself.
-        self._suspend_active_group_clear: bool = False
         self._group_pills: dict[str, _GroupPill] = {}
-        # Built-in All / None chips — set during _build_filter_strip.
-        self._all_chip: QPushButton | None = None
-        self._none_chip: QPushButton | None = None
+        # Built-in header pills.  Initialised during _setup_ui; the
+        # ``is not None`` guards in _set_active_group cope with the
+        # brief window before then.
+        self._all_pill: QPushButton | None = None
+        self._none_pill: QPushButton | None = None
         # One-shot flag: auto-activate the "Alph" trading group on
         # startup once the first batch of accounts has populated.
         # Not re-applied after the user switches away mid-session.
@@ -396,10 +486,6 @@ class AccountListPanel(QWidget):
         self._model.rowsRemoved.connect(self._on_rows_changed)
 
         self._sync_rows()
-        # _sync_rows doesn't run through _emit_selection_changed in
-        # this init path; refresh chips so the persisted check state
-        # is reflected on first paint.
-        self._refresh_builtin_chips()
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -417,21 +503,30 @@ class AccountListPanel(QWidget):
         root.setContentsMargins(10, 8, 10, 8)
         root.setSpacing(6)
 
-        # ── Header: title only.  All / None and the group pills live
-        # in the filter strip below so long group lists don't squeeze
-        # the title.  The Account pill in the top bar handles
-        # show/hide; no in-panel close button needed.
+        # ── Header: title (left) + "+" button (right) ────────────────────────
+        # "+" creates a new user-defined group seeded with every
+        # account, all unchecked.  The built-in All / None quick-select
+        # pills live in the first two slots of the 2×5 grid below.
         header = QHBoxLayout()
-        header.setSpacing(0)
+        header.setSpacing(4)
 
         title = QLabel("Account management")
         title.setFont(_TITLE_FONT)
         title.setStyleSheet("color: #ffffff; border: none;")
         header.addWidget(title)
         header.addStretch(1)
+
+        self._add_group_btn = QPushButton("+")
+        self._add_group_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._add_group_btn.setToolTip(
+            "Create a new trading group seeded with every account "
+            "(all unchecked).")
+        _apply_filter_chip_style(self._add_group_btn, False)
+        self._add_group_btn.clicked.connect(self._on_create_group)
+        header.addWidget(self._add_group_btn)
         root.addLayout(header)
 
-        # ── Filter strip: All / None / Mgn · [group pills] · + ────────────────
+        # ── Trading-group chip grid: up to 2 rows × 5 chips ──────────────────
         self._filter_strip = self._build_filter_strip()
         root.addWidget(self._filter_strip)
 
@@ -528,113 +623,121 @@ class AccountListPanel(QWidget):
     # ── Filter strip + group pills ────────────────────────────────────────────
 
     def _build_filter_strip(self) -> QWidget:
-        """Container with [All] [None] · [group chips] · [+] .  Every
-        button is rendered as a chip with the same blue-selected /
-        grey-idle palette as the symbol chips in OrderEntryPanel.
-        The `+` button stays pinned to the right; group chips scroll
-        horizontally when they overflow the panel width."""
+        """Grid container holding the trading-group chips.
+
+        Layout (2 rows × 5 columns):
+          * (0, 0) — built-in ``All``  pill
+          * (0, 1) — built-in ``None`` pill
+          * remaining 8 slots (row 0 cols 2–4, row 1 cols 0–4) — user-
+            defined group pills.  User pills drag-to-reorder among
+            themselves; the defaults always stay in their reserved
+            corner and are not draggable.
+        """
         strip = QWidget()
         strip.setObjectName("filterStrip")
-        strip.setStyleSheet(f"""
-            QWidget#filterStrip {{ background: transparent; border: none; }}
-            QScrollArea#filterScroll {{
-                background: transparent; border: none;
-            }}
-            QScrollArea#filterScroll > QWidget > QWidget {{
-                background: transparent;
-            }}
-            QScrollBar:horizontal {{ background: transparent; height: 4px; }}
-            QScrollBar::handle:horizontal {{
-                background: #3A3E48; border-radius: 2px; min-width: 20px;
-            }}
-            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
-                width: 0;
-            }}
-        """)
+        strip.setStyleSheet(
+            "QWidget#filterStrip { background: transparent; border: none; }")
 
-        lay = QHBoxLayout(strip)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(4)
+        grid = QGridLayout(strip)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(4)
+        # Equal stretch on every column so the pills divide the
+        # available width evenly and grow / shrink with the panel
+        # instead of hugging their content size.
+        for c in range(_GROUP_COLS):
+            grid.setColumnStretch(c, 1)
+        self._pills_layout = grid
+        self._pills_container = strip
 
-        # All / None — chip state mirrors the checked-account set:
-        # ALL goes blue when every visible account is checked, NONE
-        # goes blue when none are.  Updated centrally in
-        # ``_refresh_builtin_chips``.
-        self._all_chip = QPushButton("All")
-        self._all_chip.setCursor(Qt.CursorShape.PointingHandCursor)
-        _apply_filter_chip_style(self._all_chip, False)
-        self._all_chip.clicked.connect(self._select_all)
-        lay.addWidget(self._all_chip)
+        # Built-in All / None pills occupy the first two slots of row 0.
+        self._all_pill = QPushButton("All")
+        self._all_pill.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._all_pill.setToolTip("Select every account.")
+        self._all_pill.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        _apply_filter_chip_style(self._all_pill, False)
+        self._all_pill.clicked.connect(
+            lambda: self._select_default_group("All"))
+        grid.addWidget(self._all_pill, 0, 0)
 
-        self._none_chip = QPushButton("None")
-        self._none_chip.setCursor(Qt.CursorShape.PointingHandCursor)
-        _apply_filter_chip_style(self._none_chip, False)
-        self._none_chip.clicked.connect(self._select_none)
-        lay.addWidget(self._none_chip)
-
-        # Group chips live in their own container so we can rebuild
-        # them without touching All/None/+.
-        self._pills_container = QWidget()
-        self._pills_container.setStyleSheet(
-            "QWidget { background: transparent; border: none; }")
-        self._pills_layout = QHBoxLayout(self._pills_container)
-        self._pills_layout.setContentsMargins(0, 0, 0, 0)
-        self._pills_layout.setSpacing(4)
-
-        scroll = QScrollArea()
-        scroll.setObjectName("filterScroll")
-        scroll.setWidget(self._pills_container)
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        scroll.setVerticalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        # Chip body = font 12 + padding 4×2 ≈ 24 px; reserve a bit more
-        # so the optional 4-px scrollbar fits without cropping.
-        scroll.setFixedHeight(32)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        lay.addWidget(scroll, stretch=1)
-
-        plus = QPushButton("+")
-        plus.setCursor(Qt.CursorShape.PointingHandCursor)
-        plus.setToolTip(
-            "Save the current checked-account selection as a named group.")
-        _apply_filter_chip_style(plus, False)
-        plus.clicked.connect(self._on_create_group)
-        lay.addWidget(plus)
+        self._none_pill = QPushButton("None")
+        self._none_pill.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._none_pill.setToolTip("Deselect every account.")
+        self._none_pill.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        _apply_filter_chip_style(self._none_pill, False)
+        self._none_pill.clicked.connect(
+            lambda: self._select_default_group("None"))
+        grid.addWidget(self._none_pill, 0, 1)
 
         self._rebuild_pills()
         return strip
 
     def _rebuild_pills(self) -> None:
-        """Clear and repopulate the group-pill strip from self._groups.
-        Called after every group mutation (create / rename / delete /
-        update) and during initial setup."""
-        # Detach & delete existing pills.
+        """Clear and repopulate the user-group slots in the pill grid.
+        The first two slots (row 0 cols 0 and 1) host the built-in
+        All / None pills and are never touched by this method.  Only
+        the first ``_GROUP_MAX`` user groups are rendered — creation is
+        capped at that count so overflow is never visible here."""
+        # Detach & delete existing user pills.  Defaults are untouched.
         for pill in self._group_pills.values():
             self._pills_layout.removeWidget(pill)
             pill.deleteLater()
         self._group_pills.clear()
 
-        for group in self._groups:
+        for i, group in enumerate(self._groups[:_GROUP_MAX]):
+            slot = i + _GROUP_DEFAULT_SLOTS
+            row = slot // _GROUP_COLS
+            col = slot % _GROUP_COLS
             name = group["name"]
-            pill = _GroupPill(name, self._pills_container)
+            pill = _GroupPill(
+                name,
+                self._pills_container,
+                on_drop=self._on_group_drop,
+            )
             pill.activated.connect(self._select_group)
             pill.rename_requested.connect(self._rename_group)
             pill.delete_requested.connect(self._delete_group)
             pill.set_active(name == self._active_group)
-            self._pills_layout.addWidget(pill)
+            self._pills_layout.addWidget(pill, row, col)
             self._group_pills[name] = pill
-        self._pills_layout.addStretch(1)
+
+    def _on_group_drop(self, src_name: str, dst_name: str) -> None:
+        """Pill ``src_name`` was dropped onto ``dst_name`` — reorder
+        ``self._groups`` so ``src_name`` lands immediately before
+        ``dst_name``, persist, and rebuild the grid.  Mirrors
+        ``SymbolChipBar._on_drop``.
+        """
+        names = [g["name"] for g in self._groups]
+        if src_name not in names or dst_name not in names:
+            return
+        src_idx = names.index(src_name)
+        moved = self._groups.pop(src_idx)
+        # Destination index must be computed AFTER the pop so the insert
+        # lands immediately before the drop target in the new list.
+        dst_idx = next(
+            i for i, g in enumerate(self._groups) if g["name"] == dst_name)
+        self._groups.insert(dst_idx, moved)
+        config_manager.save_account_groups(self._groups)
+        self._rebuild_pills()
+        log.info("AccountList: reordered group %r before %r",
+                 src_name, dst_name)
 
     def _set_active_group(self, name: str | None) -> None:
-        """Update `_active_group`, refresh pill visual state, and emit
-        the signal only when the value actually changes."""
+        """Update `_active_group`, refresh pill visual state, persist
+        the new value so the next launch can restore it, and emit the
+        signal.  Covers both user-defined pills and the built-in All /
+        None pills."""
         if name == self._active_group:
             return
         self._active_group = name
         for pill_name, pill in self._group_pills.items():
             pill.set_active(pill_name == name)
+        if self._all_pill is not None:
+            _apply_filter_chip_style(self._all_pill, name == "All")
+        if self._none_pill is not None:
+            _apply_filter_chip_style(self._none_pill, name == "None")
+        config_manager.save_last_account_group(name)
         self.active_group_changed.emit(name)
 
     def _find_group(self, name: str) -> dict | None:
@@ -646,29 +749,57 @@ class AccountListPanel(QWidget):
     # ── Group CRUD ────────────────────────────────────────────────────────────
 
     def _on_create_group(self) -> None:
-        current = self.get_checked_accounts()
-        if not current:
+        if len(self._groups) >= _GROUP_MAX:
             QMessageBox.information(
-                self, "No accounts selected",
-                "Check at least one account first, then click "
-                "‘+’ to save the selection as a group.")
+                self, "Group limit reached",
+                f"The trading-group grid holds at most {_GROUP_MAX} "
+                f"user-defined groups (the first two slots are reserved "
+                "for the built-in All and None pills).  "
+                "Delete an existing group before creating a new one.")
             return
+        # Seed the new group with every account currently known to the
+        # model.  The user then checks the ones they actually want
+        # selected (or clicks × to drop an account from the group
+        # entirely) — see ``_on_row_toggled`` and the × button for the
+        # two kinds of mutation.
+        all_accounts = sorted(
+            rd[COL_ACCOUNT] for rd in self._model._table_data
+            if rd[COL_ACCOUNT]
+        )
         name = self._ask_group_name(
             "New account group",
-            f"Name this group ({len(current)} account(s)):",
+            f"Name this group ({len(all_accounts)} account(s)):",
             "")
         if not name:
+            return
+        if name in _DEFAULT_GROUPS:
+            QMessageBox.warning(
+                self, "Reserved name",
+                f"‘{name}’ is a built-in quick-select group — "
+                "pick a different name.")
             return
         if self._find_group(name) is not None:
             QMessageBox.warning(self, "Name in use",
                                 f"A group named ‘{name}’ already exists.")
             return
-        self._groups.append({"name": name, "accounts": sorted(current)})
+        # New group: every account is a member, none are selected.
+        # The user then checks the ones they want (updates ``selected``)
+        # and optionally clicks × to trim membership (``accounts``).
+        self._groups.append(
+            {"name": name, "accounts": all_accounts, "selected": []})
         config_manager.save_account_groups(self._groups)
         self._rebuild_pills()
         self._set_active_group(name)
-        log.info("AccountList: created group %r with %d account(s)",
-                 name, len(current))
+        self._sync_rows()
+        # _sync_rows only updates alias/balance on rows that already
+        # exist — it doesn't touch their check state.  Apply the fresh
+        # (all-unchecked) state explicitly so every visible row flips
+        # in a single pass.
+        for acct, r in self._account_rows.items():
+            r.set_checked(self._is_account_checked(acct))
+        self._emit_selection_changed()
+        log.info("AccountList: created group %r seeded with %d account(s) "
+                 "(all unchecked)", name, len(all_accounts))
 
     def _ask_group_name(self, title: str, label: str,
                         initial: str) -> str:
@@ -711,6 +842,12 @@ class AccountListPanel(QWidget):
         new_name = new_name.strip()
         if not new_name or new_name == old_name:
             return
+        if new_name in _DEFAULT_GROUPS:
+            QMessageBox.warning(
+                self, "Reserved name",
+                f"‘{new_name}’ is a built-in quick-select group — "
+                "pick a different name.")
+            return
         if self._find_group(new_name) is not None:
             QMessageBox.warning(self, "Name in use",
                                 f"A group named ‘{new_name}’ already exists.")
@@ -736,12 +873,15 @@ class AccountListPanel(QWidget):
             QMessageBox.StandardButton.Cancel)
         if ans != QMessageBox.StandardButton.Yes:
             return
+        was_active = self._active_group == name
         self._groups = [g for g in self._groups if g["name"] != name]
         config_manager.save_account_groups(self._groups)
-        if self._active_group == name:
+        if was_active:
             # Selection itself is preserved; only the active-group
-            # indicator clears.
+            # indicator clears.  Re-sync rows so the list falls back to
+            # the all-accounts view (it was filtered to this group).
             self._set_active_group(None)
+            self._sync_rows()
         self._rebuild_pills()
         log.info("AccountList: deleted group %r", name)
 
@@ -754,7 +894,16 @@ class AccountListPanel(QWidget):
     # ── Model synchronisation ─────────────────────────────────────────────────
 
     def _sync_rows(self) -> None:
-        """Rebuild / update account rows from the model."""
+        """Rebuild / update account rows from the model.
+
+        Visibility rules:
+          * always hide accounts in ``self._hidden`` (global hide list)
+          * when a trading group is active, show only that group's
+            members — the list IS the group.  Scoped-delete via the ×
+            button drops an account from the active group; the row
+            disappears here because the account is no longer a member.
+          * when no group is active, show every non-hidden account.
+        """
         model_accounts: dict[str, dict] = {}
         for row_data in self._model._table_data:
             acct = row_data[COL_ACCOUNT]
@@ -765,10 +914,25 @@ class AccountListPanel(QWidget):
                     "type": row_data[COL_TYPE],
                 }
 
-        # Add new / update existing — skip hidden accounts
-        for acct, info in model_accounts.items():
-            if acct in self._hidden:
-                continue
+        # Compute the set of accounts that should have a visible row.
+        # Built-in All / None groups and the no-group view honor the
+        # ``_hidden`` set (× hides the account from the default views).
+        # User-defined groups ignore ``_hidden`` — an account that's
+        # been hidden from All is still a member of any group that
+        # includes it, and becomes visible again when the user
+        # activates that group.
+        if self._active_group in _DEFAULT_GROUPS:
+            visible = {a for a in model_accounts if a not in self._hidden}
+        elif self._active_group is not None:
+            g = self._find_group(self._active_group)
+            group_members = set(g.get("accounts", [])) if g else set()
+            visible = {a for a in model_accounts if a in group_members}
+        else:
+            visible = {a for a in model_accounts if a not in self._hidden}
+
+        # Add new / update existing.
+        for acct in visible:
+            info = model_accounts[acct]
             if acct not in self._account_rows:
                 self._add_account_row(
                     acct, info["alias"], info["balance"], info["type"])
@@ -777,8 +941,10 @@ class AccountListPanel(QWidget):
                 r.set_name(info["alias"] if info["alias"] else acct)
                 r.set_balance(info["balance"])
 
-        # Remove stale
-        for acct in [a for a in self._account_rows if a not in model_accounts]:
+        # Remove rows whose account should no longer be visible (either
+        # missing from the model entirely or filtered out by the active
+        # group).
+        for acct in [a for a in self._account_rows if a not in visible]:
             self._remove_account_row(acct)
 
         self._refresh_add_combo(model_accounts)
@@ -786,11 +952,10 @@ class AccountListPanel(QWidget):
         self._maybe_apply_default_group()
 
     def _maybe_apply_default_group(self) -> None:
-        """One-shot: auto-activate the ``Alph`` trading group on
-        startup once the first batch of accounts populates the
-        panel.  Match is case-insensitive so ``Alph`` / ``alph`` /
-        ``ALPH`` all qualify.  Subsequent sync calls are no-ops so
-        the user is free to switch groups mid-session."""
+        """One-shot: restore the last-active group on startup (or the
+        built-in ``None`` pill on first launch) once the first batch
+        of accounts populates the panel.  Subsequent sync calls are
+        no-ops so the user is free to switch groups mid-session."""
         if self._default_group_applied:
             return
         if not self._account_rows:
@@ -798,31 +963,29 @@ class AccountListPanel(QWidget):
             # arrive a tick or two after the panel is constructed.
             return
         self._default_group_applied = True
-        target = next((g["name"] for g in self._groups
-                       if g["name"].lower() == "alph"), None)
-        if target is not None:
-            log.info("AccountList: applying default group %r on startup",
-                     target)
-            self._select_group(target)
+
+        last = config_manager.load_last_account_group()
+        if last in _DEFAULT_GROUPS:
+            log.info("AccountList: restoring last-active default group %r",
+                     last)
+            self._select_default_group(last)
+            return
+        if last and self._find_group(last) is not None:
+            log.info("AccountList: restoring last-active user group %r", last)
+            self._select_group(last)
+            return
+        # First launch (or the saved name vanished): default to "None"
+        # — every account visible, none selected.
+        log.info("AccountList: first launch, applying default 'None' group")
+        self._select_default_group("None")
 
     def _add_account_row(self, account: str, alias: str,
                          balance: str, acct_type: str) -> None:
-        # Active-group invariant: when a group is active, every
-        # visible account's check state matches the group's
-        # membership.  A new row arriving mid-session (e.g. an
-        # account joins the worker after Alph was applied) must
-        # honour that — otherwise the newcomer would default to
-        # checked just because it wasn't in the persisted
-        # _unchecked set, and the active group's selection would
-        # silently grow.
-        if self._active_group is not None:
-            g = self._find_group(self._active_group)
-            if g is not None:
-                checked = account in g.get("accounts", [])
-            else:
-                checked = account not in self._unchecked
-        else:
-            checked = account not in self._unchecked
+        # Check state is resolved through _is_account_checked so each
+        # context uses the right source of truth: user group's
+        # ``selected`` list, built-in All / None semantics, or the
+        # global ``_unchecked`` set when no group is active.
+        checked = self._is_account_checked(account)
         row = _AccountRow(account, alias, balance, acct_type, checked=checked)
         row.toggled.connect(self._on_row_toggled)
         row.removed.connect(self._on_row_removed)
@@ -879,57 +1042,95 @@ class AccountListPanel(QWidget):
         self._emit_selection_changed()
 
     def _on_row_toggled(self, account: str, checked: bool) -> None:
-        log.debug("AccountList: %s toggled → %s", account, checked)
-        if checked:
-            self._unchecked.discard(account)
+        log.debug("AccountList: %s toggled → %s (active=%s)",
+                  account, checked, self._active_group)
+        if (self._active_group is not None
+                and self._active_group not in _DEFAULT_GROUPS):
+            # Toggling within a user group updates that group's
+            # ``selected`` subset and persists — membership
+            # (``accounts``) is untouched, so the row stays visible.
+            g = self._find_group(self._active_group)
+            if g is not None:
+                selected = list(g.get("selected", g.get("accounts", [])))
+                if checked:
+                    if account not in selected:
+                        selected.append(account)
+                else:
+                    selected = [a for a in selected if a != account]
+                g["selected"] = selected
+                config_manager.save_account_groups(self._groups)
         else:
-            self._unchecked.add(account)
-        self._persist_selection()
-        # _select_group drives toggles itself; skip the user-edit path
-        # so it doesn't loop / overwrite during programmatic activation.
-        if not self._suspend_active_group_clear and self._active_group is not None:
-            # Active-group auto-update: every check/uncheck rewrites
-            # the active group's membership and persists immediately.
-            # The active group is NEVER swapped for another group whose
-            # membership happens to match — groups are independent
-            # identities, two different groups may legitimately hold
-            # the same set of accounts.
-            current = sorted(self.get_checked_accounts())
-            for g in self._groups:
-                if g["name"] == self._active_group:
-                    g["accounts"] = current
-                    break
-            config_manager.save_account_groups(self._groups)
+            # No user group active (or one of All / None) — fall back
+            # to the global ``_unchecked`` tracking which survives
+            # restarts via ``_persist_selection``.
+            if checked:
+                self._unchecked.discard(account)
+            else:
+                self._unchecked.add(account)
+            self._persist_selection()
         self._emit_selection_changed()
         self._reorder_rows()
 
     def _on_row_removed(self, account: str) -> None:
+        # When a user-defined group is active, the × button scopes to
+        # that group: the account is taken out of the active group
+        # only, every other group is left alone.  Virtual All / None
+        # groups and the no-group view fall through to the "hide from
+        # the default view" path: ``_hidden`` keeps the row out of
+        # those views, but user groups still show the account when
+        # activated (see ``_sync_rows``), so other groups are not
+        # affected.
+        if (self._active_group is not None
+                and self._active_group not in _DEFAULT_GROUPS):
+            self._remove_account_from_active_group(account)
+            return
+
         self._remove_account_row(account)
         self._hidden.add(account)
         self._unchecked.discard(account)
         self._persist_selection()
         self._persist_hidden()
-        # Cascade removal into every saved group; drop groups that
-        # become empty so the pill strip doesn't carry useless entries.
-        groups_changed = False
-        for g in self._groups:
-            if account in g["accounts"]:
-                g["accounts"] = [a for a in g["accounts"] if a != account]
-                groups_changed = True
-        before = len(self._groups)
-        self._groups = [g for g in self._groups if g["accounts"]]
-        if before != len(self._groups):
-            groups_changed = True
-            # Active group may have been dropped — clear the indicator.
-            if (self._active_group is not None
-                    and self._find_group(self._active_group) is None):
-                self._set_active_group(None)
-        if groups_changed:
-            config_manager.save_account_groups(self._groups)
-            self._rebuild_pills()
         self._refresh_add_combo()
         self._emit_selection_changed()
-        log.info("AccountList: user removed %s from visible list", account)
+        log.info("AccountList: %s hidden from default views (groups untouched)",
+                 account)
+
+    def _remove_account_from_active_group(self, account: str) -> None:
+        """Scoped delete: drop *account* from the currently-active group
+        only, leaving every other saved group untouched.  The row is
+        removed from the list because the active-group view shows only
+        group members.  If the group becomes empty, delete it (matching
+        prior behavior) and clear the active indicator so ``_sync_rows``
+        falls back to the all-accounts view."""
+        name = self._active_group
+        g = self._find_group(name) if name else None
+        if g is None:
+            return
+        if account not in g["accounts"]:
+            return
+        g["accounts"] = [a for a in g["accounts"] if a != account]
+        # Keep ``selected`` consistent — a non-member can't be selected.
+        if "selected" in g:
+            g["selected"] = [a for a in g["selected"] if a != account]
+
+        pills_need_rebuild = False
+        if not g["accounts"]:
+            # Empty group — drop it entirely.
+            self._groups = [x for x in self._groups if x is not g]
+            self._set_active_group(None)
+            pills_need_rebuild = True
+
+        config_manager.save_account_groups(self._groups)
+        if pills_need_rebuild:
+            self._rebuild_pills()
+
+        # Re-sync rows: when the group still exists the deleted account
+        # is no longer a member and its row is dropped; when the group
+        # was deleted we fall back to the all-accounts view.
+        self._sync_rows()
+        self._emit_selection_changed()
+        log.info("AccountList: removed %s from group %r (scoped delete)",
+                 account, name)
 
     def _on_add_account(self, index: int) -> None:
         acct = self._add_combo.itemData(index)
@@ -937,6 +1138,30 @@ class AccountListPanel(QWidget):
             return
         self._hidden.discard(acct)
         self._persist_hidden()
+
+        # When a user group is active, adding an account re-joins it
+        # as a checked member of that group.  Persisted alongside the
+        # other group mutations so the change survives a restart.
+        if (self._active_group is not None
+                and self._active_group not in _DEFAULT_GROUPS):
+            g = self._find_group(self._active_group)
+            if g is not None:
+                accounts = list(g.get("accounts", []))
+                if acct not in accounts:
+                    accounts.append(acct)
+                    g["accounts"] = accounts
+                selected = list(g.get("selected", []))
+                if acct not in selected:
+                    selected.append(acct)
+                    g["selected"] = selected
+                config_manager.save_account_groups(self._groups)
+        else:
+            # No user group active — make sure the freshly-visible row
+            # starts checked by removing it from the global _unchecked.
+            if acct in self._unchecked:
+                self._unchecked.discard(acct)
+                self._persist_selection()
+
         for rd in self._model._table_data:
             if rd[COL_ACCOUNT] == acct:
                 self._add_account_row(
@@ -946,6 +1171,26 @@ class AccountListPanel(QWidget):
         self._emit_selection_changed()
         self._reorder_rows()
         log.info("AccountList: user re-added %s", acct)
+
+    def _is_account_checked(self, account: str) -> bool:
+        """Resolve an account's checked state based on the active
+        group:
+
+          * ``"All"``  → every account is checked.
+          * ``"None"`` → every account is unchecked.
+          * user group → account is checked iff it's in ``selected``.
+          * no active group → check state driven by the global
+            ``_unchecked`` set.
+        """
+        if self._active_group == "All":
+            return True
+        if self._active_group == "None":
+            return False
+        if self._active_group is not None:
+            g = self._find_group(self._active_group)
+            if g is not None:
+                return account in g.get("selected", g.get("accounts", []))
+        return account not in self._unchecked
 
     def get_selected_count(self) -> int:
         """Return the number of currently checked (selected) account rows."""
@@ -957,25 +1202,7 @@ class AccountListPanel(QWidget):
 
     def _emit_selection_changed(self) -> None:
         """Broadcast the current selected-account set."""
-        self._refresh_builtin_chips()
         self.selection_changed.emit(self.get_selected_accounts())
-
-    def _refresh_builtin_chips(self) -> None:
-        """Sync the All / None chip selected-state with the current
-        checked-account set: All is blue when every visible account
-        is checked, None is blue when none are, both grey otherwise."""
-        if self._all_chip is None or self._none_chip is None:
-            return
-        visible = set(self._account_rows.keys())
-        checked = self.get_checked_accounts()
-        all_selected = bool(visible) and checked == visible
-        none_selected = not checked
-        # Edge case: zero visible accounts → checked is empty AND
-        # equal to visible.  Pick None so we don't double-highlight.
-        if all_selected and none_selected:
-            all_selected = False
-        _apply_filter_chip_style(self._all_chip, all_selected)
-        _apply_filter_chip_style(self._none_chip, none_selected)
 
     def active_group(self) -> str | None:
         """Currently-active group name, or None when the selection
@@ -1003,76 +1230,98 @@ class AccountListPanel(QWidget):
             return "None"
         return None
 
-    def _select_all(self) -> None:
-        for r in self._account_rows.values():
-            r.set_checked(True)
-        self._unchecked.clear()
-        self._persist_selection()
-        # Pure selection action — never auto-promote into a saved
-        # group whose membership happens to match.  Groups stay
-        # independent identities; they don't get hijacked by All/None.
-        self._set_active_group(None)
-        self._emit_selection_changed()
-        self._reorder_rows()
-
-    def _select_none(self) -> None:
-        for r in self._account_rows.values():
-            r.set_checked(False)
-        self._unchecked = set(self._account_rows.keys())
-        self._persist_selection()
-        self._set_active_group(None)
-        self._emit_selection_changed()
-        self._reorder_rows()
-
     def _select_group(self, name: str) -> None:
-        """Activate a saved group — checks exactly its accounts, unchecks
-        every other.  Skips accounts that no longer exist (deleted /
-        hidden since the group was saved)."""
+        """Activate a saved group — the account list is filtered to
+        that group's members (see ``_sync_rows``), and each row's
+        checked state is restored from the group's ``selected`` list.
+        Membership (``accounts``) and selection (``selected``) are
+        both persisted per-group, so switching groups correctly
+        restores per-group state.
+        """
         g = self._find_group(name)
         if g is None:
             return
-        wanted = set(g.get("accounts", []))
-        new_unchecked: set[str] = set()
-        self._suspend_active_group_clear = True
-        try:
-            for acct, r in self._account_rows.items():
-                on = acct in wanted
-                r.set_checked(on)
-                if not on:
-                    new_unchecked.add(acct)
-        finally:
-            self._suspend_active_group_clear = False
-        self._unchecked = new_unchecked
-        self._persist_selection()
+        # Update the active-group indicator before re-syncing rows so
+        # _sync_rows filters to this group's members.
         self._set_active_group(name)
+        self._sync_rows()
+        # Push the group's saved ``selected`` subset onto the visible
+        # rows so the user sees its per-group check state.
+        for acct, r in self._account_rows.items():
+            r.set_checked(self._is_account_checked(acct))
         self._emit_selection_changed()
         self._reorder_rows()
-        log.info("AccountList: activated group %r (%d/%d accounts)",
-                 name, len(self.get_checked_accounts()), len(wanted))
+        log.info("AccountList: activated group %r (%d visible / %d selected)",
+                 name, len(self._account_rows),
+                 len(g.get("selected", g.get("accounts", []))))
+
+    def _select_default_group(self, name: str) -> None:
+        """Activate one of the built-in All / None pills in the header.
+
+        * ``"All"``  — show every model account and check all of them
+          (empty ``_unchecked``).
+        * ``"None"`` — show every model account and uncheck all of them
+          (``_unchecked`` = every account).
+
+        These are virtual groups: nothing is added to ``self._groups``
+        and they don't count against the user's 2×5 grid cap.  × on a
+        row while one of these is active falls through to the classic
+        global-hide path in ``_on_row_removed``.
+        """
+        if name not in _DEFAULT_GROUPS:
+            return
+        all_accounts = {rd[COL_ACCOUNT] for rd in self._model._table_data
+                        if rd[COL_ACCOUNT]}
+        if name == "All":
+            self._unchecked = set()
+        else:  # "None"
+            self._unchecked = set(all_accounts)
+        self._persist_selection()
+        self._set_active_group(name)
+        self._sync_rows()
+        # _sync_rows only touches alias/balance on existing rows — push
+        # the new checked state explicitly so every row flips.
+        for acct, r in self._account_rows.items():
+            r.set_checked(acct not in self._unchecked)
+        self._emit_selection_changed()
+        self._reorder_rows()
+        log.info("AccountList: activated default group %r (%d account(s))",
+                 name, len(all_accounts))
 
     # ── Row ordering ──────────────────────────────────────────────────────────
 
+    # Priority buckets for the first-3-char prefix.  Lower integer →
+    # higher priority → floats further up the list.  ``mgn`` is rank 0
+    # (top), ``tfs`` rank 1, ``rsp`` and ``fhs`` share rank 2, and every
+    # other prefix falls through to rank 3 where the usual alphabetical
+    # tiebreak takes over.
+    _PREFIX_PRIORITY: dict[str, int] = {
+        "mgn": 0,
+        "tfs": 1,
+        "rsp": 2,
+        "fhs": 2,
+    }
+
     def _name_sort_key(self, account: str) -> tuple:
-        """Sort key: MGN-prefix group pinned to top, then alphabetical
-        by first 3 chars of the display name, then by last 2 chars.
-        Display name = alias when set, else account id.  Comparison is
-        case-insensitive so aliases like ``B-mgn0`` and ``b-MGN1`` land
-        together.  Account id is the final tiebreaker to keep the sort
-        deterministic when two accounts share both prefix and suffix."""
+        """Sort key: priority-prefix buckets first (MGN > TFS > RSP/FHS
+        > everything else), then alphabetical by first 3 chars of the
+        display name, then by last 2 chars.  Display name = alias when
+        set, else account id.  Comparison is case-insensitive so
+        aliases like ``B-mgn0`` and ``b-MGN1`` land together.  Account
+        id is the final tiebreaker to keep the sort deterministic when
+        two accounts share both prefix and suffix."""
         alias = self._model._aliases.get(account, "") or ""
         name = alias if alias else account
         lower = name.lower()
         first3 = lower[:3]
         last2 = lower[-2:]
-        # False sorts before True, so `not is_mgn` floats mgn rows up.
-        is_mgn = first3 == "mgn"
-        return (not is_mgn, first3, last2, account)
+        priority = self._PREFIX_PRIORITY.get(first3, 3)
+        return (priority, first3, last2, account)
 
     def _reorder_rows(self) -> None:
-        """Re-arrange the account rows by display-name prefix/suffix.
-        MGN-prefixed accounts are pinned to the top regardless of
-        check state.  Keeps the trailing ``addStretch`` entry at the
-        end of the layout."""
+        """Re-arrange the account rows by display-name prefix priority
+        (MGN > TFS > RSP/FHS > rest), then alphabetical.  Keeps the
+        trailing ``addStretch`` entry at the end of the layout."""
         if not self._account_rows:
             return
         ordered = sorted(

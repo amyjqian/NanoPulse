@@ -13,7 +13,7 @@ Design principles
 """
 from __future__ import annotations
 from src.core import config_manager
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QFont
 from PySide6.QtCore import (
     QAbstractTableModel,
     QModelIndex,
@@ -95,7 +95,18 @@ class AccountsTableModel(QAbstractTableModel):
     # ── Qt model interface ────────────────────────────────────────────────────
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        # Append a virtual "Total" row after the data rows when the table is
+        # non-empty.  The totals row is computed on demand from _table_data;
+        # nothing is stored for it.
+        n = len(self._table_data)
+        return n + 1 if n > 0 else 0
+
+    def account_count(self) -> int:
+        """Real account count, excluding the virtual totals row."""
         return len(self._table_data)
+
+    def _is_total_row(self, row: int) -> bool:
+        return row == len(self._table_data) and row > 0
 
     def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
         return len(HEADERS)
@@ -112,6 +123,8 @@ class AccountsTableModel(QAbstractTableModel):
             return None
 
         row, col = index.row(), index.column()
+        if self._is_total_row(row):
+            return self._total_data(col, role)
         if row >= len(self._table_data):
             return None
 
@@ -122,6 +135,12 @@ class AccountsTableModel(QAbstractTableModel):
                 return self._format_pnl(raw)
             if col in _FINANCIAL_COLS:
                 return self._format_financial(raw)
+            return raw
+
+        if role == Qt.ItemDataRole.EditRole:
+            # When Qt opens the inline editor for the Alias column, it asks
+            # for EditRole — return the current text so the user can modify
+            # it instead of starting from an empty field.
             return raw
 
         if role == Qt.ItemDataRole.TextAlignmentRole:
@@ -150,6 +169,9 @@ class AccountsTableModel(QAbstractTableModel):
         return None
 
     def flags(self, index: QModelIndex) -> Qt.ItemFlag:
+        if self._is_total_row(index.row()):
+            # Totals row: visible but not selectable/editable.
+            return Qt.ItemFlag.ItemIsEnabled
         base = super().flags(index)
         if index.column() == COL_ALIAS:
             return base | Qt.ItemFlag.ItemIsEditable
@@ -182,6 +204,7 @@ class AccountsTableModel(QAbstractTableModel):
         Receive a batch of ``(label, account, tag, value, currency)`` tuples
         from any worker thread and surgically update the table.
         """
+        totals_to_refresh: set[int] = set()
         for label, account, tag, value, currency in batch:
             # Buying power is cached but not shown as a column in Connections view
             if tag == "BuyingPower":
@@ -204,6 +227,10 @@ class AccountsTableModel(QAbstractTableModel):
 
             mi = self.index(row_idx, col)
             self.dataChanged.emit(mi, mi, [Qt.ItemDataRole.DisplayRole])
+            totals_to_refresh.add(col)
+
+        if totals_to_refresh and self._table_data:
+            self._emit_totals_changed(totals_to_refresh)
 
     # ── Row management ────────────────────────────────────────────────────────
 
@@ -213,7 +240,15 @@ class AccountsTableModel(QAbstractTableModel):
         alias = self._aliases.get(account, "")
         log.info("New account row: label=%r account=%r type=%s alias=%r (row %d)",
                  label, account, acct_type, alias, row_idx)
-        self.beginInsertRows(QModelIndex(), row_idx, row_idx)
+        # When inserting the very first account, the virtual totals row is
+        # also appearing — tell Qt two rows are materialising (data row 0,
+        # totals row 1).  For subsequent inserts we add just one data row;
+        # the totals row's effective index shifts down automatically because
+        # rowCount() tracks len(_table_data).
+        if row_idx == 0:
+            self.beginInsertRows(QModelIndex(), 0, 1)
+        else:
+            self.beginInsertRows(QModelIndex(), row_idx, row_idx)
         self._table_data.append(
             [label, account, acct_type, alias, "", "", "", ""])   # 8 cols
         self._row_map[(label, account)] = row_idx
@@ -235,7 +270,12 @@ class AccountsTableModel(QAbstractTableModel):
         indices = sorted((self._row_map[k]
                          for k in keys_to_remove), reverse=True)
         for idx in indices:
-            self.beginRemoveRows(QModelIndex(), idx, idx)
+            # When removing the last remaining data row, the virtual totals
+            # row disappears with it — tell Qt both rows are going away.
+            if len(self._table_data) == 1:
+                self.beginRemoveRows(QModelIndex(), 0, 1)
+            else:
+                self.beginRemoveRows(QModelIndex(), idx, idx)
             self._table_data.pop(idx)
             self.endRemoveRows()
         # Rebuild _row_map and _acct_to_label after removals
@@ -244,6 +284,74 @@ class AccountsTableModel(QAbstractTableModel):
         for i, row in enumerate(self._table_data):
             self._row_map[(row[COL_CONNECTION], row[COL_ACCOUNT])] = i
             self._acct_to_label[row[COL_ACCOUNT]] = row[COL_CONNECTION]
+        # Surviving totals row needs to recompute after removal.
+        if self._table_data:
+            self._emit_totals_changed(
+                {COL_NET_LIQ, COL_TOTAL_CASH, COL_EXCESS_LIQ, COL_DAILY_PNL})
+
+    # ── Totals row ────────────────────────────────────────────────────────────
+
+    def _sum_financial_col(self, col: int) -> float:
+        total = 0.0
+        for row in self._table_data:
+            raw = row[col]
+            if not raw:
+                continue
+            try:
+                v = float(raw)
+            except (ValueError, TypeError):
+                continue
+            # Skip IBKR "Infinity" sentinels.
+            if abs(v) > 1e100:
+                continue
+            total += v
+        return total
+
+    def _total_data(self, col: int, role: int) -> Any:
+        if role == Qt.ItemDataRole.DisplayRole:
+            if col == COL_CONNECTION:
+                return "Total"
+            if col in _FINANCIAL_COLS:
+                total = self._sum_financial_col(col)
+                if col == COL_DAILY_PNL:
+                    return self._format_pnl(str(total))
+                return self._format_financial(str(total))
+            return ""
+
+        if role == Qt.ItemDataRole.TextAlignmentRole:
+            if col in _FINANCIAL_COLS:
+                return int(Qt.AlignmentFlag.AlignRight
+                           | Qt.AlignmentFlag.AlignVCenter)
+            return int(Qt.AlignmentFlag.AlignLeft
+                       | Qt.AlignmentFlag.AlignVCenter)
+
+        if role == Qt.ItemDataRole.FontRole:
+            f = QFont()
+            f.setBold(True)
+            return f
+
+        if role == Qt.ItemDataRole.BackgroundRole:
+            # Slightly darker to visually separate the footer from data rows.
+            return QColor("#14171D")
+
+        if role == Qt.ItemDataRole.ForegroundRole:
+            if col == COL_DAILY_PNL:
+                total = self._sum_financial_col(col)
+                if total > 0:
+                    return QColor("#3FB950")
+                if total < 0:
+                    return QColor("#F85149")
+
+        return None
+
+    def _emit_totals_changed(self, cols: set[int]) -> None:
+        """Notify the view that the virtual totals row's cells recomputed."""
+        total_row = len(self._table_data)
+        if total_row == 0:
+            return
+        for c in cols:
+            idx = self.index(total_row, c)
+            self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DisplayRole])
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

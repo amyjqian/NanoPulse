@@ -6,7 +6,7 @@ dark background, icon + label per tab, accent underline on the active tab.
 """
 from __future__ import annotations
 
-from PySide6.QtWidgets import QWidget, QHBoxLayout, QSizePolicy, QLabel, QPushButton
+from PySide6.QtWidgets import QWidget, QHBoxLayout, QSizePolicy, QPushButton
 from PySide6.QtCore import Qt, Signal, QSize
 from PySide6.QtGui import QPainter, QColor, QFont, QPen
 
@@ -147,76 +147,72 @@ class TopTabBar(QWidget):
 
         layout.addStretch(1)
 
-        # Active trading-group chip — sits left of the Conn/Accts/
-        # Selected status text.  Same blue + bold styling as the
-        # selected chips in the AccountListPanel filter strip so the
-        # two read as the same affordance.  Hidden when no group is
-        # active.
-        self._group_label = QLabel(self)
+        # Active trading-group chip — centered between the tab
+        # buttons and the right-side Accounts pill / status text.
+        # Same blue + bold styling as the selected chips in the
+        # AccountListPanel filter strip so the two read as the same
+        # affordance.  The chip text is "<group> <selected>" (e.g.
+        # "Alpha 2") so the user can see both the active group and
+        # how many accounts are currently checked inside it.  Hidden
+        # when no group is active.
+        # Active-group chip + Account pill sit side-by-side on the
+        # right, with the chip immediately to the left of the pill
+        # (both styled + sized to match the symbol chips in
+        # order_panel_parts.py — padding 4×12, font-size 12, radius 6,
+        # fixed height 24 so a QLabel and a QPushButton render at the
+        # same pixel height regardless of platform metrics).
+        _CHIP_HEIGHT = 24
+        self._group_label = QPushButton("", self)
         self._group_label.setFont(_FONT_NORMAL)
+        self._group_label.setEnabled(False)  # non-interactive — just a badge.
+        self._group_label.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._group_label.setFixedHeight(_CHIP_HEIGHT)
         self._group_label.setStyleSheet(
-            "QLabel {"
+            "QPushButton {"
             " background: #0071e3; color: white;"
-            " border-radius: 4px;"
-            " padding: 2px 10px; margin-right: 12px;"
-            " font-weight: bold;"
-            "}")
+            " border: none; border-radius: 6px;"
+            " padding: 4px 12px; margin-right: 8px;"
+            " font-weight: bold; font-size: 12px;"
+            "}"
+            "QPushButton:disabled { background: #0071e3; color: white; }")
         self._group_label.hide()
         layout.addWidget(self._group_label)
 
         # "Account" pill — always visible.  Click toggles the
         # AccountListPanel inside the Nano tab.  When clicked from a
-        # different tab, the host switches to Nano first.  Same blue
-        # chip styling as the active-group chip so they read as part
-        # of the same affordance family.
+        # different tab, the host switches to Nano first.
         self._accounts_pill = QPushButton("Account", self)
         self._accounts_pill.setFont(_FONT_NORMAL)
         self._accounts_pill.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._accounts_pill.setFixedHeight(_CHIP_HEIGHT)
         self._accounts_pill.setStyleSheet(
             "QPushButton {"
             " background: #0071e3; color: white;"
-            " border: none; border-radius: 4px;"
-            " padding: 2px 12px; margin-right: 12px;"
-            " font-weight: bold;"
+            " border: none; border-radius: 6px;"
+            " padding: 4px 12px; margin-right: 12px;"
+            " font-weight: bold; font-size: 12px;"
             "}"
             "QPushButton:hover { background: #0077ed; }")
         self._accounts_pill.clicked.connect(
             self.accountsToggleRequested.emit)
         layout.addWidget(self._accounts_pill)
 
-        self._status_label = QLabel(self)
-        self._status_label.setFont(_FONT_NORMAL)
-        self._status_label.setStyleSheet(f"QLabel {{ color: {TEXT_PRIMARY}; padding-right: 20px; }}")
-        self._status_label.setText("")
-        layout.addWidget(self._status_label)
-
         # Activate first tab
         first = next(iter(self._buttons.values()))
         first.set_active(True)
 
-    def set_status(self, conn_count: int, acct_count: int,
-                   selected_count: int = 0) -> None:
-        """Update the top-right stats label.
-
-        Format: ``Conn: 2 | Accts: 5 | Selected: 3``
-        When everything is zero the label is hidden.
-        """
-        if conn_count == 0 and acct_count == 0 and selected_count == 0:
-            self._status_label.setText("")
-            return
-        text = (f"Conn: {conn_count}"
-                f"  |  Accts: {acct_count}"
-                f"  |  Selected: {selected_count}")
-        self._status_label.setText(text)
-
-    def set_active_group(self, name: str | None) -> None:
-        """Show / hide the blue active-group chip just left of the
-        Conn / Accts / Selected status text.  Hidden when *name* is
-        ``None`` or empty."""
+    def set_active_group(
+        self, name: str | None, selected_count: int = 0,
+    ) -> None:
+        """Show / hide the blue active-group chip centered in the tab
+        bar.  When a group is active the chip text combines the group
+        name with the number of accounts currently checked inside
+        it, e.g. ``"Alpha 2"``.  Hidden when *name* is ``None`` or
+        empty."""
         if not name:
             self._group_label.hide()
             return
-        self._group_label.setText(name)
+        self._group_label.setText(f"{name} {int(selected_count)}")
         self._group_label.show()
 
 
@@ -225,6 +221,26 @@ class TopTabBar(QWidget):
             btn.set_active(label == name)
         self.nav_changed.emit(name)
         self.tabBarClicked.emit(name)  # Emit signal for all tabs
+
+    # ── Title-bar gestures ────────────────────────────────────────────────────
+
+    def mouseDoubleClickEvent(self, event):  # noqa: N802
+        """Double-click empty title-bar space → toggle window zoom,
+        matching the native macOS title-bar behavior.  Interactive
+        children (tab buttons, Account pill, group chip) receive and
+        accept their own events, so this handler only fires for
+        clicks on the bar's empty regions.
+        """
+        if event.button() == Qt.MouseButton.LeftButton:
+            win = self.window()
+            if win is not None:
+                if win.isMaximized() or win.isFullScreen():
+                    win.showNormal()
+                else:
+                    win.showMaximized()
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
 
     # ── Paint ─────────────────────────────────────────────────────────────────
 

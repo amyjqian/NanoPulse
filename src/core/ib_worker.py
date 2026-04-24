@@ -2718,18 +2718,22 @@ class IBWorkerThread(QThread):
             bid_valid = not math.isnan(bid) and bid > 0 and bid < 1e12
             ask_valid = not math.isnan(ask) and ask > 0 and ask < 1e12
 
-            # Derive last from midpoint if unavailable
+            # Derive last from midpoint only when both bid and ask are
+            # live — the midpoint is a reasonable stand-in for "current
+            # price" when the tape is quiet but the book is active.
             if math.isnan(last) or last <= 0:
                 if bid_valid and ask_valid:
                     last = (bid + ask) / 2.0
 
-            # Fallback to close
+            # Do NOT synthesize last from the prior-session close: a
+            # snapshot-only ticker (close populated, bid/ask still NaN
+            # while streaming warms up) would otherwise look like a
+            # live tick with bid/ask missing, leaving the UI showing a
+            # frozen price plus a zero change and no quotes.  Leaving
+            # ``last`` at 0 here keeps the price/bid/ask/change row
+            # blank until a real tick arrives; ``close_out`` below still
+            # carries the close to the UI for day-change computation.
             if math.isnan(last) or last <= 0:
-                close = getattr(ticker, "close", float('nan'))
-                if not math.isnan(close) and close > 0:
-                    last = close
-
-            if math.isnan(last):
                 last = 0.0
 
             # Preserve the last known valid bid/ask — fall back to the cache

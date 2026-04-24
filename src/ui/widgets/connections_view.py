@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QModelIndex, QSortFilterProxyModel, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QPushButton,
     QSplitter,
     QStyledItemDelegate,
@@ -23,7 +24,15 @@ from PySide6.QtWidgets import (
 
 from src.core import config_manager
 from src.core.ib_worker import IBWorkerThread
-from .accounts_model import AccountsTableModel
+from .accounts_model import (
+    AccountsTableModel,
+    COL_ACCOUNT,
+    COL_ALIAS,
+    COL_DAILY_PNL,
+    COL_EXCESS_LIQ,
+    COL_NET_LIQ,
+    COL_TOTAL_CASH,
+)
 
 log = logging.getLogger(__name__)
 
@@ -256,6 +265,262 @@ class _CellComboBox(QComboBox):
         popup.setGeometry(pos.x(), pos.y() + 2, w, popup.height())
 
 
+# Columns whose raw cell text is a financial float ("1,234.56" / "+500").
+_NUMERIC_COLS: frozenset[int] = frozenset({
+    COL_NET_LIQ, COL_TOTAL_CASH, COL_EXCESS_LIQ, COL_DAILY_PNL,
+})
+
+
+class _AccountsSortFilterProxy(QSortFilterProxyModel):
+    """Sort / filter wrapper around ``AccountsTableModel``.
+
+    * Multi-column sort: callers set a list of ``(column, order)``
+      pairs via :meth:`set_sort_specs`; ``lessThan`` walks that list
+      in priority order so ties on the first column break using the
+      next column and so on.
+    * The virtual totals row appended by ``AccountsTableModel`` is
+      pinned to the bottom — it's never sorted alongside data rows
+      and always passes the filter, matching what users expect from
+      a footer row.
+    * ``headerData`` decorates each sorted column's header with an
+      ▲ / ▼ arrow (plus a rank number for secondary / tertiary
+      sorts) so users can see the current sort state directly.
+    * ``filterAcceptsRow`` narrows to rows whose Account or Alias
+      column contains the current search text (case-insensitive).
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._sort_specs: list[tuple[int, Qt.SortOrder]] = []
+        self._search: str = ""
+        self.setDynamicSortFilter(True)
+
+    # ── Sort state ──────────────────────────────────────────────────────────
+
+    def sort_specs(self) -> list[tuple[int, Qt.SortOrder]]:
+        return list(self._sort_specs)
+
+    def set_sort_specs(
+        self, specs: list[tuple[int, Qt.SortOrder]],
+    ) -> None:
+        self._sort_specs = list(specs)
+        # Poke Qt into resorting.  ``invalidate()`` ensures the sort
+        # actually re-runs even when the primary column / order hasn't
+        # changed (e.g. adding a secondary sort column) — ``sort()``
+        # alone will no-op in that case.
+        self.invalidate()
+        if specs:
+            first_col, first_order = specs[0]
+            self.sort(first_col, first_order)
+        else:
+            # No active sort → restore source order.
+            self.sort(-1)
+        src = self.sourceModel()
+        if src is not None:
+            self.headerDataChanged.emit(
+                Qt.Orientation.Horizontal, 0, src.columnCount() - 1)
+
+    # ── Search ──────────────────────────────────────────────────────────────
+
+    def set_search_text(self, text: str) -> None:
+        new = (text or "").strip().lower()
+        if new == self._search:
+            return
+        self._search = new
+        self.invalidateFilter()
+        # Totals row recomputes from filter-visible rows; tell the
+        # view to repaint it even when the filter itself didn't add
+        # or remove the totals row.
+        src = self.sourceModel()
+        if src is not None and src.account_count() > 0:
+            total_src_row = src.account_count()
+            total_idx = self.mapFromSource(
+                src.index(total_src_row, 0))
+            if total_idx.isValid():
+                self.dataChanged.emit(
+                    self.index(total_idx.row(), 0),
+                    self.index(total_idx.row(), src.columnCount() - 1),
+                    [Qt.ItemDataRole.DisplayRole,
+                     Qt.ItemDataRole.ForegroundRole],
+                )
+
+    # ── Totals-row recompute over filtered rows ─────────────────────────────
+
+    def _sum_visible(self, col: int) -> float:
+        """Sum ``col`` across rows currently passing the filter (i.e.,
+        every proxy row except the totals footer itself)."""
+        total = 0.0
+        src = self.sourceModel()
+        if src is None:
+            return total
+        # Iterate proxy rows directly — this naturally skips anything
+        # filtered out by the search box.
+        for proxy_row in range(self.rowCount()):
+            src_idx = self.mapToSource(self.index(proxy_row, col))
+            src_row = src_idx.row()
+            if src_row >= src.account_count():
+                continue  # skip the totals row itself
+            raw = src._table_data[src_row][col]
+            if not raw:
+                continue
+            try:
+                v = float(raw)
+            except (ValueError, TypeError):
+                continue
+            if abs(v) > 1e100:
+                continue
+            total += v
+        return total
+
+    # ── QSortFilterProxyModel overrides ─────────────────────────────────────
+
+    def _is_total_row(self, source_row: int) -> bool:
+        src = self.sourceModel()
+        return src is not None and source_row >= src.account_count() > 0
+
+    def filterAcceptsRow(  # noqa: N802
+        self, source_row: int, source_parent: QModelIndex,
+    ) -> bool:
+        # Always keep the virtual Total row visible as the footer.
+        if self._is_total_row(source_row):
+            return True
+        if not self._search:
+            return True
+        src = self.sourceModel()
+        acct = str(src.data(src.index(source_row, COL_ACCOUNT)) or "")
+        alias = str(src.data(src.index(source_row, COL_ALIAS)) or "")
+        needle = self._search
+        return needle in acct.lower() or needle in alias.lower()
+
+    def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:  # noqa: N802
+        # Pin the Total footer row to the bottom regardless of sort
+        # direction.  Qt internally reverses the result when the
+        # primary order is descending, so we return an order-aware
+        # value that survives that flip.
+        left_is_total = self._is_total_row(left.row())
+        right_is_total = self._is_total_row(right.row())
+        if left_is_total != right_is_total:
+            primary_order = (
+                self._sort_specs[0][1] if self._sort_specs
+                else Qt.SortOrder.AscendingOrder)
+            # Wanted display: data rows before total row.
+            #  asc:  lessThan(data, total) → True   (data < total)
+            #  desc: Qt reverses → we need lessThan(data, total) → False
+            #                      so the flip puts data first.
+            asc = primary_order == Qt.SortOrder.AscendingOrder
+            if right_is_total:
+                return asc      # data vs total
+            return not asc       # total vs data
+
+        src = self.sourceModel()
+        primary = (self._sort_specs[0][1]
+                   if self._sort_specs else Qt.SortOrder.AscendingOrder)
+        # Qt reverses the display when the PRIMARY sort is descending
+        # but calls ``lessThan`` with the indices untouched.  Secondary
+        # / tertiary columns don't get that free flip, so we apply the
+        # desc-specific flip here for spec positions > 0 whose order
+        # differs from the primary.
+        for i, (col, order) in enumerate(self._sort_specs):
+            l_raw = src.data(src.index(left.row(), col))
+            r_raw = src.data(src.index(right.row(), col))
+            if l_raw == r_raw:
+                continue
+            if col in _NUMERIC_COLS:
+                ln = _coerce_financial(l_raw)
+                rn = _coerce_financial(r_raw)
+                if ln == rn:
+                    continue
+                result = ln < rn
+            else:
+                ls = "" if l_raw is None else str(l_raw).lower()
+                rs = "" if r_raw is None else str(r_raw).lower()
+                if ls == rs:
+                    continue
+                result = ls < rs
+            # Secondary columns need their own asc/desc handling.
+            # Also handle a primary column whose order differs from
+            # what Qt will flip (they always match by construction,
+            # but the logic below is the general form).
+            if i == 0:
+                # Qt will flip based on primary_order; leave as-is.
+                return result
+            # Secondary: apply own order, and pre-invert if primary
+            # is descending (Qt will flip it back on display).
+            if order == Qt.SortOrder.DescendingOrder:
+                result = not result
+            if primary == Qt.SortOrder.DescendingOrder:
+                result = not result
+            return result
+        return False
+
+    def data(  # noqa: N802
+        self, index: QModelIndex,
+        role: int = Qt.ItemDataRole.DisplayRole,
+    ):
+        if not index.isValid():
+            return None
+        src = self.sourceModel()
+        if src is None:
+            return None
+        src_idx = self.mapToSource(index)
+        if src._is_total_row(src_idx.row()):
+            col = index.column()
+            # Financial columns: sum only over rows the search box left
+            # visible, then format with the source model's helpers so
+            # display style stays consistent with data rows.
+            if role == Qt.ItemDataRole.DisplayRole and col in _NUMERIC_COLS:
+                total = self._sum_visible(col)
+                if col == COL_DAILY_PNL:
+                    return src._format_pnl(str(total))
+                return src._format_financial(str(total))
+            if role == Qt.ItemDataRole.ForegroundRole and col == COL_DAILY_PNL:
+                total = self._sum_visible(col)
+                if total > 0:
+                    return QColor("#3FB950")
+                if total < 0:
+                    return QColor("#F85149")
+                return None
+            # Non-financial cells and other roles (font, bg) fall
+            # through to the source model's ``_total_data``.
+        return super().data(index, role)
+
+    def headerData(  # noqa: N802
+        self, section: int, orientation: Qt.Orientation,
+        role: int = Qt.ItemDataRole.DisplayRole,
+    ):
+        src = self.sourceModel()
+        if src is None:
+            return None
+        base = src.headerData(section, orientation, role)
+        if (role != Qt.ItemDataRole.DisplayRole
+                or orientation != Qt.Orientation.Horizontal
+                or not self._sort_specs):
+            return base
+        for rank, (col, order) in enumerate(self._sort_specs, start=1):
+            if col == section:
+                arrow = ("▲"    # ▲
+                         if order == Qt.SortOrder.AscendingOrder
+                         else "▼")  # ▼
+                suffix = arrow if rank == 1 else f"{arrow}{rank}"
+                return f"{base} {suffix}"
+        return base
+
+
+def _coerce_financial(raw) -> float:
+    """Best-effort conversion of a formatted currency/P&L string to
+    float.  Empty / "-" sentinels sort as 0 so they cluster together
+    instead of crashing the comparator."""
+    if raw is None:
+        return 0.0
+    s = str(raw).strip()
+    if not s or s == "-":
+        return 0.0
+    try:
+        return float(s.replace(",", "").replace("+", ""))
+    except (ValueError, TypeError):
+        return 0.0
+
+
 class ConnectionsView(QWidget):
     """
     Full Connections page.
@@ -341,16 +606,42 @@ class ConnectionsView(QWidget):
         bottom_layout.setContentsMargins(12, 8, 12, 10)
         bottom_layout.setSpacing(6)
 
-        # Section label
+        # Section header: label on the left, search input on the right.
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.setSpacing(8)
+
         lbl_acct = QLabel("Accounts")
         lbl_acct.setFont(
             QFont("SF Pro Display, Helvetica Neue, Arial", 13, QFont.Weight.DemiBold))
         lbl_acct.setStyleSheet(
             f"QLabel {{ color: {TEXT}; background: transparent; padding: 0 0 2px 0; }}")
-        bottom_layout.addWidget(lbl_acct)
+        header_row.addWidget(lbl_acct)
+        header_row.addStretch(1)
+
+        self._accounts_search = QLineEdit(self)
+        self._accounts_search.setPlaceholderText("Search")
+        self._accounts_search.setFixedWidth(220)
+        self._accounts_search.setStyleSheet(
+            "QLineEdit {"
+            f" background: {BG_SECONDARY}; color: {TEXT};"
+            f" border: 1px solid {BORDER}; border-radius: 4px;"
+            " padding: 3px 8px; font-size: 11px;"
+            "}"
+            f"QLineEdit:focus {{ border-color: {BLUE}; }}"
+        )
+        self._accounts_search.textChanged.connect(self._on_accounts_search)
+        header_row.addWidget(self._accounts_search)
+        bottom_layout.addLayout(header_row)
+
+        # Proxy sits between view and source model so sorting / filtering
+        # happens without touching ``AccountsTableModel`` (which is shared
+        # with the AccountListPanel).
+        self._accounts_proxy = _AccountsSortFilterProxy(self)
+        self._accounts_proxy.setSourceModel(self._model)
 
         self._accounts_view = QTableView(self)
-        self._accounts_view.setModel(self._model)
+        self._accounts_view.setModel(self._accounts_proxy)
         self._accounts_view.setAlternatingRowColors(True)
         self._accounts_view.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows)
@@ -360,6 +651,14 @@ class ConnectionsView(QWidget):
         self._accounts_view.horizontalHeader().setStretchLastSection(True)
         self._accounts_view.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Stretch)
+        # Leave Qt's own sort indicator off — ``_AccountsSortFilterProxy``
+        # decorates the header text with ▲/▼ glyphs so it can show
+        # multi-column rank (primary ▲, secondary ▼2, etc.).  Header
+        # sections stay clickable so we can catch the click.
+        header = self._accounts_view.horizontalHeader()
+        header.setSectionsClickable(True)
+        header.setSortIndicatorShown(False)
+        header.sectionClicked.connect(self._on_accounts_header_clicked)
         self._accounts_view.setStyleSheet(_TABLE_STYLE)
         bottom_layout.addWidget(self._accounts_view)
 
@@ -835,15 +1134,50 @@ class ConnectionsView(QWidget):
         if not label:
             return
 
-        # Find all account-model rows whose Connection column matches this label.
+        # Find all account-model rows whose Connection column matches
+        # this label.  The view is driven by ``_accounts_proxy`` so
+        # translate each source index before passing to the selection
+        # model; rows currently filtered out by the search box are
+        # skipped automatically.
         from .accounts_model import COL_CONNECTION
         for acct_row, row_data in enumerate(self._model._table_data):
             if row_data[COL_CONNECTION] == label:
-                idx = self._model.index(acct_row, 0)
+                src_idx = self._model.index(acct_row, 0)
+                proxy_idx = self._accounts_proxy.mapFromSource(src_idx)
+                if not proxy_idx.isValid():
+                    continue
                 sel_model.select(
-                    idx,
+                    proxy_idx,
                     sel_model.SelectionFlag.Select | sel_model.SelectionFlag.Rows,
                 )
+
+    # ── Accounts table sort + search ──────────────────────────────────────────
+
+    def _on_accounts_search(self, text: str) -> None:
+        """Live-filter the accounts table as the user types."""
+        self._accounts_proxy.set_search_text(text)
+
+    def _on_accounts_header_clicked(self, section: int) -> None:
+        """Cycle the clicked column through asc → desc → unsorted.
+
+        Multi-column sort: the click-order of the columns defines
+        priority.  Clicking a column that's already in the sort list
+        flips its direction; a third click removes it.  Clicking a
+        new column appends it as a secondary (or tertiary…) sort.
+        """
+        specs = self._accounts_proxy.sort_specs()
+        idx = next((i for i, (c, _) in enumerate(specs) if c == section),
+                   None)
+        if idx is None:
+            specs.append((section, Qt.SortOrder.AscendingOrder))
+        else:
+            col, order = specs[idx]
+            if order == Qt.SortOrder.AscendingOrder:
+                specs[idx] = (col, Qt.SortOrder.DescendingOrder)
+            else:
+                # Third click → drop this column from the sort list.
+                specs.pop(idx)
+        self._accounts_proxy.set_sort_specs(specs)
 
     # ── Row state (Action + Status) ─────────────────────────────────────────────
 
