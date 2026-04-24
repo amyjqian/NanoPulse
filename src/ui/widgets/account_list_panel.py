@@ -80,11 +80,11 @@ def _apply_filter_chip_style(btn: QPushButton, selected: bool) -> None:
 
 _TITLE_FONT = QFont("Helvetica Neue, Arial", 11)
 
-# Group-pill grid layout: 2 rows × 5 columns.  The first two slots
+# Group-pill grid layout: 3 rows × 4 columns.  The first two slots
 # (row 0, cols 0 and 1) are reserved for the built-in All / None
-# quick-select pills, so user-defined groups get the remaining 8.
-_GROUP_COLS = 5
-_GROUP_ROWS = 2
+# quick-select pills, so user-defined groups get the remaining 10.
+_GROUP_COLS = 4
+_GROUP_ROWS = 3
 _GROUP_DEFAULT_SLOTS = 2
 _GROUP_MAX = _GROUP_COLS * _GROUP_ROWS - _GROUP_DEFAULT_SLOTS
 
@@ -348,6 +348,11 @@ class _GroupPill(QPushButton):
         self.clicked.connect(lambda: self.activated.emit(self._name))
         self.setAcceptDrops(on_drop is not None)
         _apply_filter_chip_style(self, False)
+
+    def set_count(self, count: int) -> None:
+        """Render the pill as ``"<name> <count>"`` so the user can see
+        at a glance how many accounts are selected inside this group."""
+        self.setText(f"{self._name} {int(count)}")
 
     @property
     def group_name(self) -> str:
@@ -683,6 +688,27 @@ class AccountListPanel(QWidget):
             pill.set_active(name == self._active_group)
             self._pills_layout.addWidget(pill, row, col)
             self._group_pills[name] = pill
+        self._refresh_pill_counts()
+
+    def _refresh_pill_counts(self) -> None:
+        """Re-render every pill's label as ``"<name> <count>"``.
+
+          * ``All``    → total model accounts (what clicking it would select).
+          * ``None``   → 0.
+          * user pill  → ``len(group["selected"])``.
+
+        Called after any group mutation or account-set change so the
+        badges stay in sync with what's actually checked.
+        """
+        total = self._model.account_count() if self._model is not None else 0
+        if self._all_pill is not None:
+            self._all_pill.setText(f"All {total}")
+        if self._none_pill is not None:
+            self._none_pill.setText("None 0")
+        for g in self._groups:
+            pill = self._group_pills.get(g["name"])
+            if pill is not None:
+                pill.set_count(len(g.get("selected", [])))
 
     def _on_group_drop(self, src_name: str, dst_name: str) -> None:
         """Pill ``src_name`` was dropped onto ``dst_name`` — reorder
@@ -1021,6 +1047,9 @@ class AccountListPanel(QWidget):
 
     def _on_rows_changed(self, *args) -> None:
         self._sync_rows()
+        # "All" pill label depends on the total account count, which
+        # just changed — refresh the badges.
+        self._refresh_pill_counts()
         self._emit_selection_changed()
 
     def _on_row_toggled(self, account: str, checked: bool) -> None:
@@ -1041,6 +1070,10 @@ class AccountListPanel(QWidget):
                     selected = [a for a in selected if a != account]
                 g["selected"] = selected
                 config_manager.save_account_groups(self._groups)
+                # Pill badge tracks ``len(selected)`` so it needs to
+                # refresh every time the user group's check state
+                # shifts.
+                self._refresh_pill_counts()
         else:
             # No user group active (or one of All / None) — fall back
             # to the global ``_unchecked`` tracking which survives
@@ -1105,6 +1138,11 @@ class AccountListPanel(QWidget):
         config_manager.save_account_groups(self._groups)
         if pills_need_rebuild:
             self._rebuild_pills()
+        else:
+            # Group still exists but its ``selected`` shrank — refresh
+            # the count badge.  (``_rebuild_pills`` already does this
+            # in the empty-group branch above.)
+            self._refresh_pill_counts()
 
         # Re-sync rows: when the group still exists the deleted account
         # is no longer a member and its row is dropped; when the group
@@ -1137,6 +1175,7 @@ class AccountListPanel(QWidget):
                     selected.append(acct)
                     g["selected"] = selected
                 config_manager.save_account_groups(self._groups)
+                self._refresh_pill_counts()
         else:
             # No user group active — make sure the freshly-visible row
             # starts checked by removing it from the global _unchecked.

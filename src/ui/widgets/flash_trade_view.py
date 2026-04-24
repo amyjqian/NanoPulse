@@ -1226,7 +1226,7 @@ class FlashTradeView(QWidget):
         layout = config_manager.load_layout()
         # Default sizes matching the target layout (pixels, ~1500px wide x ~720px tall)
         self._main_splitter.setSizes(layout.get(_K_MAIN, [265, 285, 950]))
-        self._right_splitter.setSizes(layout.get(_K_RIGHT_H, [760, 190]))
+        self._right_splitter.setSizes(layout.get(_K_RIGHT_H, [800, 150]))
         self._top_right_splitter.setSizes(layout.get(_K_LEFT_V, [380, 340]))
         # Restore accounts-panel visibility; default True for
         # backwards-compatibility with users who never hid it.
