@@ -176,6 +176,12 @@ class MainWindow(QWidget):
             Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         root_layout.addWidget(self._status_bar)
 
+        # Surface FlashTradeView's transient messages (e.g. "Order skipped
+        # on N disconnected account(s): …") in the status bar so the user
+        # gets a non-blocking confirmation that some accounts were skipped.
+        self._flash_trade.transient_status_message.connect(
+            self._status_bar.show_message)
+
     # ── Navigation ────────────────────────────────────────────────────────────
 
     def _on_nav_changed(self, name: str) -> None:

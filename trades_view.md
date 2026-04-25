@@ -39,3 +39,5 @@ Flatten the nested `Fill` object into these columns (handle missing attributes g
 * Ensure `qasync` best practices so API calls do not block the PySide6 event loop.
 * Do not include parent-level aggregate math (like `avgPrice`) in the Trades model.
 * Provide the complete, runnable code including the `QTabWidget` setup, the `QAbstractTableModel` for the Trades, and the dark mode stylesheet.
+
+reference screen

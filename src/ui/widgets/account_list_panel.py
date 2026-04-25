@@ -216,6 +216,14 @@ class _AccountRow(QFrame):
         super().__init__(parent)
         self._account = account
         self._checked = checked
+        # Live TWS connection state for this row's account.  Defaults to
+        # True so a brand-new row isn't dimmed before the first
+        # ``set_connected()`` call.  Updated by AccountListPanel on
+        # ``dataChanged`` from AccountsTableModel.
+        self._connected: bool = True
+        # Plain display name without the "⚠ " offline prefix; kept so
+        # ``set_connected(True)`` can restore the original text.
+        self._base_name: str = alias if alias else account
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
@@ -229,8 +237,7 @@ class _AccountRow(QFrame):
         layout.addWidget(self._cb)
 
         # Account name (bold white)
-        display_name = alias if alias else account
-        self._name_lbl = QLabel(display_name)
+        self._name_lbl = QLabel(self._base_name)
         self._name_lbl.setFont(
             QFont("Helvetica Neue, Arial", 12, QFont.Weight.Bold))
         self._name_lbl.setStyleSheet(
@@ -274,14 +281,38 @@ class _AccountRow(QFrame):
         self._balance_lbl.setText(self._format_balance(balance))
 
     def set_name(self, alias: str) -> None:
-        self._name_lbl.setText(alias if alias else self._account)
+        self._base_name = alias if alias else self._account
+        self._refresh_name_label()
 
     def set_checked(self, checked: bool) -> None:
         self._checked = checked
         self._cb.setChecked(checked)
         self._apply_card_style()
 
+    def set_connected(self, connected: bool) -> None:
+        """Toggle the row's offline appearance.  When ``connected`` is
+        False the name label is prefixed with ``⚠ ``, every label is
+        dimmed, and a tooltip explains that orders will be skipped on
+        this account.  When True, restores the live styling."""
+        if self._connected == bool(connected):
+            return
+        self._connected = bool(connected)
+        self._refresh_name_label()
+        self._apply_card_style()
+        if self._connected:
+            self.setToolTip("")
+        else:
+            self.setToolTip(
+                "Connection disconnected — orders will be skipped on this "
+                "account until the connection is restored.")
+
     # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _refresh_name_label(self) -> None:
+        if self._connected:
+            self._name_lbl.setText(self._base_name)
+        else:
+            self._name_lbl.setText(f"⚠ {self._base_name}")
 
     def _on_toggle(self, checked: bool) -> None:
         self._checked = checked
@@ -289,6 +320,28 @@ class _AccountRow(QFrame):
         self.toggled.emit(self._account, checked)
 
     def _apply_card_style(self) -> None:
+        if not self._connected:
+            # Offline — desaturated frame and dim text on every label so
+            # the row clearly looks inert, regardless of the checked
+            # state.  Keeps borders distinguishable from idle rows.
+            self.setStyleSheet(f"""
+                _AccountRow {{
+                    background-color: {BG_ITEM_INACTIVE};
+                    border: 2px dashed #555555;
+                    border-radius: 4px;
+                }}
+            """)
+            self._name_lbl.setStyleSheet(
+                "color: #777777; background: transparent;")
+            self._balance_lbl.setStyleSheet(
+                "color: #555555; background: transparent;")
+            return
+        # Connected — restore the standard label styling …
+        self._name_lbl.setStyleSheet(
+            "color: #ffffff; background: transparent;")
+        self._balance_lbl.setStyleSheet(
+            "color: #aaaaaa; background: transparent;")
+        # … and the standard checked / unchecked card frame.
         if self._checked:
             self.setStyleSheet(f"""
                 _AccountRow {{
@@ -989,10 +1042,27 @@ class AccountListPanel(QWidget):
         row = _AccountRow(account, alias, balance, acct_type, checked=checked)
         row.toggled.connect(self._on_row_toggled)
         row.removed.connect(self._on_row_removed)
+        # Apply the worker's current connection state so freshly added
+        # rows for an offline label render dimmed from the start.
+        row.set_connected(self._is_account_connected(account))
         idx = self._rows_layout.count() - 1   # insert before the stretch
         self._rows_layout.insertWidget(idx, row)
         self._account_rows[account] = row
         log.debug("AccountList: added row for %s (checked=%s)", account, checked)
+
+    def _is_account_connected(self, account: str) -> bool:
+        """Resolve the live TWS connection state for ``account`` via the
+        shared model.  Defaults to True for accounts whose label hasn't
+        reported a state yet (newly-added connection)."""
+        label = self._model.connection_for_account(account)
+        return self._model.is_label_connected(label)
+
+    def _refresh_connected_states(self) -> None:
+        """Push the current connection state of each visible row's worker
+        back onto the row widget.  Called after ``dataChanged`` so flips
+        from ``set_connection_status`` reach the UI in real time."""
+        for account, row in self._account_rows.items():
+            row.set_connected(self._is_account_connected(account))
 
     def _remove_account_row(self, account: str) -> None:
         row = self._account_rows.pop(account, None)
@@ -1032,6 +1102,10 @@ class AccountListPanel(QWidget):
                 r.set_balance(rd[COL_NET_LIQ])
                 r.set_name(rd[COL_ALIAS] if rd[COL_ALIAS] else rd[COL_ACCOUNT])
                 net_liq_touched = True
+        # ``set_connection_status`` on the model emits ``dataChanged`` to
+        # signal a label-wide flip; refresh every row's offline indicator
+        # so the dim/⚠ state stays in sync with the worker's reality.
+        self._refresh_connected_states()
         # Balances just changed — re-sort so the account with the most
         # money bubbles to the top (within its selected/unselected group).
         if net_liq_touched:
@@ -1039,6 +1113,7 @@ class AccountListPanel(QWidget):
 
     def _on_rows_changed(self, *args) -> None:
         self._sync_rows()
+        self._refresh_connected_states()
         self._emit_selection_changed()
 
     def _on_row_toggled(self, account: str, checked: bool) -> None:

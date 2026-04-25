@@ -75,6 +75,12 @@ class FlashTradeView(QWidget):
     # opposite the panel state.
     accounts_panel_visibility_changed = Signal(bool)
 
+    # Emitted when a fan-out (order / flatten / cancel) skipped one or
+    # more accounts because their worker is offline.  Payload is the
+    # human-readable summary text + duration in ms for the host to
+    # surface in the status bar.
+    transient_status_message = Signal(str, int)
+
     def __init__(self, active_threads: dict[str, IBWorkerThread] | None = None,
                  accounts_model: AccountsTableModel | None = None, parent=None,
                  *, open_preferences=None):
@@ -290,6 +296,17 @@ class FlashTradeView(QWidget):
                 log.warning("FlashTrade: no accounts checked – aborting order")
                 return
 
+        # Skip offline workers up front so the UI can tell the user what
+        # was dropped instead of letting orders silently vanish inside
+        # the per-account fan-out below.
+        accounts, _disconnected = self._partition_accounts_by_connection(accounts)
+        self._notify_skipped_accounts("Order", _disconnected)
+        if not accounts:
+            log.warning(
+                "FlashTrade: no connected accounts among the selection – "
+                "aborting order")
+            return
+
         # ── 2. Look up contract from saved config ─────────────────────────
         symbol = payload.get("symbol", "")
         if not symbol:
@@ -500,6 +517,48 @@ class FlashTradeView(QWidget):
         if worker and worker.isRunning() and worker.is_ib_connected:
             return worker
         return None
+
+    def _partition_accounts_by_connection(
+        self, accounts: list[str],
+    ) -> tuple[list[str], list[str]]:
+        """Split *accounts* into ``(connected, disconnected)`` using the
+        same predicate as ``_find_worker_for_account`` so partitioning
+        never disagrees with the actual fan-out.  Accounts whose worker
+        is missing entirely are also treated as disconnected so the
+        status message names them too."""
+        connected: list[str] = []
+        disconnected: list[str] = []
+        for account in accounts:
+            if self._find_worker_for_account(account) is not None:
+                connected.append(account)
+            else:
+                disconnected.append(account)
+        return connected, disconnected
+
+    def _pretty_account(self, account: str) -> str:
+        """Return ``alias (account)`` when the user has set an alias,
+        else just the account ID.  Reuses ``AccountsTableModel._aliases``
+        the same way ``_on_order_status_updated`` does today."""
+        if self._accounts_model is not None:
+            alias = self._accounts_model._aliases.get(account, "")
+            if alias:
+                return f"{alias} ({account})"
+        return account
+
+    def _notify_skipped_accounts(
+        self, action: str, disconnected: list[str],
+    ) -> None:
+        """Emit a status-bar message + WARNING log line summarising a
+        fan-out that skipped offline accounts.  ``action`` is a short
+        verb like ``"Order"`` / ``"Flatten"`` / ``"Cancel"`` so the
+        text reads naturally."""
+        if not disconnected:
+            return
+        pretty = ", ".join(self._pretty_account(a) for a in disconnected)
+        msg = (f"{action} skipped on {len(disconnected)} disconnected "
+               f"account(s): {pretty}")
+        log.warning("FlashTrade: %s", msg)
+        self.transient_status_message.emit(msg, 6000)
 
     def _ensure_worker_connected(self, worker: IBWorkerThread) -> None:
         """Connect order_status_updated, portfolio_updated, and
@@ -743,11 +802,19 @@ class FlashTradeView(QWidget):
                 "FlashTrade: cancel-all blocked — AccountListPanel not available")
             return
 
-        checked: set[str] = set(self._account_list.get_selected_accounts())
-        if not checked:
+        checked_list = list(self._account_list.get_selected_accounts())
+        if not checked_list:
             log.warning(
                 "FlashTrade: cancel-all blocked for '%s' — no accounts checked", symbol)
             return
+        connected_list, _disc = self._partition_accounts_by_connection(checked_list)
+        self._notify_skipped_accounts("Cancel", _disc)
+        if not connected_list:
+            log.warning(
+                "FlashTrade: cancel-all blocked for '%s' — every checked "
+                "account is on a disconnected connection", symbol)
+            return
+        checked: set[str] = set(connected_list)
 
         count = 0
         for label, worker in self._active_threads.items():
@@ -770,11 +837,19 @@ class FlashTradeView(QWidget):
                 "FlashTrade: flatten blocked — AccountListPanel not available")
             return
 
-        checked: set[str] = set(self._account_list.get_selected_accounts())
-        if not checked:
+        checked_list = list(self._account_list.get_selected_accounts())
+        if not checked_list:
             log.warning(
                 "FlashTrade: flatten blocked for '%s' — no accounts checked", symbol)
             return
+        connected_list, _disc = self._partition_accounts_by_connection(checked_list)
+        self._notify_skipped_accounts("Flatten", _disc)
+        if not connected_list:
+            log.warning(
+                "FlashTrade: flatten blocked for '%s' — every checked "
+                "account is on a disconnected connection", symbol)
+            return
+        checked: set[str] = set(connected_list)
 
         count = 0
         for label, worker in self._active_threads.items():
@@ -835,11 +910,19 @@ class FlashTradeView(QWidget):
                 "FlashTrade: reverse blocked — AccountListPanel not available")
             return
 
-        checked: set[str] = set(self._account_list.get_selected_accounts())
-        if not checked:
+        checked_list = list(self._account_list.get_selected_accounts())
+        if not checked_list:
             log.warning(
                 "FlashTrade: reverse blocked for '%s' — no accounts checked", symbol)
             return
+        connected_list, _disc = self._partition_accounts_by_connection(checked_list)
+        self._notify_skipped_accounts("Reverse", _disc)
+        if not connected_list:
+            log.warning(
+                "FlashTrade: reverse blocked for '%s' — every checked "
+                "account is on a disconnected connection", symbol)
+            return
+        checked: set[str] = set(connected_list)
 
         count = 0
         for label, worker in self._active_threads.items():
@@ -937,12 +1020,22 @@ class FlashTradeView(QWidget):
                 "FlashTrade: close_tier blocked — AccountListPanel not available")
             return
 
-        checked: set[str] = set(self._account_list.get_selected_accounts())
-        if not checked:
+        checked_list = list(self._account_list.get_selected_accounts())
+        if not checked_list:
             log.warning(
                 "FlashTrade: close_tier %s blocked for '%s' — "
                 "no accounts checked", side, symbol)
             return
+        # Drop accounts on offline workers so the user sees a status
+        # message instead of having close requests vanish silently.
+        connected_list, _disc = self._partition_accounts_by_connection(checked_list)
+        self._notify_skipped_accounts("Close tier", _disc)
+        if not connected_list:
+            log.warning(
+                "FlashTrade: close_tier %s blocked for '%s' — every "
+                "checked account is on a disconnected connection", side, symbol)
+            return
+        checked: set[str] = set(connected_list)
 
         # Use the UI's cached last_price (same source the order-entry panel
         # shows); fall back to the payload's snapshot if the cache is cold.

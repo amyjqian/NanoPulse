@@ -60,6 +60,14 @@ class StatusBar(QWidget):
         self._clock.start(1000)
         self._tick()
 
+        # One-shot timer for transient ``show_message`` overlays;
+        # ``_normal_status_text`` snapshots the real status label so we
+        # can restore it when the overlay expires.
+        self._normal_status_text = "NORMAL OPERATIONS"
+        self._transient_timer = QTimer(self)
+        self._transient_timer.setSingleShot(True)
+        self._transient_timer.timeout.connect(self._clear_transient)
+
     # ── Build UI ─────────────────────────────────────────────────────────────
 
     def _setup_ui(self) -> None:
@@ -115,6 +123,26 @@ class StatusBar(QWidget):
     def _tick(self) -> None:
         self._time_lbl.setText(
             QDateTime.currentDateTime().toString("hh:mm:ss"))
+
+    # ── Transient messages ───────────────────────────────────────────────────
+
+    def show_message(self, text: str, duration_ms: int = 6000) -> None:
+        """Show ``text`` in the leading status slot for ``duration_ms``
+        milliseconds, replacing the usual "NORMAL OPERATIONS" string,
+        then restore the original.  Calling again before the timer
+        expires resets the countdown."""
+        if not text:
+            return
+        self._status_lbl.setText(text)
+        self._status_lbl.setStyleSheet(
+            f"color: #FFA657; letter-spacing: 0.8px;")  # amber accent
+        self._transient_timer.stop()
+        self._transient_timer.start(max(int(duration_ms), 500))
+
+    def _clear_transient(self) -> None:
+        self._status_lbl.setText(self._normal_status_text)
+        self._status_lbl.setStyleSheet(
+            f"color: {TEXT_PRIMARY}; letter-spacing: 1.2px;")
 
     def _apply_colors(self) -> None:
         self._dot.set_color(ACCENT)

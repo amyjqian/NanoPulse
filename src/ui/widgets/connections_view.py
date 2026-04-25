@@ -1021,6 +1021,11 @@ class ConnectionsView(QWidget):
         worker.summary_batch_updated.connect(self._model.update_batch)
         worker.connection_status_changed.connect(self._on_connection_status)
         worker.accounts_detected.connect(self._on_accounts_detected)
+        # Seed the model's per-label state with "not yet connected" so any
+        # pre-existing rows for this label (re-connect after a stop)
+        # immediately render dimmed; the worker's first
+        # ``connection_status_changed(label, True)`` will flip it back.
+        self._model.set_connection_status(label, False)
         self._active_threads[label] = worker
         worker.start()
 
@@ -1062,13 +1067,17 @@ class ConnectionsView(QWidget):
         self._auto_save()
 
     def _on_connection_status(self, label: str, connected: bool) -> None:
-        """Update both Action button and Status cell for the matching row."""
+        """Update both Action button and Status cell for the matching row,
+        and forward the live state into ``AccountsTableModel`` so the
+        AccountListPanel and order fan-out can react too."""
         log.info("Connection status: %s → %s", label,
                  "Connected" if connected else "Disconnected")
         for row in range(self._cfg_table.rowCount()):
             if self._row_label(row) == label:
                 self._set_row_state(row, connected=connected)
                 break
+        # Make every other consumer of the model aware of the state flip.
+        self._model.set_connection_status(label, connected)
 
     def _on_accounts_detected(self, label: str, accounts: list) -> None:
         """Auto-populate the Type column based on detected account IDs.
