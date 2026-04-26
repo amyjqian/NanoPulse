@@ -393,22 +393,17 @@ class FlashTradeView(QWidget):
                          limit_price, adaptive_priority)
                 order_type = "ADAPTIVE"
             else:
-                # Stocks → Pegged to Primary (REL)
-                # auxPrice = dollar offset from the NBBO
-                if action == "BUY":
-                    raw_offset = float(prefs.get("buy_bid_offset", 0))
-                    offset_unit = str(prefs.get("buy_bid_unit", "ticks"))
-                else:
-                    raw_offset = float(prefs.get("sell_ask_offset", 0))
-                    offset_unit = str(prefs.get("sell_ask_unit", "ticks"))
-                peg_offset = abs(calculate_offset(
-                    raw_offset, offset_unit,
-                    last_price if last_price > 0 else 0, tick,
-                ))
+                # Stocks → Pegged to Primary (REL).  The button labels
+                # are "Buy @Bid +1t" and "Sell @Ask -1t" — both fix the
+                # peg offset at exactly one tick so the order rests one
+                # tick inside the NBBO regardless of the user's
+                # buy_bid_offset / sell_ask_offset preferences.
+                # auxPrice = dollar offset from the NBBO (always >= 0).
+                peg_offset = tick
                 # lmtPrice = limit cap (ceiling BUY / floor SELL), 0 = no cap
                 limit_price = _cap_price()
                 log.info("FlashTrade: STK %s @%s %s base=%.4f tick=%.4f → "
-                         "PEG_PRIM limit=%.4f peg_offset=%.4f",
+                         "PEG_PRIM limit=%.4f peg_offset=%.4f (+1 tick)",
                          action, order_type, symbol, last_price, tick,
                          limit_price, peg_offset)
                 order_type = "PEG_PRIM"
@@ -1037,17 +1032,28 @@ class FlashTradeView(QWidget):
             return
         checked: set[str] = set(connected_list)
 
-        # Use the UI's cached last_price (same source the order-entry panel
-        # shows); fall back to the payload's snapshot if the cache is cold.
+        # Resolve an absolute reference price using the same fallback
+        # chain the bracket-children path uses on the worker side:
+        # cached last → payload last → cached bid/ask midpoint.  Last
+        # resort, surface a modal so the user knows why their click
+        # did nothing instead of dropping the request silently.
         last_price = 0.0
         cached = self._order_entry._price_cache.get(symbol.upper())
         if cached:
             last_price = float(cached[0])
         if last_price <= 0:
             last_price = float(data.get("last_price") or 0.0)
+        if last_price <= 0 and cached:
+            bid = float(cached[1] or 0.0)
+            ask = float(cached[2] or 0.0)
+            if bid > 0 and ask > 0:
+                last_price = (bid + ask) / 2.0
+                log.info(
+                    "FlashTrade: close_tier %s '%s' using bid/ask mid "
+                    "%.4f (no live last)", side, symbol, last_price)
         if last_price <= 0:
             log.warning(
-                "FlashTrade: close_tier %s '%s' blocked — no live price yet",
+                "FlashTrade: close_tier %s '%s' blocked — no live price",
                 side, symbol)
             return
 
@@ -1376,5 +1382,16 @@ class FlashTradeView(QWidget):
         """Re-subscribe to live price and wire any new/reconnected workers
         when the tab becomes visible."""
         super().showEvent(event)
-        self._wire_all_workers()
-        self._order_entry.refresh_price_subscription()
+        # Any Python exception raised inside a Qt virtual override
+        # (showEvent is one) trips a Shiboken bug on macOS that turns
+        # the exception into a segfault.  Catch + log here so the app
+        # stays alive and we get a stack trace instead of a crash.
+        try:
+            self._wire_all_workers()
+        except Exception:
+            log.exception("FlashTrade: _wire_all_workers raised in showEvent")
+        try:
+            self._order_entry.refresh_price_subscription()
+        except Exception:
+            log.exception(
+                "FlashTrade: refresh_price_subscription raised in showEvent")

@@ -6,21 +6,30 @@ import logging
 import math
 from typing import Any
 
-from PySide6.QtCore import QEvent, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QDoubleValidator, QFont, QFontMetrics, QIntValidator, QPainter
+from PySide6.QtCore import QEvent, QRect, Qt, QTimer, Signal
+from PySide6.QtGui import (
+    QColor,
+    QDoubleValidator,
+    QFont,
+    QFontMetrics,
+    QIntValidator,
+    QPainter,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
     QCompleter,
+    QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
-    QMessageBox,
     QPushButton,
     QSizePolicy,
+    QStyle,
+    QStyleOptionButton,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -89,6 +98,106 @@ def _make_btn(text: str, colour: str, min_h: int = 32) -> QPushButton:
     return btn
 
 
+class _ActionButton(QPushButton):
+    """Buy / Sell action button with a big primary line plus a small
+    secondary line that summarises the currently-armed Take Profit /
+    Stop Loss / Trail amounts.
+
+    Two-line layout (centred) drawn manually so each line uses its own
+    font.  QSS still drives the background / hover / pressed visuals
+    via :meth:`QStyle.drawControl` — only the text rendering is custom.
+    """
+
+    _PRIMARY_PT = 13
+    _SECONDARY_PT = 10
+
+    def __init__(self, primary: str, colour: str, parent=None) -> None:
+        super().__init__(parent)
+        self._primary = primary
+        self._secondary = ""
+        self.setMinimumHeight(40)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setStyleSheet(f"""
+            QPushButton {{
+                background: {colour};
+                color: #ffffff;
+                border: none;
+                border-radius: 4px;
+                padding: 4px 8px;
+            }}
+            QPushButton:hover {{ background: {colour}; border: 1px solid #ffffff30; }}
+            QPushButton:pressed {{ background: {colour}; border: 1px solid #ffffff60; }}
+        """)
+
+    def setPrimary(self, text: str) -> None:  # noqa: N802
+        if self._primary == text:
+            return
+        self._primary = text
+        self.update()
+
+    def setSecondary(self, text: str) -> None:  # noqa: N802
+        if self._secondary == text:
+            return
+        self._secondary = text
+        self.update()
+
+    # Override the inherited setText so an accidental setText() call
+    # routes to setPrimary() rather than silently breaking the custom
+    # paint (which never reads QPushButton.text()).
+    def setText(self, text: str) -> None:  # noqa: N802
+        self.setPrimary(text)
+
+    def text(self) -> str:
+        return self._primary
+
+    def paintEvent(self, event):  # noqa: N802
+        # Draw the QSS background only (suppress Qt's own text rendering
+        # by zeroing opt.text), then paint our two-line text on top.
+        opt = QStyleOptionButton()
+        self.initStyleOption(opt)
+        opt.text = ""
+        painter = QPainter(self)
+        try:
+            self.style().drawControl(
+                QStyle.ControlElement.CE_PushButton, opt, painter, self)
+            painter.setPen(QColor("#ffffff"))
+
+            r = self.rect()
+            f_primary = QFont(self.font())
+            f_primary.setPointSize(self._PRIMARY_PT)
+            f_primary.setBold(True)
+            fm_p = QFontMetrics(f_primary)
+
+            if self._secondary:
+                f_secondary = QFont(self.font())
+                f_secondary.setPointSize(self._SECONDARY_PT)
+                f_secondary.setBold(True)
+                fm_s = QFontMetrics(f_secondary)
+                gap = 2
+                total_h = fm_p.height() + gap + fm_s.height()
+                top = (r.height() - total_h) // 2
+
+                painter.setFont(f_primary)
+                painter.drawText(
+                    QRect(r.x(), top, r.width(), fm_p.height()),
+                    Qt.AlignmentFlag.AlignHCenter
+                    | Qt.AlignmentFlag.AlignVCenter,
+                    self._primary)
+                painter.setFont(f_secondary)
+                painter.drawText(
+                    QRect(r.x(), top + fm_p.height() + gap,
+                          r.width(), fm_s.height()),
+                    Qt.AlignmentFlag.AlignHCenter
+                    | Qt.AlignmentFlag.AlignVCenter,
+                    self._secondary)
+            else:
+                painter.setFont(f_primary)
+                painter.drawText(r, Qt.AlignmentFlag.AlignCenter, self._primary)
+        finally:
+            painter.end()
+
+
 def _sec_type_for(sym: str) -> str:
     """Return 'FUT', 'STK', 'OPT', or '?' for *sym* via ReferenceData cache."""
     from src.core.reference_data import get_instance as _rd
@@ -107,52 +216,6 @@ def _apply_chip_style(btn: QPushButton, selected: bool) -> None:
             "QPushButton{background:#3a3a4a;color:#ccc;border:none;"
             "border-radius:6px;padding:4px 12px;font-weight:600;font-size:12px}"
             "QPushButton:hover{background:#4a4a5a}")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Toggle switch
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class _ToggleSwitch(QWidget):
-    """Compact iOS-style on/off toggle (custom-painted, no images needed)."""
-
-    toggled = Signal(bool)
-    _W, _H = 40, 22
-
-    def __init__(self, on: bool = False, parent=None):
-        super().__init__(parent)
-        self._on = on
-        self.setFixedSize(self._W, self._H)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-
-    def mousePressEvent(self, event) -> None:
-        self._on = not self._on
-        self.update()
-        self.toggled.emit(self._on)
-
-    def paintEvent(self, event) -> None:
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        r = self._H // 2
-        # Track
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor("#0071e3") if self._on else QColor("#4a4a5a"))
-        p.drawRoundedRect(0, 1, self._W, self._H - 2, r, r)
-        # Thumb
-        thumb_d = self._H - 6
-        thumb_x = self._W - thumb_d - 4 if self._on else 4
-        p.setBrush(QColor("white"))
-        p.drawEllipse(thumb_x, 3, thumb_d, thumb_d)
-        p.end()
-
-    @property
-    def is_on(self) -> bool:
-        return self._on
-
-    def set_on(self, value: bool) -> None:
-        if self._on != value:
-            self._on = value
-            self.update()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -312,6 +375,13 @@ class TickPriceInput(QWidget):
 
     def text(self) -> str:
         return self._edit.text()
+
+    def setText(self, text: str) -> None:  # noqa: N802 — Qt-style mixed case
+        """Programmatic setter mirroring :class:`QLineEdit`'s API so
+        ``_TierSection.restore_state`` can push a saved Dist value
+        back into the input.  Emits ``textChanged`` for downstream
+        listeners."""
+        self._edit.setText(text)
 
     def clear(self) -> None:
         self._edit.blockSignals(True)
@@ -986,14 +1056,24 @@ class _TierSection(QWidget):
         "QLineEdit:disabled{background:#252535;color:#444;border:none}"
     )
 
+    # Cap the number of preset chips displayed.  Three chips + the
+    # custom Dist input + the title button is the most that fits on a
+    # single row at the panel's typical width — additional tiers from
+    # the user's strategy config are silently dropped here.
+    _MAX_CHIPS = 3
+
     def __init__(self, title: str, tiers: list[dict],
-                 enabled: bool = False,
                  label_color: str = Theme.ACCENT,
                  *,
-                 auto_select_min: bool = False,
+                 short_title: str | None = None,
                  parent=None):
         super().__init__(parent)
         self._title_str    = title
+        # Compact label shown alongside the dollar amount once a tier
+        # is armed.  Defaults to the long title; sections like Stop
+        # Loss / Trailing pass an abbreviation ("SL" / "TS") so the
+        # button doesn't blow out width when the dollar suffix lands.
+        self._short_title  = short_title or title
         self._label_color  = label_color
         self._tiers:             list[dict]  = tiers
         self._dollar_per_tier:   list[float] = []
@@ -1002,67 +1082,38 @@ class _TierSection(QWidget):
         self._selected_idx:      int | None  = None
         self._chip_buttons:      list[QPushButton] = []
         self._input:             TickPriceInput | None = None
-        self._toggle:            _ToggleSwitch | None = None
-        self._state_lbl:         QLabel | None = None
-        self._dollar_lbl:        QLabel | None = None
+        self._dollar_lbl:        QPushButton | None = None
         self._chips_layout:      QHBoxLayout | None = None
-        # When True, turning the toggle on (with no prior chip selection
-        # and no custom Dist) auto-selects the smallest / first tier so
-        # the user gets a sensible default with a single click.
-        self._auto_select_min:   bool = auto_select_min
-        self._build_ui(title, enabled)
+        self._build_ui()
 
     # ── Build ─────────────────────────────────────────────────────────────────
 
-    def _build_ui(self, title: str, enabled: bool) -> None:
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 4)
-        root.setSpacing(4)
-
-        # Header row:  [title: $dollar]  [stretch]  [On/Off]  [toggle]
-        # _dollar_lbl acts as the *combined* title + value label on the left:
-        #   • no chip / no dollar  →  "Take profit"          (plain white)
-        #   • chip selected, off   →  "Take profit: $500"    (dim grey preview)
-        #   • chip selected, on    →  "Take profit: $500"    (accent green/red)
-        hdr = QHBoxLayout()
-        hdr.setSpacing(6)
-        hdr.setContentsMargins(0, 0, 0, 0)
-
-        self._dollar_lbl = _make_btn(title, self._label_color, 30)
-        self._dollar_lbl.setSizePolicy(
-            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        # Pin min width to fit "Take Profit" so TP and SL buttons have the
-        # same initial width regardless of which title is shorter.
-        _fm = QFontMetrics(self._dollar_lbl.font())
-        self._dollar_lbl.setMinimumWidth(_fm.horizontalAdvance("Take Profit") + 24)
-        self._dollar_lbl.clicked.connect(self._on_header_submit)
-        # Disabled until a chip is selected or a custom Dist is typed.
-        self._dollar_lbl.setEnabled(False)
-        hdr.addWidget(self._dollar_lbl)
-        hdr.addStretch()
-
-        self._state_lbl = QLabel("On" if enabled else "Off")
-        self._state_lbl.setStyleSheet(
-            f"color: {Theme.TEXT_DIM}; font-size: 11px; border: none;")
-        hdr.addWidget(self._state_lbl)
-
-        self._toggle = _ToggleSwitch(enabled)
-        self._toggle.toggled.connect(self._on_toggled)
-        hdr.addWidget(self._toggle)
-        root.addLayout(hdr)
-
-        # Chips container (rebuilt on reload_tiers)
-        chips_w = QWidget()
-        chips_w.setStyleSheet("border: none;")
-        self._chips_layout = QHBoxLayout(chips_w)
-        self._chips_layout.setContentsMargins(0, 0, 0, 0)
+    def _build_ui(self) -> None:
+        # Single row:  [chip1] [chip2] [chip3] [Dist input] [Title button]
+        # The toggle / On-Off label that used to live in a header row is
+        # gone — selection happens implicitly when the user clicks a
+        # chip or types into the Dist input, and the ARMED-strip
+        # ``✕`` button reset() the row.
+        self._chips_layout = QHBoxLayout(self)
+        self._chips_layout.setContentsMargins(0, 0, 0, 4)
         self._chips_layout.setSpacing(4)
-        root.addWidget(chips_w)
+        self._build_chips()
 
-        self._build_chips(enabled)
+    # Stretch factors for the row.  Chosen so the relative slice each
+    # cell takes matches the design pixel widths at a typical ~900 px
+    # panel: chip 138, Dist input 190, title button 270.
+    # Total = 3 × 138 + 190 + 270 = 874 stretch units.
+    _CHIP_STRETCH = 138
+    _INPUT_STRETCH = 190
+    _BUTTON_STRETCH = 270
 
-    def _build_chips(self, enabled: bool) -> None:
-        """(Re)populate the chips row from self._tiers."""
+    def _build_chips(self) -> None:
+        """(Re)populate the chips row from ``self._tiers``.  Only the
+        first ``_MAX_CHIPS`` tiers are rendered; the row ends with the
+        custom Dist input and the ``TP`` / ``SL`` / ``TS`` title
+        button.  Chip + input widths are 7/10 of an equal split so the
+        title button gets the extra room — see the stretch constants
+        above."""
         lay = self._chips_layout
         while lay.count():
             item = lay.takeAt(0)
@@ -1071,10 +1122,11 @@ class _TierSection(QWidget):
         self._chip_buttons.clear()
         self._selected_idx = None
 
-        # Snapshot dollar values parallel to chip indices
-        self._dollar_per_tier = [t.get("dollar", 0.0) for t in self._tiers]
+        tiers = self._tiers[:self._MAX_CHIPS]
+        # Snapshot dollar values parallel to chip indices.
+        self._dollar_per_tier = [t.get("dollar", 0.0) for t in tiers]
 
-        for i, tier in enumerate(self._tiers):
+        for i, tier in enumerate(tiers):
             label = tier.get("label", f"Tier {i + 1}")
             btn = QPushButton(label)
             btn.setFixedHeight(self._CHIP_H)
@@ -1083,14 +1135,27 @@ class _TierSection(QWidget):
                 QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             btn.clicked.connect(lambda chk, idx=i: self._on_chip_clicked(idx))
             self._chip_buttons.append(btn)
-            lay.addWidget(btn)
+            lay.addWidget(btn, self._CHIP_STRETCH)
 
+        # Custom Dist input.
         self._input = TickPriceInput()
         self._input.setFixedHeight(self._CHIP_H)
         self._input.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._input.textChanged.connect(self._on_input_changed)
-        lay.addWidget(self._input)
+        lay.addWidget(self._input, self._INPUT_STRETCH)
+
+        # Title / dollar button — right-most in the row.  Doubles as
+        # the close-the-position submit button (clickable only when
+        # something is armed).  Wider stretch factor so it absorbs the
+        # 30% trimmed off the chips and Dist input.
+        self._dollar_lbl = _make_btn(
+            self._title_str, self._label_color, self._CHIP_H)
+        self._dollar_lbl.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._dollar_lbl.clicked.connect(self._on_header_submit)
+        self._dollar_lbl.setEnabled(False)
+        lay.addWidget(self._dollar_lbl, self._BUTTON_STRETCH)
 
         self._update_chip_styles()
         self._update_dollar_display()
@@ -1098,29 +1163,26 @@ class _TierSection(QWidget):
     # ── Dollar display ────────────────────────────────────────────────────────
 
     def _update_dollar_display(self) -> None:
-        """Refresh the Take Profit / Stop Loss button label.
+        """Refresh the Take Profit / Stop Loss / Trail Stop button label.
 
-        Shows just the title ("Take profit") when no chip is selected and no
-        custom Dist is typed; shows "Take profit | 500" once either provides
-        a positive dollar value.
+        Shows just the title when nothing is selected; shows
+        ``Title | $X`` once a chip or a positive Dist provides a value.
         """
         if self._dollar_lbl is None:
             return
 
-        input_text = self._input.text().strip() if self._input is not None else ""
-        toggle_on = self._toggle.is_on if self._toggle else True
-        has_selection = self._selected_idx is not None or bool(input_text)
-        # Button is enabled only when the section is on and the user has
-        # expressed a choice — either a chip or a non-empty Dist.
-        self._dollar_lbl.setEnabled(toggle_on and has_selection)
+        input_text = (self._input.text().strip()
+                      if self._input is not None else "")
+        has_chip = self._selected_idx is not None
+        has_input = bool(input_text)
+        active = has_chip or has_input
+        self._dollar_lbl.setEnabled(active)
 
-        # When the section is off or nothing is selected, show just the title
-        # with no dollar value suffix.
-        if not toggle_on or not has_selection:
+        if not active:
             self._dollar_lbl.setText(self._title_str)
             return
 
-        # Per-unit dollar: custom Dist input wins over chip selection
+        # Per-unit dollar: custom Dist wins over chip selection.
         dollar = 0.0
         if input_text:
             try:
@@ -1128,17 +1190,20 @@ class _TierSection(QWidget):
                 if dist > 0:
                     dollar = dist * self._multiplier
             except ValueError:
-                dollar = 0.0
-        if dollar <= 0 and self._selected_idx is not None \
-                and self._selected_idx < len(self._dollar_per_tier):
+                pass
+        if dollar <= 0 and has_chip and self._selected_idx < len(
+                self._dollar_per_tier):
             dollar = self._dollar_per_tier[self._selected_idx]
 
-        if not dollar or dollar <= 0:
+        if dollar <= 0:
             self._dollar_lbl.setText(self._title_str)
             return
 
-        scaled = dollar * self._qty
-        self._dollar_lbl.setText(f"{self._title_str} | {scaled:,.2f}")
+        scaled = int(round(dollar * self._qty))
+        # Armed → use the compact label so the button fits the dollar
+        # value without overflowing (e.g. ``"SL $20"`` instead of
+        # ``"Stop Loss $20"``).
+        self._dollar_lbl.setText(f"{self._short_title} ${scaled:,}")
 
     def set_qty(self, qty: int) -> None:
         """Update the quantity and refresh the dollar display (no chip rebuild)."""
@@ -1152,26 +1217,25 @@ class _TierSection(QWidget):
 
     # ── Slots ─────────────────────────────────────────────────────────────────
 
-    def _on_toggled(self, on: bool) -> None:
-        self._state_lbl.setText("On" if on else "Off")
-        if on:
-            # Auto-select the smallest (first) tier when the user turns
-            # the section on without any prior chip selection or custom
-            # Dist — saves an extra click for the common "default TP/SL
-            # at the closest tier" case.  Opt-in via auto_select_min so
-            # sections that shouldn't pick a default (e.g. Trail Stop)
-            # stay manual.
-            input_text = (self._input.text().strip()
-                          if self._input else "")
-            if (self._auto_select_min
-                    and self._selected_idx is None
-                    and not input_text
-                    and self._tiers):
-                self._selected_idx = 0
+    def _on_header_submit(self) -> None:
+        """Title button click → fire ``submit_requested`` so the host
+        (OrderEntryPanel) routes it as a close-the-position order.  No-op
+        when nothing is armed; the button is also disabled in that
+        state via ``_update_dollar_display`` so this is defensive."""
+        if self.get_value() is None:
+            return
+        self.submit_requested.emit()
+
+    def _on_chip_clicked(self, idx: int) -> None:
+        # Click a chip while it's already selected → deselect (so the
+        # user can disarm one section without resetting the others).
+        if self._selected_idx == idx:
+            self._selected_idx = None
         else:
-            # Keep _selected_idx so the dollar label stays as an informational
-            # preview even when the section is disabled.  Clear any custom text.
-            if self._input:
+            self._selected_idx = idx
+            # Custom Dist and chip selection are mutually exclusive —
+            # picking a chip clears any prior typed value.
+            if self._input is not None:
                 self._input.blockSignals(True)
                 self._input.clear()
                 self._input.blockSignals(False)
@@ -1179,70 +1243,31 @@ class _TierSection(QWidget):
         self._update_dollar_display()
         self.changed.emit()
 
-    def _on_header_submit(self) -> None:
-        """Clicking the Take Profit / Stop Loss / Trail Stop header button
-        fires the section's submit_requested signal so OrderEntryPanel can
-        route it as a close-the-position order.  If no tier is selected
-        (nothing to act on) the click is a no-op — the button is also
-        disabled in that state via _update_dollar_display, so this branch
-        is defensive.
-        """
-        if self.get_value() is None:
-            return
-        self.submit_requested.emit()
-
-    def _on_chip_clicked(self, idx: int) -> None:
-        if self._toggle and not self._toggle.is_on:
-            self._toggle.set_on(True)
-            self._state_lbl.setText("On")
-        self._selected_idx = idx
-        if self._input:
-            self._input.blockSignals(True)
-            self._input.clear()
-            self._input.blockSignals(False)
-        self._update_chip_styles()
-        self._update_dollar_display()
-        self.changed.emit()
-
-    def _on_input_changed(self, text: str) -> None:
-        stripped = text.strip()
+    def _on_input_changed(self, _text: str) -> None:
+        # Typing a positive value into Dist supersedes chip selection;
+        # an empty / non-positive value just clears the dollar preview.
+        stripped = (self._input.text().strip()
+                    if self._input is not None else "")
         try:
             val = float(stripped) if stripped else 0.0
         except ValueError:
             val = 0.0
-
-        if val > 0:
-            if self._toggle and not self._toggle.is_on:
-                self._toggle.set_on(True)
-                self._state_lbl.setText("On")
+        if val > 0 and self._selected_idx is not None:
             self._selected_idx = None
-            self._update_chip_styles()
-        else:
-            # Empty / 0 / invalid Dist → turn the section off
-            if self._toggle and self._toggle.is_on:
-                self._toggle.blockSignals(True)
-                self._toggle.set_on(False)
-                self._toggle.blockSignals(False)
-                self._state_lbl.setText("Off")
-                self._update_chip_styles()
-        # Always refresh dollar display so cleared / zeroed text removes the preview
+        self._update_chip_styles()
         self._update_dollar_display()
         self.changed.emit()
 
     def _update_chip_styles(self) -> None:
-        toggle_on = self._toggle.is_on if self._toggle else True
         for i, btn in enumerate(self._chip_buttons):
-            # Blue highlight only when the section is active (toggle ON).
-            # While inactive the chip shows grey but the dollar preview is
-            # still driven by _selected_idx.
-            _apply_chip_style(btn, i == self._selected_idx and toggle_on)
+            _apply_chip_style(btn, i == self._selected_idx)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def reload_tiers(self, tiers: list[dict]) -> None:
         """Reload chip buttons (e.g. when symbol or preferences change)."""
         self._tiers = tiers
-        self._build_chips(enabled=True)
+        self._build_chips()
 
     def set_market_price(self, price: float, tick_size: float = 0.25) -> None:
         """Forward the live market price and tick size to the TickPriceInput."""
@@ -1251,20 +1276,95 @@ class _TierSection(QWidget):
 
     @property
     def is_enabled(self) -> bool:
-        return self._toggle.is_on if self._toggle else False
+        """Section is "armed" whenever the user has expressed a choice
+        — either a chip is selected or the custom Dist input holds a
+        positive number.  There's no separate on/off toggle anymore."""
+        if self._selected_idx is not None:
+            return True
+        text = (self._input.text().strip()
+                if self._input is not None else "")
+        if not text:
+            return False
+        try:
+            return float(text) > 0
+        except ValueError:
+            return False
+
+    def reset(self) -> None:
+        """Return the section to its pristine, unselected state: no chip
+        highlighted, custom Dist cleared.  Used by the ARMED-strip close
+        button to disarm everything in one gesture."""
+        had_state = (self._selected_idx is not None
+                     or (self._input is not None
+                         and bool(self._input.text().strip())))
+        if self._input is not None:
+            self._input.blockSignals(True)
+            self._input.clear()
+            self._input.blockSignals(False)
+        self._selected_idx = None
+        self._update_chip_styles()
+        self._update_dollar_display()
+        if had_state:
+            # Only emit when something actually changed — avoids
+            # spurious refreshes that ripple into the ARMED strip.
+            self.changed.emit()
+
+    # ── Per-symbol state capture / restore ───────────────────────────────────
+
+    def capture_state(self) -> dict:
+        """Snapshot the section's current armed selection so the host
+        can stash it away (e.g. keyed by symbol) and restore it later
+        via :meth:`restore_state`.  Lightweight by design — only the
+        chip index and the custom Dist text are persisted."""
+        return {
+            "selected_idx": self._selected_idx,
+            "input_text": (
+                self._input.text() if self._input is not None else ""),
+        }
+
+    def restore_state(self, state: dict | None) -> None:
+        """Apply a snapshot produced by :meth:`capture_state`.  Pass
+        ``None`` (or a falsy dict) to reset the section to its
+        pristine state — same as calling :meth:`reset`."""
+        if not state:
+            self.reset()
+            return
+        idx = state.get("selected_idx")
+        text = state.get("input_text", "")
+        # Defensive: a chip index from the previous symbol's tier list
+        # may exceed the new tier count.  Drop it if so.
+        if idx is not None and (
+                not isinstance(idx, int) or idx < 0
+                or idx >= len(self._tiers)):
+            idx = None
+        # Push the snapshot in without bouncing through ``changed`` until
+        # both fields are settled, then emit once at the end.
+        self._selected_idx = idx
+        if self._input is not None:
+            self._input.blockSignals(True)
+            self._input.clear()
+            if text:
+                self._input.setText(text)
+            self._input.blockSignals(False)
+        self._update_chip_styles()
+        self._update_dollar_display()
+        self.changed.emit()
 
     def get_value(self) -> dict | None:
-        """Return selected tier value dict, or None if disabled/nothing chosen."""
+        """Return the selected tier as ``{"value", "unit", "label"}``,
+        or None when the section is unarmed."""
         if not self.is_enabled:
             return None
-        custom = self._input.text().strip() if self._input else ""
+        custom = (self._input.text().strip()
+                  if self._input is not None else "")
         if custom:
             try:
-                # TickPriceInput returns an absolute price, not a tick offset
-                return {"value": float(custom), "unit": "price", "label": "Custom"}
+                return {"value": float(custom), "unit": "price",
+                        "label": "Custom"}
             except ValueError:
                 return None
-        if self._selected_idx is not None and self._selected_idx < len(self._tiers):
+        if (self._selected_idx is not None
+                and self._selected_idx < len(self._tiers)):
             t = self._tiers[self._selected_idx]
             return {
                 "value": t.get("value", 0),
@@ -1355,6 +1455,14 @@ class OrderEntryPanel(QWidget):
             self._active_symbol = self._symbols[0] if self._symbols else None
         self._active_qty: int = 1
         self._sym_buttons: dict[str, QPushButton] = {}
+        # In-memory cache of the user's TP / SL / Trail selections per
+        # symbol — keyed by uppercase symbol, value is a dict
+        # ``{"pt": <_TierSection.capture_state>, "sl": ..., "tr": ...}``.
+        # Lives only for the lifetime of the app (deliberately NOT
+        # persisted to ``app_config.json``) so a fresh launch always
+        # starts every symbol unarmed, while in-session symbol
+        # switches preserve whatever the user had picked.
+        self._tier_state_by_symbol: dict[str, dict] = {}
 
         self._setup_ui()
         self._rebuild_symbol_buttons()
@@ -1517,29 +1625,60 @@ class OrderEntryPanel(QWidget):
         qty_container.setLayout(self._qty_layout)
         root.addWidget(qty_container)
 
-        root.addSpacing(12)
+        # Tighten the qty-chips ↔ ARMED banner ↔ Buy/Sell action grid
+        # gap from the original 12 px down to 4 px so the whole
+        # action stack reads as one connected block.
+        root.addSpacing(4)
+
+        # ── Pre-build tier sections so the ARMED strip below can
+        # subscribe to their ``changed`` signal.  The widgets stay
+        # detached for now and are added to ``root`` later, at their
+        # normal position below the position-management grid.
+        pt_tiers, sl_tiers, tr_tiers = self._load_tiers_for_active()
+        self._pt_section = _TierSection(
+            "Take Profit", pt_tiers, label_color=Theme.CLR_BUY,
+            short_title="TP")
+        self._pt_section.submit_requested.connect(
+            lambda: self._on_tier_submit("tp"))
+        self._sl_section = _TierSection(
+            "Stop Loss", sl_tiers, label_color=Theme.CLR_SELL,
+            short_title="SL")
+        self._sl_section.submit_requested.connect(
+            lambda: self._on_tier_submit("sl"))
+        self._tr_section = _TierSection(
+            "Trailing", tr_tiers, label_color=Theme.CLR_FLATTEN,
+            short_title="TS")
+
+        # The TP / SL / Trail amounts that used to live in a separate
+        # ARMED banner above the buttons are now drawn directly on each
+        # Buy / Sell button as a small second line — see
+        # ``_refresh_action_labels`` and :class:`_ActionButton`.
+        for _sec in (self._pt_section, self._sl_section, self._tr_section):
+            _sec.changed.connect(self._refresh_action_labels)
+
+        root.addSpacing(4)
 
         # ── Action buttons (4×2) ─────────────────────────────────────────────
         action_grid = QGridLayout()
         action_grid.setSpacing(4)
         action_grid.setContentsMargins(0, 0, 0, 0)
-        self._btn_buy_mkt = _make_btn("Buy @MKT", Theme.CLR_BUY, 36)
-        self._btn_sell_mkt = _make_btn("Sell @MKT", Theme.CLR_SELL, 36)
-        self._btn_buy_mid = _make_btn("Buy @Mid", Theme.CLR_BUY, 36)
-        self._btn_sell_mid = _make_btn("Sell @Mid", Theme.CLR_SELL, 36)
-        self._btn_buy_bid = _make_btn("Buy @Bid", Theme.CLR_BUY, 36)
-        self._btn_sell_ask = _make_btn("Sell @Ask", Theme.CLR_SELL, 36)
-        self._btn_buy_bid_lmt = _make_btn("Buy @Bid Limit", Theme.CLR_BUY, 36)
-        self._btn_sell_ask_lmt = _make_btn(
-            "Sell @Ask Limit", Theme.CLR_SELL, 36)
+        self._btn_buy_mkt = _ActionButton("Buy @MKT", Theme.CLR_BUY)
+        self._btn_sell_mkt = _ActionButton("Sell @MKT", Theme.CLR_SELL)
+        self._btn_buy_mid = _ActionButton("Buy @Mid", Theme.CLR_BUY)
+        self._btn_sell_mid = _ActionButton("Sell @Mid", Theme.CLR_SELL)
+        self._btn_buy_bid_lmt = _ActionButton("Buy @Bid Limit", Theme.CLR_BUY)
+        self._btn_sell_ask_lmt = _ActionButton(
+            "Sell @Ask Limit", Theme.CLR_SELL)
+        self._btn_buy_bid = _ActionButton("Buy @Bid +1t", Theme.CLR_BUY)
+        self._btn_sell_ask = _ActionButton("Sell @Ask -1t", Theme.CLR_SELL)
         action_grid.addWidget(self._btn_buy_mkt, 0, 0)
         action_grid.addWidget(self._btn_sell_mkt, 0, 1)
         action_grid.addWidget(self._btn_buy_mid, 1, 0)
         action_grid.addWidget(self._btn_sell_mid, 1, 1)
-        action_grid.addWidget(self._btn_buy_bid, 2, 0)
-        action_grid.addWidget(self._btn_sell_ask, 2, 1)
-        action_grid.addWidget(self._btn_buy_bid_lmt, 3, 0)
-        action_grid.addWidget(self._btn_sell_ask_lmt, 3, 1)
+        action_grid.addWidget(self._btn_buy_bid_lmt, 2, 0)
+        action_grid.addWidget(self._btn_sell_ask_lmt, 2, 1)
+        action_grid.addWidget(self._btn_buy_bid, 3, 0)
+        action_grid.addWidget(self._btn_sell_ask, 3, 1)
 
         self._btn_buy_mkt.clicked.connect(
             lambda: self._emit_order(OrderAction.BUY, "MKT"))
@@ -1600,29 +1739,12 @@ class OrderEntryPanel(QWidget):
 
         root.addSpacing(8)
 
-        # ── Take Profit ───────────────────────────────────────────────────────
-        pt_tiers, sl_tiers, tr_tiers = self._load_tiers_for_active()
-        self._pt_section = _TierSection(
-            "Take Profit", pt_tiers, enabled=False,
-            label_color=Theme.CLR_BUY, auto_select_min=True)
-        self._pt_section.submit_requested.connect(
-            lambda: self._on_tier_submit("tp"))
+        # ── Take Profit / Stop Loss / Trail Stop ─────────────────────────────
+        # The widgets themselves were created earlier (so the ARMED strip
+        # could connect to their ``changed`` signal); here we just lay
+        # them out at the bottom of the root column.
         root.addWidget(self._pt_section)
-
-        # ── Stop Loss ─────────────────────────────────────────────────────────
-        self._sl_section = _TierSection(
-            "Stop Loss", sl_tiers, enabled=False,
-            label_color=Theme.CLR_SELL, auto_select_min=True)
-        self._sl_section.submit_requested.connect(
-            lambda: self._on_tier_submit("sl"))
         root.addWidget(self._sl_section)
-
-        # ── Trailing ──────────────────────────────────────────────────────────
-        # Trail Stop header button is not wired to close-the-position
-        # (yet), but toggling on auto-selects the smallest tier like TP/SL.
-        self._tr_section = _TierSection(
-            "Trail Stop", tr_tiers, enabled=False,
-            label_color=Theme.CLR_FLATTEN, auto_select_min=True)
         root.addWidget(self._tr_section)
 
         root.addStretch(1)
@@ -1899,6 +2021,10 @@ class OrderEntryPanel(QWidget):
         self._rebuild_symbol_buttons()
 
     def _on_symbol_clicked(self, sym: str) -> None:
+        # Snapshot the outgoing symbol's TP / SL / TS selection so that
+        # coming back to it restores the same arming.  Skipped on the
+        # very first click (no prior active symbol).
+        self._capture_tier_state(self._active_symbol)
         self._active_symbol = sym
         config_manager.save_active_order_entry_symbol(sym)
         for s, btn in self._sym_buttons.items():
@@ -1907,6 +2033,32 @@ class OrderEntryPanel(QWidget):
         self._rebuild_qty_buttons()
         self._refresh_action_labels()
         self._reload_tier_sections()
+        # Restore (or reset) the new symbol's previously-stored arming.
+        self._restore_tier_state(sym)
+
+    def _capture_tier_state(self, sym: str | None) -> None:
+        if not sym or not hasattr(self, "_pt_section"):
+            return
+        self._tier_state_by_symbol[sym.upper()] = {
+            "pt": self._pt_section.capture_state(),
+            "sl": self._sl_section.capture_state(),
+            "tr": self._tr_section.capture_state(),
+        }
+
+    def _restore_tier_state(self, sym: str | None) -> None:
+        if not hasattr(self, "_pt_section"):
+            return
+        snapshot = self._tier_state_by_symbol.get(
+            sym.upper()) if sym else None
+        if snapshot:
+            self._pt_section.restore_state(snapshot.get("pt"))
+            self._sl_section.restore_state(snapshot.get("sl"))
+            self._tr_section.restore_state(snapshot.get("tr"))
+        else:
+            # No prior arming for this symbol — start fresh.
+            self._pt_section.reset()
+            self._sl_section.reset()
+            self._tr_section.reset()
 
     def _update_symbol_display(self) -> None:
         if self._active_symbol:
@@ -2079,14 +2231,92 @@ class OrderEntryPanel(QWidget):
 
     def _refresh_action_labels(self) -> None:
         q = self._active_qty
-        self._btn_buy_mkt.setText(f"Buy {q} @MKT")
-        self._btn_sell_mkt.setText(f"Sell {q} @MKT")
-        self._btn_buy_mid.setText(f"Buy {q} @Mid")
-        self._btn_sell_mid.setText(f"Sell {q} @Mid")
-        self._btn_buy_bid.setText(f"Buy {q} @Bid")
-        self._btn_sell_ask.setText(f"Sell {q} @Ask")
-        self._btn_buy_bid_lmt.setText(f"Buy {q} @Bid Limit")
-        self._btn_sell_ask_lmt.setText(f"Sell {q} @Ask Limit")
+        self._btn_buy_mkt.setPrimary(f"Buy {q} @MKT")
+        self._btn_sell_mkt.setPrimary(f"Sell {q} @MKT")
+        self._btn_buy_mid.setPrimary(f"Buy {q} @Mid")
+        self._btn_sell_mid.setPrimary(f"Sell {q} @Mid")
+        self._btn_buy_bid.setPrimary(f"Buy {q} @Bid +1t")
+        self._btn_sell_ask.setPrimary(f"Sell {q} @Ask -1t")
+        self._btn_buy_bid_lmt.setPrimary(f"Buy {q} @Bid Limit")
+        self._btn_sell_ask_lmt.setPrimary(f"Sell {q} @Ask Limit")
+        # Secondary line — shows TP / SL / Trail amounts armed for this
+        # bracket.  Hidden when nothing is armed.
+        secondary = self._format_armed_summary()
+        for b in (self._btn_buy_mkt, self._btn_sell_mkt,
+                  self._btn_buy_mid, self._btn_sell_mid,
+                  self._btn_buy_bid, self._btn_sell_ask,
+                  self._btn_buy_bid_lmt, self._btn_sell_ask_lmt):
+            b.setSecondary(secondary)
+
+    def _format_armed_summary(self) -> str:
+        """Build the small second-line text shown on the Buy/Sell action
+        buttons, e.g. ``"+$40  -$80  ↗ 50t"``.  Empty string when no
+        tier is currently armed."""
+        parts: list[str] = []
+        tp = self._tier_amount(self._pt_section)
+        if tp is not None:
+            parts.append(f"+${tp:,}")
+        sl = self._tier_amount(self._sl_section)
+        if sl is not None:
+            parts.append(f"-${sl:,}")
+        tr_text = self._trail_text(self._tr_section)
+        if tr_text is not None:
+            parts.append(f"↗ {tr_text}")
+        return "  ".join(parts)
+
+    @staticmethod
+    def _tier_amount(section: "_TierSection") -> int | None:
+        """Return the section's current armed dollar amount (qty-scaled)
+        as an integer, or None when nothing is armed.  Mirrors the math
+        in :meth:`_TierSection._update_dollar_display`."""
+        if not section.is_enabled:
+            return None
+        dollar = 0.0
+        input_text = (section._input.text().strip()
+                      if section._input is not None else "")
+        if input_text:
+            try:
+                dist = float(input_text)
+                if dist > 0:
+                    dollar = dist * section._multiplier
+            except ValueError:
+                pass
+        if dollar <= 0 and section._selected_idx is not None and (
+                section._selected_idx < len(section._dollar_per_tier)):
+            dollar = section._dollar_per_tier[section._selected_idx]
+        if dollar <= 0:
+            return None
+        return int(round(dollar * section._qty))
+
+    @staticmethod
+    def _trail_text(section: "_TierSection") -> str | None:
+        """Format the trail tier as ``"50t"`` (ticks) or ``"$1,500"`` —
+        whichever unit the active tier carries.  Returns None when the
+        section is unarmed."""
+        if not section.is_enabled:
+            return None
+        v = section.get_value()
+        if not v:
+            return None
+        value = v.get("value", 0)
+        unit = v.get("unit", "ticks")
+        try:
+            fv = float(value)
+        except (TypeError, ValueError):
+            return None
+        if fv <= 0:
+            return None
+        if unit in ("ticks", "cents"):
+            # Drop the trailing .0 for integer tick counts.
+            if fv.is_integer():
+                return f"{int(fv)}t"
+            return f"{fv:g}t"
+        if unit == "%":
+            return f"{fv:g}%"
+        # "amt" / "price" / dollar units.
+        if fv.is_integer():
+            return f"${int(fv):,}"
+        return f"${fv:,.2f}"
 
     # ── Tier helpers ──────────────────────────────────────────────────────────
 
@@ -2225,6 +2455,10 @@ class OrderEntryPanel(QWidget):
         self._pt_section.set_market_price(self._last_price, ts)
         self._sl_section.set_market_price(self._last_price, ts)
         self._tr_section.set_market_price(self._last_price, ts)
+        # ``reload_tiers`` rebuilds chips + Dist input from scratch so
+        # nothing is armed; refresh the Buy/Sell secondary line so the
+        # previous symbol's TP/SL/TS amounts don't linger on the buttons.
+        self._refresh_action_labels()
 
     def _tick_size_for_symbol(self, sym: str) -> float:
         """Return the minimum tick size for *sym*.
@@ -2318,12 +2552,9 @@ class OrderEntryPanel(QWidget):
 
         # ── Safety check ──────────────────────────────────────────────────
         if math.isnan(price) or price <= 0:
-            QMessageBox.warning(
-                self,
-                "Invalid Price",
-                f"Cannot place order: live {label} price is unavailable or invalid.\n"
-                f"Please wait for market data.",
-            )
+            log.warning(
+                "OrderEntry: order blocked — live %s price unavailable for %s",
+                label, self._active_symbol)
             return
 
         sec = _sec_type_for(self._active_symbol)
