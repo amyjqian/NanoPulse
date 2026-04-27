@@ -129,23 +129,35 @@ def setup_logging(level: int = logging.DEBUG) -> None:
     root.addHandler(file_h)
 
     # ── Dedicated loggers ─────────────────────────────────────────────────────
-    # RC #4: tws_log at INFO — pnlSingleEvent / accountSummaryEvent fire
-    # thousands of times per minute; writing them at DEBUG saturates disk I/O
-    # and locks RotatingFileHandler's internal threading.Lock on every tick.
-    # order_log stays at DEBUG for a full order audit trail.
+    # Both dedicated loggers run at DEBUG for full audit detail.  This is
+    # the "debug build" configuration — pnlSingleEvent / accountSummaryEvent
+    # / pendingTickers each fire many times per second, so the rotating
+    # handler can roll its 5 MB × 3 backups window quickly.  Trade that
+    # for full visibility while debugging; raise back to INFO in
+    # production if disk I/O starves the worker thread.
     _configure_dedicated_logger(tws_log, TWS_LOG_FILE, _TWS_FMT,
-                                file_level=logging.INFO)
+                                file_level=logging.DEBUG)
     _configure_dedicated_logger(order_log, ORDER_LOG_FILE, _ORDER_FMT,
                                 file_level=logging.DEBUG)
 
+    # ── Pipe ib_async (TWS protocol) chatter into nano_tws.log ────────────
+    # ib_async's loggers are the source of truth for every wire-level
+    # request / response / event between Nano and TWS.  Attach the
+    # nano_tws file handler to the root ``ib_async`` logger so all
+    # children (``ib_async.wrapper``, ``ib_async.client``, …) inherit
+    # it via the standard logger hierarchy.  ``propagate=False`` keeps
+    # the messages out of the global ``nanopulse.log`` file and the
+    # console — both would drown in the volume.
+    shared_tws_handler = tws_log.handlers[0]
+    ia = logging.getLogger("ib_async")
+    ia.setLevel(logging.DEBUG)
+    if shared_tws_handler not in ia.handlers:
+        ia.addHandler(shared_tws_handler)
+    ia.propagate = False
+
     logging.getLogger("NanoPulse").info(
-        "Logging initialised  (console=INFO, file=%s level=%s)",
+        "Logging initialised  (console=INFO, file=%s level=%s, "
+        "nano_tws=DEBUG, nano_order=DEBUG, ib_async→nano_tws.log)",
         LOG_FILE,
         logging.getLevelName(level),
     )
-
-    # ── Quiet noisy third-party loggers on the console ────────────────────────
-    # ib_async fires dozens of INFO lines per tick (position, wrapper, client).
-    # Keep them in the log file at DEBUG, but only show WARNING+ on screen.
-    for name in ("ib_async", "ib_async.wrapper", "ib_async.client", "ib_async.ib"):
-        logging.getLogger(name).setLevel(logging.WARNING)

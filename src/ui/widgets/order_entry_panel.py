@@ -19,6 +19,9 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
     QCompleter,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -1459,6 +1462,97 @@ _COMBO_SS = f"""
 """
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Hot-button placeholders + configuration dialog
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# A "hot button" is a one-click order shortcut the user composes themselves
+# (e.g. "Buy 1 NQ @MKT" attached to TP / SL).  The OrderEntry panel hosts
+# a small grid of slots beneath the Trailing Stop section: an unconfigured
+# slot renders as a dashed-border ``+`` placeholder, and clicking it opens
+# :class:`_HotButtonDialog` to capture the label + side.  Slot → real button
+# transformation is intentionally out of scope for this commit; we only
+# wire the placeholder + dialog UI here.
+
+
+class _HotButtonPlaceholder(QPushButton):
+    """Dashed-border ``+`` cell that, when clicked, asks the host to add
+    a new hot button.  Fixed minimum height matches the action-button
+    grid above so the layout reads as a single column of touch targets.
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__("+", parent)
+        self.setMinimumHeight(50)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setStyleSheet(
+            "QPushButton{"
+            " background:transparent;"
+            " color:#5a6478;"
+            " border:1px dashed #3a4051;"
+            " border-radius:6px;"
+            " font-size:18px;"
+            " font-weight:bold;"
+            "}"
+            "QPushButton:hover{"
+            " color:#8a94a8;"
+            " border-color:#4a5168;"
+            "}"
+        )
+
+
+class _HotButtonDialog(QDialog):
+    """Modal dialog for configuring a single hot button.
+
+    Collects two fields:
+
+    * **Label** — the text shown on the resulting hot button.
+    * **Side** — BUY or SELL.
+
+    Future scope (qty, order type, TIF, bracket attachments) is left to a
+    later iteration; this dialog covers only the label + side for now.
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Add Hot Button")
+        self.setModal(True)
+        self.setMinimumWidth(320)
+
+        self._label_input = QLineEdit(self)
+        self._label_input.setPlaceholderText("e.g. Buy 1 NQ @MKT")
+
+        self._side_combo = QComboBox(self)
+        self._side_combo.addItems(["BUY", "SELL"])
+
+        form = QFormLayout()
+        form.addRow("Label:", self._label_input)
+        form.addRow("Side:", self._side_combo)
+
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel,
+            parent=self,
+        )
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(button_box)
+
+    def values(self) -> dict:
+        """Return the user-entered ``{"label": str, "side": "BUY" | "SELL"}``.
+        ``label`` is whitespace-stripped; empty string is allowed at the
+        dialog layer — the caller decides how to react."""
+        return {
+            "label": self._label_input.text().strip(),
+            "side": self._side_combo.currentText(),
+        }
+
+
 class OrderEntryPanel(QWidget):
     """Full Order Entry widget – drop-in replacement for _titled_panel."""
 
@@ -1809,7 +1903,83 @@ class OrderEntryPanel(QWidget):
         root.addWidget(self._sl_section)
         root.addWidget(self._tr_section)
 
+        # ── Hot buttons ───────────────────────────────────────────────────────
+        # User-defined one-click order shortcuts.  Layout grows as the
+        # user adds entries: configured slots render as coloured
+        # buttons (green BUY / red SELL); a single trailing dashed-
+        # border "+" placeholder always sits at the next free slot so
+        # the user can keep adding.  Two columns per row.
+        root.addSpacing(8)
+        self._hot_grid = QGridLayout()
+        self._hot_grid.setSpacing(4)
+        self._hot_grid.setContentsMargins(0, 0, 0, 0)
+        # Always reserve two equal-width columns so a lone "+" cell
+        # in column 0 still occupies only half the panel width
+        # (column 1 holds blank space until the user adds a second
+        # hot button).  Without this Qt would collapse the empty
+        # column and let the placeholder stretch full-width.
+        self._hot_grid.setColumnStretch(0, 1)
+        self._hot_grid.setColumnStretch(1, 1)
+        self._hot_buttons: list[dict] = []
+        hot_w = QWidget()
+        hot_w.setStyleSheet("border: none;")
+        hot_w.setContentsMargins(0, 0, 0, 0)
+        hot_w.setLayout(self._hot_grid)
+        root.addWidget(hot_w)
+        self._rebuild_hot_buttons()
+
         root.addStretch(1)
+
+    def _rebuild_hot_buttons(self) -> None:
+        """Re-lay out the hot-button grid: one styled button per saved
+        entry plus a single trailing ``+`` placeholder.  Two columns
+        per row.  Cheap to call (a handful of widgets, recreated)."""
+        # Clear current children.
+        while self._hot_grid.count():
+            item = self._hot_grid.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        # Render saved entries.
+        for i, entry in enumerate(self._hot_buttons):
+            row, col = divmod(i, 2)
+            self._hot_grid.addWidget(
+                self._make_hot_button(entry), row, col)
+        # Trailing "+" placeholder always at the next free slot.
+        n = len(self._hot_buttons)
+        row, col = divmod(n, 2)
+        slot = _HotButtonPlaceholder(self)
+        slot.clicked.connect(self._on_add_hot_button)
+        self._hot_grid.addWidget(slot, row, col)
+
+    def _make_hot_button(self, entry: dict) -> QPushButton:
+        """Render a saved hot-button entry as a coloured QPushButton.
+        BUY = ``Theme.CLR_BUY`` (green), SELL = ``Theme.CLR_SELL`` (red).
+        Click handler is intentionally a no-op for now — order
+        submission is deferred to a follow-up commit; the dialog only
+        captures the label + side."""
+        side = entry.get("side", "BUY")
+        label = entry.get("label", "")
+        colour = Theme.CLR_BUY if side == "BUY" else Theme.CLR_SELL
+        btn = _make_btn(label, colour, 50)
+        return btn
+
+    def _on_add_hot_button(self) -> None:
+        """Open :class:`_HotButtonDialog` to collect a new hot button's
+        label + side, append it to the in-memory list, and rebuild the
+        grid so the next ``+`` placeholder appears in the next free
+        slot."""
+        dlg = _HotButtonDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        values = dlg.values()
+        if not values.get("label"):
+            log.info("HotButton: dialog accepted with empty label — skipping")
+            return
+        self._hot_buttons.append(values)
+        log.info("HotButton: added label=%r side=%s",
+                 values["label"], values["side"])
+        self._rebuild_hot_buttons()
 
     # ── Combo / symbol search ─────────────────────────────────────────────────
 
