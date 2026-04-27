@@ -361,6 +361,11 @@ class BookTraderView(QWidget):
         # ── DOM ladder ────────────────────────────────────────────────────────
         self._ladder = DOMLadderView(model=self._model)
         root.addWidget(self._ladder, stretch=1)
+        # Hover badge content — ``Buy {qty}`` / ``Sell {qty}`` plus a
+        # second line listing armed TP / SL / TS amounts so the trader
+        # sees exactly what a click would submit.
+        self._ladder.set_qty_provider(lambda: self._active_qty)
+        self._ladder.set_armed_summary_provider(self._format_attached_summary)
         # Populate tick combo for the initial contract.
         self._populate_tick_combo()
 
@@ -713,6 +718,27 @@ class BookTraderView(QWidget):
         for section in (self._pt_section, self._sl_section,
                         self._tr_section):
             section.set_qty(self._active_qty)
+
+    def _format_attached_summary(self) -> str:
+        """Return a one-line summary of the currently-armed brackets,
+        e.g. ``"TP $40, SL $80, TS 50t"``.  Empty string when no tier
+        is armed.  Reused by :class:`DOMLadderView`'s hover badge so
+        the trader sees which brackets a ladder click would attach.
+        """
+        # Reuse the helpers from OrderEntryPanel — they already do the
+        # tier-section → dollar-amount math the action buttons rely on.
+        from src.ui.widgets.order_entry_panel import OrderEntryPanel as _OEP
+        parts: list[str] = []
+        tp = _OEP._tier_amount(self._pt_section)
+        if tp is not None:
+            parts.append(f"TP ${tp:,}")
+        sl = _OEP._tier_amount(self._sl_section)
+        if sl is not None:
+            parts.append(f"SL ${sl:,}")
+        tr_text = _OEP._trail_text(self._tr_section)
+        if tr_text is not None:
+            parts.append(f"TS {tr_text}")
+        return ", ".join(parts)
 
     def _on_recenter_clicked(self) -> None:
         if self._last_price > 0:

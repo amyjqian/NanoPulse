@@ -262,6 +262,42 @@ class TickPriceInput(QWidget):
     _BTN_W            = 16    # px width of the up/down arrow column
     _CHIP_H           = 28    # must match _TierSection._CHIP_H
 
+    # Stylesheets — split into "normal" (idle) and "armed" (positive
+    # value typed) so the whole control can flip to the same blue
+    # background a selected tier chip uses.  Triggered by the host
+    # ``_TierSection`` via :meth:`set_armed`.
+    _EDIT_SS_NORMAL = (
+        "QLineEdit{background:#3a3a4a;color:#ccc;border:none;"
+        "border-radius:6px 0 0 6px;padding:2px 6px;font-size:11px}"
+        "QLineEdit:focus{background:#4a4a5a;color:white}"
+        "QLineEdit:disabled{background:#252535;color:#444;border:none}"
+    )
+    _EDIT_SS_ARMED = (
+        "QLineEdit{background:#0071e3;color:white;border:none;"
+        "border-radius:6px 0 0 6px;padding:2px 6px;font-size:11px;"
+        "font-weight:bold}"
+        "QLineEdit:focus{background:#0077ed;color:white}"
+        "QLineEdit:disabled{background:#252535;color:#444;border:none}"
+    )
+    _ARROW_SS_NORMAL = (
+        "QToolButton{background:#3a3a4a;color:#aaa;border:none;"
+        "font-size:7px;padding:0;margin:0}"
+        "QToolButton:hover{background:#4a4a5a;color:white}"
+        "QToolButton:pressed{background:#0071e3;color:white}"
+    )
+    _ARROW_SS_ARMED = (
+        "QToolButton{background:#0071e3;color:white;border:none;"
+        "font-size:7px;padding:0;margin:0}"
+        "QToolButton:hover{background:#0077ed;color:white}"
+        "QToolButton:pressed{background:#0077ed;color:white}"
+    )
+    _ARROW_W_SS_NORMAL = (
+        "QWidget{background:#3a3a4a;border:none;border-radius:0 6px 6px 0}"
+    )
+    _ARROW_W_SS_ARMED = (
+        "QWidget{background:#0071e3;border:none;border-radius:0 6px 6px 0}"
+    )
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._market_price: float           = 0.0
@@ -285,12 +321,7 @@ class TickPriceInput(QWidget):
         self._edit.setMinimumWidth(0)
         self._edit.setSizePolicy(
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-        self._edit.setStyleSheet(
-            "QLineEdit{background:#3a3a4a;color:#ccc;border:none;"
-            "border-radius:6px 0 0 6px;padding:2px 6px;font-size:11px}"
-            "QLineEdit:focus{background:#4a4a5a;color:white}"
-            "QLineEdit:disabled{background:#252535;color:#444;border:none}"
-        )
+        self._edit.setStyleSheet(self._EDIT_SS_NORMAL)
         # Reject non-numeric keystrokes; positive floats only
         _dv = QDoubleValidator(0.0, 1e12, 10, self._edit)
         _dv.setNotation(QDoubleValidator.Notation.StandardNotation)
@@ -300,16 +331,10 @@ class TickPriceInput(QWidget):
         self._edit.editingFinished.connect(self._snap_to_tick)
         self._edit.installEventFilter(self)
 
-        _arrow_ss = (
-            "QToolButton{background:#3a3a4a;color:#aaa;border:none;"
-            "font-size:7px;padding:0;margin:0}"
-            "QToolButton:hover{background:#4a4a5a;color:white}"
-            "QToolButton:pressed{background:#0071e3;color:white}"
-        )
         self._btn_up = QToolButton()
         self._btn_up.setText("▲")
         self._btn_up.setFixedSize(self._BTN_W, self._CHIP_H // 2)
-        self._btn_up.setStyleSheet(_arrow_ss)
+        self._btn_up.setStyleSheet(self._ARROW_SS_NORMAL)
         self._btn_up.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_up.setAutoRepeat(True)
         self._btn_up.setAutoRepeatDelay(400)    # ms before repeat starts
@@ -319,7 +344,7 @@ class TickPriceInput(QWidget):
         self._btn_dn = QToolButton()
         self._btn_dn.setText("▼")
         self._btn_dn.setFixedSize(self._BTN_W, self._CHIP_H // 2)
-        self._btn_dn.setStyleSheet(_arrow_ss)
+        self._btn_dn.setStyleSheet(self._ARROW_SS_NORMAL)
         self._btn_dn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_dn.setAutoRepeat(True)
         self._btn_dn.setAutoRepeatDelay(400)
@@ -334,9 +359,11 @@ class TickPriceInput(QWidget):
 
         self._arrow_w = QWidget()
         self._arrow_w.setFixedSize(self._BTN_W, self._CHIP_H)
-        self._arrow_w.setStyleSheet(
-            "QWidget{background:#3a3a4a;border:none;border-radius:0 6px 6px 0}")
+        self._arrow_w.setStyleSheet(self._ARROW_W_SS_NORMAL)
         self._arrow_w.setLayout(arrow_col)
+        # Track the current armed state so set_armed() can early-return
+        # when nothing changed (avoids needless QSS unpolish/polish).
+        self._armed: bool = False
 
         lay.addWidget(self._edit, 1)
         lay.addWidget(self._arrow_w)
@@ -395,6 +422,26 @@ class TickPriceInput(QWidget):
         self._market_price = price
         if tick_size is not None and tick_size > 0:
             self._tick_size = tick_size
+
+    def set_armed(self, armed: bool) -> None:
+        """Toggle the "armed" visual: when *armed* is True the QLineEdit
+        and arrow column flip to the same blue background a selected
+        tier chip uses.  Called by :class:`_TierSection` whenever the
+        Dist input holds a positive value (or the user explicitly arms
+        a chip via Dist) so the user can see at a glance which tier
+        section is contributing to the next order."""
+        armed = bool(armed)
+        if armed == self._armed:
+            return
+        self._armed = armed
+        edit_ss = self._EDIT_SS_ARMED if armed else self._EDIT_SS_NORMAL
+        arrow_ss = self._ARROW_SS_ARMED if armed else self._ARROW_SS_NORMAL
+        arrow_w_ss = (self._ARROW_W_SS_ARMED if armed
+                      else self._ARROW_W_SS_NORMAL)
+        self._edit.setStyleSheet(edit_ss)
+        self._btn_up.setStyleSheet(arrow_ss)
+        self._btn_dn.setStyleSheet(arrow_ss)
+        self._arrow_w.setStyleSheet(arrow_w_ss)
 
     # ── Signal relay ──────────────────────────────────────────────────────────
 
@@ -1241,6 +1288,11 @@ class _TierSection(QWidget):
                 self._input.blockSignals(False)
         self._update_chip_styles()
         self._update_dollar_display()
+        # Picking a chip clears the Dist value, so the input drops back
+        # to its idle visual.  textChanged is signal-blocked above, so
+        # this side-effect needs an explicit call.
+        if self._input is not None:
+            self._input.set_armed(False)
         self.changed.emit()
 
     def _on_input_changed(self, _text: str) -> None:
@@ -1256,6 +1308,10 @@ class _TierSection(QWidget):
             self._selected_idx = None
         self._update_chip_styles()
         self._update_dollar_display()
+        # Flip the Dist field to the blue "armed" style whenever it
+        # holds a positive value, matching the selected-chip colour.
+        if self._input is not None:
+            self._input.set_armed(val > 0)
         self.changed.emit()
 
     def _update_chip_styles(self) -> None:
@@ -1301,6 +1357,7 @@ class _TierSection(QWidget):
             self._input.blockSignals(True)
             self._input.clear()
             self._input.blockSignals(False)
+            self._input.set_armed(False)
         self._selected_idx = None
         self._update_chip_styles()
         self._update_dollar_display()
@@ -1346,6 +1403,11 @@ class _TierSection(QWidget):
             if text:
                 self._input.setText(text)
             self._input.blockSignals(False)
+            try:
+                _val = float(text) if text else 0.0
+            except ValueError:
+                _val = 0.0
+            self._input.set_armed(_val > 0)
         self._update_chip_styles()
         self._update_dollar_display()
         self.changed.emit()

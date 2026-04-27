@@ -1337,21 +1337,38 @@ class FlashTradeView(QWidget):
 
     # ── Accounts-panel show/hide ──────────────────────────────────────────────
 
+    # A splitter-collapsed AccountListPanel reports ``isVisible() == True``
+    # but has effectively zero width.  We treat anything below this
+    # threshold as "hidden" for toggle purposes so the user can drag the
+    # splitter shut and then click the Account pill to reopen the panel
+    # at a usable size on the next click.
+    _ACCT_PANEL_MIN_USABLE_W = 60
+    # Fallback width used when "show" is requested from a collapsed state
+    # and we have no usable saved sizes to restore.
+    _ACCT_PANEL_DEFAULT_W = 240
+
     def is_accounts_panel_visible(self) -> bool:
         if not isinstance(self._account_list, AccountListPanel):
             return False
-        return self._account_list.isVisible()
+        if not self._account_list.isVisible():
+            return False
+        # Treat a splitter-collapsed panel as hidden so the next pill
+        # click expands it instead of toggling it off.
+        return self._account_list.width() >= self._ACCT_PANEL_MIN_USABLE_W
 
     def set_accounts_panel_visible(self, visible: bool) -> None:
         """Show or hide the AccountListPanel inside the right
         splitter.  Snapshots the current splitter sizes on hide and
         restores them on show so the user keeps their column width.
-        Persists the new state and emits
+        When the panel was collapsed via the splitter (width near 0)
+        we ignore the stale saved sizes and force a sensible default
+        on show so a "Account" pill click always reveals a usable
+        panel.  Persists the new state and emits
         ``accounts_panel_visibility_changed`` so the host can flip
         the 'Show Account' pill in the top bar."""
         if not isinstance(self._account_list, AccountListPanel):
             return
-        currently = self._account_list.isVisible()
+        currently = self.is_accounts_panel_visible()
         if currently == bool(visible):
             return
         if not visible:
@@ -1362,9 +1379,31 @@ class FlashTradeView(QWidget):
             self._account_list.hide()
         else:
             self._account_list.show()
-            if self._right_splitter_saved_sizes:
-                self._right_splitter.setSizes(
-                    self._right_splitter_saved_sizes)
+            saved = self._right_splitter_saved_sizes
+            usable = (
+                saved is not None
+                and len(saved) >= 2
+                and saved[1] >= self._ACCT_PANEL_MIN_USABLE_W
+            )
+            if usable:
+                self._right_splitter.setSizes(saved)
+            else:
+                # No usable saved sizes (either never hidden, or the
+                # last hide captured a collapsed state).  Fall back to
+                # a default width derived from the splitter's current
+                # total so the panel always reappears at a sensible
+                # size regardless of how the user got here.
+                sizes = self._right_splitter.sizes()
+                total = sum(sizes) or self._right_splitter.width()
+                if total <= 0:
+                    self._right_splitter.setSizes(
+                        [800, self._ACCT_PANEL_DEFAULT_W])
+                else:
+                    acct_w = max(
+                        self._ACCT_PANEL_DEFAULT_W, total // 4)
+                    acct_w = min(acct_w, total - 200)
+                    main_w = total - acct_w
+                    self._right_splitter.setSizes([main_w, acct_w])
         self.accounts_panel_visibility_changed.emit(bool(visible))
         # Persist immediately rather than waiting for the splitter
         # debounce — visibility changes are explicit user actions
