@@ -108,8 +108,8 @@ class _ActionButton(QPushButton):
     via :meth:`QStyle.drawControl` — only the text rendering is custom.
     """
 
-    _PRIMARY_PT = 13
-    _SECONDARY_PT = 10
+    _PRIMARY_PT = 12
+    _SECONDARY_PT = 9
 
     def __init__(self, primary: str, colour: str, parent=None) -> None:
         super().__init__(parent)
