@@ -704,15 +704,23 @@ class BookTraderView(QWidget):
         # Restore (or reset) the new symbol's previously-stored arming.
         self._restore_tier_state(sym)
 
-        # Swap depth subscription on the bg worker.  L1 is owned by
-        # OrderEntryPanel (which subscribes every saved chip-bar
-        # symbol); Book Trader only takes over the L2 stream for the
-        # active symbol.
+        # Swap depth subscription on the bg worker.  L1 is normally
+        # owned by OrderEntryPanel — it subscribes every saved chip-bar
+        # symbol — but a symbol that lives only on Book Trader's chip
+        # bar (e.g. the user added MCL here without adding it to Order
+        # Entry) won't get an L1 tick from that path, so the ladder
+        # would sit at 0-centred prices forever.  Subscribe L1 for the
+        # active symbol from BookTrader too — ``subscribe_background_symbols``
+        # is idempotent on the worker side, so this is a no-op when
+        # OrderEntry already has it.
         self._ensure_bg_worker()
         if self._bg_worker is not None:
             if old:
                 self._bg_worker.unsubscribe_depth(old)
             self._bg_worker.subscribe_depth(sym)
+            l1_params = self._build_l1_params_for(sym)
+            if l1_params is not None:
+                self._bg_worker.subscribe_background_symbols([l1_params])
 
         # Different symbol → different subset of live orders is
         # relevant.  Re-project the ladder markers.
@@ -955,6 +963,37 @@ class BookTraderView(QWidget):
         except Exception:
             return None
 
+    @staticmethod
+    def _build_l1_params_for(sym: str) -> dict | None:
+        """Return the param dict ``IBWorkerThread.subscribe_background_symbols``
+        expects for *sym*, or ``None`` when no saved contract row exists
+        (in which case L1 can't be subscribed regardless).  Mirror of
+        :meth:`OrderEntryPanel._build_bg_params_for_symbol` so BookTrader
+        can subscribe its active symbol's L1 directly when OrderEntry's
+        chip bar doesn't already cover it.
+        """
+        if not sym:
+            return None
+        try:
+            from src.core.reference_data import get_instance as _rd
+            rows = _rd().contracts_by_symbol.get(sym.upper(), [])
+        except Exception:
+            return None
+        for c in rows:
+            conid = c.get("conid")
+            if conid:
+                return {
+                    "conid":        int(conid),
+                    "symbol":       sym,
+                    "sec_type":     c.get("sec_type", ""),
+                    "exchange":     c.get("exchange", "SMART"),
+                    "currency":     c.get("currency", "USD"),
+                    "local_symbol": c.get("local_symbol", ""),
+                    "expiry":       c.get("expiry", ""),
+                    "multiplier":   c.get("multiplier", ""),
+                }
+        return None
+
     def _capture_tier_state(self, sym: str | None) -> None:
         if not sym or not hasattr(self, "_pt_section"):
             return
@@ -1050,6 +1089,11 @@ class BookTraderView(QWidget):
         # symbols) so calling it on every refresh guarantees re-
         # subscription after a reconnect.
         self._bg_worker.subscribe_depth(self._active_symbol)
+        # Same idempotent re-subscription for L1 so the ladder gets
+        # prices for symbols only present in BookTrader's chip bar.
+        l1_params = self._build_l1_params_for(self._active_symbol)
+        if l1_params is not None:
+            self._bg_worker.subscribe_background_symbols([l1_params])
 
     def _wire_order_status_on_all_workers(self) -> None:
         """Connect ``order_status_updated`` for every running worker we
