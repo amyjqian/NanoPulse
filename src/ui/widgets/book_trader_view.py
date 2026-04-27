@@ -109,8 +109,35 @@ def _presets_for_sec(sec: str) -> tuple[list[int], int, list[int]]:
     return _STK_QTYS, _STK_DEFAULT, _STK_QTY_POPUP
 
 
+# Known-futures per-symbol tick sizes — used as a fallback when a saved
+# contract row was created before the Tick column existed (so it lacks
+# ``tick_size`` / ``min_tick`` / ``minTick`` fields).  Without this
+# table the FUT branch would always return the 0.25 default — wrong
+# for the metals (GC/MGC = 0.1) and energies (CL/MCL = 0.01).  Mirror
+# of the table in ``order_entry_panel._tick_size_for_symbol`` so both
+# panels agree on the default tick.
+_FUT_TICK: dict[str, float] = {
+    "MNQ": 0.25, "NQ":  0.25,
+    "MES": 0.25, "ES":  0.25,
+    "M2K": 0.1,  "RTY": 0.1,
+    "MYM": 1.0,  "YM":  1.0,
+    "MGC": 0.1,  "GC":  0.1,
+    "MCL": 0.01, "CL":  0.01,
+}
+
+
 def _tick_size_for_contract(cached: dict | None) -> float:
-    """Minimum tick size for *cached* contract row, with sensible defaults."""
+    """Minimum tick size for *cached* contract row, with sensible defaults.
+
+    Lookup order:
+      1. ``tick_size`` / ``min_tick`` / ``minTick`` field on the cached
+         row (populated by ContractsView since the Tick column landed).
+      2. Per-symbol :data:`_FUT_TICK` table — covers contracts saved
+         before the Tick column existed, and ensures GC / MGC default
+         to 0.1 and CL / MCL to 0.01 instead of the generic 0.25 FUT
+         fallback.
+      3. Coarse sec-type fallback: FUT → 0.25, everything else → 0.01.
+    """
     if cached:
         for key in ("tick_size", "min_tick", "minTick"):
             v = cached.get(key)
@@ -121,6 +148,15 @@ def _tick_size_for_contract(cached: dict | None) -> float:
                         return f
                 except (TypeError, ValueError):
                     pass
+        # Per-symbol lookup table — match on root symbol first, then
+        # local_symbol (e.g. ``GCM6``) which begins with the root.
+        sym = str(cached.get("symbol", "") or "").upper().strip()
+        if sym and sym in _FUT_TICK:
+            return _FUT_TICK[sym]
+        local = str(cached.get("local_symbol", "") or "").upper().strip()
+        for root, t in _FUT_TICK.items():
+            if local.startswith(root):
+                return t
         sec = cached.get("sec_type", "")
         if sec == "FUT":
             return 0.25

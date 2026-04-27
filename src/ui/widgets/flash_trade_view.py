@@ -199,6 +199,12 @@ class FlashTradeView(QWidget):
             self._on_close_pct_requested)
         self._order_entry.close_tier_requested.connect(
             self._on_close_tier_requested)
+        # Hot-button group-targeted variants — bypass AccountListPanel
+        # selection and fan out to the configured group's accounts.
+        self._order_entry.hot_button_flatten.connect(
+            self._on_hot_button_flatten)
+        self._order_entry.hot_button_cancel.connect(
+            self._on_hot_button_cancel)
 
         # ── Wire book trader (mirrors order-entry signal surface) ────────────
         # BookTraderView submits through the same handlers so TP/SL/Trail
@@ -280,11 +286,24 @@ class FlashTradeView(QWidget):
         3. For each account, find the correct IBWorkerThread and place the order.
         """
         # ── 1. Validate: get checked accounts ─────────────────────────────
-        # When called from flatten, the payload carries ``_flatten_account``
-        # so we target only that specific account (not all checked ones).
+        # Three account-resolution paths in order of priority:
+        #   1. ``_flatten_account`` — single-account override used by the
+        #      flatten close-needed callback (one position at a time).
+        #   2. ``_target_accounts`` — explicit list override used by
+        #      group-targeted hot buttons so they fan out to the
+        #      configured group regardless of AccountListPanel state.
+        #   3. AccountListPanel.get_selected_accounts() — default for
+        #      every other Buy/Sell click.
         flatten_account = payload.get("_flatten_account")
+        target_accounts = payload.get("_target_accounts")
         if flatten_account:
             accounts = [flatten_account]
+        elif target_accounts:
+            accounts = list(target_accounts)
+            if not accounts:
+                log.warning(
+                    "FlashTrade: _target_accounts empty – aborting order")
+                return
         else:
             if not isinstance(self._account_list, AccountListPanel):
                 log.warning(
@@ -802,15 +821,38 @@ class FlashTradeView(QWidget):
             log.warning(
                 "FlashTrade: cancel-all blocked for '%s' — no accounts checked", symbol)
             return
-        connected_list, _disc = self._partition_accounts_by_connection(checked_list)
+        self._do_cancel_all_for_symbol(symbol, checked_list)
+
+    def _on_hot_button_cancel(self, symbol: str, accounts: list) -> None:
+        """Hot-button group-targeted cancel.  Bypasses the
+        AccountListPanel selection and cancels open orders for
+        *symbol* on the accounts the caller resolved from the
+        configured trading group."""
+        accounts_list = list(accounts) if accounts else []
+        if not accounts_list:
+            log.warning(
+                "FlashTrade: hot-button cancel blocked for '%s' — empty "
+                "group account list", symbol)
+            return
+        log.info(
+            "FlashTrade: hot-button cancel '%s' on %d group account(s): %s",
+            symbol, len(accounts_list), sorted(accounts_list))
+        self._do_cancel_all_for_symbol(symbol, accounts_list)
+
+    def _do_cancel_all_for_symbol(
+            self, symbol: str, accounts: list[str]) -> None:
+        """Shared cancel-all execution.  Caller has already resolved
+        the target accounts (from AccountListPanel selection or a
+        named hot-button group)."""
+        connected_list, _disc = self._partition_accounts_by_connection(
+            accounts)
         self._notify_skipped_accounts("Cancel", _disc)
         if not connected_list:
             log.warning(
-                "FlashTrade: cancel-all blocked for '%s' — every checked "
+                "FlashTrade: cancel-all blocked for '%s' — every target "
                 "account is on a disconnected connection", symbol)
             return
         checked: set[str] = set(connected_list)
-
         count = 0
         for label, worker in self._active_threads.items():
             if worker.isRunning() and worker.is_ib_connected:
@@ -837,15 +879,38 @@ class FlashTradeView(QWidget):
             log.warning(
                 "FlashTrade: flatten blocked for '%s' — no accounts checked", symbol)
             return
-        connected_list, _disc = self._partition_accounts_by_connection(checked_list)
+        self._do_flatten_for_symbol(symbol, checked_list)
+
+    def _on_hot_button_flatten(self, symbol: str, accounts: list) -> None:
+        """Hot-button group-targeted flatten.  Bypasses the
+        AccountListPanel selection and flattens *symbol* on the
+        accounts the caller resolved from the configured trading
+        group."""
+        accounts_list = list(accounts) if accounts else []
+        if not accounts_list:
+            log.warning(
+                "FlashTrade: hot-button flatten blocked for '%s' — empty "
+                "group account list", symbol)
+            return
+        log.info(
+            "FlashTrade: hot-button flatten '%s' on %d group account(s): %s",
+            symbol, len(accounts_list), sorted(accounts_list))
+        self._do_flatten_for_symbol(symbol, accounts_list)
+
+    def _do_flatten_for_symbol(
+            self, symbol: str, accounts: list[str]) -> None:
+        """Shared flatten execution.  Caller has already resolved the
+        target accounts (from AccountListPanel selection or a named
+        hot-button group)."""
+        connected_list, _disc = self._partition_accounts_by_connection(
+            accounts)
         self._notify_skipped_accounts("Flatten", _disc)
         if not connected_list:
             log.warning(
-                "FlashTrade: flatten blocked for '%s' — every checked "
+                "FlashTrade: flatten blocked for '%s' — every target "
                 "account is on a disconnected connection", symbol)
             return
         checked: set[str] = set(connected_list)
-
         count = 0
         for label, worker in self._active_threads.items():
             if worker.isRunning() and worker.is_ib_connected:
