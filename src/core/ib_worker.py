@@ -1243,6 +1243,23 @@ class IBWorkerThread(QThread):
                 # to a cap that will not reflect the actual fill.
                 ref_price = float(params.get("bracket_ref_price")
                                   or params.get("last_price") or 0.0)
+                # When neither side supplied a price, fall back to the
+                # live bid/ask midpoint cached on this worker for the
+                # symbol.  Common for futures right after a symbol
+                # switch — the L1 stream has bid/ask but the user
+                # clicked Buy/Sell before the next "last" tick landed.
+                # Without this fallback the bracket children silently
+                # vanish because ref_price stays at 0.
+                if ref_price <= 0:
+                    sym = params.get("symbol", "")
+                    cached_bid, cached_ask = self._bg_last_bid_ask.get(
+                        sym, (0.0, 0.0))
+                    if cached_bid > 0 and cached_ask > 0:
+                        ref_price = (cached_bid + cached_ask) / 2.0
+                        order_log.info(
+                            "[%s] BRACKET-REF  using bid/ask mid %.4f "
+                            "for %s (last_price was 0)",
+                            self._label, ref_price, sym)
                 if ref_price > 0:
                     order.orderId = self._ib.client.getReqId()
                     order.transmit = False
@@ -1253,8 +1270,8 @@ class IBWorkerThread(QThread):
                 else:
                     order_log.warning(
                         "[%s] BRACKET-SKIP  no reference price "
-                        "(bracket_ref=%s last=%s) — parent-only submit, "
-                        "orderRef=%s", self._label,
+                        "(bracket_ref=%s last=%s, no cached bid/ask) — "
+                        "parent-only submit, orderRef=%s", self._label,
                         params.get("bracket_ref_price"),
                         params.get("last_price"), order.orderRef)
 
@@ -1315,6 +1332,40 @@ class IBWorkerThread(QThread):
                 getattr(order, "lmtPrice", "N/A"),
                 account, order.orderRef, c.conId, c.exchange,
             )
+
+            # Full-detail audit dump for the debug-mode build.  Captures
+            # the request payload, the resolved Order object's vars, and
+            # every attached bracket child so the log alone is enough to
+            # reconstruct exactly what got sent to TWS.
+            if order_log.isEnabledFor(logging.DEBUG):
+                try:
+                    parent_vars = {
+                        k: v for k, v in vars(order).items()
+                        if not k.startswith("_")
+                    }
+                except Exception:
+                    parent_vars = {}
+                order_log.debug(
+                    "[%s] ORDER-PLACE-DETAIL  orderRef=%s account=%s\n"
+                    "  request_params=%s\n"
+                    "  parent_order=%s",
+                    self._label, order.orderRef, account,
+                    params, parent_vars,
+                )
+                for ch in bracket_children:
+                    try:
+                        ch_vars = {
+                            k: v for k, v in vars(ch).items()
+                            if not k.startswith("_")
+                        }
+                    except Exception:
+                        ch_vars = {}
+                    order_log.debug(
+                        "[%s] ORDER-PLACE-CHILD  parentRef=%s "
+                        "childOrderRef=%s child=%s",
+                        self._label, order.orderRef,
+                        getattr(ch, "orderRef", "?"), ch_vars,
+                    )
 
             trade = self._ib.placeOrder(c, order)
 

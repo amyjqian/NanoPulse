@@ -36,9 +36,10 @@ handlers route Book Trader clicks to the same worker methods):
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import (
     QDialog,
     QFrame,
@@ -68,6 +69,23 @@ from src.ui.widgets.order_panel_parts import (
 
 log = logging.getLogger(__name__)
 
+# Lock-button icons live alongside other UI assets in src/ui/icons/.
+# Resolved relative to this file so the lookup works regardless of the
+# process's current working directory.
+_ICON_DIR = Path(__file__).resolve().parent.parent / "icons"
+_LOCK_CLOSED_ICON = str(_ICON_DIR / "lock-closed.svg")
+_LOCK_OPEN_ICON = str(_ICON_DIR / "lock-open.svg")
+
+# Tick-aggregation dropdown presets, by security type.  The contract's
+# native tick is preselected when it appears in the list; if it doesn't
+# (e.g. an exotic 0.0001 product), we prepend it so the user always sees
+# their real tick as one of the options.
+_TICK_PRESETS: dict[str, list[float]] = {
+    "FUT": [0.25, 0.5, 0.75, 1.0, 5.0, 10.0],
+    "STK": [0.01, 0.05, 0.10, 0.5, 1.0, 5.0, 10.0],
+    "OPT": [0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 1.00, 5.00],
+}
+
 
 # Qty presets (same rule as OrderEntryPanel: different sets for FUT vs. STK).
 _FUT_QTYS = [1, 2, 3, 5]
@@ -91,8 +109,35 @@ def _presets_for_sec(sec: str) -> tuple[list[int], int, list[int]]:
     return _STK_QTYS, _STK_DEFAULT, _STK_QTY_POPUP
 
 
+# Known-futures per-symbol tick sizes — used as a fallback when a saved
+# contract row was created before the Tick column existed (so it lacks
+# ``tick_size`` / ``min_tick`` / ``minTick`` fields).  Without this
+# table the FUT branch would always return the 0.25 default — wrong
+# for the metals (GC/MGC = 0.1) and energies (CL/MCL = 0.01).  Mirror
+# of the table in ``order_entry_panel._tick_size_for_symbol`` so both
+# panels agree on the default tick.
+_FUT_TICK: dict[str, float] = {
+    "MNQ": 0.25, "NQ":  0.25,
+    "MES": 0.25, "ES":  0.25,
+    "M2K": 0.1,  "RTY": 0.1,
+    "MYM": 1.0,  "YM":  1.0,
+    "MGC": 0.1,  "GC":  0.1,
+    "MCL": 0.01, "CL":  0.01,
+}
+
+
 def _tick_size_for_contract(cached: dict | None) -> float:
-    """Minimum tick size for *cached* contract row, with sensible defaults."""
+    """Minimum tick size for *cached* contract row, with sensible defaults.
+
+    Lookup order:
+      1. ``tick_size`` / ``min_tick`` / ``minTick`` field on the cached
+         row (populated by ContractsView since the Tick column landed).
+      2. Per-symbol :data:`_FUT_TICK` table — covers contracts saved
+         before the Tick column existed, and ensures GC / MGC default
+         to 0.1 and CL / MCL to 0.01 instead of the generic 0.25 FUT
+         fallback.
+      3. Coarse sec-type fallback: FUT → 0.25, everything else → 0.01.
+    """
     if cached:
         for key in ("tick_size", "min_tick", "minTick"):
             v = cached.get(key)
@@ -103,6 +148,15 @@ def _tick_size_for_contract(cached: dict | None) -> float:
                         return f
                 except (TypeError, ValueError):
                     pass
+        # Per-symbol lookup table — match on root symbol first, then
+        # local_symbol (e.g. ``GCM6``) which begins with the root.
+        sym = str(cached.get("symbol", "") or "").upper().strip()
+        if sym and sym in _FUT_TICK:
+            return _FUT_TICK[sym]
+        local = str(cached.get("local_symbol", "") or "").upper().strip()
+        for root, t in _FUT_TICK.items():
+            if local.startswith(root):
+                return t
         sec = cached.get("sec_type", "")
         if sec == "FUT":
             return 0.25
@@ -150,6 +204,11 @@ class BookTraderView(QWidget):
             _sec_type_for(self._active_symbol) if self._active_symbol else "")
         self._active_qty: int = (
             _FUT_DEFAULT if self._active_sec_type == "FUT" else _STK_DEFAULT)
+        # In-memory cache of TP / SL / TS selections per symbol —
+        # mirrors the OrderEntryPanel cache.  Lives only for the
+        # session; not persisted to JSON, so a fresh launch always
+        # starts each symbol unarmed.
+        self._tier_state_by_symbol: dict[str, dict] = {}
         self._last_price: float = 0.0
         # L1 fallback state — set False when TWS rejects the depth
         # subscription (no L2 entitlement, code 10090/10167).  While
@@ -236,6 +295,22 @@ class BookTraderView(QWidget):
         self._active_qty = default
         root.addWidget(self._qty_row)
 
+        # ── Pre-build TP / SL / Trail tier sections so the ARMED strip
+        # below can subscribe to their ``changed`` signals.  The widgets
+        # are added to the root layout later, at their normal position
+        # near the bottom of the panel.
+        self._pt_section = _TierSection(
+            "Take Profit", [], label_color=Theme.CLR_BUY,
+            short_title="TP")
+        self._sl_section = _TierSection(
+            "Stop Loss", [], label_color=Theme.CLR_SELL,
+            short_title="SL")
+        self._tr_section = _TierSection(
+            "Trailing", [], label_color=Theme.CLR_FLATTEN,
+            short_title="TS")
+
+        root.addSpacing(8)
+
         # ── Ladder header row: "BID SZ" | tick combo | "ASK SZ" ──────────────
         # Persistent in-widget header (not a Qt horizontal header) so the
         # tick-aggregation dropdown can sit centred between the two size
@@ -277,8 +352,13 @@ class BookTraderView(QWidget):
         # Lock button — when locked (default) the ladder auto-scrolls so
         # the last-price row stays centred in the viewport on every
         # tick.  Unlock to scroll the ladder manually without the view
-        # yanking back to the centre.
-        self._btn_lock = QPushButton("\U0001F512")   # 🔒
+        # yanking back to the centre.  Closed-padlock SVG when locked,
+        # open-padlock SVG when unlocked (see _on_lock_toggled).
+        self._icon_lock_closed = QIcon(_LOCK_CLOSED_ICON)
+        self._icon_lock_open = QIcon(_LOCK_OPEN_ICON)
+        self._btn_lock = QPushButton()
+        self._btn_lock.setIcon(self._icon_lock_closed)
+        self._btn_lock.setIconSize(QSize(16, 16))
         self._btn_lock.setCheckable(True)
         self._btn_lock.setChecked(True)
         self._btn_lock.setFixedSize(28, 24)
@@ -289,7 +369,7 @@ class BookTraderView(QWidget):
         self._btn_lock.setStyleSheet(
             f"QPushButton{{background:{Theme.BG_INPUT};color:{Theme.TEXT};"
             f"border:1px solid {Theme.BORDER};border-radius:3px;"
-            f"font-size:12px;padding:0}}"
+            f"padding:0}}"
             f"QPushButton:hover{{border-color:{Theme.ACCENT}}}"
             f"QPushButton:checked{{background:#3a3f50;"
             f"border-color:{Theme.ACCENT}}}")
@@ -317,6 +397,11 @@ class BookTraderView(QWidget):
         # ── DOM ladder ────────────────────────────────────────────────────────
         self._ladder = DOMLadderView(model=self._model)
         root.addWidget(self._ladder, stretch=1)
+        # Hover badge content — ``Buy {qty}`` / ``Sell {qty}`` plus a
+        # second line listing armed TP / SL / TS amounts so the trader
+        # sees exactly what a click would submit.
+        self._ladder.set_qty_provider(lambda: self._active_qty)
+        self._ladder.set_armed_summary_provider(self._format_attached_summary)
         # Populate tick combo for the initial contract.
         self._populate_tick_combo()
 
@@ -333,15 +418,9 @@ class BookTraderView(QWidget):
         root.addLayout(pm_row)
 
         # ── TP / SL / Trail tier sections ─────────────────────────────────────
-        self._pt_section = _TierSection(
-            "Take Profit", [], enabled=False,
-            label_color=Theme.CLR_BUY, auto_select_min=True)
-        self._sl_section = _TierSection(
-            "Stop Loss", [], enabled=False,
-            label_color=Theme.CLR_SELL, auto_select_min=True)
-        self._tr_section = _TierSection(
-            "Trail Stop", [], enabled=False,
-            label_color=Theme.CLR_FLATTEN, auto_select_min=True)
+        # The widgets themselves were created earlier (so the ARMED
+        # strip above could connect to their ``changed`` signal); here
+        # we just lay them out at the bottom of the root column.
         root.addWidget(self._pt_section)
         root.addWidget(self._sl_section)
         root.addWidget(self._tr_section)
@@ -592,6 +671,9 @@ class BookTraderView(QWidget):
             # initially found no workers).
             self.refresh_subscriptions()
             return
+        # Snapshot the outgoing symbol's TP / SL / TS state before we
+        # blow it away by reloading tier sections for the new symbol.
+        self._capture_tier_state(self._active_symbol)
         old = self._active_symbol
         self._active_symbol = sym
         self._active_sec_type = sec_type or _sec_type_for(sym)
@@ -619,16 +701,26 @@ class BookTraderView(QWidget):
         self._model.recenter(0.0)
         self._populate_tick_combo()
         self._reload_tier_sections()
+        # Restore (or reset) the new symbol's previously-stored arming.
+        self._restore_tier_state(sym)
 
-        # Swap depth subscription on the bg worker.  L1 is owned by
-        # OrderEntryPanel (which subscribes every saved chip-bar
-        # symbol); Book Trader only takes over the L2 stream for the
-        # active symbol.
+        # Swap depth subscription on the bg worker.  L1 is normally
+        # owned by OrderEntryPanel — it subscribes every saved chip-bar
+        # symbol — but a symbol that lives only on Book Trader's chip
+        # bar (e.g. the user added MCL here without adding it to Order
+        # Entry) won't get an L1 tick from that path, so the ladder
+        # would sit at 0-centred prices forever.  Subscribe L1 for the
+        # active symbol from BookTrader too — ``subscribe_background_symbols``
+        # is idempotent on the worker side, so this is a no-op when
+        # OrderEntry already has it.
         self._ensure_bg_worker()
         if self._bg_worker is not None:
             if old:
                 self._bg_worker.unsubscribe_depth(old)
             self._bg_worker.subscribe_depth(sym)
+            l1_params = self._build_l1_params_for(sym)
+            if l1_params is not None:
+                self._bg_worker.subscribe_background_symbols([l1_params])
 
         # Different symbol → different subset of live orders is
         # relevant.  Re-project the ladder markers.
@@ -671,6 +763,27 @@ class BookTraderView(QWidget):
                         self._tr_section):
             section.set_qty(self._active_qty)
 
+    def _format_attached_summary(self) -> str:
+        """Return a one-line summary of the currently-armed brackets,
+        e.g. ``"TP $40, SL $80, TS 50t"``.  Empty string when no tier
+        is armed.  Reused by :class:`DOMLadderView`'s hover badge so
+        the trader sees which brackets a ladder click would attach.
+        """
+        # Reuse the helpers from OrderEntryPanel — they already do the
+        # tier-section → dollar-amount math the action buttons rely on.
+        from src.ui.widgets.order_entry_panel import OrderEntryPanel as _OEP
+        parts: list[str] = []
+        tp = _OEP._tier_amount(self._pt_section)
+        if tp is not None:
+            parts.append(f"TP ${tp:,}")
+        sl = _OEP._tier_amount(self._sl_section)
+        if sl is not None:
+            parts.append(f"SL ${sl:,}")
+        tr_text = _OEP._trail_text(self._tr_section)
+        if tr_text is not None:
+            parts.append(f"TS {tr_text}")
+        return ", ".join(parts)
+
     def _on_recenter_clicked(self) -> None:
         if self._last_price > 0:
             self._model.recenter(self._last_price)
@@ -678,22 +791,28 @@ class BookTraderView(QWidget):
     def _on_lock_toggled(self, locked: bool) -> None:
         """Lock / unlock the ladder's 'keep last price centred' tracker.
 
-        The button text flips between closed-padlock (locked) and
+        The button icon flips between closed-padlock (locked) and
         open-padlock (unlocked) so the affordance matches the state.
         """
-        self._btn_lock.setText("\U0001F512" if locked else "\U0001F513")
+        self._btn_lock.setIcon(
+            self._icon_lock_closed if locked else self._icon_lock_open)
         self._ladder.set_locked(locked)
 
     def _populate_tick_combo(self) -> None:
-        """Fill the tick-aggregation combo with common multiples of the
-        contract's minimum tick.  MVP: populates 1×, 2×, 4×, 10× but
-        only the actual contract tick is selectable (others are stubbed
-        for a future aggregation feature)."""
+        """Fill the tick-aggregation combo with sec-type-appropriate
+        aggregation steps from :data:`_TICK_PRESETS`.  The contract's
+        native tick is preselected; if it isn't already a preset, it's
+        prepended so the user always sees the real tick on the list.
+        """
         tick = _tick_size_for_contract(self._active_contract_cached())
+        sec = (self._active_sec_type
+               or _sec_type_for(self._active_symbol or ""))
+        presets = list(_TICK_PRESETS.get(sec, _TICK_PRESETS["STK"]))
+        if tick > 0 and not any(abs(p - tick) < 1e-9 for p in presets):
+            presets = [tick] + presets
         self._cmb_tick.blockSignals(True)
         self._cmb_tick.clear()
-        options = [tick, tick * 2, tick * 4, tick * 10]
-        for t in options:
+        for t in presets:
             self._cmb_tick.addItem(f"{t:g}")
         self._cmb_tick.setCurrentText(f"{tick:g}")
         self._cmb_tick.blockSignals(False)
@@ -844,6 +963,60 @@ class BookTraderView(QWidget):
         except Exception:
             return None
 
+    @staticmethod
+    def _build_l1_params_for(sym: str) -> dict | None:
+        """Return the param dict ``IBWorkerThread.subscribe_background_symbols``
+        expects for *sym*, or ``None`` when no saved contract row exists
+        (in which case L1 can't be subscribed regardless).  Mirror of
+        :meth:`OrderEntryPanel._build_bg_params_for_symbol` so BookTrader
+        can subscribe its active symbol's L1 directly when OrderEntry's
+        chip bar doesn't already cover it.
+        """
+        if not sym:
+            return None
+        try:
+            from src.core.reference_data import get_instance as _rd
+            rows = _rd().contracts_by_symbol.get(sym.upper(), [])
+        except Exception:
+            return None
+        for c in rows:
+            conid = c.get("conid")
+            if conid:
+                return {
+                    "conid":        int(conid),
+                    "symbol":       sym,
+                    "sec_type":     c.get("sec_type", ""),
+                    "exchange":     c.get("exchange", "SMART"),
+                    "currency":     c.get("currency", "USD"),
+                    "local_symbol": c.get("local_symbol", ""),
+                    "expiry":       c.get("expiry", ""),
+                    "multiplier":   c.get("multiplier", ""),
+                }
+        return None
+
+    def _capture_tier_state(self, sym: str | None) -> None:
+        if not sym or not hasattr(self, "_pt_section"):
+            return
+        self._tier_state_by_symbol[sym.upper()] = {
+            "pt": self._pt_section.capture_state(),
+            "sl": self._sl_section.capture_state(),
+            "tr": self._tr_section.capture_state(),
+        }
+
+    def _restore_tier_state(self, sym: str | None) -> None:
+        if not hasattr(self, "_pt_section"):
+            return
+        snapshot = self._tier_state_by_symbol.get(
+            sym.upper()) if sym else None
+        if snapshot:
+            self._pt_section.restore_state(snapshot.get("pt"))
+            self._sl_section.restore_state(snapshot.get("sl"))
+            self._tr_section.restore_state(snapshot.get("tr"))
+        else:
+            self._pt_section.reset()
+            self._sl_section.reset()
+            self._tr_section.reset()
+
     def _reload_tier_sections(self) -> None:
         """Reload TP / SL / Trail chips from ReferenceData and sync
         qty + multiplier + market price into each section."""
@@ -916,6 +1089,11 @@ class BookTraderView(QWidget):
         # symbols) so calling it on every refresh guarantees re-
         # subscription after a reconnect.
         self._bg_worker.subscribe_depth(self._active_symbol)
+        # Same idempotent re-subscription for L1 so the ladder gets
+        # prices for symbols only present in BookTrader's chip bar.
+        l1_params = self._build_l1_params_for(self._active_symbol)
+        if l1_params is not None:
+            self._bg_worker.subscribe_background_symbols([l1_params])
 
     def _wire_order_status_on_all_workers(self) -> None:
         """Connect ``order_status_updated`` for every running worker we

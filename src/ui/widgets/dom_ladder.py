@@ -24,7 +24,7 @@ is driven by the L1 ``bg_price_updated`` signal.
 """
 from __future__ import annotations
 
-from typing import Literal
+from typing import Callable, Literal
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter
@@ -714,10 +714,12 @@ class DOMLadderView(QTableView):
             self._on_scroll_recenter_timeout)
 
         # ── Hover-side badge ─────────────────────────────────────────────────
-        # Pre-click intent indicator: a small green BUY / red SELL chip
+        # Pre-click intent indicator: a Buy {qty} / Sell {qty} chip
         # follows the cursor while hovering over the ladder so the
         # trader sees what a click here would submit *before* clicking.
-        # Mirrors the same side rule mousePressEvent uses.
+        # Mirrors the same side rule mousePressEvent uses.  Optionally
+        # shows a second line with the currently-armed TP / SL / TS
+        # amounts so the trader knows which brackets ride on the click.
         self.viewport().setMouseTracking(True)
         self.setMouseTracking(True)
         self._hover_badge = QLabel(self.viewport())
@@ -726,6 +728,22 @@ class DOMLadderView(QTableView):
         self._hover_badge.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self._hover_badge.hide()
+        # Optional providers — host (BookTraderView) wires these so the
+        # badge can read the current order qty + armed-tier summary.
+        self._qty_provider: Callable[[], int] | None = None
+        self._armed_summary_provider: Callable[[], str] | None = None
+
+    def set_qty_provider(self, fn: Callable[[], int]) -> None:
+        """Register a callable returning the current order qty.  Used
+        by the hover badge to render ``"Buy {qty}"`` / ``"Sell {qty}"``."""
+        self._qty_provider = fn
+
+    def set_armed_summary_provider(self, fn: Callable[[], str]) -> None:
+        """Register a callable returning the second-line text shown on
+        the hover badge — typically a comma-separated armed-tier
+        summary like ``"TP $40, SL $80, TS 50t"``.  Empty string means
+        nothing is armed and the badge stays single-line."""
+        self._armed_summary_provider = fn
 
     def model(self) -> DOMLadderModel:  # type: ignore[override]
         return self._model
@@ -748,29 +766,58 @@ class DOMLadderView(QTableView):
     def _show_hover_badge(self, side: str, anchor) -> None:
         """Render the badge at *side* (BUY / SELL) and reposition it
         next to *anchor* (a QPoint in viewport coordinates).  Offset
-        slightly so the badge doesn't sit under the cursor."""
+        slightly so the badge doesn't sit under the cursor.
+
+        Line 1: ``"Buy {qty}"`` or ``"Sell {qty}"`` (qty pulled from the
+        registered provider; defaults to 1 if no provider is wired).
+        Line 2: the armed-tier summary string from the provider, when
+        non-empty (e.g. ``"TP $40, SL $80, TS 50t"``).
+        """
         if side == "BUY":
             bg, fg = "#1A2A1A", "#3FB950"
-            text = "BUY"
+            verb = "Buy"
         else:
             bg, fg = "#2A1818", "#F85149"
-            text = "SELL"
+            verb = "Sell"
+        qty = 1
+        if self._qty_provider is not None:
+            try:
+                qty = int(self._qty_provider() or 1)
+            except (TypeError, ValueError):
+                qty = 1
+        primary = f"{verb} {qty}"
+        secondary = ""
+        if self._armed_summary_provider is not None:
+            try:
+                secondary = str(self._armed_summary_provider() or "")
+            except Exception:
+                secondary = ""
+        text = primary if not secondary else f"{primary}\n{secondary}"
         self._hover_badge.setText(text)
         self._hover_badge.setStyleSheet(
             f"QLabel#ladderHoverBadge {{"
             f"background:{bg};color:{fg};"
             f"border:1px solid {fg};border-radius:3px;"
-            f"padding:1px 6px}}")
+            f"padding:2px 6px}}")
         self._hover_badge.adjustSize()
-        x = anchor.x() + 14
-        y = anchor.y() + 2
-        # Keep the badge inside the viewport so it doesn't get clipped
-        # at the right/bottom edges.
-        vp = self.viewport().rect()
         bw = self._hover_badge.width()
         bh = self._hover_badge.height()
+        # BUY hovers sit in the left bid column → place the badge to the
+        # LEFT of the cursor so it leans away from the price column.
+        # SELL hovers sit in the right ask column → keep the badge on
+        # the RIGHT of the cursor for the same reason.  Either way the
+        # badge stays out of the price column the trader is reading.
+        y = anchor.y() + 2
+        if side == "BUY":
+            x = anchor.x() - bw - 14
+        else:
+            x = anchor.x() + 14
+        # Keep the badge inside the viewport so it doesn't get clipped.
+        vp = self.viewport().rect()
+        if x < vp.left():
+            x = vp.left() + 2
         if x + bw > vp.right():
-            x = anchor.x() - bw - 6
+            x = vp.right() - bw - 2
         if y + bh > vp.bottom():
             y = vp.bottom() - bh
         self._hover_badge.move(x, y)
@@ -883,16 +930,23 @@ class DOMLadderView(QTableView):
     def sync_to_last(self) -> None:
         """Ask the view to re-centre on the last price.
 
-        No longer yanks the viewport on every tick — the model owns a
-        debounced auto-recenter that fires on drift > 10 rows after a
-        3-second delay, and its ``modelReset`` snaps the viewport
-        automatically.  This method is kept as a safety valve: if the
-        last-price row has drifted more than ``_DRIFT_LIMIT_ROWS`` from
-        the viewport centre (e.g. user scrolled way off), pull it back
-        into view so the market doesn't disappear entirely — but only
-        after ``_DRIFT_LIMIT_MS`` of sustained drift, so a brief
-        scroll into deep territory doesn't yank back on the next tick.
+        Behaviour depends on the lock state:
+
+        * **Locked** (default) — snap the viewport to the last-price
+          row immediately so the cell stays pinned to the centre as
+          the market moves.  This matches the visible affordance of
+          the closed-padlock button: while it's closed, the price
+          cell is always in the middle.
+        * **Unlocked** — preserve the user's manual scroll position.
+          A safety valve still fires when the last drifts more than
+          ``_DRIFT_LIMIT_ROWS`` from the viewport centre and stays
+          drifted for ``_DRIFT_LIMIT_MS`` (so the market never
+          disappears entirely), but a brief scroll into deep
+          territory won't yank back on the next tick.
         """
+        if self._locked:
+            self._scroll_to_last()
+            return
         drift = self._last_row_drift()
         drifted = drift is not None and drift > self._DRIFT_LIMIT_ROWS
         if drifted:

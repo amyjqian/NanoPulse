@@ -6,21 +6,45 @@ import logging
 import math
 from typing import Any
 
-from PySide6.QtCore import QEvent, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QDoubleValidator, QFont, QFontMetrics, QIntValidator, QPainter
+from PySide6.QtCore import (
+    QEvent,
+    QMimeData,
+    QPoint,
+    QRect,
+    Qt,
+    QTimer,
+    Signal,
+)
+from PySide6.QtGui import (
+    QColor,
+    QDoubleValidator,
+    QDrag,
+    QFont,
+    QFontMetrics,
+    QIntValidator,
+    QPainter,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
+    QCheckBox,
     QComboBox,
     QCompleter,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
+    QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
-    QMessageBox,
+    QMenu,
     QPushButton,
     QSizePolicy,
+    QStyle,
+    QStyleOptionButton,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -89,6 +113,106 @@ def _make_btn(text: str, colour: str, min_h: int = 32) -> QPushButton:
     return btn
 
 
+class _ActionButton(QPushButton):
+    """Buy / Sell action button with a big primary line plus a small
+    secondary line that summarises the currently-armed Take Profit /
+    Stop Loss / Trail amounts.
+
+    Two-line layout (centred) drawn manually so each line uses its own
+    font.  QSS still drives the background / hover / pressed visuals
+    via :meth:`QStyle.drawControl` — only the text rendering is custom.
+    """
+
+    _PRIMARY_PT = 12
+    _SECONDARY_PT = 9
+
+    def __init__(self, primary: str, colour: str, parent=None) -> None:
+        super().__init__(parent)
+        self._primary = primary
+        self._secondary = ""
+        self.setMinimumHeight(40)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setStyleSheet(f"""
+            QPushButton {{
+                background: {colour};
+                color: #ffffff;
+                border: none;
+                border-radius: 4px;
+                padding: 4px 8px;
+            }}
+            QPushButton:hover {{ background: {colour}; border: 1px solid #ffffff30; }}
+            QPushButton:pressed {{ background: {colour}; border: 1px solid #ffffff60; }}
+        """)
+
+    def setPrimary(self, text: str) -> None:  # noqa: N802
+        if self._primary == text:
+            return
+        self._primary = text
+        self.update()
+
+    def setSecondary(self, text: str) -> None:  # noqa: N802
+        if self._secondary == text:
+            return
+        self._secondary = text
+        self.update()
+
+    # Override the inherited setText so an accidental setText() call
+    # routes to setPrimary() rather than silently breaking the custom
+    # paint (which never reads QPushButton.text()).
+    def setText(self, text: str) -> None:  # noqa: N802
+        self.setPrimary(text)
+
+    def text(self) -> str:
+        return self._primary
+
+    def paintEvent(self, event):  # noqa: N802
+        # Draw the QSS background only (suppress Qt's own text rendering
+        # by zeroing opt.text), then paint our two-line text on top.
+        opt = QStyleOptionButton()
+        self.initStyleOption(opt)
+        opt.text = ""
+        painter = QPainter(self)
+        try:
+            self.style().drawControl(
+                QStyle.ControlElement.CE_PushButton, opt, painter, self)
+            painter.setPen(QColor("#ffffff"))
+
+            r = self.rect()
+            f_primary = QFont(self.font())
+            f_primary.setPointSize(self._PRIMARY_PT)
+            f_primary.setBold(True)
+            fm_p = QFontMetrics(f_primary)
+
+            if self._secondary:
+                f_secondary = QFont(self.font())
+                f_secondary.setPointSize(self._SECONDARY_PT)
+                f_secondary.setBold(True)
+                fm_s = QFontMetrics(f_secondary)
+                gap = 2
+                total_h = fm_p.height() + gap + fm_s.height()
+                top = (r.height() - total_h) // 2
+
+                painter.setFont(f_primary)
+                painter.drawText(
+                    QRect(r.x(), top, r.width(), fm_p.height()),
+                    Qt.AlignmentFlag.AlignHCenter
+                    | Qt.AlignmentFlag.AlignVCenter,
+                    self._primary)
+                painter.setFont(f_secondary)
+                painter.drawText(
+                    QRect(r.x(), top + fm_p.height() + gap,
+                          r.width(), fm_s.height()),
+                    Qt.AlignmentFlag.AlignHCenter
+                    | Qt.AlignmentFlag.AlignVCenter,
+                    self._secondary)
+            else:
+                painter.setFont(f_primary)
+                painter.drawText(r, Qt.AlignmentFlag.AlignCenter, self._primary)
+        finally:
+            painter.end()
+
+
 def _sec_type_for(sym: str) -> str:
     """Return 'FUT', 'STK', 'OPT', or '?' for *sym* via ReferenceData cache."""
     from src.core.reference_data import get_instance as _rd
@@ -107,52 +231,6 @@ def _apply_chip_style(btn: QPushButton, selected: bool) -> None:
             "QPushButton{background:#3a3a4a;color:#ccc;border:none;"
             "border-radius:6px;padding:4px 12px;font-weight:600;font-size:12px}"
             "QPushButton:hover{background:#4a4a5a}")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Toggle switch
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class _ToggleSwitch(QWidget):
-    """Compact iOS-style on/off toggle (custom-painted, no images needed)."""
-
-    toggled = Signal(bool)
-    _W, _H = 40, 22
-
-    def __init__(self, on: bool = False, parent=None):
-        super().__init__(parent)
-        self._on = on
-        self.setFixedSize(self._W, self._H)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-
-    def mousePressEvent(self, event) -> None:
-        self._on = not self._on
-        self.update()
-        self.toggled.emit(self._on)
-
-    def paintEvent(self, event) -> None:
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        r = self._H // 2
-        # Track
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor("#0071e3") if self._on else QColor("#4a4a5a"))
-        p.drawRoundedRect(0, 1, self._W, self._H - 2, r, r)
-        # Thumb
-        thumb_d = self._H - 6
-        thumb_x = self._W - thumb_d - 4 if self._on else 4
-        p.setBrush(QColor("white"))
-        p.drawEllipse(thumb_x, 3, thumb_d, thumb_d)
-        p.end()
-
-    @property
-    def is_on(self) -> bool:
-        return self._on
-
-    def set_on(self, value: bool) -> None:
-        if self._on != value:
-            self._on = value
-            self.update()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -199,6 +277,42 @@ class TickPriceInput(QWidget):
     _BTN_W            = 16    # px width of the up/down arrow column
     _CHIP_H           = 28    # must match _TierSection._CHIP_H
 
+    # Stylesheets — split into "normal" (idle) and "armed" (positive
+    # value typed) so the whole control can flip to the same blue
+    # background a selected tier chip uses.  Triggered by the host
+    # ``_TierSection`` via :meth:`set_armed`.
+    _EDIT_SS_NORMAL = (
+        "QLineEdit{background:#3a3a4a;color:#ccc;border:none;"
+        "border-radius:6px 0 0 6px;padding:2px 6px;font-size:11px}"
+        "QLineEdit:focus{background:#4a4a5a;color:white}"
+        "QLineEdit:disabled{background:#252535;color:#444;border:none}"
+    )
+    _EDIT_SS_ARMED = (
+        "QLineEdit{background:#0071e3;color:white;border:none;"
+        "border-radius:6px 0 0 6px;padding:2px 6px;font-size:11px;"
+        "font-weight:bold}"
+        "QLineEdit:focus{background:#0077ed;color:white}"
+        "QLineEdit:disabled{background:#252535;color:#444;border:none}"
+    )
+    _ARROW_SS_NORMAL = (
+        "QToolButton{background:#3a3a4a;color:#aaa;border:none;"
+        "font-size:7px;padding:0;margin:0}"
+        "QToolButton:hover{background:#4a4a5a;color:white}"
+        "QToolButton:pressed{background:#0071e3;color:white}"
+    )
+    _ARROW_SS_ARMED = (
+        "QToolButton{background:#0071e3;color:white;border:none;"
+        "font-size:7px;padding:0;margin:0}"
+        "QToolButton:hover{background:#0077ed;color:white}"
+        "QToolButton:pressed{background:#0077ed;color:white}"
+    )
+    _ARROW_W_SS_NORMAL = (
+        "QWidget{background:#3a3a4a;border:none;border-radius:0 6px 6px 0}"
+    )
+    _ARROW_W_SS_ARMED = (
+        "QWidget{background:#0071e3;border:none;border-radius:0 6px 6px 0}"
+    )
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._market_price: float           = 0.0
@@ -222,12 +336,7 @@ class TickPriceInput(QWidget):
         self._edit.setMinimumWidth(0)
         self._edit.setSizePolicy(
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-        self._edit.setStyleSheet(
-            "QLineEdit{background:#3a3a4a;color:#ccc;border:none;"
-            "border-radius:6px 0 0 6px;padding:2px 6px;font-size:11px}"
-            "QLineEdit:focus{background:#4a4a5a;color:white}"
-            "QLineEdit:disabled{background:#252535;color:#444;border:none}"
-        )
+        self._edit.setStyleSheet(self._EDIT_SS_NORMAL)
         # Reject non-numeric keystrokes; positive floats only
         _dv = QDoubleValidator(0.0, 1e12, 10, self._edit)
         _dv.setNotation(QDoubleValidator.Notation.StandardNotation)
@@ -237,16 +346,10 @@ class TickPriceInput(QWidget):
         self._edit.editingFinished.connect(self._snap_to_tick)
         self._edit.installEventFilter(self)
 
-        _arrow_ss = (
-            "QToolButton{background:#3a3a4a;color:#aaa;border:none;"
-            "font-size:7px;padding:0;margin:0}"
-            "QToolButton:hover{background:#4a4a5a;color:white}"
-            "QToolButton:pressed{background:#0071e3;color:white}"
-        )
         self._btn_up = QToolButton()
         self._btn_up.setText("▲")
         self._btn_up.setFixedSize(self._BTN_W, self._CHIP_H // 2)
-        self._btn_up.setStyleSheet(_arrow_ss)
+        self._btn_up.setStyleSheet(self._ARROW_SS_NORMAL)
         self._btn_up.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_up.setAutoRepeat(True)
         self._btn_up.setAutoRepeatDelay(400)    # ms before repeat starts
@@ -256,7 +359,7 @@ class TickPriceInput(QWidget):
         self._btn_dn = QToolButton()
         self._btn_dn.setText("▼")
         self._btn_dn.setFixedSize(self._BTN_W, self._CHIP_H // 2)
-        self._btn_dn.setStyleSheet(_arrow_ss)
+        self._btn_dn.setStyleSheet(self._ARROW_SS_NORMAL)
         self._btn_dn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_dn.setAutoRepeat(True)
         self._btn_dn.setAutoRepeatDelay(400)
@@ -271,9 +374,11 @@ class TickPriceInput(QWidget):
 
         self._arrow_w = QWidget()
         self._arrow_w.setFixedSize(self._BTN_W, self._CHIP_H)
-        self._arrow_w.setStyleSheet(
-            "QWidget{background:#3a3a4a;border:none;border-radius:0 6px 6px 0}")
+        self._arrow_w.setStyleSheet(self._ARROW_W_SS_NORMAL)
         self._arrow_w.setLayout(arrow_col)
+        # Track the current armed state so set_armed() can early-return
+        # when nothing changed (avoids needless QSS unpolish/polish).
+        self._armed: bool = False
 
         lay.addWidget(self._edit, 1)
         lay.addWidget(self._arrow_w)
@@ -313,6 +418,13 @@ class TickPriceInput(QWidget):
     def text(self) -> str:
         return self._edit.text()
 
+    def setText(self, text: str) -> None:  # noqa: N802 — Qt-style mixed case
+        """Programmatic setter mirroring :class:`QLineEdit`'s API so
+        ``_TierSection.restore_state`` can push a saved Dist value
+        back into the input.  Emits ``textChanged`` for downstream
+        listeners."""
+        self._edit.setText(text)
+
     def clear(self) -> None:
         self._edit.blockSignals(True)
         self._edit.clear()
@@ -325,6 +437,26 @@ class TickPriceInput(QWidget):
         self._market_price = price
         if tick_size is not None and tick_size > 0:
             self._tick_size = tick_size
+
+    def set_armed(self, armed: bool) -> None:
+        """Toggle the "armed" visual: when *armed* is True the QLineEdit
+        and arrow column flip to the same blue background a selected
+        tier chip uses.  Called by :class:`_TierSection` whenever the
+        Dist input holds a positive value (or the user explicitly arms
+        a chip via Dist) so the user can see at a glance which tier
+        section is contributing to the next order."""
+        armed = bool(armed)
+        if armed == self._armed:
+            return
+        self._armed = armed
+        edit_ss = self._EDIT_SS_ARMED if armed else self._EDIT_SS_NORMAL
+        arrow_ss = self._ARROW_SS_ARMED if armed else self._ARROW_SS_NORMAL
+        arrow_w_ss = (self._ARROW_W_SS_ARMED if armed
+                      else self._ARROW_W_SS_NORMAL)
+        self._edit.setStyleSheet(edit_ss)
+        self._btn_up.setStyleSheet(arrow_ss)
+        self._btn_dn.setStyleSheet(arrow_ss)
+        self._arrow_w.setStyleSheet(arrow_w_ss)
 
     # ── Signal relay ──────────────────────────────────────────────────────────
 
@@ -986,14 +1118,24 @@ class _TierSection(QWidget):
         "QLineEdit:disabled{background:#252535;color:#444;border:none}"
     )
 
+    # Cap the number of preset chips displayed.  Three chips + the
+    # custom Dist input + the title button is the most that fits on a
+    # single row at the panel's typical width — additional tiers from
+    # the user's strategy config are silently dropped here.
+    _MAX_CHIPS = 3
+
     def __init__(self, title: str, tiers: list[dict],
-                 enabled: bool = False,
                  label_color: str = Theme.ACCENT,
                  *,
-                 auto_select_min: bool = False,
+                 short_title: str | None = None,
                  parent=None):
         super().__init__(parent)
         self._title_str    = title
+        # Compact label shown alongside the dollar amount once a tier
+        # is armed.  Defaults to the long title; sections like Stop
+        # Loss / Trailing pass an abbreviation ("SL" / "TS") so the
+        # button doesn't blow out width when the dollar suffix lands.
+        self._short_title  = short_title or title
         self._label_color  = label_color
         self._tiers:             list[dict]  = tiers
         self._dollar_per_tier:   list[float] = []
@@ -1002,67 +1144,38 @@ class _TierSection(QWidget):
         self._selected_idx:      int | None  = None
         self._chip_buttons:      list[QPushButton] = []
         self._input:             TickPriceInput | None = None
-        self._toggle:            _ToggleSwitch | None = None
-        self._state_lbl:         QLabel | None = None
-        self._dollar_lbl:        QLabel | None = None
+        self._dollar_lbl:        QPushButton | None = None
         self._chips_layout:      QHBoxLayout | None = None
-        # When True, turning the toggle on (with no prior chip selection
-        # and no custom Dist) auto-selects the smallest / first tier so
-        # the user gets a sensible default with a single click.
-        self._auto_select_min:   bool = auto_select_min
-        self._build_ui(title, enabled)
+        self._build_ui()
 
     # ── Build ─────────────────────────────────────────────────────────────────
 
-    def _build_ui(self, title: str, enabled: bool) -> None:
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 4)
-        root.setSpacing(4)
-
-        # Header row:  [title: $dollar]  [stretch]  [On/Off]  [toggle]
-        # _dollar_lbl acts as the *combined* title + value label on the left:
-        #   • no chip / no dollar  →  "Take profit"          (plain white)
-        #   • chip selected, off   →  "Take profit: $500"    (dim grey preview)
-        #   • chip selected, on    →  "Take profit: $500"    (accent green/red)
-        hdr = QHBoxLayout()
-        hdr.setSpacing(6)
-        hdr.setContentsMargins(0, 0, 0, 0)
-
-        self._dollar_lbl = _make_btn(title, self._label_color, 30)
-        self._dollar_lbl.setSizePolicy(
-            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        # Pin min width to fit "Take Profit" so TP and SL buttons have the
-        # same initial width regardless of which title is shorter.
-        _fm = QFontMetrics(self._dollar_lbl.font())
-        self._dollar_lbl.setMinimumWidth(_fm.horizontalAdvance("Take Profit") + 24)
-        self._dollar_lbl.clicked.connect(self._on_header_submit)
-        # Disabled until a chip is selected or a custom Dist is typed.
-        self._dollar_lbl.setEnabled(False)
-        hdr.addWidget(self._dollar_lbl)
-        hdr.addStretch()
-
-        self._state_lbl = QLabel("On" if enabled else "Off")
-        self._state_lbl.setStyleSheet(
-            f"color: {Theme.TEXT_DIM}; font-size: 11px; border: none;")
-        hdr.addWidget(self._state_lbl)
-
-        self._toggle = _ToggleSwitch(enabled)
-        self._toggle.toggled.connect(self._on_toggled)
-        hdr.addWidget(self._toggle)
-        root.addLayout(hdr)
-
-        # Chips container (rebuilt on reload_tiers)
-        chips_w = QWidget()
-        chips_w.setStyleSheet("border: none;")
-        self._chips_layout = QHBoxLayout(chips_w)
-        self._chips_layout.setContentsMargins(0, 0, 0, 0)
+    def _build_ui(self) -> None:
+        # Single row:  [chip1] [chip2] [chip3] [Dist input] [Title button]
+        # The toggle / On-Off label that used to live in a header row is
+        # gone — selection happens implicitly when the user clicks a
+        # chip or types into the Dist input, and the ARMED-strip
+        # ``✕`` button reset() the row.
+        self._chips_layout = QHBoxLayout(self)
+        self._chips_layout.setContentsMargins(0, 0, 0, 4)
         self._chips_layout.setSpacing(4)
-        root.addWidget(chips_w)
+        self._build_chips()
 
-        self._build_chips(enabled)
+    # Stretch factors for the row.  Chosen so the relative slice each
+    # cell takes matches the design pixel widths at a typical ~900 px
+    # panel: chip 138, Dist input 190, title button 270.
+    # Total = 3 × 138 + 190 + 270 = 874 stretch units.
+    _CHIP_STRETCH = 138
+    _INPUT_STRETCH = 190
+    _BUTTON_STRETCH = 270
 
-    def _build_chips(self, enabled: bool) -> None:
-        """(Re)populate the chips row from self._tiers."""
+    def _build_chips(self) -> None:
+        """(Re)populate the chips row from ``self._tiers``.  Only the
+        first ``_MAX_CHIPS`` tiers are rendered; the row ends with the
+        custom Dist input and the ``TP`` / ``SL`` / ``TS`` title
+        button.  Chip + input widths are 7/10 of an equal split so the
+        title button gets the extra room — see the stretch constants
+        above."""
         lay = self._chips_layout
         while lay.count():
             item = lay.takeAt(0)
@@ -1071,10 +1184,11 @@ class _TierSection(QWidget):
         self._chip_buttons.clear()
         self._selected_idx = None
 
-        # Snapshot dollar values parallel to chip indices
-        self._dollar_per_tier = [t.get("dollar", 0.0) for t in self._tiers]
+        tiers = self._tiers[:self._MAX_CHIPS]
+        # Snapshot dollar values parallel to chip indices.
+        self._dollar_per_tier = [t.get("dollar", 0.0) for t in tiers]
 
-        for i, tier in enumerate(self._tiers):
+        for i, tier in enumerate(tiers):
             label = tier.get("label", f"Tier {i + 1}")
             btn = QPushButton(label)
             btn.setFixedHeight(self._CHIP_H)
@@ -1083,14 +1197,27 @@ class _TierSection(QWidget):
                 QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             btn.clicked.connect(lambda chk, idx=i: self._on_chip_clicked(idx))
             self._chip_buttons.append(btn)
-            lay.addWidget(btn)
+            lay.addWidget(btn, self._CHIP_STRETCH)
 
+        # Custom Dist input.
         self._input = TickPriceInput()
         self._input.setFixedHeight(self._CHIP_H)
         self._input.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._input.textChanged.connect(self._on_input_changed)
-        lay.addWidget(self._input)
+        lay.addWidget(self._input, self._INPUT_STRETCH)
+
+        # Title / dollar button — right-most in the row.  Doubles as
+        # the close-the-position submit button (clickable only when
+        # something is armed).  Wider stretch factor so it absorbs the
+        # 30% trimmed off the chips and Dist input.
+        self._dollar_lbl = _make_btn(
+            self._title_str, self._label_color, self._CHIP_H)
+        self._dollar_lbl.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._dollar_lbl.clicked.connect(self._on_header_submit)
+        self._dollar_lbl.setEnabled(False)
+        lay.addWidget(self._dollar_lbl, self._BUTTON_STRETCH)
 
         self._update_chip_styles()
         self._update_dollar_display()
@@ -1098,29 +1225,26 @@ class _TierSection(QWidget):
     # ── Dollar display ────────────────────────────────────────────────────────
 
     def _update_dollar_display(self) -> None:
-        """Refresh the Take Profit / Stop Loss button label.
+        """Refresh the Take Profit / Stop Loss / Trail Stop button label.
 
-        Shows just the title ("Take profit") when no chip is selected and no
-        custom Dist is typed; shows "Take profit | 500" once either provides
-        a positive dollar value.
+        Shows just the title when nothing is selected; shows
+        ``Title | $X`` once a chip or a positive Dist provides a value.
         """
         if self._dollar_lbl is None:
             return
 
-        input_text = self._input.text().strip() if self._input is not None else ""
-        toggle_on = self._toggle.is_on if self._toggle else True
-        has_selection = self._selected_idx is not None or bool(input_text)
-        # Button is enabled only when the section is on and the user has
-        # expressed a choice — either a chip or a non-empty Dist.
-        self._dollar_lbl.setEnabled(toggle_on and has_selection)
+        input_text = (self._input.text().strip()
+                      if self._input is not None else "")
+        has_chip = self._selected_idx is not None
+        has_input = bool(input_text)
+        active = has_chip or has_input
+        self._dollar_lbl.setEnabled(active)
 
-        # When the section is off or nothing is selected, show just the title
-        # with no dollar value suffix.
-        if not toggle_on or not has_selection:
+        if not active:
             self._dollar_lbl.setText(self._title_str)
             return
 
-        # Per-unit dollar: custom Dist input wins over chip selection
+        # Per-unit dollar: custom Dist wins over chip selection.
         dollar = 0.0
         if input_text:
             try:
@@ -1128,17 +1252,20 @@ class _TierSection(QWidget):
                 if dist > 0:
                     dollar = dist * self._multiplier
             except ValueError:
-                dollar = 0.0
-        if dollar <= 0 and self._selected_idx is not None \
-                and self._selected_idx < len(self._dollar_per_tier):
+                pass
+        if dollar <= 0 and has_chip and self._selected_idx < len(
+                self._dollar_per_tier):
             dollar = self._dollar_per_tier[self._selected_idx]
 
-        if not dollar or dollar <= 0:
+        if dollar <= 0:
             self._dollar_lbl.setText(self._title_str)
             return
 
-        scaled = dollar * self._qty
-        self._dollar_lbl.setText(f"{self._title_str} | {scaled:,.2f}")
+        scaled = int(round(dollar * self._qty))
+        # Armed → use the compact label so the button fits the dollar
+        # value without overflowing (e.g. ``"SL $20"`` instead of
+        # ``"Stop Loss $20"``).
+        self._dollar_lbl.setText(f"{self._short_title} ${scaled:,}")
 
     def set_qty(self, qty: int) -> None:
         """Update the quantity and refresh the dollar display (no chip rebuild)."""
@@ -1152,97 +1279,66 @@ class _TierSection(QWidget):
 
     # ── Slots ─────────────────────────────────────────────────────────────────
 
-    def _on_toggled(self, on: bool) -> None:
-        self._state_lbl.setText("On" if on else "Off")
-        if on:
-            # Auto-select the smallest (first) tier when the user turns
-            # the section on without any prior chip selection or custom
-            # Dist — saves an extra click for the common "default TP/SL
-            # at the closest tier" case.  Opt-in via auto_select_min so
-            # sections that shouldn't pick a default (e.g. Trail Stop)
-            # stay manual.
-            input_text = (self._input.text().strip()
-                          if self._input else "")
-            if (self._auto_select_min
-                    and self._selected_idx is None
-                    and not input_text
-                    and self._tiers):
-                self._selected_idx = 0
-        else:
-            # Keep _selected_idx so the dollar label stays as an informational
-            # preview even when the section is disabled.  Clear any custom text.
-            if self._input:
-                self._input.blockSignals(True)
-                self._input.clear()
-                self._input.blockSignals(False)
-        self._update_chip_styles()
-        self._update_dollar_display()
-        self.changed.emit()
-
     def _on_header_submit(self) -> None:
-        """Clicking the Take Profit / Stop Loss / Trail Stop header button
-        fires the section's submit_requested signal so OrderEntryPanel can
-        route it as a close-the-position order.  If no tier is selected
-        (nothing to act on) the click is a no-op — the button is also
-        disabled in that state via _update_dollar_display, so this branch
-        is defensive.
-        """
+        """Title button click → fire ``submit_requested`` so the host
+        (OrderEntryPanel) routes it as a close-the-position order.  No-op
+        when nothing is armed; the button is also disabled in that
+        state via ``_update_dollar_display`` so this is defensive."""
         if self.get_value() is None:
             return
         self.submit_requested.emit()
 
     def _on_chip_clicked(self, idx: int) -> None:
-        if self._toggle and not self._toggle.is_on:
-            self._toggle.set_on(True)
-            self._state_lbl.setText("On")
-        self._selected_idx = idx
-        if self._input:
-            self._input.blockSignals(True)
-            self._input.clear()
-            self._input.blockSignals(False)
+        # Click a chip while it's already selected → deselect (so the
+        # user can disarm one section without resetting the others).
+        if self._selected_idx == idx:
+            self._selected_idx = None
+        else:
+            self._selected_idx = idx
+            # Custom Dist and chip selection are mutually exclusive —
+            # picking a chip clears any prior typed value.
+            if self._input is not None:
+                self._input.blockSignals(True)
+                self._input.clear()
+                self._input.blockSignals(False)
         self._update_chip_styles()
         self._update_dollar_display()
+        # Picking a chip clears the Dist value, so the input drops back
+        # to its idle visual.  textChanged is signal-blocked above, so
+        # this side-effect needs an explicit call.
+        if self._input is not None:
+            self._input.set_armed(False)
         self.changed.emit()
 
-    def _on_input_changed(self, text: str) -> None:
-        stripped = text.strip()
+    def _on_input_changed(self, _text: str) -> None:
+        # Typing a positive value into Dist supersedes chip selection;
+        # an empty / non-positive value just clears the dollar preview.
+        stripped = (self._input.text().strip()
+                    if self._input is not None else "")
         try:
             val = float(stripped) if stripped else 0.0
         except ValueError:
             val = 0.0
-
-        if val > 0:
-            if self._toggle and not self._toggle.is_on:
-                self._toggle.set_on(True)
-                self._state_lbl.setText("On")
+        if val > 0 and self._selected_idx is not None:
             self._selected_idx = None
-            self._update_chip_styles()
-        else:
-            # Empty / 0 / invalid Dist → turn the section off
-            if self._toggle and self._toggle.is_on:
-                self._toggle.blockSignals(True)
-                self._toggle.set_on(False)
-                self._toggle.blockSignals(False)
-                self._state_lbl.setText("Off")
-                self._update_chip_styles()
-        # Always refresh dollar display so cleared / zeroed text removes the preview
+        self._update_chip_styles()
         self._update_dollar_display()
+        # Flip the Dist field to the blue "armed" style whenever it
+        # holds a positive value, matching the selected-chip colour.
+        if self._input is not None:
+            self._input.set_armed(val > 0)
         self.changed.emit()
 
     def _update_chip_styles(self) -> None:
-        toggle_on = self._toggle.is_on if self._toggle else True
         for i, btn in enumerate(self._chip_buttons):
-            # Blue highlight only when the section is active (toggle ON).
-            # While inactive the chip shows grey but the dollar preview is
-            # still driven by _selected_idx.
-            _apply_chip_style(btn, i == self._selected_idx and toggle_on)
+            _apply_chip_style(btn, i == self._selected_idx)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def reload_tiers(self, tiers: list[dict]) -> None:
         """Reload chip buttons (e.g. when symbol or preferences change)."""
         self._tiers = tiers
-        self._build_chips(enabled=True)
+        self._build_chips()
 
     def set_market_price(self, price: float, tick_size: float = 0.25) -> None:
         """Forward the live market price and tick size to the TickPriceInput."""
@@ -1251,20 +1347,101 @@ class _TierSection(QWidget):
 
     @property
     def is_enabled(self) -> bool:
-        return self._toggle.is_on if self._toggle else False
+        """Section is "armed" whenever the user has expressed a choice
+        — either a chip is selected or the custom Dist input holds a
+        positive number.  There's no separate on/off toggle anymore."""
+        if self._selected_idx is not None:
+            return True
+        text = (self._input.text().strip()
+                if self._input is not None else "")
+        if not text:
+            return False
+        try:
+            return float(text) > 0
+        except ValueError:
+            return False
+
+    def reset(self) -> None:
+        """Return the section to its pristine, unselected state: no chip
+        highlighted, custom Dist cleared.  Used by the ARMED-strip close
+        button to disarm everything in one gesture."""
+        had_state = (self._selected_idx is not None
+                     or (self._input is not None
+                         and bool(self._input.text().strip())))
+        if self._input is not None:
+            self._input.blockSignals(True)
+            self._input.clear()
+            self._input.blockSignals(False)
+            self._input.set_armed(False)
+        self._selected_idx = None
+        self._update_chip_styles()
+        self._update_dollar_display()
+        if had_state:
+            # Only emit when something actually changed — avoids
+            # spurious refreshes that ripple into the ARMED strip.
+            self.changed.emit()
+
+    # ── Per-symbol state capture / restore ───────────────────────────────────
+
+    def capture_state(self) -> dict:
+        """Snapshot the section's current armed selection so the host
+        can stash it away (e.g. keyed by symbol) and restore it later
+        via :meth:`restore_state`.  Lightweight by design — only the
+        chip index and the custom Dist text are persisted."""
+        return {
+            "selected_idx": self._selected_idx,
+            "input_text": (
+                self._input.text() if self._input is not None else ""),
+        }
+
+    def restore_state(self, state: dict | None) -> None:
+        """Apply a snapshot produced by :meth:`capture_state`.  Pass
+        ``None`` (or a falsy dict) to reset the section to its
+        pristine state — same as calling :meth:`reset`."""
+        if not state:
+            self.reset()
+            return
+        idx = state.get("selected_idx")
+        text = state.get("input_text", "")
+        # Defensive: a chip index from the previous symbol's tier list
+        # may exceed the new tier count.  Drop it if so.
+        if idx is not None and (
+                not isinstance(idx, int) or idx < 0
+                or idx >= len(self._tiers)):
+            idx = None
+        # Push the snapshot in without bouncing through ``changed`` until
+        # both fields are settled, then emit once at the end.
+        self._selected_idx = idx
+        if self._input is not None:
+            self._input.blockSignals(True)
+            self._input.clear()
+            if text:
+                self._input.setText(text)
+            self._input.blockSignals(False)
+            try:
+                _val = float(text) if text else 0.0
+            except ValueError:
+                _val = 0.0
+            self._input.set_armed(_val > 0)
+        self._update_chip_styles()
+        self._update_dollar_display()
+        self.changed.emit()
 
     def get_value(self) -> dict | None:
-        """Return selected tier value dict, or None if disabled/nothing chosen."""
+        """Return the selected tier as ``{"value", "unit", "label"}``,
+        or None when the section is unarmed."""
         if not self.is_enabled:
             return None
-        custom = self._input.text().strip() if self._input else ""
+        custom = (self._input.text().strip()
+                  if self._input is not None else "")
         if custom:
             try:
-                # TickPriceInput returns an absolute price, not a tick offset
-                return {"value": float(custom), "unit": "price", "label": "Custom"}
+                return {"value": float(custom), "unit": "price",
+                        "label": "Custom"}
             except ValueError:
                 return None
-        if self._selected_idx is not None and self._selected_idx < len(self._tiers):
+        if (self._selected_idx is not None
+                and self._selected_idx < len(self._tiers)):
             t = self._tiers[self._selected_idx]
             return {
                 "value": t.get("value", 0),
@@ -1295,6 +1472,1152 @@ _COMBO_SS = f"""
         padding: 2px; outline: none;
     }}
 """
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Hot-button placeholders + configuration dialog
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# A "hot button" is a one-click order shortcut the user composes themselves
+# (e.g. "Buy 1 NQ @MKT" attached to TP / SL).  The OrderEntry panel hosts
+# a small grid of slots beneath the Trailing Stop section: an unconfigured
+# slot renders as a dashed-border ``+`` placeholder, and clicking it opens
+# :class:`_HotButtonDialog` to capture the label + side.  Slot → real button
+# transformation is intentionally out of scope for this commit; we only
+# wire the placeholder + dialog UI here.
+
+
+# MIME type for the drag-and-drop reorder: payload is the source
+# index encoded as ASCII text.  Defined module-level so both the
+# saved-cell + placeholder drop targets agree.
+_HOT_BUTTON_MIME = "application/x-nano-hotbutton-index"
+
+
+class _HotButtonPlaceholder(QPushButton):
+    """Dashed-border ``+`` cell that, when clicked, asks the host to add
+    a new hot button.  Doubles as a drop target — dragging a saved
+    cell here moves it to the end of the list.  Fixed minimum height
+    matches the action-button grid above so the layout reads as a
+    single column of touch targets.
+    """
+
+    # Emitted when a saved cell is dropped on the placeholder.  The
+    # source index is the cell's position in ``OrderEntryPanel._hot_buttons``;
+    # the host treats the placeholder as "move to end".
+    dropFromCell = Signal(int)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__("+", parent)
+        # Match the Flatten button's height (30 px min, no max) so
+        # the hot-button row sits flush with the position-management
+        # grid above.  ``+`` glyph at 16 px keeps it visually
+        # balanced inside the slightly taller cell.
+        self.setMinimumHeight(30)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setStyleSheet(
+            "QPushButton{"
+            " background:transparent;"
+            " color:#5a6478;"
+            " border:1px dashed #3a4051;"
+            " border-radius:6px;"
+            " font-size:16px;"
+            " font-weight:bold;"
+            " padding:0;"
+            "}"
+            "QPushButton:hover{"
+            " color:#8a94a8;"
+            " border-color:#4a5168;"
+            "}"
+        )
+        self.setAcceptDrops(True)
+
+    # ── Drop target ──────────────────────────────────────────────────────────
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802
+        if event.mimeData().hasFormat(_HOT_BUTTON_MIME):
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802
+        if event.mimeData().hasFormat(_HOT_BUTTON_MIME):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        data = event.mimeData().data(_HOT_BUTTON_MIME)
+        try:
+            src = int(bytes(data).decode())
+        except (ValueError, UnicodeDecodeError):
+            event.ignore()
+            return
+        self.dropFromCell.emit(src)
+        event.acceptProposedAction()
+
+
+class _HotButtonCell(QPushButton):
+    """A saved hot button rendered in the OrderEntry hot-buttons grid.
+
+    Adds three behaviours on top of a plain ``QPushButton``:
+
+    * **Right-click menu** — Edit / Delete the cell's underlying entry.
+    * **Drag source** — left-press + move past the start-drag distance
+      kicks off a ``QDrag`` carrying the cell's index in the host's
+      ``_hot_buttons`` list.
+    * **Drop target** — accepts drops of the same MIME type from
+      sibling cells; emits ``reorderRequested(src_index, dst_index)``
+      so the host can reshuffle the list and rebuild the grid.
+
+    Click semantics on a *normal* (non-drag) press are inherited from
+    ``QPushButton`` — the host wires the ``clicked`` signal to whatever
+    submission flow is appropriate (currently a no-op pending the
+    follow-up that wires order routing).
+    """
+
+    editRequested = Signal(int)
+    deleteRequested = Signal(int)
+    reorderRequested = Signal(int, int)  # (src_index, dst_index)
+
+    def __init__(self, label: str, colour: str, parent=None) -> None:
+        super().__init__(label, parent)
+        self._index: int = 0
+        self._press_pos: QPoint | None = None
+        # Match the Flatten button's size: 30 px min height (no
+        # max), 11 px text, 4×8 px padding, 4 px border-radius.
+        # Width comes from the 2-column hot-button grid, which
+        # spans the full panel just like ``pm_grid``.
+        self.setMinimumHeight(30)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setStyleSheet(
+            f"""
+            QPushButton {{
+                background: {colour};
+                color: #ffffff;
+                border: none;
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-weight: bold;
+                font-size: 11px;
+            }}
+            QPushButton:hover {{
+                background: {colour};
+                border: 1px solid #ffffff30;
+            }}
+            QPushButton:pressed {{
+                background: {colour};
+                border: 1px solid #ffffff60;
+            }}
+            """
+        )
+        self.setAcceptDrops(True)
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def set_index(self, i: int) -> None:
+        self._index = int(i)
+
+    def index(self) -> int:
+        return self._index
+
+    # ── Drag source ──────────────────────────────────────────────────────────
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._press_pos = event.position().toPoint()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if (self._press_pos is not None
+                and event.buttons() & Qt.MouseButton.LeftButton):
+            dist = (event.position().toPoint()
+                    - self._press_pos).manhattanLength()
+            if dist >= QApplication.startDragDistance():
+                # Drag took over — clear the press anchor so a second
+                # tiny mouseMove doesn't restart the drag and reset
+                # parent state.
+                self._press_pos = None
+                self._start_drag()
+                return
+        super().mouseMoveEvent(event)
+
+    def _start_drag(self) -> None:
+        drag = QDrag(self)
+        mime = QMimeData()
+        mime.setData(_HOT_BUTTON_MIME, str(self._index).encode("ascii"))
+        drag.setMimeData(mime)
+        # Use the rendered button as the drag pixmap so the user sees
+        # exactly what's moving.
+        pm = self.grab()
+        drag.setPixmap(pm)
+        drag.setHotSpot(QPoint(pm.width() // 2, pm.height() // 2))
+        drag.exec(Qt.DropAction.MoveAction)
+
+    # ── Drop target ──────────────────────────────────────────────────────────
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802
+        if event.mimeData().hasFormat(_HOT_BUTTON_MIME):
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802
+        if event.mimeData().hasFormat(_HOT_BUTTON_MIME):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        data = event.mimeData().data(_HOT_BUTTON_MIME)
+        try:
+            src = int(bytes(data).decode())
+        except (ValueError, UnicodeDecodeError):
+            event.ignore()
+            return
+        if src != self._index:
+            self.reorderRequested.emit(src, self._index)
+        event.acceptProposedAction()
+
+    # ── Right-click menu ─────────────────────────────────────────────────────
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802
+        menu = QMenu(self)
+        edit_a = menu.addAction("Edit")
+        delete_a = menu.addAction("Delete")
+        chosen = menu.exec(event.globalPos())
+        if chosen is edit_a:
+            self.editRequested.emit(self._index)
+        elif chosen is delete_a:
+            self.deleteRequested.emit(self._index)
+
+
+class _Segmented(QWidget):
+    """Generic segmented selector — N options, one selected at a time.
+
+    Each option is rendered as a flat checkable button.  Pass an
+    ``active_colors`` map to override the default blue active fill on a
+    per-option basis (used by the SIDE row to colour BUY green / SELL
+    red).
+    """
+
+    selectionChanged = Signal(str)
+
+    _ACTIVE_BG_DEFAULT = "#0071e3"
+    _INACTIVE_BG = "#262a36"
+    _ACTIVE_FG = "#ffffff"
+    _INACTIVE_FG = "#aab1c0"
+
+    def __init__(
+        self,
+        options: list[tuple[str, str]],
+        *,
+        active_colors: dict[str, str] | None = None,
+        height: int = 30,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._options = options
+        self._active_colors = active_colors or {}
+        self._height = height
+        self._selected: str = options[0][0]
+        self._buttons: dict[str, QPushButton] = {}
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+        for value, label in options:
+            btn = QPushButton(label, self)
+            btn.setCheckable(True)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setFixedHeight(self._height)
+            btn.setSizePolicy(
+                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            btn.clicked.connect(
+                lambda _chk, v=value: self._on_clicked(v))
+            self._buttons[value] = btn
+            lay.addWidget(btn)
+        self._restyle()
+
+    def _on_clicked(self, value: str) -> None:
+        if value == self._selected:
+            # keep the segment latched so users can't deselect everything
+            self._buttons[value].setChecked(True)
+            return
+        self._selected = value
+        self._restyle()
+        self.selectionChanged.emit(value)
+
+    def _restyle(self) -> None:
+        for value, btn in self._buttons.items():
+            active = value == self._selected
+            btn.setChecked(active)
+            if active:
+                bg = self._active_colors.get(value, self._ACTIVE_BG_DEFAULT)
+                fg = self._ACTIVE_FG
+            else:
+                bg = self._INACTIVE_BG
+                fg = self._INACTIVE_FG
+            btn.setStyleSheet(
+                "QPushButton{"
+                f" background:{bg}; color:{fg};"
+                " border:none; border-radius:5px;"
+                " padding:6px 12px;"
+                " font-weight:bold; font-size:11px;"
+                "}"
+            )
+
+    def selected(self) -> str:
+        return self._selected
+
+    def set_selected(self, value: str) -> None:
+        if value not in self._buttons or value == self._selected:
+            return
+        self._selected = value
+        self._restyle()
+
+
+def _hot_button_default_draft() -> dict:
+    """Pristine HotButton draft used to seed the modal in Add mode."""
+    return {
+        "side": "BUY",
+        "group": "__current__",
+        "symbol": "",
+        "qty": "",
+        "ord_type": "LMT",
+        "anchor": "BID",
+        "offset": 0,
+        "label": "",
+        "tp": {"on": False, "v": 80.0, "u": "abs"},
+        "sl": {"on": False, "v": 80.0, "u": "abs"},
+    }
+
+
+def _auto_hot_button_label(side: str, qty: str, sym: str,
+                           ord_type: str, anchor: str, offset: int) -> str:
+    """Generate the auto-label shown when the user leaves the label
+    field blank.  Falls back to ``QTY`` / ``SYM`` placeholders so the
+    preview reads naturally before the user picks values.
+    """
+    qty_part = qty.strip() if qty.strip() else "QTY"
+    sym_part = sym.strip().upper() if sym.strip() else "SYM"
+    # Position-management sides ignore order type / anchor entirely —
+    # the label is just the action + symbol.
+    if side == "FLATTEN":
+        return f"Flatten {sym_part}"
+    if side == "CANCEL":
+        return f"Cancel {sym_part}"
+    verb = "Buy" if side == "BUY" else "Sell"
+    if ord_type == "MKT":
+        return f"{verb} {qty_part} {sym_part} MKT"
+    anchor_label = {"BID": "@Bid", "ASK": "@Ask", "MID": "@Mid"}.get(
+        anchor, f"@{anchor}")
+    if offset:
+        sign = "+" if offset > 0 else ""
+        return f"{verb} {qty_part} {sym_part} {anchor_label} {sign}{offset}"
+    return f"{verb} {qty_part} {sym_part} {anchor_label}"
+
+
+# Saved-button accent colour for each side.  Mirrors the existing
+# FlashTrade action-button palette so a hot button blends with the
+# Buy/Sell/Flatten/Cancel buttons in the position-management grid.
+_HOT_BUTTON_COLOURS: dict[str, str] = {
+    "BUY": Theme.CLR_BUY,
+    "SELL": Theme.CLR_SELL,
+    "FLATTEN": Theme.CLR_FLATTEN,
+    "CANCEL": Theme.CLR_CANCEL,
+}
+
+
+class _HotButtonModal(QDialog):
+    """Add/Edit dialog for a single Hot Button — implementation of
+    ``new-hot-buttons.md`` §4.
+
+    Collects every field defined by :func:`_hot_button_default_draft`
+    plus optional Take Profit / Stop Loss bracket legs.  A live
+    preview line at the bottom mirrors the current draft state so the
+    user sees what their button will say before saving.
+    """
+
+    # Attached-order legs only support absolute dollar offsets — the
+    # ticks / % unit options were removed at the user's request, so
+    # there's no longer a unit dropdown in the bracket rows; the
+    # legend reads "$ price" inline as a static label.
+    UNIT_OPTIONS = [("abs", "$ price")]
+
+    def __init__(
+        self,
+        parent=None,
+        *,
+        draft: dict | None = None,
+        groups: list[str] | None = None,
+        edit_mode: bool = False,
+    ) -> None:
+        super().__init__(parent)
+        self._draft = dict(draft) if draft else _hot_button_default_draft()
+        # Bracket legs are nested dicts — copy them too so cancelling
+        # the dialog doesn't mutate the caller's data.
+        self._draft["tp"] = dict(self._draft.get(
+            "tp", {"on": False, "v": 80.0, "u": "abs"}))
+        self._draft["sl"] = dict(self._draft.get(
+            "sl", {"on": False, "v": 80.0, "u": "abs"}))
+        self._edit_mode = edit_mode
+        self._delete_requested = False
+        # When the caller doesn't pass a groups list, pull the
+        # user-defined trading groups from app_config.json.  Built-in
+        # "All" / "None" header pills aren't in that list, so no
+        # extra filtering is needed.
+        if groups is None:
+            try:
+                groups = [g["name"] for g
+                          in config_manager.load_account_groups()
+                          if g.get("name")]
+            except Exception:
+                log.exception(
+                    "HotButtonModal: failed to load account groups")
+                groups = []
+        self._groups = list(groups)
+
+        self.setWindowTitle("Edit Hot Button" if edit_mode else "Add Hot Button")
+        self.setModal(True)
+        self.setMinimumWidth(540)
+        self.setStyleSheet(
+            f"QDialog{{background:{Theme.BG_PANEL};color:{Theme.TEXT};}}")
+
+        self._build_ui()
+        self._apply_draft()
+        self._update_preview()
+
+    # ── Build ─────────────────────────────────────────────────────────────────
+
+    def _build_ui(self) -> None:
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(20, 16, 20, 16)
+        outer.setSpacing(14)
+
+        # Header — side badge + title + subtitle
+        header = QHBoxLayout()
+        header.setSpacing(10)
+        self._lbl_side_badge = QLabel(self._draft["side"], self)
+        self._lbl_side_badge.setFixedHeight(22)
+        self._lbl_side_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._lbl_side_badge.setMinimumWidth(40)
+        title = QLabel("Edit Hot Button" if self._edit_mode else "Add Hot Button")
+        title.setStyleSheet(
+            f"color:{Theme.TEXT}; font-size:15px; font-weight:bold;")
+        subtitle = QLabel("— rapid buy/sell shortcut")
+        subtitle.setStyleSheet(
+            f"color:{Theme.TEXT_DIM}; font-size:11px;")
+        header.addWidget(self._lbl_side_badge)
+        header.addWidget(title)
+        header.addWidget(subtitle)
+        header.addStretch(1)
+        outer.addLayout(header)
+
+        # ── TRADING GROUP + SIDE row ────────────────────────────────
+        row1 = QHBoxLayout()
+        row1.setSpacing(12)
+        # Group dropdown
+        col_g = QVBoxLayout()
+        col_g.setSpacing(4)
+        col_g.addWidget(self._caption("TRADING GROUP"))
+        self._cmb_group = QComboBox(self)
+        # Special "Current Selection" entry maps to the __current__ sentinel.
+        self._cmb_group.addItem("— Current Selection —", "__current__")
+        for g in self._groups:
+            self._cmb_group.addItem(g, g)
+        self._cmb_group.setStyleSheet(self._INPUT_QSS)
+        self._cmb_group.currentIndexChanged.connect(self._on_group_changed)
+        col_g.addWidget(self._cmb_group)
+        # Side segmented — four options.  FLATTEN closes positions,
+        # CANCEL cancels open orders; both render in their respective
+        # action-button accent colours so the saved hot button's style
+        # is consistent with the existing FlashTrade buttons.
+        col_s = QVBoxLayout()
+        col_s.setSpacing(4)
+        col_s.addWidget(self._caption("SIDE"))
+        self._seg_side = _Segmented(
+            [("BUY", "BUY"), ("SELL", "SELL"),
+             ("FLATTEN", "FLATTEN"), ("CANCEL", "CANCEL")],
+            active_colors={
+                "BUY": Theme.CLR_BUY,
+                "SELL": Theme.CLR_SELL,
+                "FLATTEN": Theme.CLR_FLATTEN,
+                "CANCEL": Theme.CLR_CANCEL,
+            },
+        )
+        self._seg_side.selectionChanged.connect(self._on_side_changed)
+        col_s.addWidget(self._seg_side)
+        row1.addLayout(col_g, stretch=1)
+        row1.addLayout(col_s, stretch=1)
+        outer.addLayout(row1)
+
+        # ── SYMBOL ───────────────────────────────────────────────────
+        outer.addLayout(self._symbol_row())
+        # ── SHARES / QTY ─────────────────────────────────────────────
+        outer.addLayout(self._qty_row())
+        # ── ORDER TYPE ───────────────────────────────────────────────
+        col_ot = QVBoxLayout()
+        col_ot.setSpacing(4)
+        col_ot.addWidget(self._caption("ORDER TYPE"))
+        self._seg_ord_type = _Segmented(
+            [("LMT", "Limit"), ("MKT", "Market")], height=34)
+        self._seg_ord_type.selectionChanged.connect(self._on_ord_type_changed)
+        col_ot.addWidget(self._seg_ord_type)
+        outer.addLayout(col_ot)
+
+        # ── LIMIT ANCHOR + OFFSET (faded when MKT) ───────────────────
+        self._limit_row_w = QWidget(self)
+        lim_row = QHBoxLayout(self._limit_row_w)
+        lim_row.setContentsMargins(0, 0, 0, 0)
+        lim_row.setSpacing(12)
+        col_a = QVBoxLayout()
+        col_a.setSpacing(4)
+        col_a.addWidget(self._caption("LIMIT ANCHOR"))
+        self._seg_anchor = _Segmented(
+            [("BID", "@ Bid"), ("ASK", "@ Ask"), ("MID", "Mid")])
+        self._seg_anchor.selectionChanged.connect(self._on_anchor_changed)
+        col_a.addWidget(self._seg_anchor)
+        col_o = QVBoxLayout()
+        col_o.setSpacing(4)
+        col_o.addLayout(self._caption_row(
+            "OFFSET", "ticks · ± from anchor"))
+        self._inp_offset = QLineEdit("0", self)
+        self._inp_offset.setValidator(QIntValidator(-9999, 9999, self))
+        self._inp_offset.setStyleSheet(self._INPUT_QSS)
+        self._inp_offset.setFixedHeight(30)
+        self._inp_offset.textChanged.connect(self._on_offset_changed)
+        col_o.addWidget(self._inp_offset)
+        lim_row.addLayout(col_a, stretch=2)
+        lim_row.addLayout(col_o, stretch=1)
+        outer.addWidget(self._limit_row_w)
+
+        # ── BUTTON LABEL ─────────────────────────────────────────────
+        col_l = QVBoxLayout()
+        col_l.setSpacing(4)
+        col_l.addLayout(self._caption_row("BUTTON LABEL", "auto"))
+        self._inp_label = QLineEdit(self)
+        self._inp_label.setPlaceholderText("e.g. Quick Buy 100 @Bid")
+        self._inp_label.setMaxLength(28)
+        self._inp_label.setStyleSheet(self._INPUT_QSS)
+        self._inp_label.setFixedHeight(30)
+        self._inp_label.textChanged.connect(self._on_label_changed)
+        col_l.addWidget(self._inp_label)
+        outer.addLayout(col_l)
+
+        # ── ATTACHED ORDERS ──────────────────────────────────────────
+        self._attached_card_w = self._attached_card()
+        outer.addWidget(self._attached_card_w)
+
+        # ── PREVIEW ──────────────────────────────────────────────────
+        outer.addWidget(self._preview_row())
+
+        # ── Footer ───────────────────────────────────────────────────
+        foot = QHBoxLayout()
+        foot.setSpacing(8)
+        if self._edit_mode:
+            self._btn_delete = QPushButton("Delete", self)
+            self._btn_delete.setStyleSheet(
+                "QPushButton{"
+                f" background:transparent; color:{Theme.CLR_SELL};"
+                f" border:1px solid {Theme.CLR_SELL}; border-radius:5px;"
+                " padding:6px 14px; font-weight:bold; font-size:11px;"
+                "}"
+                "QPushButton:hover{ background:#3a1a1a; }"
+            )
+            self._btn_delete.clicked.connect(self._on_delete_clicked)
+            foot.addWidget(self._btn_delete)
+        foot.addStretch(1)
+        btn_cancel = QPushButton("Cancel", self)
+        btn_cancel.setStyleSheet(self._BTN_NEUTRAL_QSS)
+        btn_cancel.clicked.connect(self.reject)
+        btn_save = QPushButton(
+            "Save Changes" if self._edit_mode else "Save", self)
+        btn_save.setStyleSheet(self._BTN_PRIMARY_QSS)
+        btn_save.clicked.connect(self.accept)
+        btn_save.setDefault(True)
+        foot.addWidget(btn_cancel)
+        foot.addWidget(btn_save)
+        outer.addLayout(foot)
+
+    # ── Sub-builders ──────────────────────────────────────────────────────────
+
+    def _symbol_row(self) -> QVBoxLayout:
+        col = QVBoxLayout()
+        col.setSpacing(4)
+        cap_row = QHBoxLayout()
+        cap_row.setContentsMargins(0, 0, 0, 0)
+        cap_row.addWidget(self._caption("SYMBOL"))
+        cap_row.addStretch(1)
+        self._seg_sym_mode = _Segmented(
+            [("default", "DEFAULT · USE SELECTED"), ("specific", "SPECIFIC")],
+            height=22,
+        )
+        self._seg_sym_mode.selectionChanged.connect(self._on_sym_mode_changed)
+        # Right-align the toggle, give it a max width so it doesn't
+        # eat the row.
+        wrap = QWidget(self)
+        wlay = QHBoxLayout(wrap)
+        wlay.setContentsMargins(0, 0, 0, 0)
+        wlay.addWidget(self._seg_sym_mode)
+        wrap.setMaximumWidth(280)
+        cap_row.addWidget(wrap)
+        col.addLayout(cap_row)
+        self._inp_symbol = QLineEdit(self)
+        self._inp_symbol.setPlaceholderText(
+            "e.g. NQM6, AAPL — leave empty to use selected")
+        self._inp_symbol.setStyleSheet(self._INPUT_QSS)
+        self._inp_symbol.setFixedHeight(30)
+        self._inp_symbol.textChanged.connect(self._on_symbol_changed)
+        self._install_symbol_completer(self._inp_symbol)
+        col.addWidget(self._inp_symbol)
+        # Match-status hint — populated by _update_symbol_status() based
+        # on a lookup against the saved-contracts cache.
+        self._lbl_sym_status = QLabel("", self)
+        self._lbl_sym_status.setStyleSheet(
+            f"color:{Theme.TEXT_DIM}; font-size:9px;")
+        self._lbl_sym_status.setMinimumHeight(14)
+        col.addWidget(self._lbl_sym_status)
+        return col
+
+    def _qty_row(self) -> QVBoxLayout:
+        col = QVBoxLayout()
+        col.setSpacing(4)
+        cap_row = QHBoxLayout()
+        cap_row.setContentsMargins(0, 0, 0, 0)
+        cap_row.addWidget(self._caption("SHARES / QTY"))
+        cap_row.addStretch(1)
+        self._seg_qty_mode = _Segmented(
+            [("default", "DEFAULT · USE CHIP"), ("specific", "SPECIFIC")],
+            height=22,
+        )
+        self._seg_qty_mode.selectionChanged.connect(self._on_qty_mode_changed)
+        wrap = QWidget(self)
+        wlay = QHBoxLayout(wrap)
+        wlay.setContentsMargins(0, 0, 0, 0)
+        wlay.addWidget(self._seg_qty_mode)
+        wrap.setMaximumWidth(260)
+        cap_row.addWidget(wrap)
+        col.addLayout(cap_row)
+        self._inp_qty = QLineEdit(self)
+        self._inp_qty.setPlaceholderText(
+            "leave empty to use selected qty chip")
+        self._inp_qty.setStyleSheet(self._INPUT_QSS)
+        self._inp_qty.setFixedHeight(30)
+        self._inp_qty.textChanged.connect(self._on_qty_changed)
+        col.addWidget(self._inp_qty)
+        return col
+
+    def _attached_card(self) -> QFrame:
+        card = QFrame(self)
+        card.setObjectName("attachedCard")
+        card.setStyleSheet(
+            "QFrame#attachedCard{"
+            f" background:{Theme.BG_INPUT};"
+            f" border:1px solid {Theme.BORDER};"
+            " border-radius:6px;"
+            "}"
+        )
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setSpacing(6)
+        head = QHBoxLayout()
+        head.setSpacing(6)
+        h_dot = QLabel("●", card)
+        h_dot.setStyleSheet(f"color:{Theme.ACCENT}; font-size:10px;")
+        h_lbl = QLabel("ATTACHED ORDERS", card)
+        h_lbl.setStyleSheet(
+            f"color:{Theme.TEXT}; font-size:10px; font-weight:bold;"
+            " letter-spacing:1px;")
+        h_sub = QLabel("— sent as bracket on fill", card)
+        h_sub.setStyleSheet(f"color:{Theme.TEXT_DIM}; font-size:10px;")
+        head.addWidget(h_dot)
+        head.addWidget(h_lbl)
+        head.addWidget(h_sub)
+        head.addStretch(1)
+        lay.addLayout(head)
+
+        # TP row + SL row
+        self._tp_widgets = self._build_bracket_row(
+            "Take Profit", "limit · opposite side · same qty",
+            Theme.CLR_BUY, "tp", card)
+        self._sl_widgets = self._build_bracket_row(
+            "Stop Loss", "stop · opposite side · same qty",
+            Theme.CLR_SELL, "sl", card)
+        lay.addLayout(self._tp_widgets["row"])
+        lay.addLayout(self._sl_widgets["row"])
+        return card
+
+    def _build_bracket_row(self, name: str, sublabel: str,
+                           accent_colour: str, key: str,
+                           parent: QWidget) -> dict:
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        chk = QCheckBox(parent)
+        chk.setStyleSheet(self._SWITCH_QSS)
+        chk.toggled.connect(
+            lambda on, k=key: self._on_bracket_toggled(k, on))
+        lbl_box = QVBoxLayout()
+        lbl_box.setSpacing(0)
+        nm = QLabel(name, parent)
+        nm.setStyleSheet(f"color:{accent_colour}; font-size:11px;"
+                         " font-weight:bold;")
+        sub = QLabel(sublabel, parent)
+        sub.setStyleSheet(f"color:{Theme.TEXT_DIM}; font-size:9px;")
+        lbl_box.addWidget(nm)
+        lbl_box.addWidget(sub)
+        val = QLineEdit("80", parent)
+        val.setValidator(QDoubleValidator(0.0, 1e9, 4, parent))
+        val.setStyleSheet(self._INPUT_QSS)
+        val.setFixedHeight(28)
+        val.setFixedWidth(80)
+        val.textChanged.connect(
+            lambda t, k=key: self._on_bracket_value_changed(k, t))
+        # Static "$ price" label — replaces the previous unit dropdown
+        # since the only supported unit is absolute dollar offset.
+        unit_lbl = QLabel("$ price", parent)
+        unit_lbl.setStyleSheet(
+            f"color:{Theme.TEXT_DIM}; font-size:11px;"
+            " padding:0 6px;")
+        unit_lbl.setFixedWidth(70)
+        unit_lbl.setAlignment(Qt.AlignmentFlag.AlignVCenter
+                              | Qt.AlignmentFlag.AlignLeft)
+        row.addWidget(chk)
+        row.addLayout(lbl_box, stretch=1)
+        row.addWidget(val)
+        row.addWidget(unit_lbl)
+        return {"row": row, "chk": chk, "val": val, "unit_lbl": unit_lbl,
+                "name": nm, "sub": sub}
+
+    def _preview_row(self) -> QFrame:
+        f = QFrame(self)
+        f.setObjectName("previewCard")
+        f.setStyleSheet(
+            "QFrame#previewCard{"
+            f" background:{Theme.BG_INPUT};"
+            f" border:1px solid {Theme.BORDER};"
+            " border-radius:6px;"
+            "}"
+        )
+        lay = QHBoxLayout(f)
+        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setSpacing(12)
+        cap = QLabel("PREVIEW", f)
+        cap.setStyleSheet(
+            f"color:{Theme.TEXT_DIM}; font-size:10px; font-weight:bold;"
+            " letter-spacing:1px;")
+        # Mini styled tile that mirrors the eventual hot-button rendering.
+        self._preview_btn = QPushButton(f)
+        self._preview_btn.setEnabled(False)
+        self._preview_btn.setMinimumHeight(46)
+        self._preview_btn.setMinimumWidth(170)
+        # Summary line
+        self._preview_line = QLabel("", f)
+        self._preview_line.setStyleSheet(
+            f"color:{Theme.TEXT}; font-size:11px;")
+        self._preview_line.setWordWrap(True)
+        lay.addWidget(cap)
+        lay.addWidget(self._preview_btn)
+        lay.addWidget(self._preview_line, stretch=1)
+        return f
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _caption(self, text: str) -> QLabel:
+        lbl = QLabel(text, self)
+        lbl.setStyleSheet(
+            f"color:{Theme.TEXT_DIM}; font-size:10px; font-weight:bold;"
+            " letter-spacing:1px;")
+        return lbl
+
+    def _caption_row(self, primary: str, secondary: str) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(self._caption(primary))
+        row.addStretch(1)
+        s = QLabel(secondary, self)
+        s.setStyleSheet(f"color:{Theme.TEXT_DIM}; font-size:9px;")
+        row.addWidget(s)
+        return row
+
+    _INPUT_QSS = (
+        "QLineEdit, QComboBox{"
+        " background:#262a36; color:#e6e9ef;"
+        " border:1px solid #2c313a; border-radius:5px;"
+        " padding:4px 8px; font-size:11px;"
+        "}"
+        "QLineEdit:focus, QComboBox:focus{ border-color:#0071e3; }"
+        "QLineEdit:disabled, QComboBox:disabled{ color:#5a6478; }"
+        "QComboBox::drop-down{ border:none; width:20px; }"
+        # Style the popup list — without this Qt falls back to the
+        # platform default which renders light-on-light on dark themes.
+        "QComboBox QAbstractItemView{"
+        " background:#262a36; color:#e6e9ef;"
+        " selection-background-color:#0071e3;"
+        " selection-color:#ffffff;"
+        " border:1px solid #2c313a;"
+        " outline:none; padding:2px;"
+        "}"
+        "QComboBox QAbstractItemView::item{"
+        " min-height:22px; padding:2px 8px;"
+        "}"
+    )
+    _BTN_NEUTRAL_QSS = (
+        "QPushButton{"
+        " background:transparent; color:#aab1c0;"
+        " border:1px solid #3a4051; border-radius:5px;"
+        " padding:6px 14px; font-weight:bold; font-size:11px;"
+        "}"
+        "QPushButton:hover{ color:#e6e9ef; border-color:#4a5168; }"
+    )
+    _BTN_PRIMARY_QSS = (
+        "QPushButton{"
+        " background:#0071e3; color:#ffffff;"
+        " border:none; border-radius:5px;"
+        " padding:6px 14px; font-weight:bold; font-size:11px;"
+        "}"
+        "QPushButton:hover{ background:#0077ed; }"
+    )
+    _SWITCH_QSS = (
+        "QCheckBox::indicator{"
+        " width:34px; height:18px; border-radius:9px;"
+        " background:#3a4051; border:none;"
+        "}"
+        "QCheckBox::indicator:checked{ background:#3FB950; }"
+    )
+
+    # ── Draft load / save ─────────────────────────────────────────────────────
+
+    def _apply_draft(self) -> None:
+        d = self._draft
+        # Side
+        self._seg_side.set_selected(d.get("side", "BUY"))
+        self._lbl_side_badge.setText(d["side"])
+        self._restyle_side_badge()
+        # Group
+        gv = d.get("group", "__current__")
+        idx = self._cmb_group.findData(gv)
+        self._cmb_group.setCurrentIndex(idx if idx >= 0 else 0)
+        # Symbol
+        sym = d.get("symbol", "")
+        self._seg_sym_mode.set_selected("specific" if sym else "default")
+        self._inp_symbol.blockSignals(True)
+        self._inp_symbol.setText(sym)
+        self._inp_symbol.blockSignals(False)
+        self._inp_symbol.setEnabled(bool(sym))
+        # Qty
+        qty = d.get("qty", "")
+        self._seg_qty_mode.set_selected("specific" if qty else "default")
+        self._inp_qty.blockSignals(True)
+        self._inp_qty.setText(qty)
+        self._inp_qty.blockSignals(False)
+        self._inp_qty.setEnabled(bool(qty))
+        # Order type
+        self._seg_ord_type.set_selected(d.get("ord_type", "LMT"))
+        # Anchor + offset
+        self._seg_anchor.set_selected(d.get("anchor", "BID"))
+        self._inp_offset.blockSignals(True)
+        self._inp_offset.setText(str(int(d.get("offset", 0))))
+        self._inp_offset.blockSignals(False)
+        # Label
+        self._inp_label.blockSignals(True)
+        self._inp_label.setText(d.get("label", ""))
+        self._inp_label.blockSignals(False)
+        # Brackets — only the toggle + dollar value are user-editable
+        # now (unit is fixed at "abs").
+        for key, w in (("tp", self._tp_widgets), ("sl", self._sl_widgets)):
+            leg = d.get(key, {})
+            # Force the unit to the only supported option so any old
+            # ticks / % drafts upgrade cleanly.
+            leg["u"] = "abs"
+            self._draft[key]["u"] = "abs"
+            w["chk"].blockSignals(True)
+            w["chk"].setChecked(bool(leg.get("on", False)))
+            w["chk"].blockSignals(False)
+            w["val"].blockSignals(True)
+            w["val"].setText(str(leg.get("v", 80)))
+            w["val"].blockSignals(False)
+            self._restyle_bracket_row(key)
+        # Limit-anchor row faded when MKT.  Also covers the CANCEL
+        # case (which hides everything order-type-related).
+        self._update_side_dependent_state()
+        # Initialise the symbol-search hint for the loaded draft.
+        self._update_symbol_status()
+
+    def values(self) -> dict:
+        """Return the current draft as a fully-populated HotButton dict."""
+        return dict(self._draft)
+
+    def delete_requested(self) -> bool:
+        return self._delete_requested
+
+    # ── Slots ─────────────────────────────────────────────────────────────────
+
+    def _on_side_changed(self, side: str) -> None:
+        self._draft["side"] = side
+        self._lbl_side_badge.setText(side)
+        self._restyle_side_badge()
+        self._update_side_dependent_state()
+        self._update_preview()
+
+    def _update_side_dependent_state(self) -> None:
+        """When the SIDE is set to CANCEL, gray out everything that
+        doesn't apply to a cancel-orders shortcut: the order-type
+        segment, the limit-anchor + offset row, and the attached-
+        orders card.  BUY / SELL / FLATTEN restore the normal state
+        (limit row still gated by the MKT toggle below)."""
+        is_cancel = self._draft.get("side") == "CANCEL"
+        self._seg_ord_type.setEnabled(not is_cancel)
+        self._attached_card_w.setEnabled(not is_cancel)
+        # Limit-row state combines: side != CANCEL AND ord_type == LMT
+        self._update_limit_row_state()
+
+    def _on_group_changed(self, _i: int) -> None:
+        v = self._cmb_group.currentData()
+        self._draft["group"] = v if v is not None else "__current__"
+        self._update_preview()
+
+    def _on_sym_mode_changed(self, mode: str) -> None:
+        self._inp_symbol.setEnabled(mode == "specific")
+        if mode == "default":
+            self._inp_symbol.blockSignals(True)
+            self._inp_symbol.clear()
+            self._inp_symbol.blockSignals(False)
+            self._draft["symbol"] = ""
+        self._update_symbol_status()
+        self._update_preview()
+
+    def _on_symbol_changed(self, text: str) -> None:
+        self._draft["symbol"] = text.strip()
+        if self._draft["symbol"]:
+            self._seg_sym_mode.set_selected("specific")
+        self._update_symbol_status()
+        self._update_preview()
+
+    def _install_symbol_completer(self, line: QLineEdit) -> None:
+        """Wire a case-insensitive ``contains``-match QCompleter against
+        :attr:`ReferenceData.contracts_by_symbol`.  The completer's
+        popup picks up the modal's dark QSS so it doesn't render
+        light-on-light, and selecting a row fires
+        :meth:`_on_symbol_changed` via the line-edit's ``textChanged``.
+        """
+        try:
+            from src.core.reference_data import get_instance as _rd
+            cache = _rd().contracts_by_symbol
+        except Exception:
+            log.exception(
+                "HotButtonModal: contract cache unavailable for completer")
+            cache = {}
+        # Build an ordered, deduped list of symbols + local_symbols
+        # (e.g. ``"NQ"`` and ``"NQM6"`` both navigate to the same contract).
+        seen: set[str] = set()
+        items: list[str] = []
+        for sym, rows in sorted(cache.items()):
+            for label in (sym,) + tuple(
+                    str(r.get("local_symbol") or "") for r in rows):
+                if not label:
+                    continue
+                key = label.upper()
+                if key in seen:
+                    continue
+                seen.add(key)
+                items.append(label)
+        completer = QCompleter(items, line)
+        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        completer.setCompletionMode(
+            QCompleter.CompletionMode.PopupCompletion)
+        # Style the completer popup to match the modal's dark theme.
+        popup = completer.popup()
+        popup.setStyleSheet(
+            "QListView{"
+            " background:#262a36; color:#e6e9ef;"
+            " selection-background-color:#0071e3;"
+            " selection-color:#ffffff;"
+            " border:1px solid #2c313a; outline:none;"
+            "}"
+            "QListView::item{ padding:4px 10px; min-height:22px; }"
+        )
+        line.setCompleter(completer)
+
+    def _update_symbol_status(self) -> None:
+        """Validate the SPECIFIC-mode symbol against the saved-contracts
+        cache and display a small status hint below the input.
+        Empty / DEFAULT mode → blank hint.  Match → ``✓ <local_symbol> ·
+        <sec_type>``.  No match → ``⚠ symbol not found``.
+        """
+        sym = self._draft.get("symbol", "")
+        if not sym:
+            self._lbl_sym_status.setText("")
+            return
+        try:
+            from src.core.reference_data import get_instance as _rd
+            contracts = _rd().contracts_by_symbol.get(sym.upper(), [])
+        except Exception:
+            log.exception("HotButtonModal: contract lookup failed")
+            contracts = []
+        if not contracts:
+            self._lbl_sym_status.setText("⚠ symbol not found")
+            self._lbl_sym_status.setStyleSheet(
+                f"color:{Theme.CLR_FLATTEN}; font-size:9px;")
+            return
+        c = contracts[0]
+        pieces: list[str] = []
+        local = c.get("local_symbol") or c.get("symbol") or sym
+        pieces.append(str(local))
+        sec_type = c.get("sec_type") or ""
+        if sec_type:
+            pieces.append(str(sec_type))
+        exch = c.get("exchange") or ""
+        if exch:
+            pieces.append(str(exch))
+        extra = ""
+        if len(contracts) > 1:
+            extra = f"  (+{len(contracts) - 1} more)"
+        self._lbl_sym_status.setText(
+            "✓ " + " · ".join(pieces) + extra)
+        self._lbl_sym_status.setStyleSheet(
+            f"color:{Theme.CLR_BUY}; font-size:9px;")
+
+    def _on_qty_mode_changed(self, mode: str) -> None:
+        self._inp_qty.setEnabled(mode == "specific")
+        if mode == "default":
+            self._inp_qty.blockSignals(True)
+            self._inp_qty.clear()
+            self._inp_qty.blockSignals(False)
+            self._draft["qty"] = ""
+        self._update_preview()
+
+    def _on_qty_changed(self, text: str) -> None:
+        self._draft["qty"] = text.strip()
+        if self._draft["qty"]:
+            self._seg_qty_mode.set_selected("specific")
+        self._update_preview()
+
+    def _on_ord_type_changed(self, t: str) -> None:
+        self._draft["ord_type"] = t
+        self._update_limit_row_state()
+        self._update_preview()
+
+    def _on_anchor_changed(self, a: str) -> None:
+        self._draft["anchor"] = a
+        self._update_preview()
+
+    def _on_offset_changed(self, t: str) -> None:
+        try:
+            self._draft["offset"] = int(t) if t.lstrip("-").isdigit() else 0
+        except ValueError:
+            self._draft["offset"] = 0
+        self._update_preview()
+
+    def _on_label_changed(self, t: str) -> None:
+        self._draft["label"] = t.strip()
+        self._update_preview()
+
+    def _on_bracket_toggled(self, key: str, on: bool) -> None:
+        self._draft[key]["on"] = bool(on)
+        self._restyle_bracket_row(key)
+        self._update_preview()
+
+    def _on_bracket_value_changed(self, key: str, t: str) -> None:
+        try:
+            self._draft[key]["v"] = float(t) if t else 0.0
+        except ValueError:
+            self._draft[key]["v"] = 0.0
+        self._update_preview()
+
+    def _on_delete_clicked(self) -> None:
+        self._delete_requested = True
+        self.accept()
+
+    # ── Visual updates ────────────────────────────────────────────────────────
+
+    def _restyle_side_badge(self) -> None:
+        side = self._draft.get("side", "BUY")
+        bg = _HOT_BUTTON_COLOURS.get(side, Theme.CLR_BUY)
+        self._lbl_side_badge.setStyleSheet(
+            f"QLabel{{ background:{bg}; color:#ffffff;"
+            " border-radius:4px; padding:2px 8px;"
+            " font-weight:bold; font-size:10px; letter-spacing:1px; }}")
+
+    def _restyle_bracket_row(self, key: str) -> None:
+        w = self._tp_widgets if key == "tp" else self._sl_widgets
+        on = self._draft[key]["on"]
+        # QSS opacity isn't supported per-rule; use enable/disable +
+        # palette swap instead.
+        w["val"].setEnabled(on)
+        # Dim the labels (and the static "$ price" tail) when off.
+        if on:
+            colour = (Theme.CLR_BUY if key == "tp" else Theme.CLR_SELL)
+            w["name"].setStyleSheet(
+                f"color:{colour}; font-size:11px; font-weight:bold;")
+            w["sub"].setStyleSheet(
+                f"color:{Theme.TEXT_DIM}; font-size:9px;")
+            w["unit_lbl"].setStyleSheet(
+                f"color:{Theme.TEXT_DIM}; font-size:11px; padding:0 6px;")
+        else:
+            w["name"].setStyleSheet(
+                "color:#5a6478; font-size:11px; font-weight:bold;")
+            w["sub"].setStyleSheet("color:#3a4051; font-size:9px;")
+            w["unit_lbl"].setStyleSheet(
+                "color:#3a4051; font-size:11px; padding:0 6px;")
+
+    def _update_limit_row_state(self) -> None:
+        is_lmt = self._draft.get("ord_type") == "LMT"
+        is_cancel = self._draft.get("side") == "CANCEL"
+        self._limit_row_w.setEnabled(is_lmt and not is_cancel)
+
+    def _update_preview(self) -> None:
+        d = self._draft
+        side = d["side"]
+        qty = d["qty"]
+        sym = d["symbol"]
+        anchor = d["anchor"]
+        offset = int(d["offset"] or 0)
+        ord_type = d["ord_type"]
+        label = d["label"]
+        # Auto label when blank.
+        text = label or _auto_hot_button_label(
+            side, qty, sym, ord_type, anchor, offset)
+        colour = _HOT_BUTTON_COLOURS.get(side, Theme.CLR_BUY)
+        self._preview_btn.setText(text)
+        self._preview_btn.setStyleSheet(
+            f"QPushButton{{ background:{colour}; color:#ffffff;"
+            " border:none; border-radius:6px;"
+            " padding:6px 10px; font-weight:bold; font-size:11px; }}"
+            f"QPushButton:disabled{{ background:{colour}; color:#ffffff; }}")
+        # Summary line — mirrors the spec's preview text format.  For
+        # CANCEL / FLATTEN the order-type / anchor / brackets aren't
+        # meaningful so we keep the line short.
+        sym_part = sym or "[selected sym]"
+        qty_part = qty or "[selected qty]"
+        group_v = d.get("group", "__current__")
+        group_part = "[current group]" if group_v == "__current__" else group_v
+        if side == "CANCEL":
+            summary = f"CANCEL {sym_part} · group {group_part}"
+            self._preview_line.setText(summary)
+            return
+        if side == "FLATTEN":
+            summary = f"FLATTEN {sym_part} · group {group_part}"
+        elif ord_type == "MKT":
+            summary = (f"{side} {qty_part} {sym_part} · MKT · "
+                       f"group {group_part}")
+        else:
+            sign = "+" if offset >= 0 else "-"
+            summary = (
+                f"{side} {qty_part} {sym_part} · LMT @ {anchor} "
+                f"{sign}{abs(offset)}t · group {group_part}")
+        attached = []
+        if d["tp"]["on"]:
+            attached.append(self._fmt_leg("TP", d["tp"]))
+        if d["sl"]["on"]:
+            attached.append(self._fmt_leg("SL", d["sl"]))
+        if attached:
+            summary += "\n↳ attached: " + " · ".join(attached)
+        self._preview_line.setText(summary)
+
+    @staticmethod
+    def _fmt_leg(name: str, leg: dict) -> str:
+        # Only "abs" (dollar offset) is supported now; legacy ticks /
+        # pct entries are migrated to "abs" at draft load.
+        v = leg.get("v", 0)
+        sign = "+" if v >= 0 else "-"
+        return f"{name} {sign}${abs(v):g}"
 
 
 class OrderEntryPanel(QWidget):
@@ -1331,6 +2654,15 @@ class OrderEntryPanel(QWidget):
     # STP/STP LMT (sl) exit order.  No-op for zero-position accounts.
     close_tier_requested = Signal(dict)
 
+    # Hot-button group-targeted variants — payload includes the
+    # explicit account list so FlashTradeView fans out to those
+    # accounts regardless of the AccountListPanel selection.  Used
+    # only when a hot button is configured with a named trading group
+    # (BUY/SELL go through ``order_requested`` with a
+    # ``_target_accounts`` payload field instead).
+    hot_button_flatten = Signal(str, list)   # (symbol, accounts)
+    hot_button_cancel = Signal(str, list)    # (symbol, accounts)
+
     def __init__(self, active_threads: dict | None = None, parent=None):
         super().__init__(parent)
         self._active_threads: dict = active_threads if active_threads is not None else {}
@@ -1355,6 +2687,14 @@ class OrderEntryPanel(QWidget):
             self._active_symbol = self._symbols[0] if self._symbols else None
         self._active_qty: int = 1
         self._sym_buttons: dict[str, QPushButton] = {}
+        # In-memory cache of the user's TP / SL / Trail selections per
+        # symbol — keyed by uppercase symbol, value is a dict
+        # ``{"pt": <_TierSection.capture_state>, "sl": ..., "tr": ...}``.
+        # Lives only for the lifetime of the app (deliberately NOT
+        # persisted to ``app_config.json``) so a fresh launch always
+        # starts every symbol unarmed, while in-session symbol
+        # switches preserve whatever the user had picked.
+        self._tier_state_by_symbol: dict[str, dict] = {}
 
         self._setup_ui()
         self._rebuild_symbol_buttons()
@@ -1517,29 +2857,60 @@ class OrderEntryPanel(QWidget):
         qty_container.setLayout(self._qty_layout)
         root.addWidget(qty_container)
 
-        root.addSpacing(12)
+        # Tighten the qty-chips ↔ ARMED banner ↔ Buy/Sell action grid
+        # gap from the original 12 px down to 4 px so the whole
+        # action stack reads as one connected block.
+        root.addSpacing(4)
+
+        # ── Pre-build tier sections so the ARMED strip below can
+        # subscribe to their ``changed`` signal.  The widgets stay
+        # detached for now and are added to ``root`` later, at their
+        # normal position below the position-management grid.
+        pt_tiers, sl_tiers, tr_tiers = self._load_tiers_for_active()
+        self._pt_section = _TierSection(
+            "Take Profit", pt_tiers, label_color=Theme.CLR_BUY,
+            short_title="TP")
+        self._pt_section.submit_requested.connect(
+            lambda: self._on_tier_submit("tp"))
+        self._sl_section = _TierSection(
+            "Stop Loss", sl_tiers, label_color=Theme.CLR_SELL,
+            short_title="SL")
+        self._sl_section.submit_requested.connect(
+            lambda: self._on_tier_submit("sl"))
+        self._tr_section = _TierSection(
+            "Trailing", tr_tiers, label_color=Theme.CLR_FLATTEN,
+            short_title="TS")
+
+        # The TP / SL / Trail amounts that used to live in a separate
+        # ARMED banner above the buttons are now drawn directly on each
+        # Buy / Sell button as a small second line — see
+        # ``_refresh_action_labels`` and :class:`_ActionButton`.
+        for _sec in (self._pt_section, self._sl_section, self._tr_section):
+            _sec.changed.connect(self._refresh_action_labels)
+
+        root.addSpacing(4)
 
         # ── Action buttons (4×2) ─────────────────────────────────────────────
         action_grid = QGridLayout()
         action_grid.setSpacing(4)
         action_grid.setContentsMargins(0, 0, 0, 0)
-        self._btn_buy_mkt = _make_btn("Buy @MKT", Theme.CLR_BUY, 36)
-        self._btn_sell_mkt = _make_btn("Sell @MKT", Theme.CLR_SELL, 36)
-        self._btn_buy_mid = _make_btn("Buy @Mid", Theme.CLR_BUY, 36)
-        self._btn_sell_mid = _make_btn("Sell @Mid", Theme.CLR_SELL, 36)
-        self._btn_buy_bid = _make_btn("Buy @Bid", Theme.CLR_BUY, 36)
-        self._btn_sell_ask = _make_btn("Sell @Ask", Theme.CLR_SELL, 36)
-        self._btn_buy_bid_lmt = _make_btn("Buy @Bid Limit", Theme.CLR_BUY, 36)
-        self._btn_sell_ask_lmt = _make_btn(
-            "Sell @Ask Limit", Theme.CLR_SELL, 36)
+        self._btn_buy_mkt = _ActionButton("Buy @MKT", Theme.CLR_BUY)
+        self._btn_sell_mkt = _ActionButton("Sell @MKT", Theme.CLR_SELL)
+        self._btn_buy_mid = _ActionButton("Buy @Mid", Theme.CLR_BUY)
+        self._btn_sell_mid = _ActionButton("Sell @Mid", Theme.CLR_SELL)
+        self._btn_buy_bid_lmt = _ActionButton("Buy @Bid Limit", Theme.CLR_BUY)
+        self._btn_sell_ask_lmt = _ActionButton(
+            "Sell @Ask Limit", Theme.CLR_SELL)
+        self._btn_buy_bid = _ActionButton("Buy @Bid +1t", Theme.CLR_BUY)
+        self._btn_sell_ask = _ActionButton("Sell @Ask -1t", Theme.CLR_SELL)
         action_grid.addWidget(self._btn_buy_mkt, 0, 0)
         action_grid.addWidget(self._btn_sell_mkt, 0, 1)
         action_grid.addWidget(self._btn_buy_mid, 1, 0)
         action_grid.addWidget(self._btn_sell_mid, 1, 1)
-        action_grid.addWidget(self._btn_buy_bid, 2, 0)
-        action_grid.addWidget(self._btn_sell_ask, 2, 1)
-        action_grid.addWidget(self._btn_buy_bid_lmt, 3, 0)
-        action_grid.addWidget(self._btn_sell_ask_lmt, 3, 1)
+        action_grid.addWidget(self._btn_buy_bid_lmt, 2, 0)
+        action_grid.addWidget(self._btn_sell_ask_lmt, 2, 1)
+        action_grid.addWidget(self._btn_buy_bid, 3, 0)
+        action_grid.addWidget(self._btn_sell_ask, 3, 1)
 
         self._btn_buy_mkt.clicked.connect(
             lambda: self._emit_order(OrderAction.BUY, "MKT"))
@@ -1600,32 +2971,436 @@ class OrderEntryPanel(QWidget):
 
         root.addSpacing(8)
 
-        # ── Take Profit ───────────────────────────────────────────────────────
-        pt_tiers, sl_tiers, tr_tiers = self._load_tiers_for_active()
-        self._pt_section = _TierSection(
-            "Take Profit", pt_tiers, enabled=False,
-            label_color=Theme.CLR_BUY, auto_select_min=True)
-        self._pt_section.submit_requested.connect(
-            lambda: self._on_tier_submit("tp"))
+        # ── Take Profit / Stop Loss / Trail Stop ─────────────────────────────
+        # The widgets themselves were created earlier (so the ARMED strip
+        # could connect to their ``changed`` signal); here we just lay
+        # them out at the bottom of the root column.
         root.addWidget(self._pt_section)
-
-        # ── Stop Loss ─────────────────────────────────────────────────────────
-        self._sl_section = _TierSection(
-            "Stop Loss", sl_tiers, enabled=False,
-            label_color=Theme.CLR_SELL, auto_select_min=True)
-        self._sl_section.submit_requested.connect(
-            lambda: self._on_tier_submit("sl"))
         root.addWidget(self._sl_section)
-
-        # ── Trailing ──────────────────────────────────────────────────────────
-        # Trail Stop header button is not wired to close-the-position
-        # (yet), but toggling on auto-selects the smallest tier like TP/SL.
-        self._tr_section = _TierSection(
-            "Trail Stop", tr_tiers, enabled=False,
-            label_color=Theme.CLR_FLATTEN, auto_select_min=True)
         root.addWidget(self._tr_section)
 
+        # ── Hot buttons ───────────────────────────────────────────────────────
+        # User-defined one-click order shortcuts.  Layout grows as the
+        # user adds entries: configured slots render as coloured
+        # buttons (green BUY / red SELL); a single trailing dashed-
+        # border "+" placeholder always sits at the next free slot so
+        # the user can keep adding.  Two columns per row.
+        root.addSpacing(8)
+        self._hot_grid = QGridLayout()
+        # Match the Buy/Sell action-button grid spacing so each hot
+        # button ends up the exact same width as a Buy/Sell button.
+        self._hot_grid.setSpacing(4)
+        self._hot_grid.setContentsMargins(0, 0, 0, 0)
+        # Always reserve two equal-width columns so a lone "+" cell
+        # in column 0 still occupies only half the panel width
+        # (column 1 holds blank space until the user adds a second
+        # hot button).  Without this Qt would collapse the empty
+        # column and let the placeholder stretch full-width.
+        self._hot_grid.setColumnStretch(0, 1)
+        self._hot_grid.setColumnStretch(1, 1)
+        # Restore the user's saved hot buttons; first launch returns
+        # an empty list so the panel shows just the "+" placeholder.
+        try:
+            self._hot_buttons: list[dict] = config_manager.load_hot_buttons()
+        except Exception:
+            log.exception("HotButton: load failed; starting with empty list")
+            self._hot_buttons = []
+        hot_w = QWidget()
+        hot_w.setStyleSheet("border: none;")
+        hot_w.setContentsMargins(0, 0, 0, 0)
+        hot_w.setLayout(self._hot_grid)
+        # Hot buttons fill the full panel width (same as the Buy/Sell
+        # action grid above) so each cell ends up at the same width
+        # as a Buy/Sell button.
+        root.addWidget(hot_w)
+        self._rebuild_hot_buttons()
+
         root.addStretch(1)
+
+    def _rebuild_hot_buttons(self) -> None:
+        """Re-lay out the hot-button grid: one styled cell per saved
+        entry plus a single trailing ``+`` placeholder.  Two columns
+        per row.  Cheap to call (a handful of widgets, recreated)."""
+        # Clear current children.
+        while self._hot_grid.count():
+            item = self._hot_grid.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        # Render saved entries.
+        for i, entry in enumerate(self._hot_buttons):
+            row, col = divmod(i, 2)
+            cell = self._make_hot_button(entry)
+            cell.set_index(i)
+            cell.editRequested.connect(self._on_hot_button_edit)
+            cell.deleteRequested.connect(self._on_hot_button_delete)
+            cell.reorderRequested.connect(self._on_hot_button_reorder)
+            # Bind the index via a default-arg lambda so each cell
+            # captures its own ``i`` instead of the loop's last value.
+            cell.clicked.connect(
+                lambda _chk=False, idx=i: self._on_hot_button_clicked(idx))
+            self._hot_grid.addWidget(cell, row, col)
+        # Trailing "+" placeholder always at the next free slot.  Also
+        # accepts drops so the user can drag a saved cell here to move
+        # it to the end of the list.
+        n = len(self._hot_buttons)
+        row, col = divmod(n, 2)
+        slot = _HotButtonPlaceholder(self)
+        slot.clicked.connect(self._on_add_hot_button)
+        slot.dropFromCell.connect(self._on_hot_button_drop_to_end)
+        self._hot_grid.addWidget(slot, row, col)
+
+    def _make_hot_button(self, entry: dict) -> "_HotButtonCell":
+        """Render a saved hot-button entry as a :class:`_HotButtonCell`.
+        Side → colour mapping uses :data:`_HOT_BUTTON_COLOURS` so the
+        styling matches the FlashTrade Buy/Sell/Flatten/Cancel action
+        buttons.  Auto-generates the label from the other entry fields
+        when the user left it blank.  The cell handles right-click
+        Edit/Delete + drag-and-drop reorder; left-click submission is
+        intentionally a no-op for now — order routing is deferred."""
+        side = entry.get("side", "BUY")
+        label = entry.get("label", "") or _auto_hot_button_label(
+            side=side,
+            qty=entry.get("qty", ""),
+            sym=entry.get("symbol", ""),
+            ord_type=entry.get("ord_type", "LMT"),
+            anchor=entry.get("anchor", "BID"),
+            offset=int(entry.get("offset", 0) or 0),
+        )
+        colour = _HOT_BUTTON_COLOURS.get(side, Theme.CLR_BUY)
+        return _HotButtonCell(label, colour, parent=self)
+
+    # ── Hot-button host actions ──────────────────────────────────────────────
+
+    def _persist_hot_buttons(self) -> None:
+        """Atomically write the current ``_hot_buttons`` list to
+        ``app_config.json``.  Called after every mutation (add / edit /
+        delete / reorder) so the user's hot-button layout survives a
+        restart.  Failures are logged but not propagated — a write
+        problem must never break order entry."""
+        try:
+            config_manager.save_hot_buttons(self._hot_buttons)
+        except Exception:
+            log.exception("HotButton: failed to persist to app_config.json")
+
+    def _on_add_hot_button(self) -> None:
+        """Open :class:`_HotButtonModal` in Add mode, append the
+        resulting HotButton dict to the in-memory list, and rebuild
+        the grid so the next ``+`` placeholder appears in the next
+        free slot."""
+        dlg = _HotButtonModal(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        if dlg.delete_requested():
+            return  # Delete in Add mode is a no-op
+        values = dlg.values()
+        self._hot_buttons.append(values)
+        log.info("HotButton: added side=%s label=%r ord_type=%s",
+                 values.get("side"), values.get("label"),
+                 values.get("ord_type"))
+        self._rebuild_hot_buttons()
+        self._persist_hot_buttons()
+
+    def _on_hot_button_edit(self, index: int) -> None:
+        """Right-click → Edit → reopen the modal in Edit mode for the
+        cell at *index*.  On Save, replace the entry in place; on
+        Delete (modal footer), drop the entry."""
+        if not (0 <= index < len(self._hot_buttons)):
+            return
+        dlg = _HotButtonModal(
+            self, draft=self._hot_buttons[index], edit_mode=True)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        if dlg.delete_requested():
+            log.info("HotButton: deleted index=%d via modal", index)
+            del self._hot_buttons[index]
+        else:
+            self._hot_buttons[index] = dlg.values()
+            log.info("HotButton: edited index=%d", index)
+        self._rebuild_hot_buttons()
+        self._persist_hot_buttons()
+
+    def _on_hot_button_delete(self, index: int) -> None:
+        """Right-click → Delete → remove the cell at *index*."""
+        if not (0 <= index < len(self._hot_buttons)):
+            return
+        log.info("HotButton: deleted index=%d", index)
+        del self._hot_buttons[index]
+        self._rebuild_hot_buttons()
+        self._persist_hot_buttons()
+
+    def _on_hot_button_reorder(self, src: int, dst: int) -> None:
+        """Drag-and-drop reorder: move the entry at *src* to the slot
+        currently occupied by *dst*, sliding the rest down.  No-op
+        when src == dst or when either index is out of range."""
+        n = len(self._hot_buttons)
+        if src == dst or not (0 <= src < n) or not (0 <= dst < n):
+            return
+        item = self._hot_buttons.pop(src)
+        # ``dst`` was computed before the pop, so adjust if the source
+        # sat earlier in the list.
+        if dst > src:
+            dst -= 1
+        self._hot_buttons.insert(dst, item)
+        log.info("HotButton: reorder src=%d → dst=%d", src, dst)
+        self._rebuild_hot_buttons()
+        self._persist_hot_buttons()
+
+    def _on_hot_button_drop_to_end(self, src: int) -> None:
+        """Drag-and-drop onto the trailing ``+`` placeholder → move
+        the entry at *src* to the end of the list."""
+        n = len(self._hot_buttons)
+        if not (0 <= src < n) or src == n - 1:
+            return
+        item = self._hot_buttons.pop(src)
+        self._hot_buttons.append(item)
+        log.info("HotButton: moved src=%d to end", src)
+        self._rebuild_hot_buttons()
+        self._persist_hot_buttons()
+
+    def _resolve_hot_button_target_accounts(
+            self, group: str) -> list[str] | None:
+        """Resolve the target-account list for a hot button's trading
+        group.  Returns:
+
+        * ``None`` for the ``__current__`` sentinel — caller falls
+          through to whatever the AccountListPanel currently has
+          selected (preserves the existing OrderEntry semantics).
+        * The group's currently-checked subset (``selected`` field)
+          when *group* names a known user-defined group from
+          ``app_config.json``.  An empty list means the user has
+          nothing checked in that group right now; an empty list is
+          also returned when the group can't be found at all (the
+          caller treats both as "abort with warning").
+        """
+        if not group or group == "__current__":
+            return None
+        try:
+            groups = config_manager.load_account_groups()
+        except Exception:
+            log.exception(
+                "HotButton: failed to load account_groups from config")
+            return []
+        for g in groups:
+            if g.get("name") == group:
+                # Prefer the currently-checked subset so a hot button
+                # that targets "Beta" matches what the user sees
+                # checked while Beta is active in the AccountListPanel.
+                # Fall back to the full membership only when
+                # ``selected`` is missing entirely (legacy configs
+                # that haven't been migrated yet).
+                sel = g.get("selected")
+                if isinstance(sel, list):
+                    return [a for a in sel if a]
+                return [a for a in g.get("accounts", []) if a]
+        log.warning(
+            "HotButton: group %r not found in account_groups config", group)
+        return []
+
+    def _on_hot_button_clicked(self, index: int) -> None:
+        """Hot-button click → build and submit an order from the saved
+        entry.  Mirrors the ``_emit_*`` helpers used by the explicit
+        Buy/Sell/Flatten/Cancel buttons so the routing in
+        :class:`FlashTradeView` is the same regardless of source.
+
+        Resolution rules:
+          * ``symbol`` empty → fall back to ``self._active_symbol``.
+          * ``qty`` empty / non-integer → fall back to ``self._active_qty``.
+          * ``ord_type == "MKT"`` → emit ``type="MKT"``.
+          * ``ord_type == "LMT"`` → compute
+            ``limit_price = anchor_base + offset * tick`` (anchor base
+            from the live bid/ask/mid cache, falls back to last) and
+            emit ``type="BID_LMT"``/``"ASK_LMT"`` so FlashTradeView
+            routes a plain LMT at the explicit price.
+          * ``side == "FLATTEN"`` → emit
+            :pyattr:`flatten_requested(symbol)` for ``__current__``,
+            or :pyattr:`hot_button_flatten(symbol, accounts)` when a
+            named group resolves to a non-empty account list.
+          * ``side == "CANCEL"`` → :pyattr:`cancel_all_requested` /
+            :pyattr:`hot_button_cancel` mirror the same rule.
+          * Attached ``tp`` / ``sl`` legs (``u == "abs"``) → translate
+            to the existing ``{value, unit}`` payload using ``"price"``
+            (dollar offset) so the worker's bracket builder reuses the
+            same path the OrderEntry tier sections use.
+
+        Trading group routing: ``__current__`` sentinel uses the
+        AccountListPanel selection (existing behaviour).  Named groups
+        bypass that selection and fan out to every member of the
+        group, so a hot button still fires the right accounts even if
+        the user has switched the AccountListPanel to ``None`` /
+        another group.
+        """
+        if not (0 <= index < len(self._hot_buttons)):
+            return
+        entry = self._hot_buttons[index]
+        side = str(entry.get("side", "BUY"))
+
+        # Symbol resolution — fall back to the panel's focused symbol.
+        sym_raw = str(entry.get("symbol", "") or "").strip()
+        sym = (sym_raw or (self._active_symbol or "")).upper()
+        if not sym:
+            log.warning(
+                "HotButton[%d]: no symbol (entry empty + no active symbol)",
+                index)
+            return
+
+        # Group routing — resolve target accounts for named groups.
+        group = str(entry.get("group", "__current__") or "__current__")
+        target_accounts = self._resolve_hot_button_target_accounts(group)
+        if group != "__current__":
+            if not target_accounts:
+                log.warning(
+                    "HotButton[%d]: group %r resolves to no accounts — "
+                    "aborting submission so we don't silently fall back "
+                    "to the AccountListPanel selection.",
+                    index, group)
+                return
+            log.info("HotButton[%d]: group %r → %d target account(s): %s",
+                     index, group, len(target_accounts),
+                     sorted(target_accounts))
+
+        # ── CANCEL / FLATTEN — position-management actions ────────────────
+        if side == "CANCEL":
+            if target_accounts:
+                log.info("HotButton[%d]: CANCEL %s on group %r",
+                         index, sym, group)
+                self.hot_button_cancel.emit(sym, list(target_accounts))
+            else:
+                log.info("HotButton[%d]: CANCEL %s", index, sym)
+                self.cancel_all_requested.emit(sym)
+            return
+        if side == "FLATTEN":
+            if target_accounts:
+                log.info("HotButton[%d]: FLATTEN %s on group %r",
+                         index, sym, group)
+                self.hot_button_flatten.emit(sym, list(target_accounts))
+            else:
+                log.info("HotButton[%d]: FLATTEN %s", index, sym)
+                self.flatten_requested.emit(sym)
+            return
+
+        # ── BUY / SELL — qty resolution ───────────────────────────────────
+        raw_qty = str(entry.get("qty", "") or "").strip()
+        qty: int | None = None
+        if raw_qty:
+            # "100" supported now; "25%" is in the spec but resolution
+            # against position size lives in a follow-up — fall back to
+            # the active chip qty so the click still does *something*.
+            try:
+                qty = int(raw_qty)
+            except ValueError:
+                log.info(
+                    "HotButton[%d]: qty=%r not integer; falling back "
+                    "to active chip qty=%d",
+                    index, raw_qty, self._active_qty)
+        if qty is None or qty <= 0:
+            qty = self._active_qty
+        if qty <= 0:
+            log.warning("HotButton[%d]: qty resolves to 0 — aborting", index)
+            return
+
+        ord_type = str(entry.get("ord_type", "LMT"))
+        sec_type = _sec_type_for(sym)
+        # Per-symbol price cache lookup — critical when the hot
+        # button targets a *different* symbol than the OrderEntry's
+        # active one.  ``self._last_*`` only reflect the focused
+        # symbol; without this lookup an "ES" hot button clicked
+        # while NQ is focused would compute an NQ-priced LMT against
+        # the ES contract.
+        cached = self._price_cache.get(sym.upper())
+        if cached:
+            sym_last, sym_bid, sym_ask = cached
+        else:
+            sym_last, sym_bid, sym_ask = 0.0, 0.0, 0.0
+        payload: dict = {
+            "action": side,
+            "symbol": sym,
+            "qty": qty,
+            "sec_type": sec_type,
+            "last_price": float(sym_last),
+        }
+        # Group-targeted hot buttons override the AccountListPanel
+        # selection so the order fires on the configured group's
+        # accounts even when the user has the panel set to None /
+        # another group.  Read by FlashTradeView._on_order_requested.
+        if target_accounts:
+            payload["_target_accounts"] = list(target_accounts)
+
+        if ord_type == "MKT":
+            payload["type"] = "MKT"
+        else:
+            anchor = str(entry.get("anchor", "BID"))
+            try:
+                offset_ticks = int(entry.get("offset", 0) or 0)
+            except (TypeError, ValueError):
+                offset_ticks = 0
+            base = self._anchor_base_price_for(
+                anchor, sym_bid, sym_ask, sym_last)
+            if base <= 0:
+                log.warning(
+                    "HotButton[%d]: live %s base price unavailable for "
+                    "%s — skipping LMT submission",
+                    index, anchor, sym)
+                return
+            tick = self._tick_size_for_symbol(sym)
+            limit_price = base + offset_ticks * tick
+            if tick > 0:
+                # Snap to a tick boundary so the broker doesn't reject.
+                limit_price = round(limit_price / tick) * tick
+            payload["type"] = "BID_LMT" if side == "BUY" else "ASK_LMT"
+            payload["limit_price"] = float(limit_price)
+
+        # ── Attached brackets ─────────────────────────────────────────────
+        payload["profit_take"] = self._bracket_payload(entry.get("tp"))
+        payload["stop_loss"] = self._bracket_payload(entry.get("sl"))
+        payload["trailing"] = None  # hot buttons don't expose a trail leg
+
+        log.info(
+            "HotButton[%d]: emit order side=%s qty=%d sym=%s type=%s "
+            "limit=%s tp=%s sl=%s",
+            index, side, qty, sym, payload.get("type"),
+            payload.get("limit_price"),
+            payload.get("profit_take"), payload.get("stop_loss"))
+        self.order_requested.emit(payload)
+
+    @staticmethod
+    def _anchor_base_price_for(
+            anchor: str, bid: float, ask: float, last: float) -> float:
+        """Resolve the anchor (BID/ASK/MID) to a usable base price from
+        an explicit ``(bid, ask, last)`` triple.  The caller picks the
+        triple — for hot buttons that's the per-symbol price cache,
+        not the panel's focused-symbol values, so a click on an "ES"
+        hot button uses ES quotes even while the panel is showing NQ.
+        Falls back to ``last`` when the anchor side isn't streaming
+        (e.g. overnight sessions)."""
+        if anchor == "BID":
+            base = bid
+        elif anchor == "ASK":
+            base = ask
+        elif anchor == "MID" and bid > 0 and ask > 0:
+            base = (bid + ask) / 2.0
+        else:
+            base = 0.0
+        if math.isnan(base) or base <= 0:
+            base = last
+        return float(base) if not math.isnan(base) else 0.0
+
+    @staticmethod
+    def _bracket_payload(leg: dict | None) -> dict | None:
+        """Translate a hot-button bracket leg (``{on, v, u}``) into the
+        ``{value, unit}`` shape the worker's bracket builder expects.
+        ``u == "abs"`` is mapped to ``"price"`` (dollar offset) since
+        the existing bracket-children path treats those as equivalent.
+        Returns ``None`` when the leg is off / missing."""
+        if not isinstance(leg, dict) or not leg.get("on"):
+            return None
+        u = leg.get("u", "abs")
+        unit = "price" if u == "abs" else u
+        return {
+            "value": float(leg.get("v", 0) or 0),
+            "unit": unit,
+            "label": "HotButton",
+        }
 
     # ── Combo / symbol search ─────────────────────────────────────────────────
 
@@ -1899,6 +3674,10 @@ class OrderEntryPanel(QWidget):
         self._rebuild_symbol_buttons()
 
     def _on_symbol_clicked(self, sym: str) -> None:
+        # Snapshot the outgoing symbol's TP / SL / TS selection so that
+        # coming back to it restores the same arming.  Skipped on the
+        # very first click (no prior active symbol).
+        self._capture_tier_state(self._active_symbol)
         self._active_symbol = sym
         config_manager.save_active_order_entry_symbol(sym)
         for s, btn in self._sym_buttons.items():
@@ -1907,6 +3686,32 @@ class OrderEntryPanel(QWidget):
         self._rebuild_qty_buttons()
         self._refresh_action_labels()
         self._reload_tier_sections()
+        # Restore (or reset) the new symbol's previously-stored arming.
+        self._restore_tier_state(sym)
+
+    def _capture_tier_state(self, sym: str | None) -> None:
+        if not sym or not hasattr(self, "_pt_section"):
+            return
+        self._tier_state_by_symbol[sym.upper()] = {
+            "pt": self._pt_section.capture_state(),
+            "sl": self._sl_section.capture_state(),
+            "tr": self._tr_section.capture_state(),
+        }
+
+    def _restore_tier_state(self, sym: str | None) -> None:
+        if not hasattr(self, "_pt_section"):
+            return
+        snapshot = self._tier_state_by_symbol.get(
+            sym.upper()) if sym else None
+        if snapshot:
+            self._pt_section.restore_state(snapshot.get("pt"))
+            self._sl_section.restore_state(snapshot.get("sl"))
+            self._tr_section.restore_state(snapshot.get("tr"))
+        else:
+            # No prior arming for this symbol — start fresh.
+            self._pt_section.reset()
+            self._sl_section.reset()
+            self._tr_section.reset()
 
     def _update_symbol_display(self) -> None:
         if self._active_symbol:
@@ -2079,14 +3884,92 @@ class OrderEntryPanel(QWidget):
 
     def _refresh_action_labels(self) -> None:
         q = self._active_qty
-        self._btn_buy_mkt.setText(f"Buy {q} @MKT")
-        self._btn_sell_mkt.setText(f"Sell {q} @MKT")
-        self._btn_buy_mid.setText(f"Buy {q} @Mid")
-        self._btn_sell_mid.setText(f"Sell {q} @Mid")
-        self._btn_buy_bid.setText(f"Buy {q} @Bid")
-        self._btn_sell_ask.setText(f"Sell {q} @Ask")
-        self._btn_buy_bid_lmt.setText(f"Buy {q} @Bid Limit")
-        self._btn_sell_ask_lmt.setText(f"Sell {q} @Ask Limit")
+        self._btn_buy_mkt.setPrimary(f"Buy {q} @MKT")
+        self._btn_sell_mkt.setPrimary(f"Sell {q} @MKT")
+        self._btn_buy_mid.setPrimary(f"Buy {q} @Mid")
+        self._btn_sell_mid.setPrimary(f"Sell {q} @Mid")
+        self._btn_buy_bid.setPrimary(f"Buy {q} @Bid +1t")
+        self._btn_sell_ask.setPrimary(f"Sell {q} @Ask -1t")
+        self._btn_buy_bid_lmt.setPrimary(f"Buy {q} @Bid Limit")
+        self._btn_sell_ask_lmt.setPrimary(f"Sell {q} @Ask Limit")
+        # Secondary line — shows TP / SL / Trail amounts armed for this
+        # bracket.  Hidden when nothing is armed.
+        secondary = self._format_armed_summary()
+        for b in (self._btn_buy_mkt, self._btn_sell_mkt,
+                  self._btn_buy_mid, self._btn_sell_mid,
+                  self._btn_buy_bid, self._btn_sell_ask,
+                  self._btn_buy_bid_lmt, self._btn_sell_ask_lmt):
+            b.setSecondary(secondary)
+
+    def _format_armed_summary(self) -> str:
+        """Build the small second-line text shown on the Buy/Sell action
+        buttons, e.g. ``"+$40  -$80  ↗ 50t"``.  Empty string when no
+        tier is currently armed."""
+        parts: list[str] = []
+        tp = self._tier_amount(self._pt_section)
+        if tp is not None:
+            parts.append(f"+${tp:,}")
+        sl = self._tier_amount(self._sl_section)
+        if sl is not None:
+            parts.append(f"-${sl:,}")
+        tr_text = self._trail_text(self._tr_section)
+        if tr_text is not None:
+            parts.append(f"↗ {tr_text}")
+        return "  ".join(parts)
+
+    @staticmethod
+    def _tier_amount(section: "_TierSection") -> int | None:
+        """Return the section's current armed dollar amount (qty-scaled)
+        as an integer, or None when nothing is armed.  Mirrors the math
+        in :meth:`_TierSection._update_dollar_display`."""
+        if not section.is_enabled:
+            return None
+        dollar = 0.0
+        input_text = (section._input.text().strip()
+                      if section._input is not None else "")
+        if input_text:
+            try:
+                dist = float(input_text)
+                if dist > 0:
+                    dollar = dist * section._multiplier
+            except ValueError:
+                pass
+        if dollar <= 0 and section._selected_idx is not None and (
+                section._selected_idx < len(section._dollar_per_tier)):
+            dollar = section._dollar_per_tier[section._selected_idx]
+        if dollar <= 0:
+            return None
+        return int(round(dollar * section._qty))
+
+    @staticmethod
+    def _trail_text(section: "_TierSection") -> str | None:
+        """Format the trail tier as ``"50t"`` (ticks) or ``"$1,500"`` —
+        whichever unit the active tier carries.  Returns None when the
+        section is unarmed."""
+        if not section.is_enabled:
+            return None
+        v = section.get_value()
+        if not v:
+            return None
+        value = v.get("value", 0)
+        unit = v.get("unit", "ticks")
+        try:
+            fv = float(value)
+        except (TypeError, ValueError):
+            return None
+        if fv <= 0:
+            return None
+        if unit in ("ticks", "cents"):
+            # Drop the trailing .0 for integer tick counts.
+            if fv.is_integer():
+                return f"{int(fv)}t"
+            return f"{fv:g}t"
+        if unit == "%":
+            return f"{fv:g}%"
+        # "amt" / "price" / dollar units.
+        if fv.is_integer():
+            return f"${int(fv):,}"
+        return f"${fv:,.2f}"
 
     # ── Tier helpers ──────────────────────────────────────────────────────────
 
@@ -2225,6 +4108,10 @@ class OrderEntryPanel(QWidget):
         self._pt_section.set_market_price(self._last_price, ts)
         self._sl_section.set_market_price(self._last_price, ts)
         self._tr_section.set_market_price(self._last_price, ts)
+        # ``reload_tiers`` rebuilds chips + Dist input from scratch so
+        # nothing is armed; refresh the Buy/Sell secondary line so the
+        # previous symbol's TP/SL/TS amounts don't linger on the buttons.
+        self._refresh_action_labels()
 
     def _tick_size_for_symbol(self, sym: str) -> float:
         """Return the minimum tick size for *sym*.
@@ -2318,12 +4205,9 @@ class OrderEntryPanel(QWidget):
 
         # ── Safety check ──────────────────────────────────────────────────
         if math.isnan(price) or price <= 0:
-            QMessageBox.warning(
-                self,
-                "Invalid Price",
-                f"Cannot place order: live {label} price is unavailable or invalid.\n"
-                f"Please wait for market data.",
-            )
+            log.warning(
+                "OrderEntry: order blocked — live %s price unavailable for %s",
+                label, self._active_symbol)
             return
 
         sec = _sec_type_for(self._active_symbol)

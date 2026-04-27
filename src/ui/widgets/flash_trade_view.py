@@ -75,6 +75,12 @@ class FlashTradeView(QWidget):
     # opposite the panel state.
     accounts_panel_visibility_changed = Signal(bool)
 
+    # Emitted when a fan-out (order / flatten / cancel) skipped one or
+    # more accounts because their worker is offline.  Payload is the
+    # human-readable summary text + duration in ms for the host to
+    # surface in the status bar.
+    transient_status_message = Signal(str, int)
+
     def __init__(self, active_threads: dict[str, IBWorkerThread] | None = None,
                  accounts_model: AccountsTableModel | None = None, parent=None,
                  *, open_preferences=None):
@@ -193,6 +199,12 @@ class FlashTradeView(QWidget):
             self._on_close_pct_requested)
         self._order_entry.close_tier_requested.connect(
             self._on_close_tier_requested)
+        # Hot-button group-targeted variants — bypass AccountListPanel
+        # selection and fan out to the configured group's accounts.
+        self._order_entry.hot_button_flatten.connect(
+            self._on_hot_button_flatten)
+        self._order_entry.hot_button_cancel.connect(
+            self._on_hot_button_cancel)
 
         # ── Wire book trader (mirrors order-entry signal surface) ────────────
         # BookTraderView submits through the same handlers so TP/SL/Trail
@@ -274,11 +286,24 @@ class FlashTradeView(QWidget):
         3. For each account, find the correct IBWorkerThread and place the order.
         """
         # ── 1. Validate: get checked accounts ─────────────────────────────
-        # When called from flatten, the payload carries ``_flatten_account``
-        # so we target only that specific account (not all checked ones).
+        # Three account-resolution paths in order of priority:
+        #   1. ``_flatten_account`` — single-account override used by the
+        #      flatten close-needed callback (one position at a time).
+        #   2. ``_target_accounts`` — explicit list override used by
+        #      group-targeted hot buttons so they fan out to the
+        #      configured group regardless of AccountListPanel state.
+        #   3. AccountListPanel.get_selected_accounts() — default for
+        #      every other Buy/Sell click.
         flatten_account = payload.get("_flatten_account")
+        target_accounts = payload.get("_target_accounts")
         if flatten_account:
             accounts = [flatten_account]
+        elif target_accounts:
+            accounts = list(target_accounts)
+            if not accounts:
+                log.warning(
+                    "FlashTrade: _target_accounts empty – aborting order")
+                return
         else:
             if not isinstance(self._account_list, AccountListPanel):
                 log.warning(
@@ -289,6 +314,17 @@ class FlashTradeView(QWidget):
             if not accounts:
                 log.warning("FlashTrade: no accounts checked – aborting order")
                 return
+
+        # Skip offline workers up front so the UI can tell the user what
+        # was dropped instead of letting orders silently vanish inside
+        # the per-account fan-out below.
+        accounts, _disconnected = self._partition_accounts_by_connection(accounts)
+        self._notify_skipped_accounts("Order", _disconnected)
+        if not accounts:
+            log.warning(
+                "FlashTrade: no connected accounts among the selection – "
+                "aborting order")
+            return
 
         # ── 2. Look up contract from saved config ─────────────────────────
         symbol = payload.get("symbol", "")
@@ -376,22 +412,17 @@ class FlashTradeView(QWidget):
                          limit_price, adaptive_priority)
                 order_type = "ADAPTIVE"
             else:
-                # Stocks → Pegged to Primary (REL)
-                # auxPrice = dollar offset from the NBBO
-                if action == "BUY":
-                    raw_offset = float(prefs.get("buy_bid_offset", 0))
-                    offset_unit = str(prefs.get("buy_bid_unit", "ticks"))
-                else:
-                    raw_offset = float(prefs.get("sell_ask_offset", 0))
-                    offset_unit = str(prefs.get("sell_ask_unit", "ticks"))
-                peg_offset = abs(calculate_offset(
-                    raw_offset, offset_unit,
-                    last_price if last_price > 0 else 0, tick,
-                ))
+                # Stocks → Pegged to Primary (REL).  The button labels
+                # are "Buy @Bid +1t" and "Sell @Ask -1t" — both fix the
+                # peg offset at exactly one tick so the order rests one
+                # tick inside the NBBO regardless of the user's
+                # buy_bid_offset / sell_ask_offset preferences.
+                # auxPrice = dollar offset from the NBBO (always >= 0).
+                peg_offset = tick
                 # lmtPrice = limit cap (ceiling BUY / floor SELL), 0 = no cap
                 limit_price = _cap_price()
                 log.info("FlashTrade: STK %s @%s %s base=%.4f tick=%.4f → "
-                         "PEG_PRIM limit=%.4f peg_offset=%.4f",
+                         "PEG_PRIM limit=%.4f peg_offset=%.4f (+1 tick)",
                          action, order_type, symbol, last_price, tick,
                          limit_price, peg_offset)
                 order_type = "PEG_PRIM"
@@ -500,6 +531,48 @@ class FlashTradeView(QWidget):
         if worker and worker.isRunning() and worker.is_ib_connected:
             return worker
         return None
+
+    def _partition_accounts_by_connection(
+        self, accounts: list[str],
+    ) -> tuple[list[str], list[str]]:
+        """Split *accounts* into ``(connected, disconnected)`` using the
+        same predicate as ``_find_worker_for_account`` so partitioning
+        never disagrees with the actual fan-out.  Accounts whose worker
+        is missing entirely are also treated as disconnected so the
+        status message names them too."""
+        connected: list[str] = []
+        disconnected: list[str] = []
+        for account in accounts:
+            if self._find_worker_for_account(account) is not None:
+                connected.append(account)
+            else:
+                disconnected.append(account)
+        return connected, disconnected
+
+    def _pretty_account(self, account: str) -> str:
+        """Return ``alias (account)`` when the user has set an alias,
+        else just the account ID.  Reuses ``AccountsTableModel._aliases``
+        the same way ``_on_order_status_updated`` does today."""
+        if self._accounts_model is not None:
+            alias = self._accounts_model._aliases.get(account, "")
+            if alias:
+                return f"{alias} ({account})"
+        return account
+
+    def _notify_skipped_accounts(
+        self, action: str, disconnected: list[str],
+    ) -> None:
+        """Emit a status-bar message + WARNING log line summarising a
+        fan-out that skipped offline accounts.  ``action`` is a short
+        verb like ``"Order"`` / ``"Flatten"`` / ``"Cancel"`` so the
+        text reads naturally."""
+        if not disconnected:
+            return
+        pretty = ", ".join(self._pretty_account(a) for a in disconnected)
+        msg = (f"{action} skipped on {len(disconnected)} disconnected "
+               f"account(s): {pretty}")
+        log.warning("FlashTrade: %s", msg)
+        self.transient_status_message.emit(msg, 6000)
 
     def _ensure_worker_connected(self, worker: IBWorkerThread) -> None:
         """Connect order_status_updated, portfolio_updated, and
@@ -743,12 +816,43 @@ class FlashTradeView(QWidget):
                 "FlashTrade: cancel-all blocked — AccountListPanel not available")
             return
 
-        checked: set[str] = set(self._account_list.get_selected_accounts())
-        if not checked:
+        checked_list = list(self._account_list.get_selected_accounts())
+        if not checked_list:
             log.warning(
                 "FlashTrade: cancel-all blocked for '%s' — no accounts checked", symbol)
             return
+        self._do_cancel_all_for_symbol(symbol, checked_list)
 
+    def _on_hot_button_cancel(self, symbol: str, accounts: list) -> None:
+        """Hot-button group-targeted cancel.  Bypasses the
+        AccountListPanel selection and cancels open orders for
+        *symbol* on the accounts the caller resolved from the
+        configured trading group."""
+        accounts_list = list(accounts) if accounts else []
+        if not accounts_list:
+            log.warning(
+                "FlashTrade: hot-button cancel blocked for '%s' — empty "
+                "group account list", symbol)
+            return
+        log.info(
+            "FlashTrade: hot-button cancel '%s' on %d group account(s): %s",
+            symbol, len(accounts_list), sorted(accounts_list))
+        self._do_cancel_all_for_symbol(symbol, accounts_list)
+
+    def _do_cancel_all_for_symbol(
+            self, symbol: str, accounts: list[str]) -> None:
+        """Shared cancel-all execution.  Caller has already resolved
+        the target accounts (from AccountListPanel selection or a
+        named hot-button group)."""
+        connected_list, _disc = self._partition_accounts_by_connection(
+            accounts)
+        self._notify_skipped_accounts("Cancel", _disc)
+        if not connected_list:
+            log.warning(
+                "FlashTrade: cancel-all blocked for '%s' — every target "
+                "account is on a disconnected connection", symbol)
+            return
+        checked: set[str] = set(connected_list)
         count = 0
         for label, worker in self._active_threads.items():
             if worker.isRunning() and worker.is_ib_connected:
@@ -770,12 +874,43 @@ class FlashTradeView(QWidget):
                 "FlashTrade: flatten blocked — AccountListPanel not available")
             return
 
-        checked: set[str] = set(self._account_list.get_selected_accounts())
-        if not checked:
+        checked_list = list(self._account_list.get_selected_accounts())
+        if not checked_list:
             log.warning(
                 "FlashTrade: flatten blocked for '%s' — no accounts checked", symbol)
             return
+        self._do_flatten_for_symbol(symbol, checked_list)
 
+    def _on_hot_button_flatten(self, symbol: str, accounts: list) -> None:
+        """Hot-button group-targeted flatten.  Bypasses the
+        AccountListPanel selection and flattens *symbol* on the
+        accounts the caller resolved from the configured trading
+        group."""
+        accounts_list = list(accounts) if accounts else []
+        if not accounts_list:
+            log.warning(
+                "FlashTrade: hot-button flatten blocked for '%s' — empty "
+                "group account list", symbol)
+            return
+        log.info(
+            "FlashTrade: hot-button flatten '%s' on %d group account(s): %s",
+            symbol, len(accounts_list), sorted(accounts_list))
+        self._do_flatten_for_symbol(symbol, accounts_list)
+
+    def _do_flatten_for_symbol(
+            self, symbol: str, accounts: list[str]) -> None:
+        """Shared flatten execution.  Caller has already resolved the
+        target accounts (from AccountListPanel selection or a named
+        hot-button group)."""
+        connected_list, _disc = self._partition_accounts_by_connection(
+            accounts)
+        self._notify_skipped_accounts("Flatten", _disc)
+        if not connected_list:
+            log.warning(
+                "FlashTrade: flatten blocked for '%s' — every target "
+                "account is on a disconnected connection", symbol)
+            return
+        checked: set[str] = set(connected_list)
         count = 0
         for label, worker in self._active_threads.items():
             if worker.isRunning() and worker.is_ib_connected:
@@ -835,11 +970,19 @@ class FlashTradeView(QWidget):
                 "FlashTrade: reverse blocked — AccountListPanel not available")
             return
 
-        checked: set[str] = set(self._account_list.get_selected_accounts())
-        if not checked:
+        checked_list = list(self._account_list.get_selected_accounts())
+        if not checked_list:
             log.warning(
                 "FlashTrade: reverse blocked for '%s' — no accounts checked", symbol)
             return
+        connected_list, _disc = self._partition_accounts_by_connection(checked_list)
+        self._notify_skipped_accounts("Reverse", _disc)
+        if not connected_list:
+            log.warning(
+                "FlashTrade: reverse blocked for '%s' — every checked "
+                "account is on a disconnected connection", symbol)
+            return
+        checked: set[str] = set(connected_list)
 
         count = 0
         for label, worker in self._active_threads.items():
@@ -937,24 +1080,45 @@ class FlashTradeView(QWidget):
                 "FlashTrade: close_tier blocked — AccountListPanel not available")
             return
 
-        checked: set[str] = set(self._account_list.get_selected_accounts())
-        if not checked:
+        checked_list = list(self._account_list.get_selected_accounts())
+        if not checked_list:
             log.warning(
                 "FlashTrade: close_tier %s blocked for '%s' — "
                 "no accounts checked", side, symbol)
             return
+        # Drop accounts on offline workers so the user sees a status
+        # message instead of having close requests vanish silently.
+        connected_list, _disc = self._partition_accounts_by_connection(checked_list)
+        self._notify_skipped_accounts("Close tier", _disc)
+        if not connected_list:
+            log.warning(
+                "FlashTrade: close_tier %s blocked for '%s' — every "
+                "checked account is on a disconnected connection", side, symbol)
+            return
+        checked: set[str] = set(connected_list)
 
-        # Use the UI's cached last_price (same source the order-entry panel
-        # shows); fall back to the payload's snapshot if the cache is cold.
+        # Resolve an absolute reference price using the same fallback
+        # chain the bracket-children path uses on the worker side:
+        # cached last → payload last → cached bid/ask midpoint.  Last
+        # resort, surface a modal so the user knows why their click
+        # did nothing instead of dropping the request silently.
         last_price = 0.0
         cached = self._order_entry._price_cache.get(symbol.upper())
         if cached:
             last_price = float(cached[0])
         if last_price <= 0:
             last_price = float(data.get("last_price") or 0.0)
+        if last_price <= 0 and cached:
+            bid = float(cached[1] or 0.0)
+            ask = float(cached[2] or 0.0)
+            if bid > 0 and ask > 0:
+                last_price = (bid + ask) / 2.0
+                log.info(
+                    "FlashTrade: close_tier %s '%s' using bid/ask mid "
+                    "%.4f (no live last)", side, symbol, last_price)
         if last_price <= 0:
             log.warning(
-                "FlashTrade: close_tier %s '%s' blocked — no live price yet",
+                "FlashTrade: close_tier %s '%s' blocked — no live price",
                 side, symbol)
             return
 
@@ -1238,21 +1402,38 @@ class FlashTradeView(QWidget):
 
     # ── Accounts-panel show/hide ──────────────────────────────────────────────
 
+    # A splitter-collapsed AccountListPanel reports ``isVisible() == True``
+    # but has effectively zero width.  We treat anything below this
+    # threshold as "hidden" for toggle purposes so the user can drag the
+    # splitter shut and then click the Account pill to reopen the panel
+    # at a usable size on the next click.
+    _ACCT_PANEL_MIN_USABLE_W = 60
+    # Fallback width used when "show" is requested from a collapsed state
+    # and we have no usable saved sizes to restore.
+    _ACCT_PANEL_DEFAULT_W = 240
+
     def is_accounts_panel_visible(self) -> bool:
         if not isinstance(self._account_list, AccountListPanel):
             return False
-        return self._account_list.isVisible()
+        if not self._account_list.isVisible():
+            return False
+        # Treat a splitter-collapsed panel as hidden so the next pill
+        # click expands it instead of toggling it off.
+        return self._account_list.width() >= self._ACCT_PANEL_MIN_USABLE_W
 
     def set_accounts_panel_visible(self, visible: bool) -> None:
         """Show or hide the AccountListPanel inside the right
         splitter.  Snapshots the current splitter sizes on hide and
         restores them on show so the user keeps their column width.
-        Persists the new state and emits
+        When the panel was collapsed via the splitter (width near 0)
+        we ignore the stale saved sizes and force a sensible default
+        on show so a "Account" pill click always reveals a usable
+        panel.  Persists the new state and emits
         ``accounts_panel_visibility_changed`` so the host can flip
         the 'Show Account' pill in the top bar."""
         if not isinstance(self._account_list, AccountListPanel):
             return
-        currently = self._account_list.isVisible()
+        currently = self.is_accounts_panel_visible()
         if currently == bool(visible):
             return
         if not visible:
@@ -1263,9 +1444,31 @@ class FlashTradeView(QWidget):
             self._account_list.hide()
         else:
             self._account_list.show()
-            if self._right_splitter_saved_sizes:
-                self._right_splitter.setSizes(
-                    self._right_splitter_saved_sizes)
+            saved = self._right_splitter_saved_sizes
+            usable = (
+                saved is not None
+                and len(saved) >= 2
+                and saved[1] >= self._ACCT_PANEL_MIN_USABLE_W
+            )
+            if usable:
+                self._right_splitter.setSizes(saved)
+            else:
+                # No usable saved sizes (either never hidden, or the
+                # last hide captured a collapsed state).  Fall back to
+                # a default width derived from the splitter's current
+                # total so the panel always reappears at a sensible
+                # size regardless of how the user got here.
+                sizes = self._right_splitter.sizes()
+                total = sum(sizes) or self._right_splitter.width()
+                if total <= 0:
+                    self._right_splitter.setSizes(
+                        [800, self._ACCT_PANEL_DEFAULT_W])
+                else:
+                    acct_w = max(
+                        self._ACCT_PANEL_DEFAULT_W, total // 4)
+                    acct_w = min(acct_w, total - 200)
+                    main_w = total - acct_w
+                    self._right_splitter.setSizes([main_w, acct_w])
         self.accounts_panel_visibility_changed.emit(bool(visible))
         # Persist immediately rather than waiting for the splitter
         # debounce — visibility changes are explicit user actions
@@ -1283,5 +1486,16 @@ class FlashTradeView(QWidget):
         """Re-subscribe to live price and wire any new/reconnected workers
         when the tab becomes visible."""
         super().showEvent(event)
-        self._wire_all_workers()
-        self._order_entry.refresh_price_subscription()
+        # Any Python exception raised inside a Qt virtual override
+        # (showEvent is one) trips a Shiboken bug on macOS that turns
+        # the exception into a segfault.  Catch + log here so the app
+        # stays alive and we get a stack trace instead of a crash.
+        try:
+            self._wire_all_workers()
+        except Exception:
+            log.exception("FlashTrade: _wire_all_workers raised in showEvent")
+        try:
+            self._order_entry.refresh_price_subscription()
+        except Exception:
+            log.exception(
+                "FlashTrade: refresh_price_subscription raised in showEvent")

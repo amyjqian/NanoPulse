@@ -91,6 +91,13 @@ class AccountsTableModel(QAbstractTableModel):
         self._aliases: dict[str, str] = config_manager.load_aliases()
         # Buying power tracked separately (not shown as a column in Connections view)
         self._buying_power: dict[str, float] = {}   # account → buying power
+        # Live TWS connection state per connection-label.  Updated by
+        # ConnectionsView when the worker emits ``connection_status_changed``;
+        # consumed by AccountListPanel to dim rows whose worker is offline
+        # and by FlashTradeView during order fan-out to skip them.  Defaults
+        # to "True" for any unknown label so freshly-detected accounts aren't
+        # treated as offline before the first signal lands.
+        self._connected_labels: dict[str, bool] = {}
 
     # ── Qt model interface ────────────────────────────────────────────────────
 
@@ -284,10 +291,41 @@ class AccountsTableModel(QAbstractTableModel):
         for i, row in enumerate(self._table_data):
             self._row_map[(row[COL_CONNECTION], row[COL_ACCOUNT])] = i
             self._acct_to_label[row[COL_ACCOUNT]] = row[COL_CONNECTION]
+        # Drop the connection-state entry too — the label no longer has
+        # any account rows attached to it, so its state is irrelevant.
+        self._connected_labels.pop(label, None)
         # Surviving totals row needs to recompute after removal.
         if self._table_data:
             self._emit_totals_changed(
                 {COL_NET_LIQ, COL_TOTAL_CASH, COL_EXCESS_LIQ, COL_DAILY_PNL})
+
+    # ── Per-label TWS connection state ────────────────────────────────────────
+
+    def set_connection_status(self, label: str, connected: bool) -> None:
+        """Record the live TWS connection state for ``label``.
+
+        Emits ``dataChanged`` on every row whose Connection column matches
+        so views (the Connect-tab accounts table, AccountListPanel) repaint
+        with the new state — AccountListPanel listens to ``dataChanged``
+        already (see ``_on_model_data_changed``)."""
+        prev = self._connected_labels.get(label)
+        if prev == bool(connected):
+            return
+        self._connected_labels[label] = bool(connected)
+        last_col = self.columnCount() - 1
+        for (lbl, _acct), row_idx in self._row_map.items():
+            if lbl == label:
+                tl = self.index(row_idx, 0)
+                br = self.index(row_idx, last_col)
+                self.dataChanged.emit(tl, br, [Qt.ItemDataRole.DisplayRole])
+
+    def is_label_connected(self, label: str | None) -> bool:
+        """True when ``label`` is currently reporting a live TWS
+        connection.  Defaults to True for unknown labels so a brand-new
+        connection isn't dimmed before the first signal arrives."""
+        if not label:
+            return True
+        return self._connected_labels.get(label, True)
 
     # ── Totals row ────────────────────────────────────────────────────────────
 

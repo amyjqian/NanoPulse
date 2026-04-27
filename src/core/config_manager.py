@@ -426,6 +426,100 @@ def save_last_account_group(
     log.debug("Saved last active account group %r to %s", name, p)
 
 
+# ── Hot buttons persistence ──────────────────────────────────────────────────
+
+
+def _normalise_hot_button_leg(leg: Any) -> dict[str, Any]:
+    """Coerce a stored bracket leg into the shape the modal expects:
+    ``{"on": bool, "v": float, "u": "abs"}``.  Legacy ``ticks``/``pct``
+    units are migrated to ``"abs"`` because the only supported unit is
+    now absolute dollar offset.
+    """
+    if not isinstance(leg, dict):
+        return {"on": False, "v": 80.0, "u": "abs"}
+    try:
+        v = float(leg.get("v", 80.0) or 80.0)
+    except (TypeError, ValueError):
+        v = 80.0
+    return {
+        "on": bool(leg.get("on", False)),
+        "v": v,
+        "u": "abs",
+    }
+
+
+def _normalise_hot_button(entry: Any) -> dict[str, Any] | None:
+    """Coerce a stored hot-button entry into the canonical schema.
+    Returns ``None`` for invalid entries (caller drops them silently —
+    persistence will overwrite the corrupt slot on next save)."""
+    if not isinstance(entry, dict):
+        return None
+    side = entry.get("side", "BUY")
+    if side not in ("BUY", "SELL", "FLATTEN", "CANCEL"):
+        return None
+    ord_type = entry.get("ord_type", "LMT")
+    if ord_type not in ("LMT", "MKT"):
+        ord_type = "LMT"
+    anchor = entry.get("anchor", "BID")
+    if anchor not in ("BID", "ASK", "MID"):
+        anchor = "BID"
+    try:
+        offset = int(entry.get("offset", 0) or 0)
+    except (TypeError, ValueError):
+        offset = 0
+    return {
+        "side": side,
+        "group": str(entry.get("group", "__current__") or "__current__"),
+        "symbol": str(entry.get("symbol", "") or ""),
+        "qty": str(entry.get("qty", "") or ""),
+        "ord_type": ord_type,
+        "anchor": anchor,
+        "offset": offset,
+        "label": str(entry.get("label", "") or ""),
+        "tp": _normalise_hot_button_leg(entry.get("tp")),
+        "sl": _normalise_hot_button_leg(entry.get("sl")),
+    }
+
+
+def load_hot_buttons(path: Path | str | None = None) -> list[dict[str, Any]]:
+    """Load the OrderEntry hot-button list.  Returns an ordered list
+    of normalised hot-button dicts (see
+    :func:`_normalise_hot_button`).  Invalid entries are dropped.
+    Returns an empty list when nothing has been persisted yet — the
+    UI starts with just the trailing "+" placeholder in that case.
+    """
+    p = Path(path) if path else _default_path()
+    data = _read_json(p)
+    raw = data.get("hot_buttons", [])
+    if not isinstance(raw, list):
+        return []
+    cleaned: list[dict[str, Any]] = []
+    for entry in raw:
+        normed = _normalise_hot_button(entry)
+        if normed is not None:
+            cleaned.append(normed)
+    return cleaned
+
+
+def save_hot_buttons(
+    buttons: list[dict[str, Any]],
+    path: Path | str | None = None,
+) -> None:
+    """Persist the OrderEntry hot-button list, preserving order.
+    Each entry is renormalised before write so any stale fields from
+    the in-memory dict don't leak to disk."""
+    p = Path(path) if path else _default_path()
+    data = _read_json(p)
+    serialised: list[dict[str, Any]] = []
+    for entry in buttons:
+        normed = _normalise_hot_button(entry)
+        if normed is not None:
+            serialised.append(normed)
+    data["hot_buttons"] = serialised
+    _write_json(p, data)
+    log.debug("Saved %d hot button(s) to %s", len(serialised), p)
+
+
 # ── Preferences persistence ──────────────────────────────────────────────────
 
 

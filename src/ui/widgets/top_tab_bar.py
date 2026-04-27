@@ -6,7 +6,11 @@ dark background, icon + label per tab, accent underline on the active tab.
 """
 from __future__ import annotations
 
-from PySide6.QtWidgets import QWidget, QHBoxLayout, QSizePolicy, QPushButton
+import time
+
+from PySide6.QtWidgets import (
+    QApplication, QHBoxLayout, QPushButton, QSizePolicy, QWidget,
+)
 from PySide6.QtCore import Qt, Signal, QSize
 from PySide6.QtGui import QPainter, QColor, QFont, QPen
 
@@ -230,8 +234,23 @@ class TopTabBar(QWidget):
         children (tab buttons, Account pill, group chip) receive and
         accept their own events, so this handler only fires for
         clicks on the bar's empty regions.
+
+        Guarded with a short debounce window: macOS occasionally
+        delivers the platform's own zoom double-click AND a Qt
+        ``mouseDoubleClickEvent`` for the same gesture, and a burst
+        of rapid clicks can also land two events back-to-back.  We
+        therefore ignore any second toggle that arrives within
+        Qt's ``doubleClickInterval`` of the previous one, which
+        previously caused the window to grow and snap back.
         """
         if event.button() == Qt.MouseButton.LeftButton:
+            interval_ms = max(QApplication.doubleClickInterval(), 300)
+            now_ms = int(time.monotonic() * 1000)
+            last_ms = getattr(self, "_last_zoom_toggle_ms", 0)
+            if now_ms - last_ms < interval_ms:
+                event.accept()
+                return
+            self._last_zoom_toggle_ms = now_ms
             win = self.window()
             if win is not None:
                 if win.isMaximized() or win.isFullScreen():
