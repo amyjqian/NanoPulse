@@ -3402,7 +3402,9 @@ class IBWorkerThread(QThread):
             "exec_id":       exec_id,
             "time":          et_time.strftime("%b%d %H:%M:%S") if et_time else "",
             "time_sort":     et_time.isoformat() if et_time else "",
+            "con_id":        int(getattr(contract, "conId", 0) or 0) if contract else 0,
             "symbol":        getattr(contract, "symbol", "") if contract else "",
+            "local_symbol":  getattr(contract, "localSymbol", "") if contract else "",
             "sec_type":      getattr(contract, "secType", "") if contract else "",
             # Contract multiplier (e.g. "20" for NQ, "2" for MNQ, "" or
             # "1" for stocks).  Stored as float so downstream consumers
