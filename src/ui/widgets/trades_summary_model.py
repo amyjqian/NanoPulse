@@ -56,7 +56,8 @@ S_COL_KEYS: list[str] = [
 # ``NASDAQ`` (an exchange) works the same way in both views — the
 # summary just folds the matching subset into symbol aggregates.
 _FILL_SEARCH_KEYS: tuple[str, ...] = (
-    "symbol", "side", "account", "sec_type", "exchange", "order_ref",
+    "symbol", "local_symbol", "side", "account", "sec_type",
+    "exchange", "order_ref",
 )
 
 _S_NUM_COLS = len(S_HEADERS)
@@ -388,10 +389,28 @@ class TradesSummaryModel(QAbstractTableModel):
 
     @staticmethod
     def _agg_key(fill: dict) -> tuple[str, str]:
-        """Aggregation key: (symbol, sec_type).  A root symbol traded as
-        both a stock and an option (e.g. TSLA) produces two keys so the
-        summary doesn't combine unrelated instruments into one row."""
+        """Aggregation key.  Prefer ``con_id`` so the same contract folds
+        into one row even when IB echoes back ``contract.symbol`` as the
+        local symbol on some fills (e.g. an NQ futures fill arriving with
+        ``symbol="NQM6"`` while sibling fills carry ``symbol="NQ"``).
+        Falls back to ``(symbol, sec_type)`` for legacy fills missing a
+        conId.  A root symbol traded as both a stock and an option (e.g.
+        TSLA) keeps separate rows because each contract has its own conId.
+        """
+        con_id = int(fill.get("con_id", 0) or 0)
+        if con_id > 0:
+            return (f"cid:{con_id}", fill.get("sec_type", "") or "")
         return (fill.get("symbol", "") or "—", fill.get("sec_type", "") or "")
+
+    @staticmethod
+    def _fill_display_symbol(fill: dict) -> str:
+        """Display label for a fill: localSymbol (``NQM6``) when present,
+        else the root symbol (``NQ``).  Matches the orders blotter and
+        positions view so the same contract reads identically across
+        every panel."""
+        return (fill.get("local_symbol", "")
+                or fill.get("symbol", "")
+                or "—")
 
     def add_fill(self, fill: dict) -> None:
         """Fold a flattened fill into its symbol aggregate, or refresh in
@@ -454,7 +473,7 @@ class TradesSummaryModel(QAbstractTableModel):
                 self.beginInsertRows(QModelIndex(), 0, 1)
             else:
                 self.beginInsertRows(QModelIndex(), n, n)
-            self._agg[key] = self._empty_agg(key)
+            self._agg[key] = self._empty_agg(fill)
             self._order.append(key)
             self.endInsertRows()
 
@@ -638,7 +657,7 @@ class TradesSummaryModel(QAbstractTableModel):
                 continue
             key = self._agg_key(fill)
             if key not in self._agg:
-                self._agg[key] = self._empty_agg(key)
+                self._agg[key] = self._empty_agg(fill)
                 self._order.append(key)
             self._add_to_agg(key, fill)
         self.endResetModel()
@@ -646,11 +665,10 @@ class TradesSummaryModel(QAbstractTableModel):
     # ── Internal aggregation helpers ────────────────────────────────────────
 
     @staticmethod
-    def _empty_agg(key: tuple[str, str]) -> dict:
-        symbol, sec_type = key
+    def _empty_agg(fill: dict) -> dict:
         return {
-            "symbol": symbol,
-            "sec_type": sec_type,
+            "symbol": TradesSummaryModel._fill_display_symbol(fill),
+            "sec_type": fill.get("sec_type", "") or "",
             "buys_qty": 0.0,
             "sells_qty": 0.0,
             # Price-weighted notionals — kept in per-point terms so
@@ -672,6 +690,13 @@ class TradesSummaryModel(QAbstractTableModel):
 
     def _add_to_agg(self, key: tuple[str, str], fill: dict) -> None:
         agg = self._agg[key]
+        # Upgrade the display label only when a later fill carries a
+        # populated localSymbol that the initial fill lacked — this keeps
+        # the row's label in sync with orders/positions without ever
+        # downgrading a localSymbol back to a bare root.
+        local = fill.get("local_symbol", "") or ""
+        if local and agg.get("symbol", "") != local:
+            agg["symbol"] = local
         side = fill.get("side", "")
         shares = float(fill.get("shares", 0.0) or 0.0)
         price = float(fill.get("price", 0.0) or 0.0)

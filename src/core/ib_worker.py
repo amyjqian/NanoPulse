@@ -158,6 +158,56 @@ def _symbol_matches(contract, query_upper: str) -> bool:
     return query_upper in (local, root)
 
 
+def _contract_to_dict(contract) -> dict:
+    """Snapshot an ib_async ``Contract`` into a saved-contract-shaped dict.
+
+    Used by flatten / reverse / close-pct so the UI can route the offsetting
+    order against the *position's actual contract* — critical when the user
+    has rolled their saved contract row to the next expiration (e.g. NQU6)
+    but still holds an open position on the previous one (e.g. NQM6).  The
+    saved-contract lookup would miss in that case; this preserves the
+    in-flight contract identity end-to-end.
+
+    ``exchange`` requires a fallback because ``ib.positions()`` returns
+    Contract objects with an empty exchange field — placeOrder then fails
+    with Warning 321 "Missing order exchange".  We pull the exchange (and
+    other routing fields that share the same gap) from the in-memory
+    contracts cache, matched by root symbol since exchange is constant
+    across expirations of the same root.
+    """
+    d = {
+        "conid":        int(getattr(contract, "conId", 0) or 0),
+        "symbol":       getattr(contract, "symbol", "") or "",
+        "sec_type":     getattr(contract, "secType", "") or "",
+        "exchange":     (getattr(contract, "exchange", "")
+                         or getattr(contract, "primaryExchange", "")
+                         or ""),
+        "currency":     getattr(contract, "currency", "") or "",
+        "local_symbol": getattr(contract, "localSymbol", "") or "",
+        "expiry":       getattr(contract, "lastTradeDateOrContractMonth", "") or "",
+        "multiplier":   getattr(contract, "multiplier", "") or "",
+    }
+    if not d["exchange"]:
+        try:
+            from src.core.reference_data import get_instance as _rd
+            rd = _rd()
+            # Try the root symbol first (what the saved-contracts cache
+            # is keyed by), then fall back to the local symbol.
+            cached = (rd.pick_active_contract(d["symbol"])
+                      or rd.pick_active_contract(d["local_symbol"]))
+            if cached:
+                if not d["exchange"] and cached.get("exchange"):
+                    d["exchange"] = cached["exchange"]
+                if not d["currency"] and cached.get("currency"):
+                    d["currency"] = cached["currency"]
+                if not d["multiplier"] and cached.get("multiplier"):
+                    d["multiplier"] = cached["multiplier"]
+        except Exception:
+            log.debug("_contract_to_dict: ReferenceData fallback failed",
+                      exc_info=True)
+    return d
+
+
 class IBWorkerThread(QThread):
     """One thread ↔ one TWS/Gateway connection."""
 
@@ -1890,12 +1940,16 @@ class IBWorkerThread(QThread):
                            self._label, action, symbol, qty, account)
 
             # Emit to UI thread — the UI will route through the normal
-            # order-placement path (limit cap, RTH, prefs, etc.).
+            # order-placement path (limit cap, RTH, prefs, etc.).  Include
+            # the position's contract so the UI can build the order without
+            # depending on the saved-contracts DB matching the open position
+            # (the user may have rolled their saved row to a later expiry).
             self.flatten_close_needed.emit({
                 "symbol":  symbol,
                 "account": account,
                 "action":  action,
                 "qty":     qty,
+                "_resolved_contract": _contract_to_dict(contract),
             })
 
     async def _do_reverse(self, symbol: str, account: str) -> None:
@@ -1950,12 +2004,14 @@ class IBWorkerThread(QThread):
                            int(net_pos), account)
 
             # Emit to UI thread — the UI will route through the normal
-            # order-placement path (limit cap, RTH, prefs, etc.).
+            # order-placement path (limit cap, RTH, prefs, etc.).  See
+            # _do_flatten for why _resolved_contract is included.
             self.reverse_close_needed.emit({
                 "symbol":  symbol,
                 "account": account,
                 "action":  action,
                 "qty":     qty,
+                "_resolved_contract": _contract_to_dict(contract),
             })
 
     async def _do_close_pct(self, symbol: str, account: str, pct: int) -> None:
@@ -2007,11 +2063,13 @@ class IBWorkerThread(QThread):
                            int(net_pos), account)
 
             # Reuse flatten_close_needed — same data shape, same UI handling.
+            # See _do_flatten for why _resolved_contract is included.
             self.flatten_close_needed.emit({
                 "symbol":  symbol,
                 "account": account,
                 "action":  action,
                 "qty":     qty,
+                "_resolved_contract": _contract_to_dict(contract),
             })
 
     async def _do_close_tier(self, symbol: str, account: str, side: str,
@@ -3402,7 +3460,9 @@ class IBWorkerThread(QThread):
             "exec_id":       exec_id,
             "time":          et_time.strftime("%b%d %H:%M:%S") if et_time else "",
             "time_sort":     et_time.isoformat() if et_time else "",
+            "con_id":        int(getattr(contract, "conId", 0) or 0) if contract else 0,
             "symbol":        getattr(contract, "symbol", "") if contract else "",
+            "local_symbol":  getattr(contract, "localSymbol", "") if contract else "",
             "sec_type":      getattr(contract, "secType", "") if contract else "",
             # Contract multiplier (e.g. "20" for NQ, "2" for MNQ, "" or
             # "1" for stocks).  Stored as float so downstream consumers

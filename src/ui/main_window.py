@@ -154,6 +154,13 @@ class MainWindow(QWidget):
         self._contracts_view.contracts_changed.connect(
             self._flash_trade._order_entry._refresh_combo_items
         )
+        # Contract deletion that disabled or rolled hot-button symbols
+        # writes the new list to disk via config_manager.save_hot_buttons.
+        # Reload here so the OrderEntry grid greys out / re-points the
+        # affected cells without requiring an app restart.
+        self._contracts_view.hot_buttons_changed.connect(
+            self._flash_trade._order_entry.reload_hot_buttons
+        )
 
         # ── Account pill toggles the Account Management panel ───────────────
         # The pill is always visible.  Click toggles the panel; when

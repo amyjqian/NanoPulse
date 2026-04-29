@@ -150,7 +150,9 @@ class TradesModel(QAbstractTableModel):
         if col == COL_TIME:
             return row.get("time", "") or ""
         if col == COL_SYMBOL:
-            return row.get("symbol", "") or ""
+            # Prefer localSymbol ("NQM6") over root symbol ("NQ") so the
+            # trades blotter matches the orders blotter and positions view.
+            return row.get("local_symbol", "") or row.get("symbol", "") or ""
         if col == COL_SECTYPE:
             return row.get("sec_type", "") or ""
         if col == COL_SIDE:

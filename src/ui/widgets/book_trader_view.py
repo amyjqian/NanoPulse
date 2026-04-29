@@ -286,7 +286,10 @@ class BookTraderView(QWidget):
             [(s, _sec_type_for(s)) for s in self._symbols])
         root.addWidget(self._chip_bar)
 
-        root.addSpacing(12)
+        # Symbol-chip bar → qty-chip row gap.  Tightened from 12 px to
+        # 7 px (3/5) to match the OrderEntry panel and tighten the
+        # visual cluster.
+        root.addSpacing(7)
 
         # ── Qty chip row ──────────────────────────────────────────────────────
         self._qty_row = QtyChipRow()
@@ -327,11 +330,10 @@ class BookTraderView(QWidget):
             f"font-size: 10px; font-family: 'Helvetica Neue', Arial; "
             f"font-weight: bold;"
         )
-        self._lbl_bid_hdr = QLabel("BID<br>SZ")
-        self._lbl_bid_hdr.setTextFormat(Qt.TextFormat.RichText)
+        self._lbl_bid_hdr = QLabel("Bid Size")
         self._lbl_bid_hdr.setStyleSheet(_hdr_ss)
         self._lbl_bid_hdr.setAlignment(
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self._lbl_bid_hdr.setCursor(Qt.CursorShape.PointingHandCursor)
         self._lbl_bid_hdr.setToolTip("Double-click to recentre ladder")
         self._lbl_bid_hdr.mouseDoubleClickEvent = (  # type: ignore[method-assign]
@@ -349,18 +351,31 @@ class BookTraderView(QWidget):
             f"color:{Theme.TEXT};selection-background-color:#3a3f50}}")
         self._cmb_tick.currentTextChanged.connect(self._on_tick_changed)
 
-        # Lock button — when locked (default) the ladder auto-scrolls so
-        # the last-price row stays centred in the viewport on every
-        # tick.  Unlock to scroll the ladder manually without the view
-        # yanking back to the centre.  Closed-padlock SVG when locked,
-        # open-padlock SVG when unlocked (see _on_lock_toggled).
+        # Lock button — when locked the ladder auto-scrolls so the
+        # last-price row stays centred in the viewport on every tick.
+        # Unlock to scroll the ladder manually without the view yanking
+        # back to the centre.  Closed-padlock SVG when locked, open-
+        # padlock SVG when unlocked (see _on_lock_toggled).
+        # Initial state: persisted user choice (defaults to UNLOCKED on
+        # first launch).  setChecked() runs before .toggled is wired so
+        # the load doesn't fire the save callback.
         self._icon_lock_closed = QIcon(_LOCK_CLOSED_ICON)
         self._icon_lock_open = QIcon(_LOCK_OPEN_ICON)
+        try:
+            self._initial_lock_state: bool = (
+                config_manager.load_book_trader_lock_state())
+        except Exception:
+            log.debug(
+                "BookTrader: could not read persisted lock state, "
+                "defaulting to unlocked", exc_info=True)
+            self._initial_lock_state = False
         self._btn_lock = QPushButton()
-        self._btn_lock.setIcon(self._icon_lock_closed)
+        self._btn_lock.setIcon(
+            self._icon_lock_closed if self._initial_lock_state
+            else self._icon_lock_open)
         self._btn_lock.setIconSize(QSize(16, 16))
         self._btn_lock.setCheckable(True)
-        self._btn_lock.setChecked(True)
+        self._btn_lock.setChecked(self._initial_lock_state)
         self._btn_lock.setFixedSize(28, 24)
         self._btn_lock.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_lock.setToolTip(
@@ -375,11 +390,10 @@ class BookTraderView(QWidget):
             f"border-color:{Theme.ACCENT}}}")
         self._btn_lock.toggled.connect(self._on_lock_toggled)
 
-        self._lbl_ask_hdr = QLabel("ASK<br>SZ")
-        self._lbl_ask_hdr.setTextFormat(Qt.TextFormat.RichText)
+        self._lbl_ask_hdr = QLabel("Ask Size")
         self._lbl_ask_hdr.setStyleSheet(_hdr_ss)
         self._lbl_ask_hdr.setAlignment(
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         # Centre cell groups the tick-aggregation combo and the lock
         # button side-by-side under a single stretch slot; outer cells
@@ -396,6 +410,12 @@ class BookTraderView(QWidget):
 
         # ── DOM ladder ────────────────────────────────────────────────────────
         self._ladder = DOMLadderView(model=self._model)
+        # Sync the ladder's internal lock flag with the persisted button
+        # state.  DOMLadderView defaults its _locked to True; if the user
+        # last left the lock OFF, push that through immediately so the
+        # initial behaviour matches the displayed icon without waiting
+        # for the user to click the button.
+        self._ladder.set_locked(self._initial_lock_state)
         root.addWidget(self._ladder, stretch=1)
         # Hover badge content — ``Buy {qty}`` / ``Sell {qty}`` plus a
         # second line listing armed TP / SL / TS amounts so the trader
@@ -421,9 +441,16 @@ class BookTraderView(QWidget):
         # The widgets themselves were created earlier (so the ARMED
         # strip above could connect to their ``changed`` signal); here
         # we just lay them out at the bottom of the root column.
-        root.addWidget(self._pt_section)
-        root.addWidget(self._sl_section)
-        root.addWidget(self._tr_section)
+        # Wrap in a sub-VBox with tighter spacing (root uses 8 px; we
+        # halve it to 4 px) so TP / SL / Trail read as a connected
+        # cluster without affecting the surrounding gaps.
+        tier_box = QVBoxLayout()
+        tier_box.setContentsMargins(0, 0, 0, 0)
+        tier_box.setSpacing(4)
+        tier_box.addWidget(self._pt_section)
+        tier_box.addWidget(self._sl_section)
+        tier_box.addWidget(self._tr_section)
+        root.addLayout(tier_box)
 
     def _wire_internals(self) -> None:
         # Ticker strip "+" button → our searchable add-symbol popup.
@@ -793,10 +820,17 @@ class BookTraderView(QWidget):
 
         The button icon flips between closed-padlock (locked) and
         open-padlock (unlocked) so the affordance matches the state.
+        Persists the choice so the next app launch restores it.
         """
         self._btn_lock.setIcon(
             self._icon_lock_closed if locked else self._icon_lock_open)
         self._ladder.set_locked(locked)
+        try:
+            config_manager.save_book_trader_lock_state(locked)
+        except Exception:
+            log.warning(
+                "BookTrader: could not persist lock state %s",
+                locked, exc_info=True)
 
     def _populate_tick_combo(self) -> None:
         """Fill the tick-aggregation combo with sec-type-appropriate

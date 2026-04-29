@@ -430,13 +430,15 @@ class DOMLadderDelegate(QStyledItemDelegate):
     price cell with above/below-last colouring plus a last-row highlight
     and tick-direction glyph."""
 
-    _ROW_H = 16
-    _NUMERIC_FONT = QFont("Menlo, Consolas, monospace", 9)
-    _PRICE_FONT = QFont("Menlo, Consolas, monospace", 10)
+    # Row height bumped along with the font sizes (was 16) so the
+    # taller text has comfortable vertical breathing room.
+    _ROW_H = 18
+    _NUMERIC_FONT = QFont("Menlo, Consolas, monospace", 10)
+    _PRICE_FONT = QFont("Menlo, Consolas, monospace", 11)
     _PRICE_FONT.setWeight(QFont.Weight.Bold)
-    _LAST_ARROW_FONT = QFont("Helvetica Neue, Arial", 9)
+    _LAST_ARROW_FONT = QFont("Helvetica Neue, Arial", 10)
     _LAST_ARROW_FONT.setWeight(QFont.Weight.Bold)
-    _TRADE_STRIPE_FONT = QFont("Helvetica Neue, Arial", 9)
+    _TRADE_STRIPE_FONT = QFont("Helvetica Neue, Arial", 10)
     _TRADE_STRIPE_FONT.setWeight(QFont.Weight.Bold)
 
     def paint(self, painter: QPainter, option, index) -> None:
@@ -684,6 +686,13 @@ class DOMLadderView(QTableView):
             f"border-radius:4px;gridline-color:{Theme.BORDER}}}"
             f"QTableView::item{{padding:0px;border:none}}")
 
+        # 3-column DOM layout — BID on the left, PRICE fixed in the
+        # centre at just enough width to fit a typical price string,
+        # ASK on the right.  BID and ASK use Stretch so the depth bars
+        # claim every spare pixel; the centre PRICE cell stays the same
+        # width across all rows (no jitter as the price string changes
+        # length on tick updates) and acts as the unambiguous click
+        # target — a stable visual anchor between the two size columns.
         # Stretch all three columns to fill the view width equally — the
         # view sits inside a parent layout that can be wider than the
         # columns' natural size; without Stretch the ladder would have
@@ -754,11 +763,27 @@ class DOMLadderView(QTableView):
     def _side_at(pos, col: int, cell_rect) -> str | None:
         """Return ``"BUY"`` / ``"SELL"`` for *pos* over a cell at
         *col* with bounding *cell_rect*, mirroring the click logic.
-        ``None`` for cells/positions that don't trade."""
+        ``None`` for cells/positions that don't trade.
+
+        Hit zone is a contiguous band through the centre of the row —
+        the inner halves of the size cells plus the full price cell.
+        The outer halves of bid / ask are excluded so a stray click on
+        a depth bar far from the price column doesn't submit an order:
+
+          * right half of bid-size cell → BUY
+          * left  half of price cell    → BUY
+          * right half of price cell    → SELL
+          * left  half of ask-size cell → SELL
+
+        Outer halves of bid / ask return ``None`` (no hover badge, no
+        order on click).
+        """
         if col == COL_BID_SZ:
-            return "BUY"
+            # Inner (right) half of bid size cell.
+            return "BUY" if pos.x() >= cell_rect.center().x() else None
         if col == COL_ASK_SZ:
-            return "SELL"
+            # Inner (left) half of ask size cell.
+            return "SELL" if pos.x() < cell_rect.center().x() else None
         if col == COL_PRICE:
             return "BUY" if pos.x() < cell_rect.center().x() else "SELL"
         return None
@@ -843,18 +868,11 @@ class DOMLadderView(QTableView):
         super().leaveEvent(event)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
-        """Route clicks to BUY / SELL limit orders:
-
-        * bid-size cell   → BUY LMT at that row's price
-        * ask-size cell   → SELL LMT at that row's price
-        * price cell      → split horizontally:
-                              left half  → BUY  LMT at that price
-                              right half → SELL LMT at that price
-
-        This mirrors what most pro DOM ladders do — a single click
-        anywhere on the ladder submits an order at the row's price,
-        and the horizontal side picks the direction.
-        """
+        """Route clicks to BUY / SELL limit orders.  Whole row is
+        clickable; the L/R split goes through the price cell's
+        centre — see :meth:`_side_at` for the exact rule, which the
+        hover badge uses too so the affordance always matches the
+        click."""
         pos = event.position().toPoint()
         idx = self.indexAt(pos)
         if idx.isValid():
@@ -862,17 +880,13 @@ class DOMLadderView(QTableView):
             col = idx.column()
             prices = self._model.prices
             if 0 <= row < len(prices):
-                price = float(prices[row])
-                if col == COL_BID_SZ:
-                    self.ladder_clicked.emit("BUY", price)
-                elif col == COL_ASK_SZ:
-                    self.ladder_clicked.emit("SELL", price)
-                elif col == COL_PRICE:
-                    rect = self.visualRect(idx)
-                    if pos.x() < rect.center().x():
-                        self.ladder_clicked.emit("BUY", price)
-                    else:
-                        self.ladder_clicked.emit("SELL", price)
+                # Reuse the same rule the hover badge uses so the
+                # affordance and the action stay in lock-step.
+                rect = self.visualRect(idx)
+                side = self._side_at(pos, col, rect)
+                if side is not None:
+                    price = float(prices[row])
+                    self.ladder_clicked.emit(side, price)
         super().mousePressEvent(event)
 
     def _scroll_to_last(self) -> None:

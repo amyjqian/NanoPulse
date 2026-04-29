@@ -332,14 +332,19 @@ class FlashTradeView(QWidget):
             log.warning("FlashTrade: no symbol in order payload – aborting")
             return
 
-        contracts = config_manager.load_contracts()
-        contract = None
-        q = symbol.upper()
-        for c in contracts:
-            if (c.get("symbol", "").upper() == q
-                    or c.get("local_symbol", "").upper() == q):
-                contract = c
-                break
+        # Flatten / reverse / close-pct flows pre-resolve the contract from
+        # the live position itself so the order routes correctly even when
+        # the user's saved-contracts row has been rolled to a later
+        # expiration (e.g. position on NQM6, saved row already on NQU6).
+        contract = payload.get("_resolved_contract")
+        if not contract:
+            # Buy/Sell entry from the order panel — resolve from saved
+            # contracts.  pick_active_contract handles multi-expiry roots
+            # (NQM6 + NQU6 both saved as "NQ") by picking the soonest
+            # non-expired contract; an exact local_symbol match still
+            # pins to that specific contract.
+            from src.core.reference_data import get_instance as _rd
+            contract = _rd().pick_active_contract(symbol)
 
         if not contract:
             log.warning(
@@ -467,10 +472,18 @@ class FlashTradeView(QWidget):
 
             params = {
                 "conid": int(conid),
-                "symbol": symbol,
+                # Use the resolved contract's root symbol — payload's
+                # ``symbol`` may be a local symbol (e.g. flatten on NQM6
+                # passes "NQM6"), and IB expects the bare root in
+                # contract.symbol with localSymbol carrying the expiry
+                # code separately.
+                "symbol": contract.get("symbol", "") or symbol,
                 "sec_type": contract.get("sec_type", ""),
-                "exchange": contract.get("exchange", "SMART"),
-                "currency": contract.get("currency", "USD"),
+                # `or "SMART"` rather than .get(..., "SMART") because the
+                # key may be present-but-empty (positions returned from
+                # ib.positions() carry exchange="" until enriched).
+                "exchange": contract.get("exchange") or "SMART",
+                "currency": contract.get("currency") or "USD",
                 "local_symbol": contract.get("local_symbol", ""),
                 "expiry": contract.get("expiry", ""),
                 "multiplier": contract.get("multiplier", ""),
@@ -946,7 +959,10 @@ class FlashTradeView(QWidget):
 
         # Build the same payload that _emit_order("BUY"/"SELL", "MKT")
         # would produce, then feed it through _on_order_requested which
-        # applies limit cap, RTH, prefs, etc.
+        # applies limit cap, RTH, prefs, etc.  Forward _resolved_contract
+        # from the worker so the offsetting order routes against the
+        # position's actual contract (necessary when the saved-contracts
+        # DB has been rolled to a later expiration).
         payload = {
             "action": action,
             "type": "MKT",
@@ -956,6 +972,8 @@ class FlashTradeView(QWidget):
             # Force to a single account — override normal "all checked" logic
             "_flatten_account": account,
         }
+        if data.get("_resolved_contract"):
+            payload["_resolved_contract"] = data["_resolved_contract"]
         log.info("FlashTrade: flatten close → routing %s %d %s @MKT "
                  "account=%s last=%.4f through normal order path",
                  action, qty, symbol, account, last_price)
@@ -1026,6 +1044,8 @@ class FlashTradeView(QWidget):
             # Force to a single account — override normal "all checked" logic
             "_flatten_account": account,
         }
+        if data.get("_resolved_contract"):
+            payload["_resolved_contract"] = data["_resolved_contract"]
         log.info("FlashTrade: reverse close → routing %s %d %s @MKT "
                  "account=%s last=%.4f through normal order path",
                  action, qty, symbol, account, last_price)

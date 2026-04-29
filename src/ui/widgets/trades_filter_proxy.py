@@ -79,7 +79,8 @@ def _try_parse_time_query(text: str) -> datetime | None:
 # Flat view: every common identifying column a user might type.
 # Summary view: symbol + the exchanges set (so "nasdaq" / "cme" filter).
 _SEARCH_KEYS_FLAT = (
-    "symbol", "side", "account", "sec_type", "exchange", "order_ref",
+    "symbol", "local_symbol", "side", "account", "sec_type",
+    "exchange", "order_ref",
 )
 _SEARCH_KEYS_SUMMARY = ("symbol", "sec_type", "exchanges")
 

@@ -290,6 +290,31 @@ def save_book_trader_active_symbol(
     log.debug("Saved active book-trader symbol %r to %s", symbol, p)
 
 
+def load_book_trader_lock_state(path: Path | str | None = None) -> bool:
+    """Return the persisted Book Trader ladder-lock state.
+
+    Defaults to ``False`` (unlocked) on first launch so the user is not
+    surprised by auto-scrolling on a fresh install.  Once the user
+    toggles the lock, ``save_book_trader_lock_state`` persists their
+    choice so subsequent launches respect it.
+    """
+    p = Path(path) if path else _default_path()
+    data = _read_json(p)
+    return bool(data.get("book_trader_lock_state", False))
+
+
+def save_book_trader_lock_state(
+    locked: bool,
+    path: Path | str | None = None,
+) -> None:
+    """Persist the Book Trader ladder-lock state."""
+    p = Path(path) if path else _default_path()
+    data = _read_json(p)
+    data["book_trader_lock_state"] = bool(locked)
+    _write_json(p, data)
+    log.debug("Saved book-trader lock state %s to %s", bool(locked), p)
+
+
 # ── Account-list panel state persistence ──────────────────────────────────────
 
 
@@ -478,6 +503,11 @@ def _normalise_hot_button(entry: Any) -> dict[str, Any] | None:
         "label": str(entry.get("label", "") or ""),
         "tp": _normalise_hot_button_leg(entry.get("tp")),
         "sl": _normalise_hot_button_leg(entry.get("sl")),
+        # Set when a saved contract referenced by this button is deleted
+        # without a replacement.  Disabled buttons render greyed-out and
+        # ignore clicks until the user re-edits them or a replacement
+        # contract is added.
+        "disabled": bool(entry.get("disabled", False)),
     }
 
 

@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from PySide6.QtCore import QObject, Signal
 
@@ -25,6 +27,38 @@ log = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _STRATEGY_DB  = _PROJECT_ROOT / "data" / "strategy_tiers.db"
+_ET = ZoneInfo("America/New_York")
+
+
+def _parse_expiry_date(expiry: str) -> date | None:
+    """Parse a contract expiry string into a calendar date.
+
+    IB returns ``lastTradeDateOrContractMonth`` in two shapes —
+    ``YYYYMMDD`` for daily-precision expiries (most futures) and
+    ``YYYYMM`` for month-precision (some commodity contracts).  For the
+    monthly form we treat the expiry as the last day of that month so a
+    "soonest non-expired" comparison still does the right thing on the
+    final session of the month.  Returns ``None`` for empty / unparseable
+    input — the caller treats that as "expiry unknown".
+    """
+    if not expiry:
+        return None
+    s = str(expiry).strip()
+    if len(s) == 8 and s.isdigit():
+        try:
+            return date(int(s[0:4]), int(s[4:6]), int(s[6:8]))
+        except ValueError:
+            return None
+    if len(s) == 6 and s.isdigit():
+        try:
+            year, month = int(s[0:4]), int(s[4:6])
+            if month == 12:
+                return date(year, 12, 31)
+            from calendar import monthrange
+            return date(year, month, monthrange(year, month)[1])
+        except ValueError:
+            return None
+    return None
 
 _ORDER_TYPES: tuple[str, ...] = ("take_profit", "stop_loss", "stop", "trailing")
 
@@ -103,9 +137,71 @@ class ReferenceData(QObject):
         return self.multipliers.get(symbol.upper(), 1.0)
 
     def get_contract(self, symbol: str) -> dict[str, Any] | None:
-        """Return the first saved contract row for *symbol*, or None."""
-        rows = self.contracts_by_symbol.get(symbol.upper(), [])
-        return rows[0] if rows else None
+        """Return the active saved contract for *symbol*, or None.
+
+        For futures with multiple saved expirations under the same root
+        (e.g. ``NQM6`` and ``NQU6`` both under ``"NQ"``), this picks the
+        soonest non-expired contract — i.e. the rollover-aware "front
+        month".  For stocks, options, or symbols with a single saved
+        contract, returns that one row.  An exact ``local_symbol`` match
+        always wins over a root match so the caller can pin to a
+        specific expiry by typing its local symbol (e.g. ``"NQM6"``).
+        """
+        return self.pick_active_contract(symbol)
+
+    def pick_active_contract(self, query: str) -> dict[str, Any] | None:
+        """Resolve *query* (root symbol or local symbol) to one contract.
+
+        Resolution rules
+        ----------------
+        1. If any saved contract's ``local_symbol`` equals *query*
+           exactly, return that contract — the user has pinned a
+           specific expiry.
+        2. Otherwise filter saved contracts whose ``symbol`` equals
+           *query*.  For non-FUT or single-row results, return the first
+           match (preserves prior behaviour).
+        3. For FUT with multiple matches, return the contract with the
+           soonest ``expiry`` that is still ≥ today (US/Eastern).  If
+           every saved expiry has already passed, return the one with
+           the latest expiry (so the order routes somewhere — IB will
+           reject an expired contract with a clear error rather than
+           the app silently picking nothing).
+        """
+        if not query:
+            return None
+        q = query.upper().strip()
+
+        for c in self.contracts:
+            if (c.get("local_symbol", "") or "").upper().strip() == q:
+                return c
+
+        rows = self.contracts_by_symbol.get(q, [])
+        if not rows:
+            return None
+        if len(rows) == 1:
+            return rows[0]
+        if (rows[0].get("sec_type", "") or "").upper() != "FUT":
+            return rows[0]
+
+        today = datetime.now(_ET).date()
+        future_rows: list[tuple[date, dict]] = []
+        all_rows: list[tuple[date | None, dict]] = []
+        for c in rows:
+            d = _parse_expiry_date(c.get("expiry", ""))
+            all_rows.append((d, c))
+            if d is not None and d >= today:
+                future_rows.append((d, c))
+        if future_rows:
+            future_rows.sort(key=lambda t: t[0])
+            return future_rows[0][1]
+        # All expired (or no expiry data).  Prefer the row with the
+        # latest expiry; fall back to the first row when no row carries
+        # parseable expiry data.
+        dated = [(d, c) for d, c in all_rows if d is not None]
+        if dated:
+            dated.sort(key=lambda t: t[0], reverse=True)
+            return dated[0][1]
+        return rows[0]
 
     # ── Strategy Tiers ────────────────────────────────────────────────────────
 
