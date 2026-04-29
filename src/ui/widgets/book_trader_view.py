@@ -286,7 +286,10 @@ class BookTraderView(QWidget):
             [(s, _sec_type_for(s)) for s in self._symbols])
         root.addWidget(self._chip_bar)
 
-        root.addSpacing(12)
+        # Symbol-chip bar → qty-chip row gap.  Tightened from 12 px to
+        # 7 px (3/5) to match the OrderEntry panel and tighten the
+        # visual cluster.
+        root.addSpacing(7)
 
         # ── Qty chip row ──────────────────────────────────────────────────────
         self._qty_row = QtyChipRow()
@@ -440,9 +443,16 @@ class BookTraderView(QWidget):
         # The widgets themselves were created earlier (so the ARMED
         # strip above could connect to their ``changed`` signal); here
         # we just lay them out at the bottom of the root column.
-        root.addWidget(self._pt_section)
-        root.addWidget(self._sl_section)
-        root.addWidget(self._tr_section)
+        # Wrap in a sub-VBox with tighter spacing (root uses 8 px; we
+        # halve it to 4 px) so TP / SL / Trail read as a connected
+        # cluster without affecting the surrounding gaps.
+        tier_box = QVBoxLayout()
+        tier_box.setContentsMargins(0, 0, 0, 0)
+        tier_box.setSpacing(4)
+        tier_box.addWidget(self._pt_section)
+        tier_box.addWidget(self._sl_section)
+        tier_box.addWidget(self._tr_section)
+        root.addLayout(tier_box)
 
     def _wire_internals(self) -> None:
         # Ticker strip "+" button → our searchable add-symbol popup.

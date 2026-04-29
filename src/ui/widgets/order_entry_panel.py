@@ -3083,7 +3083,10 @@ class OrderEntryPanel(QWidget):
         sym_container.setLayout(self._sym_grid)
         root.addWidget(sym_container)
 
-        root.addSpacing(12)
+        # Symbol-chip grid → qty-chip row gap.  Tightened from 12 px
+        # to 7 px (3/5) so the two strips read as a more connected
+        # cluster without losing the visual separation.
+        root.addSpacing(7)
 
         # ── Quantity buttons row ──────────────────────────────────────────────
         self._qty_layout = QHBoxLayout()
@@ -3213,9 +3216,17 @@ class OrderEntryPanel(QWidget):
         # The widgets themselves were created earlier (so the ARMED strip
         # could connect to their ``changed`` signal); here we just lay
         # them out at the bottom of the root column.
-        root.addWidget(self._pt_section)
-        root.addWidget(self._sl_section)
-        root.addWidget(self._tr_section)
+        # Wrap the three tier sections in their own VBox with tighter
+        # spacing (root layout uses 8 px between siblings; here we
+        # halve it to 4 px so TP / SL / Trail read as a connected
+        # cluster) without affecting the surrounding gaps.
+        tier_box = QVBoxLayout()
+        tier_box.setContentsMargins(0, 0, 0, 0)
+        tier_box.setSpacing(4)
+        tier_box.addWidget(self._pt_section)
+        tier_box.addWidget(self._sl_section)
+        tier_box.addWidget(self._tr_section)
+        root.addLayout(tier_box)
 
         # ── Hot buttons ───────────────────────────────────────────────────────
         # User-defined one-click order shortcuts.  Layout grows as the
