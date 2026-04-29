@@ -330,11 +330,10 @@ class BookTraderView(QWidget):
             f"font-size: 10px; font-family: 'Helvetica Neue', Arial; "
             f"font-weight: bold;"
         )
-        self._lbl_bid_hdr = QLabel("BID<br>SZ")
-        self._lbl_bid_hdr.setTextFormat(Qt.TextFormat.RichText)
+        self._lbl_bid_hdr = QLabel("Bid Size")
         self._lbl_bid_hdr.setStyleSheet(_hdr_ss)
         self._lbl_bid_hdr.setAlignment(
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self._lbl_bid_hdr.setCursor(Qt.CursorShape.PointingHandCursor)
         self._lbl_bid_hdr.setToolTip("Double-click to recentre ladder")
         self._lbl_bid_hdr.mouseDoubleClickEvent = (  # type: ignore[method-assign]
@@ -391,11 +390,10 @@ class BookTraderView(QWidget):
             f"border-color:{Theme.ACCENT}}}")
         self._btn_lock.toggled.connect(self._on_lock_toggled)
 
-        self._lbl_ask_hdr = QLabel("ASK<br>SZ")
-        self._lbl_ask_hdr.setTextFormat(Qt.TextFormat.RichText)
+        self._lbl_ask_hdr = QLabel("Ask Size")
         self._lbl_ask_hdr.setStyleSheet(_hdr_ss)
         self._lbl_ask_hdr.setAlignment(
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         # Centre cell groups the tick-aggregation combo and the lock
         # button side-by-side under a single stretch slot; outer cells
