@@ -27,7 +27,7 @@ from __future__ import annotations
 from typing import Callable, Literal
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPoint, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter
+from PySide6.QtGui import QColor, QFont, QPainter
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHeaderView,
@@ -693,16 +693,12 @@ class DOMLadderView(QTableView):
         # width across all rows (no jitter as the price string changes
         # length on tick updates) and acts as the unambiguous click
         # target — a stable visual anchor between the two size columns.
+        # Stretch all three columns to fill the view width equally — the
+        # view sits inside a parent layout that can be wider than the
+        # columns' natural size; without Stretch the ladder would have
+        # dead space to the right of the ASK column.
         hh = self.horizontalHeader()
-        price_metrics = QFontMetrics(DOMLadderDelegate._PRICE_FONT)
-        # "999,999.99" is wider than any realistic instrument price we
-        # render at 2-decimal precision; the +20 px padding leaves room
-        # for the last-trade size stripe and tick-direction glyph.
-        price_col_w = price_metrics.horizontalAdvance("999,999.99") + 20
-        hh.setSectionResizeMode(COL_BID_SZ, QHeaderView.ResizeMode.Stretch)
-        hh.setSectionResizeMode(COL_PRICE, QHeaderView.ResizeMode.Fixed)
-        hh.setSectionResizeMode(COL_ASK_SZ, QHeaderView.ResizeMode.Stretch)
-        self.setColumnWidth(COL_PRICE, price_col_w)
+        hh.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         # No visible scrollbar — the 41-row ladder still scrolls via
         # mouse wheel / trackpad, but the bar itself is hidden so the
@@ -769,11 +765,25 @@ class DOMLadderView(QTableView):
         *col* with bounding *cell_rect*, mirroring the click logic.
         ``None`` for cells/positions that don't trade.
 
-        Only the centre PRICE cell trades — hovering over the bid /
-        ask size cells now returns ``None`` so no Buy/Sell badge
-        appears (those cells used to be click targets but were
-        retired to prevent misclicks).
+        Hit zone is a contiguous band through the centre of the row —
+        the inner halves of the size cells plus the full price cell.
+        The outer halves of bid / ask are excluded so a stray click on
+        a depth bar far from the price column doesn't submit an order:
+
+          * right half of bid-size cell → BUY
+          * left  half of price cell    → BUY
+          * right half of price cell    → SELL
+          * left  half of ask-size cell → SELL
+
+        Outer halves of bid / ask return ``None`` (no hover badge, no
+        order on click).
         """
+        if col == COL_BID_SZ:
+            # Inner (right) half of bid size cell.
+            return "BUY" if pos.x() >= cell_rect.center().x() else None
+        if col == COL_ASK_SZ:
+            # Inner (left) half of ask size cell.
+            return "SELL" if pos.x() < cell_rect.center().x() else None
         if col == COL_PRICE:
             return "BUY" if pos.x() < cell_rect.center().x() else "SELL"
         return None
@@ -858,33 +868,25 @@ class DOMLadderView(QTableView):
         super().leaveEvent(event)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
-        """Route clicks to BUY / SELL limit orders.
-
-        Only the centre PRICE cell submits orders:
-
-          * left half of the price cell  → BUY  LMT at that price
-          * right half of the price cell → SELL LMT at that price
-
-        The bid-size and ask-size cells used to be click targets too,
-        but the wide hit area led to misclicks (a stray click anywhere
-        on a size cell fired a live order).  Restricting submission to
-        the relatively narrow price cell — and still splitting it
-        left/right — keeps the one-click DOM workflow while removing
-        the most common source of accidental orders.
-        """
+        """Route clicks to BUY / SELL limit orders.  Whole row is
+        clickable; the L/R split goes through the price cell's
+        centre — see :meth:`_side_at` for the exact rule, which the
+        hover badge uses too so the affordance always matches the
+        click."""
         pos = event.position().toPoint()
         idx = self.indexAt(pos)
         if idx.isValid():
             row = idx.row()
             col = idx.column()
             prices = self._model.prices
-            if 0 <= row < len(prices) and col == COL_PRICE:
-                price = float(prices[row])
+            if 0 <= row < len(prices):
+                # Reuse the same rule the hover badge uses so the
+                # affordance and the action stay in lock-step.
                 rect = self.visualRect(idx)
-                if pos.x() < rect.center().x():
-                    self.ladder_clicked.emit("BUY", price)
-                else:
-                    self.ladder_clicked.emit("SELL", price)
+                side = self._side_at(pos, col, rect)
+                if side is not None:
+                    price = float(prices[row])
+                    self.ladder_clicked.emit(side, price)
         super().mousePressEvent(event)
 
     def _scroll_to_last(self) -> None:
