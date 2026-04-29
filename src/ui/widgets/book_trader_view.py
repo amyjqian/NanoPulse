@@ -349,18 +349,31 @@ class BookTraderView(QWidget):
             f"color:{Theme.TEXT};selection-background-color:#3a3f50}}")
         self._cmb_tick.currentTextChanged.connect(self._on_tick_changed)
 
-        # Lock button — when locked (default) the ladder auto-scrolls so
-        # the last-price row stays centred in the viewport on every
-        # tick.  Unlock to scroll the ladder manually without the view
-        # yanking back to the centre.  Closed-padlock SVG when locked,
-        # open-padlock SVG when unlocked (see _on_lock_toggled).
+        # Lock button — when locked the ladder auto-scrolls so the
+        # last-price row stays centred in the viewport on every tick.
+        # Unlock to scroll the ladder manually without the view yanking
+        # back to the centre.  Closed-padlock SVG when locked, open-
+        # padlock SVG when unlocked (see _on_lock_toggled).
+        # Initial state: persisted user choice (defaults to UNLOCKED on
+        # first launch).  setChecked() runs before .toggled is wired so
+        # the load doesn't fire the save callback.
         self._icon_lock_closed = QIcon(_LOCK_CLOSED_ICON)
         self._icon_lock_open = QIcon(_LOCK_OPEN_ICON)
+        try:
+            self._initial_lock_state: bool = (
+                config_manager.load_book_trader_lock_state())
+        except Exception:
+            log.debug(
+                "BookTrader: could not read persisted lock state, "
+                "defaulting to unlocked", exc_info=True)
+            self._initial_lock_state = False
         self._btn_lock = QPushButton()
-        self._btn_lock.setIcon(self._icon_lock_closed)
+        self._btn_lock.setIcon(
+            self._icon_lock_closed if self._initial_lock_state
+            else self._icon_lock_open)
         self._btn_lock.setIconSize(QSize(16, 16))
         self._btn_lock.setCheckable(True)
-        self._btn_lock.setChecked(True)
+        self._btn_lock.setChecked(self._initial_lock_state)
         self._btn_lock.setFixedSize(28, 24)
         self._btn_lock.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_lock.setToolTip(
@@ -396,6 +409,12 @@ class BookTraderView(QWidget):
 
         # ── DOM ladder ────────────────────────────────────────────────────────
         self._ladder = DOMLadderView(model=self._model)
+        # Sync the ladder's internal lock flag with the persisted button
+        # state.  DOMLadderView defaults its _locked to True; if the user
+        # last left the lock OFF, push that through immediately so the
+        # initial behaviour matches the displayed icon without waiting
+        # for the user to click the button.
+        self._ladder.set_locked(self._initial_lock_state)
         root.addWidget(self._ladder, stretch=1)
         # Hover badge content — ``Buy {qty}`` / ``Sell {qty}`` plus a
         # second line listing armed TP / SL / TS amounts so the trader
@@ -793,10 +812,17 @@ class BookTraderView(QWidget):
 
         The button icon flips between closed-padlock (locked) and
         open-padlock (unlocked) so the affordance matches the state.
+        Persists the choice so the next app launch restores it.
         """
         self._btn_lock.setIcon(
             self._icon_lock_closed if locked else self._icon_lock_open)
         self._ladder.set_locked(locked)
+        try:
+            config_manager.save_book_trader_lock_state(locked)
+        except Exception:
+            log.warning(
+                "BookTrader: could not persist lock state %s",
+                locked, exc_info=True)
 
     def _populate_tick_combo(self) -> None:
         """Fill the tick-aggregation combo with sec-type-appropriate

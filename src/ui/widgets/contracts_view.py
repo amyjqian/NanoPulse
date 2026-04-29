@@ -233,6 +233,10 @@ class ContractsView(QWidget):
     persist them for quick lookup during order entry.
     """
     contracts_changed = Signal()
+    # Emitted after a contract deletion that updated/disabled hot buttons
+    # so the OrderEntryPanel can reload its in-memory list and rebuild
+    # the grid (greying out disabled cells, refreshing tooltips, etc.).
+    hot_buttons_changed = Signal()
 
     def __init__(
         self,
@@ -786,10 +790,251 @@ class ContractsView(QWidget):
                       for idx in self._saved_table.selectedIndexes()), reverse=True)
         if not rows:
             return
+
+        # Compute hot-button impact BEFORE removing the rows so we can
+        # show the user what will change and let them cancel.  Returns
+        # the new hot-button list to persist (or None if no impact).
+        new_hot_buttons = self._review_hot_button_impact(rows)
+        if new_hot_buttons is None:
+            # User cancelled the impact dialog — abort the deletion.
+            return
+
         for r in rows:
             self._saved_table.removeRow(r)
         self._save_all_contracts()
         log.info("Removed %d contract(s)", len(rows))
+
+        # Persist any hot-button updates produced by the impact review.
+        # Empty list means "there were no impacted hot buttons" — skip.
+        if new_hot_buttons:
+            try:
+                from src.core import config_manager as _cm
+                _cm.save_hot_buttons(new_hot_buttons)
+                self.hot_buttons_changed.emit()
+                log.info("Updated hot buttons after contract deletion")
+            except Exception:
+                log.exception(
+                    "Failed to persist hot-button updates after deletion")
+
+    def _review_hot_button_impact(
+            self, rows_to_delete: list[int]) -> list[dict] | None:
+        """Compute the impact of *rows_to_delete* on saved hot buttons,
+        confirm with the user via a dialog, and return the updated
+        hot-button list.
+
+        Returns:
+          * ``None``  — user cancelled (caller should abort the deletion).
+          * ``[]``    — no impacted hot buttons (caller deletes silently).
+          * ``[...]`` — impacted hot buttons; caller deletes contracts then
+                        persists this updated list.
+
+        Replacement rule: when a deleted FUT row has at least one
+        surviving same-root saved row, hot buttons whose ``symbol`` field
+        targeted the deleted contract are rewritten to the surviving
+        local symbol.  When no replacement remains, those hot buttons
+        get ``disabled: True`` and render greyed-out.
+        """
+        from src.core import config_manager as _cm
+        try:
+            hot_buttons = _cm.load_hot_buttons()
+        except Exception:
+            log.exception("Could not load hot buttons; skipping impact review")
+            return []
+
+        # Snapshot rows about to be deleted (uppercase for matching).
+        deleted: list[dict] = []
+        for r in rows_to_delete:
+            deleted.append({
+                "symbol":       (self._cell(r, _COL_SYMBOL) or "").upper().strip(),
+                "sec_type":     (self._cell(r, _COL_SECTYPE) or "").upper().strip(),
+                "local_symbol": (self._cell(r, _COL_LOCAL) or "").upper().strip(),
+                "expiry":       self._cell(r, _COL_EXPIRY) or "",
+            })
+
+        # Snapshot rows that will SURVIVE the deletion, indexed by root.
+        # For each surviving row we keep both local_symbol and expiry so
+        # the resolver below can mirror pick_active_contract's "soonest
+        # non-expired" rule.
+        delete_set = set(rows_to_delete)
+        survivors_by_root: dict[str, list[dict]] = {}
+        survivor_locals: set[str] = set()
+        for row_idx in range(self._saved_table.rowCount()):
+            if row_idx in delete_set:
+                continue
+            root = (self._cell(row_idx, _COL_SYMBOL) or "").upper().strip()
+            sec_type = (self._cell(row_idx, _COL_SECTYPE) or "").upper().strip()
+            if sec_type != "FUT":
+                continue
+            local = self._cell(row_idx, _COL_LOCAL) or ""
+            survivor_locals.add(local.upper().strip())
+            survivors_by_root.setdefault(root, []).append({
+                "local_symbol": local,
+                "expiry":       self._cell(row_idx, _COL_EXPIRY) or "",
+            })
+
+        def _resolves_post_delete(sym: str) -> dict | None:
+            """Return the contract (from survivors) that *sym* would
+            resolve to after the deletion, or None.  Mirrors
+            ReferenceData.pick_active_contract: exact local match wins,
+            otherwise root match → soonest non-expired."""
+            up = sym.upper().strip()
+            if up in survivor_locals:
+                # Exact local-symbol match — find which row it is.
+                for survivors in survivors_by_root.values():
+                    for s in survivors:
+                        if (s.get("local_symbol", "") or "").upper().strip() == up:
+                            return s
+            survivors = survivors_by_root.get(up, [])
+            if survivors:
+                return self._choose_replacement(survivors)
+            return None
+
+        # Walk hot buttons, decide replace / disable per entry.  Buttons
+        # whose symbol is the still-surviving root of a deleted contract
+        # are left untouched (auto-rollover via pick_active_contract).
+        # Buttons pinned to a deleted local symbol are re-pointed when
+        # any same-root survivor exists, otherwise disabled.
+        impact: list[tuple[int, str, str, dict]] = []
+        new_buttons: list[dict] = [dict(b) for b in hot_buttons]
+        for i, btn in enumerate(new_buttons):
+            btn_sym = (btn.get("symbol", "") or "").upper().strip()
+            if not btn_sym:
+                continue
+            # Was this button pointing at a row we're about to delete?
+            target = next((d for d in deleted
+                           if d["sec_type"] == "FUT"
+                           and btn_sym in (d["symbol"], d["local_symbol"])),
+                          None)
+            if target is None:
+                continue
+
+            # Direct post-deletion resolution (exact local match in any
+            # survivor, or root match producing a surviving row).
+            direct = _resolves_post_delete(btn_sym)
+            if direct is not None:
+                # btn_sym still resolves on its own — no change needed.
+                # Most common case: a root-symbol button whose root has
+                # other surviving expirations.
+                continue
+
+            # Direct resolution failed.  If the deleted contract's root
+            # has any survivor, re-point this button at the survivor's
+            # local symbol.  Otherwise disable it.
+            same_root_survivors = survivors_by_root.get(target["symbol"], [])
+            if same_root_survivors:
+                replacement = self._choose_replacement(same_root_survivors)
+                new_local = (replacement.get("local_symbol", "") or "").strip()
+                if new_local:
+                    btn["symbol"] = new_local
+                    btn["disabled"] = False
+                    impact.append((i, "replace",
+                                   f"{btn_sym} → {new_local}", btn))
+                    continue
+            btn["disabled"] = True
+            impact.append((i, "disable",
+                           f"{btn_sym} (no replacement)", btn))
+
+        if not impact:
+            return []
+
+        if not self._confirm_hot_button_impact(deleted, impact):
+            return None
+        return new_buttons
+
+    @staticmethod
+    def _choose_replacement(survivors: list[dict]) -> dict:
+        """Pick the best replacement contract from *survivors* (same root).
+        Mirrors ReferenceData.pick_active_contract's FUT rule: soonest
+        non-expired by expiry; falls back to latest expiry when none are
+        future."""
+        from datetime import date, datetime
+        from zoneinfo import ZoneInfo
+        et_today = datetime.now(ZoneInfo("America/New_York")).date()
+
+        def _parse(s: str) -> date | None:
+            s = (s or "").strip()
+            if len(s) == 8 and s.isdigit():
+                try:
+                    return date(int(s[0:4]), int(s[4:6]), int(s[6:8]))
+                except ValueError:
+                    return None
+            if len(s) == 6 and s.isdigit():
+                try:
+                    from calendar import monthrange
+                    y, m = int(s[0:4]), int(s[4:6])
+                    return date(y, m, monthrange(y, m)[1])
+                except ValueError:
+                    return None
+            return None
+
+        future = [(d, s) for s in survivors
+                  if (d := _parse(s.get("expiry", ""))) is not None
+                  and d >= et_today]
+        if future:
+            future.sort(key=lambda t: t[0])
+            return future[0][1]
+        dated = [(d, s) for s in survivors
+                 if (d := _parse(s.get("expiry", ""))) is not None]
+        if dated:
+            dated.sort(key=lambda t: t[0], reverse=True)
+            return dated[0][1]
+        return survivors[0]
+
+    def _confirm_hot_button_impact(
+            self,
+            deleted: list[dict],
+            impact: list[tuple[int, str, str, dict]]) -> bool:
+        """Show the deletion-impact dialog and return True if the user
+        chose to proceed.  Lists every impacted hot button with a clear
+        before/after; users can cancel and keep the contracts/buttons
+        intact."""
+        deleted_fut_locals = ", ".join(
+            d["local_symbol"] or d["symbol"]
+            for d in deleted if d["sec_type"] == "FUT"
+        ) or "(no futures rows)"
+
+        # Lazy import: _auto_hot_button_label lives in order_entry_panel
+        # and we don't want a top-level import cycle.
+        from src.ui.widgets.order_entry_panel import _auto_hot_button_label
+        replace_lines: list[str] = []
+        disable_lines: list[str] = []
+        for _i, action, detail, btn in impact:
+            label = btn.get("label", "") or _auto_hot_button_label(
+                side=btn.get("side", "BUY"),
+                qty=btn.get("qty", ""),
+                sym=btn.get("symbol", ""),
+                ord_type=btn.get("ord_type", "LMT"),
+                anchor=btn.get("anchor", "BID"),
+                offset=int(btn.get("offset", 0) or 0),
+                tp=btn.get("tp"),
+                sl=btn.get("sl"),
+            )
+            if action == "replace":
+                replace_lines.append(f"  • {label}   →   {detail}")
+            else:
+                disable_lines.append(f"  • {label}   →   {detail}")
+
+        msg = [f"Deleting: {deleted_fut_locals}", ""]
+        if replace_lines:
+            msg.append("Hot buttons that will be re-pointed to the next "
+                       "available contract:")
+            msg.extend(replace_lines)
+            msg.append("")
+        if disable_lines:
+            msg.append("Hot buttons that will be DISABLED (no replacement "
+                       "contract is saved):")
+            msg.extend(disable_lines)
+            msg.append("")
+        msg.append("Proceed with the deletion?")
+
+        reply = QMessageBox.question(
+            self,
+            "Hot buttons reference deleted contracts",
+            "\n".join(msg),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Yes,
+        )
+        return reply == QMessageBox.StandardButton.Yes
 
     def _on_clear_all(self) -> None:
         if self._saved_table.rowCount() == 0:
@@ -863,6 +1108,9 @@ _BROWSE_COLS = [
     "", "ConID", "Symbol", "SecType", "Exchange", "Currency",
     "Expiry", "Strike", "Right", "LocalSymbol", "Multiplier",
 ]
+# Column index of the Expiry header — used as the default sort key in
+# BrowseDialog so multi-result futures lists land in calendar order.
+_BROWSE_COL_EXPIRY = 6
 
 _BROWSE_TABLE_STYLE = f"""
     QTableWidget {{
@@ -982,6 +1230,12 @@ class BrowseDialog(QDialog):
         self._table.setEditTriggers(
             QAbstractItemView.EditTrigger.NoEditTriggers)
         self._table.verticalHeader().setVisible(False)
+        # Click-to-sort on column headers.  Toggled off while populating
+        # so the row indices line up with ``contracts`` during the build,
+        # then re-enabled with an initial Expiry-ASC sort below.
+        self._table.setSortingEnabled(False)
+        self._table.horizontalHeader().setSortIndicatorShown(True)
+        self._table.horizontalHeader().setSectionsClickable(True)
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Interactive)
@@ -1000,6 +1254,10 @@ class BrowseDialog(QDialog):
                 chk_item.setToolTip("Already saved")
             else:
                 chk_item.setCheckState(Qt.CheckState.Unchecked)
+            # Persist the original list index on the checkbox item so
+            # selected_contracts() can map back to the right dict after
+            # the user re-sorts the table by clicking a column header.
+            chk_item.setData(Qt.ItemDataRole.UserRole, row)
             self._table.setItem(row, 0, chk_item)
 
             values = [
@@ -1021,9 +1279,28 @@ class BrowseDialog(QDialog):
                         item.setForeground(QColor(GREEN))
                     elif val == "OPT":
                         item.setForeground(QColor(ORANGE))
+                # Strike column sorts numerically rather than lex —
+                # otherwise "100" lands before "99" because '1' < '9'.
+                # Stored on UserRole so the default Qt sort comparator
+                # uses it; Expiry strings (YYYYMMDD) already lex-sort
+                # correctly, so no extra handling needed there.
+                if col == 7:  # Strike
+                    try:
+                        item.setData(Qt.ItemDataRole.UserRole,
+                                     float(val) if val else 0.0)
+                    except (TypeError, ValueError):
+                        item.setData(Qt.ItemDataRole.UserRole, 0.0)
                 if conid_str in existing_conids:
                     item.setForeground(QColor(TEXT_DIM))
                 self._table.setItem(row, col, item)
+
+        # Re-enable sorting and land on Expiry-ASC as the default order
+        # (most browse results are for futures month chains, where the
+        # natural reading order is calendar).  The user can click any
+        # header to override.
+        self._table.setSortingEnabled(True)
+        self._table.sortItems(
+            _BROWSE_COL_EXPIRY, Qt.SortOrder.AscendingOrder)
 
         layout.addWidget(self._table)
 
@@ -1071,10 +1348,21 @@ class BrowseDialog(QDialog):
                 item.setCheckState(Qt.CheckState.Unchecked)
 
     def selected_contracts(self) -> list[dict]:
-        """Return the list of contract dicts the user checked."""
+        """Return the list of contract dicts the user checked.
+
+        Reads the original-index pointer stored on the checkbox item
+        rather than the live row index — sorting the table moves rows,
+        so a row→list lookup would point at the wrong contract."""
         selected: list[dict] = []
         for row in range(self._table.rowCount()):
             chk = self._table.item(row, 0)
-            if chk and chk.checkState() == Qt.CheckState.Checked:
-                selected.append(self._contracts[row])
+            if not chk or chk.checkState() != Qt.CheckState.Checked:
+                continue
+            src = chk.data(Qt.ItemDataRole.UserRole)
+            try:
+                idx = int(src)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= idx < len(self._contracts):
+                selected.append(self._contracts[idx])
         return selected

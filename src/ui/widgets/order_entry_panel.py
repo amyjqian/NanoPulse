@@ -1771,46 +1771,117 @@ class _Segmented(QWidget):
         self._selected = value
         self._restyle()
 
+    def clear_selection(self) -> None:
+        """Render every button as inactive — used when the segment is
+        contextually irrelevant (e.g. the LIMIT ANCHOR row when the
+        order type is MKT).  The internal ``_selected`` is cleared so
+        ``selected()`` returns ``""`` until ``set_selected`` is called
+        again with a real option, which is how callers restore the
+        prior choice when the row becomes relevant again."""
+        if self._selected == "":
+            return
+        self._selected = ""
+        self._restyle()
+
 
 def _hot_button_default_draft() -> dict:
-    """Pristine HotButton draft used to seed the modal in Add mode."""
+    """Pristine HotButton draft used to seed the modal in Add mode.
+
+    LIMIT ANCHOR defaults to ``MID`` so a freshly-created hot button
+    that the user later switches to LMT lands on @Mid (the most common
+    starting point for a marketable limit) rather than @Bid.  Existing
+    saved hot buttons keep their persisted anchor on Edit.
+    """
     return {
         "side": "BUY",
         "group": "__current__",
         "symbol": "",
         "qty": "",
         "ord_type": "LMT",
-        "anchor": "BID",
+        "anchor": "MID",
         "offset": 0,
         "label": "",
         "tp": {"on": False, "v": 80.0, "u": "abs"},
         "sl": {"on": False, "v": 80.0, "u": "abs"},
+        "disabled": False,
     }
 
 
 def _auto_hot_button_label(side: str, qty: str, sym: str,
-                           ord_type: str, anchor: str, offset: int) -> str:
+                           ord_type: str, anchor: str, offset: int,
+                           tp: dict | None = None,
+                           sl: dict | None = None) -> str:
     """Generate the auto-label shown when the user leaves the label
-    field blank.  Falls back to ``QTY`` / ``SYM`` placeholders so the
-    preview reads naturally before the user picks values.
+    field blank.
+
+    Format for BUY / SELL:
+        ``{qty} {SYM} @{venue} [{tp_value} - {sl_value}]``
+
+    Where:
+      * Side is encoded by the button's background colour, not the label
+        text — so we omit the ``Buy``/``Sell`` verb to keep the label
+        compact for narrow grid cells.
+      * ``qty`` is hidden when it equals ``1`` (the common single-lot
+        case reads cleanly without a leading number).
+      * ``@{venue}`` is ``@MKT`` for market orders, otherwise ``@Bid`` /
+        ``@Ask`` / ``@Mid`` (with ``+/-N`` offset suffix when set) for
+        limit orders.
+      * Take-profit / stop-loss values are appended only when their
+        respective leg toggle is on.  When both are on they're joined
+        with ``" - "`` so the label reads e.g. ``NQ @MKT 80 - 50``.
+    Falls back to ``QTY`` / ``SYM`` placeholders so the preview still
+    reads naturally before the user picks values.
     """
-    qty_part = qty.strip() if qty.strip() else "QTY"
     sym_part = sym.strip().upper() if sym.strip() else "SYM"
-    # Position-management sides ignore order type / anchor entirely —
-    # the label is just the action + symbol.
+    # FLATTEN / CANCEL ignore qty / venue entirely.
     if side == "FLATTEN":
         return f"Flatten {sym_part}"
     if side == "CANCEL":
         return f"Cancel {sym_part}"
-    verb = "Buy" if side == "BUY" else "Sell"
+
+    qty_clean = qty.strip()
+    if qty_clean == "1":
+        qty_part = ""
+    elif qty_clean:
+        qty_part = qty_clean
+    else:
+        qty_part = "QTY"
+
     if ord_type == "MKT":
-        return f"{verb} {qty_part} {sym_part} MKT"
-    anchor_label = {"BID": "@Bid", "ASK": "@Ask", "MID": "@Mid"}.get(
-        anchor, f"@{anchor}")
-    if offset:
-        sign = "+" if offset > 0 else ""
-        return f"{verb} {qty_part} {sym_part} {anchor_label} {sign}{offset}"
-    return f"{verb} {qty_part} {sym_part} {anchor_label}"
+        venue = "@MKT"
+    else:
+        anchor_label = {"BID": "@Bid", "ASK": "@Ask", "MID": "@Mid"}.get(
+            anchor, f"@{anchor}")
+        if offset:
+            sign = "+" if offset > 0 else ""
+            venue = f"{anchor_label} {sign}{offset}"
+        else:
+            venue = anchor_label
+
+    def _leg_active(leg: dict | None) -> bool:
+        return bool(leg and leg.get("on"))
+
+    def _fmt_leg_value(leg: dict | None) -> str:
+        # When the bracket pair is shown, an inactive leg renders as
+        # "0" so the user can see at a glance which side is armed —
+        # but the pair itself is omitted entirely when both legs are
+        # off (no brackets attached at all).
+        if not _leg_active(leg):
+            return "0"
+        v = leg.get("v", 0)
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return "0"
+        return f"{int(f)}" if f.is_integer() else f"{f:g}"
+
+    if _leg_active(tp) or _leg_active(sl):
+        bracket = f"{_fmt_leg_value(tp)} - {_fmt_leg_value(sl)}"
+    else:
+        bracket = ""
+
+    chunks = [c for c in (qty_part, sym_part, venue, bracket) if c]
+    return " ".join(chunks)
 
 
 # Saved-button accent colour for each side.  Mirrors the existing
@@ -1847,6 +1918,7 @@ class _HotButtonModal(QDialog):
         draft: dict | None = None,
         groups: list[str] | None = None,
         edit_mode: bool = False,
+        default_specific: bool = False,
     ) -> None:
         super().__init__(parent)
         self._draft = dict(draft) if draft else _hot_button_default_draft()
@@ -1857,6 +1929,24 @@ class _HotButtonModal(QDialog):
         self._draft["sl"] = dict(self._draft.get(
             "sl", {"on": False, "v": 80.0, "u": "abs"}))
         self._edit_mode = edit_mode
+        # Force the SYMBOL / QTY mode segments to "specific" with empty
+        # inputs even when the draft has no value — used by Add mode so
+        # the user always lands on the explicit-input variant rather
+        # than the "use selected from panel" default.
+        self._default_specific = bool(default_specific)
+        # Tracks whether the user has manually edited the LABEL input.
+        # While False, every field-change slot rewrites the label with
+        # the auto-generated text so the user sees a live preview as
+        # they fill in symbol / qty / order type / brackets.  Flips to
+        # True the moment the user types into the label field, then
+        # back to False if they clear it again so auto-fill resumes.
+        self._label_user_edited = False
+        # Same idea for the QTY input — when the user types a symbol
+        # that resolves to a known sec_type, we auto-fill QTY from the
+        # trading_prefs default size for that instrument class (FUT vs
+        # STK).  Once the user manually edits qty, this flag freezes
+        # the value; clearing the field re-engages auto-fill.
+        self._qty_user_edited = False
         self._delete_requested = False
         # When the caller doesn't pass a groups list, pull the
         # user-defined trading groups from app_config.json.  Built-in
@@ -1970,7 +2060,7 @@ class _HotButtonModal(QDialog):
         col_a.setSpacing(4)
         col_a.addWidget(self._caption("LIMIT ANCHOR"))
         self._seg_anchor = _Segmented(
-            [("BID", "@ Bid"), ("ASK", "@ Ask"), ("MID", "Mid")])
+            [("BID", "@Bid"), ("ASK", "@Ask"), ("MID", "@Mid")])
         self._seg_anchor.selectionChanged.connect(self._on_anchor_changed)
         col_a.addWidget(self._seg_anchor)
         col_o = QVBoxLayout()
@@ -2083,7 +2173,7 @@ class _HotButtonModal(QDialog):
         cap_row.addWidget(self._caption("SHARES / QTY"))
         cap_row.addStretch(1)
         self._seg_qty_mode = _Segmented(
-            [("default", "DEFAULT · USE CHIP"), ("specific", "SPECIFIC")],
+            [("default", "DEFAULT · USE SELECTED"), ("specific", "SPECIFIC")],
             height=22,
         )
         self._seg_qty_mode.selectionChanged.connect(self._on_qty_mode_changed)
@@ -2293,20 +2383,29 @@ class _HotButtonModal(QDialog):
         gv = d.get("group", "__current__")
         idx = self._cmb_group.findData(gv)
         self._cmb_group.setCurrentIndex(idx if idx >= 0 else 0)
-        # Symbol
+        # Symbol — segment forced to "specific" when default_specific is
+        # set OR the draft already carries a value.  When forced with
+        # an empty value the input is enabled but blank so the user can
+        # type directly without first toggling the segment.
         sym = d.get("symbol", "")
-        self._seg_sym_mode.set_selected("specific" if sym else "default")
+        sym_specific = bool(sym) or self._default_specific
+        self._seg_sym_mode.set_selected("specific" if sym_specific else "default")
         self._inp_symbol.blockSignals(True)
         self._inp_symbol.setText(sym)
         self._inp_symbol.blockSignals(False)
-        self._inp_symbol.setEnabled(bool(sym))
-        # Qty
+        self._inp_symbol.setEnabled(sym_specific)
+        # Qty — same rule as Symbol.
         qty = d.get("qty", "")
-        self._seg_qty_mode.set_selected("specific" if qty else "default")
+        qty_specific = bool(qty) or self._default_specific
+        self._seg_qty_mode.set_selected("specific" if qty_specific else "default")
         self._inp_qty.blockSignals(True)
         self._inp_qty.setText(qty)
         self._inp_qty.blockSignals(False)
-        self._inp_qty.setEnabled(bool(qty))
+        self._inp_qty.setEnabled(qty_specific)
+        # An existing non-empty qty in the draft (Edit mode) is the
+        # user's prior choice — freeze it so auto-fill on symbol typing
+        # doesn't clobber it.  Empty qty (Add mode) stays in auto.
+        self._qty_user_edited = bool(qty)
         # Order type
         self._seg_ord_type.set_selected(d.get("ord_type", "LMT"))
         # Anchor + offset
@@ -2314,10 +2413,18 @@ class _HotButtonModal(QDialog):
         self._inp_offset.blockSignals(True)
         self._inp_offset.setText(str(int(d.get("offset", 0))))
         self._inp_offset.blockSignals(False)
-        # Label
+        # Label.  Decide once at load time whether the saved label is a
+        # custom override (user-edited) or an auto-derived snapshot:
+        # * Empty / matches what the auto rule produces from the loaded
+        #   fields → treat as auto so future field edits regenerate it.
+        # * Anything else → treat as user-edited and freeze.
+        saved_label = d.get("label", "")
         self._inp_label.blockSignals(True)
-        self._inp_label.setText(d.get("label", ""))
+        self._inp_label.setText(saved_label)
         self._inp_label.blockSignals(False)
+        auto_now = self._compute_auto_label()
+        self._label_user_edited = (
+            bool(saved_label) and saved_label != auto_now)
         # Brackets — only the toggle + dollar value are user-editable
         # now (unit is fixed at "abs").
         for key, w in (("tp", self._tp_widgets), ("sl", self._sl_widgets)):
@@ -2338,6 +2445,44 @@ class _HotButtonModal(QDialog):
         self._update_side_dependent_state()
         # Initialise the symbol-search hint for the loaded draft.
         self._update_symbol_status()
+        # Final preview pass — also fills in the auto-label field when
+        # not user-edited, so the user always sees a live label even
+        # before they touch any input.
+        self._update_preview()
+
+    def _compute_auto_label(self) -> str:
+        """Generate the auto-label text from the current draft state.
+        Used both to populate ``_inp_label`` live and to detect whether
+        a saved label is a custom override or an auto-derived snapshot.
+        """
+        d = self._draft
+        return _auto_hot_button_label(
+            side=d.get("side", "BUY"),
+            qty=d.get("qty", ""),
+            sym=d.get("symbol", ""),
+            ord_type=d.get("ord_type", "LMT"),
+            anchor=d.get("anchor", "BID"),
+            offset=int(d.get("offset", 0) or 0),
+            tp=d.get("tp"),
+            sl=d.get("sl"),
+        )
+
+    def _refresh_auto_label_field(self) -> None:
+        """Push the auto-generated label into ``_inp_label`` whenever
+        the user hasn't manually overridden it.  Skips when the field
+        text already matches so the cursor doesn't jump while typing
+        in adjacent inputs.  ``blockSignals`` prevents this programmatic
+        update from triggering ``_on_label_changed``."""
+        if self._label_user_edited:
+            return
+        auto = self._compute_auto_label()
+        if self._inp_label.text() == auto:
+            self._draft["label"] = auto
+            return
+        self._inp_label.blockSignals(True)
+        self._inp_label.setText(auto)
+        self._inp_label.blockSignals(False)
+        self._draft["label"] = auto
 
     def values(self) -> dict:
         """Return the current draft as a fully-populated HotButton dict."""
@@ -2386,8 +2531,64 @@ class _HotButtonModal(QDialog):
         self._draft["symbol"] = text.strip()
         if self._draft["symbol"]:
             self._seg_sym_mode.set_selected("specific")
+        # Auto-fill QTY from trading prefs when the symbol resolves to
+        # a known sec_type and the user hasn't already typed a custom
+        # qty.  Futures pull from prefs['FUT']['quantity']; stocks /
+        # options share prefs['STK']['quantity'].
+        self._auto_fill_qty_from_prefs()
         self._update_symbol_status()
         self._update_preview()
+
+    def _auto_fill_qty_from_prefs(self) -> None:
+        """Populate ``_inp_qty`` with the trading-prefs default size for
+        the current symbol's instrument class — Futures or Stock.  No-op
+        when the user has manually edited qty (``_qty_user_edited``) or
+        the symbol can't be resolved to a known sec_type.
+
+        Lookup uses :class:`ReferenceData.get_sec_type` and falls back
+        to the FUT preference bucket for FUT, STK for STK / OPT.  An
+        unknown symbol (``"?"``) leaves qty alone so we don't guess.
+        """
+        if self._qty_user_edited:
+            return
+        sym = (self._draft.get("symbol") or "").strip().upper()
+        if not sym:
+            return
+        try:
+            from src.core.reference_data import get_instance as _rd
+            from src.core.trading_prefs import trading_prefs
+            sec = _rd().get_sec_type(sym)
+        except Exception:
+            log.debug("HotButton: prefs auto-fill lookup failed",
+                      exc_info=True)
+            return
+        if sec == "FUT":
+            pref_key = "FUT"
+        elif sec in ("STK", "OPT"):
+            pref_key = "STK"
+        else:
+            return
+        try:
+            qty_pref = (trading_prefs.get(pref_key) or {}).get("quantity")
+        except Exception:
+            return
+        if not qty_pref:
+            return
+        try:
+            qty_str = str(int(qty_pref))
+        except (TypeError, ValueError):
+            return
+        if self._inp_qty.text() == qty_str:
+            self._draft["qty"] = qty_str
+            return
+        self._inp_qty.blockSignals(True)
+        self._inp_qty.setText(qty_str)
+        self._inp_qty.blockSignals(False)
+        self._draft["qty"] = qty_str
+        # Also force the qty mode segment to "specific" since we just
+        # populated a concrete value.
+        self._seg_qty_mode.set_selected("specific")
+        self._inp_qty.setEnabled(True)
 
     def _install_symbol_completer(self, line: QLineEdit) -> None:
         """Wire a case-insensitive ``contains``-match QCompleter against
@@ -2481,12 +2682,21 @@ class _HotButtonModal(QDialog):
             self._inp_qty.clear()
             self._inp_qty.blockSignals(False)
             self._draft["qty"] = ""
+            # Switching back to "use selected chip" cancels the user's
+            # manual qty so the next symbol typing can re-auto-fill
+            # from prefs (kept frozen otherwise).
+            self._qty_user_edited = False
         self._update_preview()
 
     def _on_qty_changed(self, text: str) -> None:
-        self._draft["qty"] = text.strip()
-        if self._draft["qty"]:
+        clean = text.strip()
+        self._draft["qty"] = clean
+        if clean:
             self._seg_qty_mode.set_selected("specific")
+        # User typing flips qty out of auto mode so a later symbol
+        # change won't replace their value.  Clearing the field
+        # re-engages auto so the next symbol fires the prefs default.
+        self._qty_user_edited = bool(clean)
         self._update_preview()
 
     def _on_ord_type_changed(self, t: str) -> None:
@@ -2506,7 +2716,19 @@ class _HotButtonModal(QDialog):
         self._update_preview()
 
     def _on_label_changed(self, t: str) -> None:
-        self._draft["label"] = t.strip()
+        text = t.strip()
+        self._draft["label"] = text
+        # The user manually typing into the label field flips us out of
+        # auto mode so subsequent symbol/qty/order-type/bracket changes
+        # don't clobber their custom text.  An empty field re-engages
+        # auto mode — typing back to blank is the natural way to ask
+        # for the live-generated label again.  Typing the exact auto
+        # text also stays in auto mode (e.g. user retyped what was
+        # already there).
+        if not text:
+            self._label_user_edited = False
+        else:
+            self._label_user_edited = text != self._compute_auto_label()
         self._update_preview()
 
     def _on_bracket_toggled(self, key: str, on: bool) -> None:
@@ -2560,9 +2782,24 @@ class _HotButtonModal(QDialog):
     def _update_limit_row_state(self) -> None:
         is_lmt = self._draft.get("ord_type") == "LMT"
         is_cancel = self._draft.get("side") == "CANCEL"
-        self._limit_row_w.setEnabled(is_lmt and not is_cancel)
+        active = is_lmt and not is_cancel
+        self._limit_row_w.setEnabled(active)
+        # When the row is inactive (MKT / CANCEL) clear the anchor
+        # segment so no @Bid/@Ask/@Mid pill appears highlighted —
+        # there's no anchor decision to make at MKT.  Switching back to
+        # LMT restores the draft's saved anchor.
+        if active:
+            self._seg_anchor.set_selected(
+                self._draft.get("anchor", "MID"))
+        else:
+            self._seg_anchor.clear_selection()
 
     def _update_preview(self) -> None:
+        # Refresh the auto-fill label in the input field FIRST so the
+        # preview button below picks up the same text the user sees
+        # typed into the label box.  No-op when the user has manually
+        # edited the label.
+        self._refresh_auto_label_field()
         d = self._draft
         side = d["side"]
         qty = d["qty"]
@@ -2573,7 +2810,8 @@ class _HotButtonModal(QDialog):
         label = d["label"]
         # Auto label when blank.
         text = label or _auto_hot_button_label(
-            side, qty, sym, ord_type, anchor, offset)
+            side, qty, sym, ord_type, anchor, offset,
+            tp=d.get("tp"), sl=d.get("sl"))
         colour = _HOT_BUTTON_COLOURS.get(side, Theme.CLR_BUY)
         self._preview_btn.setText(text)
         self._preview_btn.setStyleSheet(
@@ -3066,9 +3304,70 @@ class OrderEntryPanel(QWidget):
             ord_type=entry.get("ord_type", "LMT"),
             anchor=entry.get("anchor", "BID"),
             offset=int(entry.get("offset", 0) or 0),
+            tp=entry.get("tp"),
+            sl=entry.get("sl"),
         )
-        colour = _HOT_BUTTON_COLOURS.get(side, Theme.CLR_BUY)
-        return _HotButtonCell(label, colour, parent=self)
+        is_disabled = bool(entry.get("disabled", False))
+        # Disabled buttons render in a neutral grey so the user sees the
+        # underlying contract is gone.  We do NOT call setEnabled(False)
+        # because that would also block right-click — the user must still
+        # be able to Edit / Delete the cell from the context menu.  The
+        # left-click submission is short-circuited in
+        # ``_on_hot_button_clicked`` when ``disabled`` is True.
+        colour = "#484F58" if is_disabled else _HOT_BUTTON_COLOURS.get(
+            side, Theme.CLR_BUY)
+        cell = _HotButtonCell(label, colour, parent=self)
+        if is_disabled:
+            cell.setCursor(Qt.CursorShape.ArrowCursor)
+            cell.setToolTip(
+                f"Disabled — saved contract for '{entry.get('symbol', '')}' "
+                f"was deleted.  Right-click to Edit or Delete, or re-add "
+                f"the contract.")
+            return cell
+        # Tooltip surfaces the resolved localSymbol so the user can see
+        # which actual contract a root-symbol button (e.g. "NQ") will
+        # trade right now (e.g. "NQM6").  Updates on every rebuild, so
+        # rolling the contract row in Contracts View immediately reflects
+        # here without re-defining the button.
+        tip = self._hot_button_tooltip(entry)
+        if tip:
+            cell.setToolTip(tip)
+        return cell
+
+    def reload_hot_buttons(self) -> None:
+        """Reload the hot-button list from disk and rebuild the grid.
+        Used by ContractsView after a contract deletion that updated
+        related hot-button symbols (auto-rolled or disabled)."""
+        try:
+            self._hot_buttons = config_manager.load_hot_buttons()
+        except Exception:
+            log.exception("HotButton: reload failed; keeping in-memory list")
+            return
+        self._rebuild_hot_buttons()
+
+    def _hot_button_tooltip(self, entry: dict) -> str:
+        """Build the hover tooltip describing the contract a hot button
+        currently resolves to — including which front-month is active
+        when the button targets a futures root with multiple saved
+        expirations.  Empty when there's no symbol or no extra info to
+        surface (e.g. stocks where local_symbol matches the ticker)."""
+        sym = (entry.get("symbol", "") or "").strip().upper()
+        if not sym:
+            return ""
+        try:
+            from src.core.reference_data import get_instance as _rd
+            c = _rd().pick_active_contract(sym)
+        except Exception:
+            return ""
+        if not c:
+            return f"{sym}: no saved contract — add one in Contracts"
+        local = (c.get("local_symbol") or "").strip()
+        expiry = (c.get("expiry") or "").strip()
+        if not local or local.upper() == sym:
+            return ""
+        if expiry:
+            return f"{sym} → {local}  (expiry {expiry})"
+        return f"{sym} → {local}"
 
     # ── Hot-button host actions ──────────────────────────────────────────────
 
@@ -3087,8 +3386,20 @@ class OrderEntryPanel(QWidget):
         """Open :class:`_HotButtonModal` in Add mode, append the
         resulting HotButton dict to the in-memory list, and rebuild
         the grid so the next ``+`` placeholder appears in the next
-        free slot."""
-        dlg = _HotButtonModal(self)
+        free slot.
+
+        Add-mode UX:
+          * Symbol / Qty mode segments default to ``SPECIFIC`` with
+            *empty* inputs (force-set via ``default_specific=True``) so
+            the user types directly into the inputs without first
+            flipping a segment toggle.
+          * Order type defaults to ``MKT``.
+          * The label field auto-fills as the user types — see
+            ``_HotButtonModal._refresh_auto_label_field``.
+        """
+        draft = _hot_button_default_draft()
+        draft["ord_type"] = "MKT"
+        dlg = _HotButtonModal(self, draft=draft, default_specific=True)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         if dlg.delete_requested():
@@ -3115,7 +3426,15 @@ class OrderEntryPanel(QWidget):
             log.info("HotButton: deleted index=%d via modal", index)
             del self._hot_buttons[index]
         else:
-            self._hot_buttons[index] = dlg.values()
+            new_entry = dlg.values()
+            # Editing a disabled cell implies the user is fixing the
+            # broken reference (typically by changing the symbol to one
+            # that has a saved contract).  Clear the disabled flag so
+            # the cell goes back to its normal coloured state — if the
+            # new symbol is still bad, the user will see no orders fire
+            # and can re-edit.
+            new_entry["disabled"] = False
+            self._hot_buttons[index] = new_entry
             log.info("HotButton: edited index=%d", index)
         self._rebuild_hot_buttons()
         self._persist_hot_buttons()
@@ -3231,6 +3550,14 @@ class OrderEntryPanel(QWidget):
         another group.
         """
         if not (0 <= index < len(self._hot_buttons)):
+            return
+        # Disabled buttons are greyed out via setEnabled(False), but the
+        # guard here is a belt-and-braces backstop: if a future change
+        # paths a click around the QPushButton enabled state, we still
+        # refuse to route an order against a deleted contract.
+        if self._hot_buttons[index].get("disabled"):
+            log.info("HotButton[%d]: click ignored — entry is disabled",
+                     index)
             return
         entry = self._hot_buttons[index]
         side = str(entry.get("side", "BUY"))
@@ -4462,23 +4789,30 @@ class OrderEntryPanel(QWidget):
         return params_list
 
     def _build_bg_params_for_symbol(self, sym: str) -> dict | None:
-        """Build market data params for a single symbol from the reference cache."""
+        """Build market data params for a single symbol from the reference cache.
+
+        Routes through ``pick_active_contract`` so a root like ``NQ`` with
+        multiple saved expirations resolves to the front-month
+        automatically — keeping the panel's market-data subscription on
+        the same contract that order entry will trade against.
+        """
         from src.core.reference_data import get_instance as _rd
-        q = sym.upper()
-        for c in _rd().contracts_by_symbol.get(q, []):
-            conid = c.get("conid")
-            if conid:
-                return {
-                    "conid":        int(conid),
-                    "symbol":       sym,
-                    "sec_type":     c.get("sec_type", ""),
-                    "exchange":     c.get("exchange", "SMART"),
-                    "currency":     c.get("currency", "USD"),
-                    "local_symbol": c.get("local_symbol", ""),
-                    "expiry":       c.get("expiry", ""),
-                    "multiplier":   c.get("multiplier", ""),
-                }
-        return None
+        c = _rd().pick_active_contract(sym)
+        if not c:
+            return None
+        conid = c.get("conid")
+        if not conid:
+            return None
+        return {
+            "conid":        int(conid),
+            "symbol":       sym,
+            "sec_type":     c.get("sec_type", ""),
+            "exchange":     c.get("exchange", "SMART"),
+            "currency":     c.get("currency", "USD"),
+            "local_symbol": c.get("local_symbol", ""),
+            "expiry":       c.get("expiry", ""),
+            "multiplier":   c.get("multiplier", ""),
+        }
 
     def _on_bg_price_update(self, sym: str, last: float, bid: float,
                             ask: float, close: float = 0.0) -> None:
