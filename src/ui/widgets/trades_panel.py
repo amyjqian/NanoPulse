@@ -379,38 +379,31 @@ class TradesPanel(QWidget):
 
     # ── Summary row hide / restore ──────────────────────────────────────────
 
-    def _row_key_at_summary_index(self, idx) -> tuple | None:
-        """Map a view-index on the summary table to its aggregate key
-        ``(symbol, sec_type)``, or ``None`` if the index is invalid or
-        points at the totals row."""
+    def _summary_row_at(self, idx) -> tuple[tuple, str] | None:
+        """Map a view-index on the summary table to ``(lookup_key, label)``.
+        ``lookup_key`` is the model's internal ``_order`` key (``cid:…``-
+        based) used for ``hide_symbol``; ``label`` is the human-readable
+        Symbol/sec-type combo for the menu.  Returns ``None`` for invalid
+        indexes or the totals footer row."""
         if not idx.isValid():
             return None
         src = self._summary_proxy.mapToSource(idx)
-        agg = self._summary_model.row_data(src.row())
-        if agg is None:
+        key = self._summary_model.row_key(src.row())
+        if key is None:
             return None
+        agg = self._summary_model.row_data(src.row()) or {}
         sym = agg.get("symbol", "")
         if not sym:
             return None
-        return (sym, agg.get("sec_type", "") or "")
-
-    @staticmethod
-    def _key_label(key: tuple) -> str:
-        """Human-readable label for a ``(symbol, sec_type)`` key.
-        Matches the Symbol column so the context menu reads as
-        "Hide TSLA" for stocks and "Hide TSLA OPT" for options."""
-        sym, sec = key
-        if sec and sec != "STK":
-            return f"{sym} {sec}"
-        return sym
+        sec = agg.get("sec_type", "") or ""
+        label = f"{sym} {sec}" if sec and sec != "STK" else sym
+        return key, label
 
     def _on_summary_context_menu(self, pos) -> None:
         menu = QMenu(self._summary_table)
-        idx = self._summary_table.indexAt(pos)
-        key = self._row_key_at_summary_index(idx)
+        info = self._summary_row_at(self._summary_table.indexAt(pos))
 
-        hide_action = (menu.addAction(f"Hide {self._key_label(key)}")
-                       if key else None)
+        hide_action = menu.addAction(f"Hide {info[1]}") if info else None
 
         restore_action = None
         n_hidden = self._summary_model.hidden_count()
@@ -425,17 +418,16 @@ class TradesPanel(QWidget):
             self._summary_table.viewport().mapToGlobal(pos))
         if chosen is None:
             return
-        if chosen is hide_action and key:
-            self._summary_model.hide_symbol(key)
+        if chosen is hide_action and info:
+            self._summary_model.hide_symbol(info[0])
         elif chosen is restore_action:
             self._summary_model.restore_hidden()
 
     def _hide_current_summary_row(self) -> None:
         """Delete-key handler: hide the focused row."""
-        key = self._row_key_at_summary_index(
-            self._summary_table.currentIndex())
-        if key:
-            self._summary_model.hide_symbol(key)
+        info = self._summary_row_at(self._summary_table.currentIndex())
+        if info:
+            self._summary_model.hide_symbol(info[0])
 
     # ── Column visibility + order ───────────────────────────────────────────
 

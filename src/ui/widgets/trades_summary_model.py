@@ -135,6 +135,15 @@ class TradesSummaryModel(QAbstractTableModel):
             return self._agg[self._order[row]]
         return None
 
+    def row_key(self, row: int) -> tuple[str, str] | None:
+        # Aggregation key for ``hide_symbol`` lookups.  The key uses
+        # ``cid:<con_id>`` (see ``_agg_key``) and is *not* derivable from
+        # the agg dict's display fields, so callers that want to hide a
+        # row must round-trip through this helper.
+        if 0 <= row < len(self._order):
+            return self._order[row]
+        return None
+
     def column_keys(self) -> list[str]:
         return list(S_COL_KEYS)
 
