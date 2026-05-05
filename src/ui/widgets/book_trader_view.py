@@ -309,7 +309,7 @@ class BookTraderView(QWidget):
             "Stop Loss", [], label_color=Theme.CLR_SELL,
             short_title="SL")
         self._tr_section = _TierSection(
-            "Trailing", [], label_color=Theme.CLR_FLATTEN,
+            "Trailing", [], label_color=Theme.CLR_CLOSE,
             short_title="TS")
 
         root.addSpacing(8)

@@ -3119,7 +3119,7 @@ class OrderEntryPanel(QWidget):
         self._sl_section.submit_requested.connect(
             lambda: self._on_tier_submit("sl"))
         self._tr_section = _TierSection(
-            "Trailing", tr_tiers, label_color=Theme.CLR_FLATTEN,
+            "Trailing", tr_tiers, label_color=Theme.CLR_CLOSE,
             short_title="TS")
 
         # The TP / SL / Trail amounts that used to live in a separate

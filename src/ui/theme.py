@@ -18,13 +18,13 @@ class Theme:
     ACCENT = "#3FB950"
 
     # Action Colors
-    CLR_BUY = "#2e7d32"
-    CLR_SELL = "#c62828"
+    CLR_BUY = "#2EA043"
+    CLR_SELL = "#F85149"
     CLR_BUY_LMT = "#1b5e20"
     CLR_SELL_LMT = "#8b0000"
 
     # Position Colors
-    CLR_FLATTEN = "#cc6600"
-    CLR_REVERSE = "#8E44AD"
-    CLR_CLOSE = "#8E8E93"
-    CLR_CANCEL = "#3A3A3C"
+    CLR_FLATTEN = "#C2700A"
+    CLR_REVERSE = "#8957E5"
+    CLR_CLOSE = "#4a5160"
+    CLR_CANCEL = "#2b3140"
