@@ -53,9 +53,12 @@ NanoPulse is a PySide6 (Qt) desktop trading front-end for Interactive Brokers, u
 
 ### Logging (`src/utils/logger.py`)
 Three loggers, all rotating (5 MB × 3 backups) under `data/logs/`:
-- Root logger → `nanopulse.log` (DEBUG to file, INFO to console).
-- `nano_tws` → `nano_tws.log` at **INFO** — intentionally above DEBUG because `pnlSingleEvent` / `accountSummaryEvent` fire thousands of times per minute and DEBUG saturates the rotating handler's lock.
-- `nano_order` → `nano_order.log` at DEBUG — full order audit trail.
+- Root logger → `nanopulse.log` at **INFO** (file + console).
+- `nano_tws` → `nano_tws.log` at **INFO** — `pnlSingleEvent` / `accountSummaryEvent` fire thousands of times per minute and DEBUG saturates the rotating handler's lock.
+- `nano_order` → `nano_order.log` at **INFO** — order audit trail.
+- `ib_async` → piped into `nano_tws.log` at **INFO**.
+
+Drop any of these to DEBUG temporarily when tracing wire-level / state issues.
 
 Both dedicated loggers set `propagate = False` so their output stays out of the console. `ib_async.*` loggers are explicitly pinned to WARNING+ for the console but DEBUG still reaches the file. Import the dedicated loggers as `from src.utils.logger import tws_log, order_log`.
 

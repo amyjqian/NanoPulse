@@ -89,7 +89,7 @@ def _configure_dedicated_logger(
     logger.addHandler(fh)
 
 
-def setup_logging(level: int = logging.DEBUG) -> None:
+def setup_logging(level: int = logging.INFO) -> None:
     """
     Configure the root logger with a console handler and a rotating file handler.
 
@@ -129,16 +129,16 @@ def setup_logging(level: int = logging.DEBUG) -> None:
     root.addHandler(file_h)
 
     # ── Dedicated loggers ─────────────────────────────────────────────────────
-    # Both dedicated loggers run at DEBUG for full audit detail.  This is
-    # the "debug build" configuration — pnlSingleEvent / accountSummaryEvent
-    # / pendingTickers each fire many times per second, so the rotating
-    # handler can roll its 5 MB × 3 backups window quickly.  Trade that
-    # for full visibility while debugging; raise back to INFO in
-    # production if disk I/O starves the worker thread.
+    # Both dedicated loggers run at INFO — the production setting.
+    # pnlSingleEvent / accountSummaryEvent / pendingTickers each fire
+    # many times per second, so dropping their DEBUG-level chatter keeps
+    # the rotating 5 MB × 3 backups window from churning and avoids disk
+    # I/O starving the worker thread.  Drop to DEBUG temporarily when
+    # tracing wire-level issues.
     _configure_dedicated_logger(tws_log, TWS_LOG_FILE, _TWS_FMT,
-                                file_level=logging.DEBUG)
+                                file_level=logging.INFO)
     _configure_dedicated_logger(order_log, ORDER_LOG_FILE, _ORDER_FMT,
-                                file_level=logging.DEBUG)
+                                file_level=logging.INFO)
 
     # ── Pipe ib_async (TWS protocol) chatter into nano_tws.log ────────────
     # ib_async's loggers are the source of truth for every wire-level
@@ -150,14 +150,14 @@ def setup_logging(level: int = logging.DEBUG) -> None:
     # console — both would drown in the volume.
     shared_tws_handler = tws_log.handlers[0]
     ia = logging.getLogger("ib_async")
-    ia.setLevel(logging.DEBUG)
+    ia.setLevel(logging.INFO)
     if shared_tws_handler not in ia.handlers:
         ia.addHandler(shared_tws_handler)
     ia.propagate = False
 
     logging.getLogger("NanoPulse").info(
         "Logging initialised  (console=INFO, file=%s level=%s, "
-        "nano_tws=DEBUG, nano_order=DEBUG, ib_async→nano_tws.log)",
+        "nano_tws=INFO, nano_order=INFO, ib_async→nano_tws.log)",
         LOG_FILE,
         logging.getLevelName(level),
     )
