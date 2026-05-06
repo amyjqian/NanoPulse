@@ -43,10 +43,10 @@ BORDER = "#30363D"
 TEXT = "#C9D1D9"
 TEXT_DIM = "#8B949E"
 
-CLR_FLATTEN = "#C2700A"
-CLR_CLOSE = "#4a5160"
-CLR_REVERSE = "#8957E5"
-CLR_CANCEL = "#2b3140"
+CLR_FLATTEN = "#cc6600"
+CLR_CLOSE = "#8E8E93"
+CLR_REVERSE = "#8E44AD"
+CLR_CANCEL = "#3A3A3C"
 
 # Orange accent matches the Flatten button + trades control bar.
 ACCENT = "#CC6600"
