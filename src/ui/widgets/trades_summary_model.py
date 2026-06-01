@@ -121,6 +121,17 @@ class TradesSummaryModel(QAbstractTableModel):
         # the total row iterates over ``_order`` (visible only) so hides
         # recompute the footer.  Cleared on any filter-driven rebuild.
         self._hidden_symbols: set[tuple[str, str]] = set()
+        # exec_ids the user hid in the *flat* list view.  Mirrored here by
+        # the panel so a fill hidden in the list also drops out of its
+        # symbol aggregate.  Unlike ``_hidden_symbols`` this is owned by
+        # the flat proxy, so it survives this model's filter rebuilds.
+        self._hidden_fills: set[str] = set()
+        # Keys the user asked to "match buy & sell": the larger of the
+        # buy/sell legs is trimmed (qty + notional, avg price kept) down
+        # to the smaller so Net reads flat and the P&L columns show only
+        # the closed round-trip.  Applied at render time via
+        # ``_effective_agg`` so live fills keep updating the raw aggregate.
+        self._matched_keys: set[tuple[str, str]] = set()
 
         self._symbol_font = QFont("Helvetica Neue, Arial", 11)
         self._symbol_font.setWeight(QFont.Weight.DemiBold)
@@ -187,7 +198,9 @@ class TradesSummaryModel(QAbstractTableModel):
 
         if row < 0 or row >= len(self._order):
             return None
-        agg = self._agg[self._order[row]]
+        agg = self._effective_agg(self._order[row])
+        if agg is None:
+            return None
 
         if role == Qt.ItemDataRole.DisplayRole:
             return self._cell_text(agg, col)
@@ -227,10 +240,34 @@ class TradesSummaryModel(QAbstractTableModel):
         return None
 
     def _visible_aggs(self) -> list[dict]:
-        """Aggregates that are currently shown (hidden symbols excluded).
-        The totals footer folds over these so hiding a row recomputes
-        the footer immediately."""
-        return [self._agg[s] for s in self._order if s in self._agg]
+        """Aggregates that are currently shown (hidden symbols excluded),
+        each in its *effective* form so matched rows fold their trimmed
+        round-trip values into the totals footer.  The footer recomputes
+        immediately when a row is hidden or matched."""
+        aggs = [self._effective_agg(s) for s in self._order if s in self._agg]
+        return [a for a in aggs if a is not None]
+
+    def _effective_agg(self, key: tuple[str, str]) -> dict | None:
+        """The aggregate as rendered.  For a matched key the larger leg is
+        scaled down to the smaller (preserving average price) so Net is
+        flat and the P&L columns reflect only the closed portion; every
+        other row returns its raw aggregate unchanged."""
+        agg = self._agg.get(key)
+        if agg is None or key not in self._matched_keys:
+            return agg
+        b_q = agg.get("buys_qty", 0.0)
+        s_q = agg.get("sells_qty", 0.0)
+        matched = min(b_q, s_q)
+        if matched <= 0 or b_q == s_q:
+            return agg
+        eff = dict(agg)
+        if b_q > matched:
+            eff["buys_notional"] = agg.get("buys_notional", 0.0) * (matched / b_q)
+            eff["buys_qty"] = matched
+        if s_q > matched:
+            eff["sells_notional"] = agg.get("sells_notional", 0.0) * (matched / s_q)
+            eff["sells_qty"] = matched
+        return eff
 
     def _total_cell_text(self, col: int) -> str:
         if col == S_COL_SYMBOL:
@@ -531,6 +568,17 @@ class TradesSummaryModel(QAbstractTableModel):
         self._search_text = new_search
         self._rebuild_from_fills()
 
+    def set_hidden_fills(self, exec_ids) -> None:
+        """Exclude *exec_ids* (fills hidden in the flat list view) from
+        aggregation.  Driven by the panel from the flat proxy's hide set
+        so a trade hidden in the list also vanishes from its summary
+        aggregate."""
+        new = {e for e in (exec_ids or ()) if e}
+        if new == self._hidden_fills:
+            return
+        self._hidden_fills = new
+        self._rebuild_from_fills()
+
     def clear(self) -> None:
         if not self._order and not self._fills:
             return
@@ -539,6 +587,8 @@ class TradesSummaryModel(QAbstractTableModel):
         self._order.clear()
         self._fills.clear()
         self._hidden_symbols.clear()
+        self._hidden_fills.clear()
+        self._matched_keys.clear()
         self._latest_fill_date = None
         self._anchor_date = None
         self.endResetModel()
@@ -582,6 +632,58 @@ class TradesSummaryModel(QAbstractTableModel):
     def hidden_count(self) -> int:
         return len(self._hidden_symbols)
 
+    def visible_fill_count(self) -> int:
+        """Total number of fills folded into the currently-visible
+        aggregates (user-hidden symbols excluded).  Mirrors the flat
+        view's trade count so hiding a summary row drops the counter in
+        the control bar too."""
+        return sum(
+            int(self._agg[s].get("fill_count", 0))
+            for s in self._order if s in self._agg
+        )
+
+    # ── Match buy & sell (user-driven, per row) ─────────────────────────────
+
+    def can_match(self, key: tuple[str, str]) -> bool:
+        """True when *key* has both a buy and a sell leg of unequal size,
+        so trimming the larger to the smaller is meaningful."""
+        agg = self._agg.get(key)
+        if agg is None:
+            return False
+        b = agg.get("buys_qty", 0.0)
+        s = agg.get("sells_qty", 0.0)
+        return b > 0 and s > 0 and b != s
+
+    def is_matched(self, key: tuple[str, str]) -> bool:
+        return key in self._matched_keys
+
+    def match_symbol(self, key: tuple[str, str]) -> None:
+        """Trim *key* to its matched round-trip and repaint the row +
+        totals footer.  No-op if the legs already balance or one side is
+        empty."""
+        if not key or key in self._matched_keys or not self.can_match(key):
+            return
+        self._matched_keys.add(key)
+        self._emit_row_and_total(key)
+
+    def unmatch_symbol(self, key: tuple[str, str]) -> None:
+        """Restore the full (untrimmed) buy/sell legs for *key*."""
+        if key not in self._matched_keys:
+            return
+        self._matched_keys.discard(key)
+        self._emit_row_and_total(key)
+
+    def _emit_row_and_total(self, key: tuple[str, str]) -> None:
+        """Repaint *key*'s visible row and the totals footer."""
+        if key not in self._order:
+            return
+        row = self._order.index(key)
+        self.dataChanged.emit(
+            self.index(row, 0), self.index(row, _S_NUM_COLS - 1))
+        total_row = len(self._order)
+        self.dataChanged.emit(
+            self.index(total_row, 0), self.index(total_row, _S_NUM_COLS - 1))
+
     # ── Date-filter helpers ─────────────────────────────────────────────────
 
     @staticmethod
@@ -609,6 +711,10 @@ class TradesSummaryModel(QAbstractTableModel):
         return self._latest_fill_date if self._latest_fill_date < today else today
 
     def _passes_filter(self, fill: dict) -> bool:
+        if self._hidden_fills:
+            ek = fill.get("exec_id", "")
+            if ek and ek in self._hidden_fills:
+                return False
         if not self._passes_time_filter(fill):
             return False
         if not self._passes_search_filter(fill):
@@ -761,6 +867,7 @@ class TradesSummaryModel(QAbstractTableModel):
         # Hidden rows aren't in ``_order`` but still have a stored
         # aggregate — drop from internal state only; no row signals
         # needed because the view isn't showing them.
+        self._matched_keys.discard(key)
         if key in self._hidden_symbols:
             self._hidden_symbols.discard(key)
             self._agg.pop(key, None)

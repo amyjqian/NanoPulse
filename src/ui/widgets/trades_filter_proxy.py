@@ -21,7 +21,7 @@ import logging
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from PySide6.QtCore import QModelIndex, QSortFilterProxyModel, Qt
+from PySide6.QtCore import QModelIndex, QSortFilterProxyModel, Qt, Signal
 
 log = logging.getLogger(__name__)
 
@@ -89,6 +89,11 @@ class TradesFilterProxy(QSortFilterProxyModel):
     """Proxy model wiring the control-bar search box + date range to the
     flat/summary trades sources."""
 
+    # Emitted whenever the user-hidden fill set changes (hide / restore /
+    # auto-clear on filter change).  The panel listens so it can mirror the
+    # hidden exec_ids into the summary model and keep the two views in sync.
+    hiddenKeysChanged = Signal()
+
     def __init__(self, parent=None, *, is_summary: bool = False):
         super().__init__(parent)
         self._is_summary = is_summary
@@ -108,6 +113,12 @@ class TradesFilterProxy(QSortFilterProxyModel):
         # of a blank panel.  Recomputed when rows are inserted into the
         # source model.
         self._anchor_date: date = datetime.now(_ET).date()
+        # Fills the user has temporarily hidden (flat view), keyed by
+        # ``exec_id`` so the hide stays attached to the right fill as rows
+        # shift on new inserts.  Cleared whenever a filter changes — see
+        # the setters below — so a hide can't silently exclude rows from a
+        # different window the user may not realise are gone.
+        self._hidden_keys: set[str] = set()
 
     # ── Public setters (hooked to the control bar) ──────────────────────────
 
@@ -146,6 +157,7 @@ class TradesFilterProxy(QSortFilterProxyModel):
             return
         self._search = new_search
         self._time_threshold = new_threshold
+        self._clear_hidden_keys()
         self.invalidateFilter()
 
     def setDaysBack(self, days: int) -> None:
@@ -154,6 +166,7 @@ class TradesFilterProxy(QSortFilterProxyModel):
         if days == self._days_back:
             return
         self._days_back = days
+        self._clear_hidden_keys()
         self.invalidateFilter()
 
     def setPresetThreshold(self, dt: datetime | None) -> None:
@@ -162,10 +175,45 @@ class TradesFilterProxy(QSortFilterProxyModel):
         if dt == self._preset_threshold:
             return
         self._preset_threshold = dt
+        self._clear_hidden_keys()
         self.invalidateFilter()
 
     def presetThreshold(self) -> datetime | None:
         return self._preset_threshold
+
+    # ── User-driven row hide / restore (flat view) ──────────────────────────
+
+    def hideKeys(self, keys) -> None:
+        """Temporarily hide every fill whose ``exec_id`` is in *keys*.
+        Empty / unknown keys are ignored; a no-op set change skips the
+        (expensive) re-filter."""
+        new = {k for k in keys if k}
+        if not new or new <= self._hidden_keys:
+            return
+        self._hidden_keys |= new
+        self.hiddenKeysChanged.emit()
+        self.invalidateFilter()
+
+    def restoreHidden(self) -> None:
+        if not self._hidden_keys:
+            return
+        self._clear_hidden_keys()
+        self.invalidateFilter()
+
+    def hiddenCount(self) -> int:
+        return len(self._hidden_keys)
+
+    def hiddenKeys(self) -> set[str]:
+        """Copy of the currently-hidden ``exec_id`` set (the panel mirrors
+        this into the summary model)."""
+        return set(self._hidden_keys)
+
+    def _clear_hidden_keys(self) -> None:
+        """Drop every hidden key, emitting ``hiddenKeysChanged`` only when
+        the set actually had entries."""
+        if self._hidden_keys:
+            self._hidden_keys.clear()
+            self.hiddenKeysChanged.emit()
 
     def anchorDate(self) -> date:
         """Session day the date filter is anchored to — ``today_ET``
@@ -186,6 +234,13 @@ class TradesFilterProxy(QSortFilterProxyModel):
         data = row_data(src_row) if row_data else None
         if data is None:
             return True
+
+        # User-hidden fills (flat view) — keyed by exec_id so the hide is
+        # stable as rows shift on new inserts.
+        if self._hidden_keys:
+            ek = data.get("exec_id", "")
+            if ek and ek in self._hidden_keys:
+                return False
 
         # Time-threshold filter — show only fills at or after this
         # moment.  The session-of-day preset (from the combo) beats the
