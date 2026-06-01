@@ -232,14 +232,26 @@ class TradesPanel(QWidget):
         self._control_bar.searchTextChanged.connect(self._on_search_changed)
         self._control_bar.settingsClicked.connect(self._on_gear_clicked)
 
-        # Keep the visible-trade counter in sync with the flat proxy.
-        # invalidateFilter() (from search/date changes) emits layoutChanged;
-        # incremental add_fill() emits rowsInserted; clear() → modelReset.
+        # Keep the visible-trade counter in sync with whichever view is
+        # active.  Flat: invalidateFilter() (search/date) emits
+        # layoutChanged; incremental add_fill() emits rowsInserted;
+        # clear() → modelReset.  Summary: hide_symbol() emits rowsRemoved,
+        # restore_hidden()/filter rebuilds emit modelReset, and per-fill
+        # folds emit dataChanged — all of which can change the visible
+        # fill count, so the summary counter tracks user-hidden rows too.
         self._flat_proxy.layoutChanged.connect(self._refresh_trade_count)
         self._flat_proxy.rowsInserted.connect(self._refresh_trade_count)
         self._flat_proxy.rowsRemoved.connect(self._refresh_trade_count)
         self._flat_proxy.modelReset.connect(self._refresh_trade_count)
-        self._refresh_trade_count()
+        self._summary_model.rowsInserted.connect(self._refresh_trade_count)
+        self._summary_model.rowsRemoved.connect(self._refresh_trade_count)
+        self._summary_model.modelReset.connect(self._refresh_trade_count)
+        self._summary_model.dataChanged.connect(self._refresh_trade_count)
+
+        # Mirror per-fill hides from the flat list into the summary model
+        # so a trade hidden in the list also drops out of its aggregate.
+        self._flat_proxy.hiddenKeysChanged.connect(
+            self._sync_summary_hidden_fills)
 
         self._stack = QStackedWidget(self)
         self._flat_table = self._make_table(self._flat_proxy)
@@ -248,26 +260,41 @@ class TradesPanel(QWidget):
         self._stack.addWidget(self._summary_table)   # index 1
         root.addWidget(self._stack, 1)
 
+        # Initial count — deferred until the stack exists since
+        # _refresh_trade_count reads the active view kind from it.
+        self._refresh_trade_count()
+
         self._apply_flat_default_widths()
         self._apply_summary_default_widths()
 
-        # Summary-only: right-click menu + Delete-key shortcut to
-        # temporarily hide rows from the totals footer.
+        # Both views allow multi-row selection (set in _make_table) so a
+        # batch of rows can be temporarily hidden via the right-click menu
+        # or the Delete key — summary hides whole symbol aggregates, flat
+        # hides individual fills.
         self._summary_table.setContextMenuPolicy(
             Qt.ContextMenuPolicy.CustomContextMenu)
         self._summary_table.customContextMenuRequested.connect(
             self._on_summary_context_menu)
-        delete_sc = QShortcut(
+        summary_delete_sc = QShortcut(
             QKeySequence(Qt.Key.Key_Delete), self._summary_table)
-        delete_sc.setContext(Qt.ShortcutContext.WidgetShortcut)
-        delete_sc.activated.connect(self._hide_current_summary_row)
+        summary_delete_sc.setContext(Qt.ShortcutContext.WidgetShortcut)
+        summary_delete_sc.activated.connect(self._hide_selected_summary_rows)
+
+        self._flat_table.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self._flat_table.customContextMenuRequested.connect(
+            self._on_flat_context_menu)
+        flat_delete_sc = QShortcut(
+            QKeySequence(Qt.Key.Key_Delete), self._flat_table)
+        flat_delete_sc.setContext(Qt.ShortcutContext.WidgetShortcut)
+        flat_delete_sc.activated.connect(self._hide_selected_flat_rows)
 
     def _make_table(self, proxy) -> QTableView:
         t = QTableView(self)
         t.setModel(proxy)
         t.setAlternatingRowColors(True)
         t.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        t.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        t.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         t.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         t.verticalHeader().setVisible(False)
         t.setShowGrid(False)
@@ -333,6 +360,9 @@ class TradesPanel(QWidget):
 
     def _on_summary_toggled(self, on: bool) -> None:
         self._stack.setCurrentIndex(1 if on else 0)
+        # The two views count differently (flat = visible rows, summary =
+        # fills behind the un-hidden aggregates) so re-source on toggle.
+        self._refresh_trade_count()
 
     def _on_date_changed(self, key: str) -> None:
         days, hm = _FILTER_PRESETS.get(key, (1, None))
@@ -363,10 +393,17 @@ class TradesPanel(QWidget):
         self._refresh_summary_threshold()
 
     def _refresh_trade_count(self, *_args) -> None:
-        """Push the flat proxy's visible-row count to the control bar.
-        The *_args absorb whatever signal payload Qt passes in
-        (rowsInserted/rowsRemoved carry parent/first/last)."""
-        self._control_bar.setTradeCount(self._flat_proxy.rowCount())
+        """Push the active view's trade count to the control bar.  Flat
+        view reports its visible rows; summary view reports the number of
+        fills behind the un-hidden aggregates so hiding a summary row
+        drops the count.  The *_args absorb whatever signal payload Qt
+        passes in (rowsInserted/rowsRemoved carry parent/first/last;
+        dataChanged carries topLeft/bottomRight/roles)."""
+        if self._active_view_kind() == "summary":
+            count = self._summary_model.visible_fill_count()
+        else:
+            count = self._flat_proxy.rowCount()
+        self._control_bar.setTradeCount(count)
 
     def _refresh_summary_threshold(self) -> None:
         """Summary model has a single ``_time_threshold`` slot; mirror
@@ -399,11 +436,58 @@ class TradesPanel(QWidget):
         label = f"{sym} {sec}" if sec and sec != "STK" else sym
         return key, label
 
+    def _selected_summary_rows(self) -> list[tuple[tuple, str]]:
+        """``(lookup_key, label)`` for every selected summary row, skipping
+        invalid indexes and the totals footer.  Returns at most one entry
+        per row (``selectedRows`` already de-dupes per row)."""
+        sel = self._summary_table.selectionModel()
+        if sel is None:
+            return []
+        infos: list[tuple[tuple, str]] = []
+        for idx in sel.selectedRows():
+            info = self._summary_row_at(idx)
+            if info:
+                infos.append(info)
+        return infos
+
+    def _hide_rows(self, infos: list[tuple[tuple, str]]) -> None:
+        """Hide each row by its lookup key.  Keys are resolved before any
+        removal so the shifting row indices during the loop don't matter."""
+        for key, _label in infos:
+            self._summary_model.hide_symbol(key)
+
     def _on_summary_context_menu(self, pos) -> None:
         menu = QMenu(self._summary_table)
-        info = self._summary_row_at(self._summary_table.indexAt(pos))
+        selected = self._selected_summary_rows()
+        clicked = self._summary_row_at(self._summary_table.indexAt(pos))
 
-        hide_action = menu.addAction(f"Hide {info[1]}") if info else None
+        # Right-clicking a row outside the current selection targets just
+        # that row; clicking inside (or with several rows selected) acts
+        # on the whole selection.
+        selected_keys = {k for k, _ in selected}
+        if clicked and clicked[0] not in selected_keys:
+            targets = [clicked]
+        else:
+            targets = selected or ([clicked] if clicked else [])
+
+        hide_action = None
+        if targets:
+            if len(targets) == 1:
+                hide_action = menu.addAction(f"Hide {targets[0][1]}")
+            else:
+                hide_action = menu.addAction(
+                    f"Hide {len(targets)} selected rows")
+
+        # Match buy & sell — single-row action on the right-clicked row.
+        # ("&&" renders a literal ampersand; a single "&" is a mnemonic.)
+        match_action = None
+        unmatch_action = None
+        if clicked:
+            ckey = clicked[0]
+            if self._summary_model.is_matched(ckey):
+                unmatch_action = menu.addAction("Restore full buy/sell")
+            elif self._summary_model.can_match(ckey):
+                match_action = menu.addAction("Match buy && sell")
 
         restore_action = None
         n_hidden = self._summary_model.hidden_count()
@@ -418,16 +502,118 @@ class TradesPanel(QWidget):
             self._summary_table.viewport().mapToGlobal(pos))
         if chosen is None:
             return
-        if chosen is hide_action and info:
-            self._summary_model.hide_symbol(info[0])
+        if chosen is hide_action and targets:
+            self._hide_rows(targets)
+        elif chosen is match_action and clicked:
+            self._summary_model.match_symbol(clicked[0])
+        elif chosen is unmatch_action and clicked:
+            self._summary_model.unmatch_symbol(clicked[0])
         elif chosen is restore_action:
             self._summary_model.restore_hidden()
 
-    def _hide_current_summary_row(self) -> None:
-        """Delete-key handler: hide the focused row."""
-        info = self._summary_row_at(self._summary_table.currentIndex())
-        if info:
-            self._summary_model.hide_symbol(info[0])
+    def _hide_selected_summary_rows(self) -> None:
+        """Delete-key handler: hide every selected row, falling back to the
+        focused row when the selection is empty."""
+        infos = self._selected_summary_rows()
+        if not infos:
+            info = self._summary_row_at(self._summary_table.currentIndex())
+            if info:
+                infos = [info]
+        self._hide_rows(infos)
+
+    # ── Flat row hide / restore ─────────────────────────────────────────────
+
+    def _flat_row_at(self, idx) -> tuple[str, str] | None:
+        """Map a view-index on the flat table to ``(exec_id, label)``.
+        ``exec_id`` is the per-fill identity the proxy hides on; ``label``
+        is a short ``side qty symbol`` descriptor for the menu.  Returns
+        ``None`` for invalid indexes or fills without an exec_id (which
+        can't be reliably hidden)."""
+        if not idx.isValid():
+            return None
+        src = self._flat_proxy.mapToSource(idx)
+        data = self._flat_model.row_data(src.row()) or {}
+        exec_id = data.get("exec_id", "")
+        if not exec_id:
+            return None
+        sym = data.get("local_symbol", "") or data.get("symbol", "") or "—"
+        side = data.get("side", "") or ""
+        try:
+            qty = int(float(data.get("shares", 0) or 0))
+            qty_s = str(qty) if qty else ""
+        except (TypeError, ValueError):
+            qty_s = ""
+        parts = [p for p in (side, qty_s, sym) if p]
+        return exec_id, " ".join(parts) if parts else sym
+
+    def _selected_flat_rows(self) -> list[tuple[str, str]]:
+        """``(exec_id, label)`` for every selected flat row, skipping
+        invalid rows and fills without an exec_id."""
+        sel = self._flat_table.selectionModel()
+        if sel is None:
+            return []
+        infos: list[tuple[str, str]] = []
+        for idx in sel.selectedRows():
+            info = self._flat_row_at(idx)
+            if info:
+                infos.append(info)
+        return infos
+
+    def _on_flat_context_menu(self, pos) -> None:
+        menu = QMenu(self._flat_table)
+        selected = self._selected_flat_rows()
+        clicked = self._flat_row_at(self._flat_table.indexAt(pos))
+
+        # Right-clicking a row outside the current selection targets just
+        # that row; clicking inside (or with several rows selected) acts
+        # on the whole selection.
+        selected_keys = {k for k, _ in selected}
+        if clicked and clicked[0] not in selected_keys:
+            targets = [clicked]
+        else:
+            targets = selected or ([clicked] if clicked else [])
+
+        hide_action = None
+        if targets:
+            if len(targets) == 1:
+                hide_action = menu.addAction(f"Hide {targets[0][1]}")
+            else:
+                hide_action = menu.addAction(
+                    f"Hide {len(targets)} selected trades")
+
+        restore_action = None
+        n_hidden = self._flat_proxy.hiddenCount()
+        if n_hidden:
+            suffix = "s" if n_hidden > 1 else ""
+            restore_action = menu.addAction(
+                f"Restore {n_hidden} hidden trade{suffix}")
+
+        if not menu.actions():
+            return
+        chosen = menu.exec(self._flat_table.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen is hide_action and targets:
+            self._flat_proxy.hideKeys([k for k, _ in targets])
+        elif chosen is restore_action:
+            self._flat_proxy.restoreHidden()
+
+    def _hide_selected_flat_rows(self) -> None:
+        """Delete-key handler: hide every selected flat row, falling back
+        to the focused row when the selection is empty."""
+        infos = self._selected_flat_rows()
+        if not infos:
+            info = self._flat_row_at(self._flat_table.currentIndex())
+            if info:
+                infos = [info]
+        if infos:
+            self._flat_proxy.hideKeys([k for k, _ in infos])
+
+    def _sync_summary_hidden_fills(self) -> None:
+        """Push the flat view's hidden exec_ids into the summary model so a
+        fill hidden in the list also disappears from its symbol aggregate.
+        Driven by ``TradesFilterProxy.hiddenKeysChanged``."""
+        self._summary_model.set_hidden_fills(self._flat_proxy.hiddenKeys())
 
     # ── Column visibility + order ───────────────────────────────────────────
 
@@ -611,3 +797,6 @@ class TradesPanel(QWidget):
     def clear_fills(self) -> None:
         self._flat_model.clear()
         self._summary_model.clear()
+        # Reset the flat hide set too (and, via its signal, the summary's
+        # mirrored copy) so a fresh fill stream starts with nothing hidden.
+        self._flat_proxy.restoreHidden()
