@@ -128,6 +128,32 @@ def _pnl_color(val: float) -> QColor:
 class AccountPositionModel(QAbstractTableModel):
     """Grouped table – account header row followed by its position rows."""
 
+    # Keep the account ordering identical to the Account Management panel
+    # (``AccountListPanel._name_sort_key``): ``mgn`` prefix ranks first
+    # (top), ``tfs`` rank 1, ``rsp`` and ``fhs`` share rank 2, and every
+    # other prefix falls through to rank 3 where the alphabetical tiebreak
+    # takes over.
+    _PREFIX_PRIORITY: dict[str, int] = {
+        "mgn": 0,
+        "tfs": 1,
+        "rsp": 2,
+        "fhs": 2,
+    }
+
+    def _name_sort_key(self, account: str) -> tuple:
+        """Sort key matching ``AccountListPanel._name_sort_key``:
+        priority-prefix buckets first (MGN > TFS > RSP/FHS > everything
+        else), then alphabetical by first 3 chars of the display name,
+        then last 2 chars.  Display name = alias when set, else account
+        id.  Case-insensitive, with the account id as final tiebreaker."""
+        alias = (self._get_alias(account) if self._get_alias else "") or ""
+        name = alias if alias else account
+        lower = name.lower()
+        first3 = lower[:3]
+        last2 = lower[-2:]
+        priority = self._PREFIX_PRIORITY.get(first3, 3)
+        return (priority, first3, last2, account)
+
     def __init__(self, get_alias=None, parent=None):
         super().__init__(parent)
         self._rows: list[dict] = []
@@ -461,7 +487,7 @@ class AccountPositionModel(QAbstractTableModel):
                 continue
             acct_pos.setdefault(account, []).append((key, pos))
 
-        for account in sorted(acct_pos):
+        for account in sorted(acct_pos, key=self._name_sort_key):
             # Sort positions within the account by abs(market_value) desc,
             # with abs(position qty) as tiebreaker for rows where market
             # value hasn't arrived yet from pnlSingleEvent.
