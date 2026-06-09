@@ -91,6 +91,10 @@ class AccountsTableModel(QAbstractTableModel):
         self._aliases: dict[str, str] = config_manager.load_aliases()
         # Buying power tracked separately (not shown as a column in Connections view)
         self._buying_power: dict[str, float] = {}   # account → buying power
+        # Per-currency cash balances from the ``$LEDGER:ALL`` summary tag,
+        # keyed account → {currency: balance}.  Not a table column — read by
+        # AccountListPanel to render the "USD 6,300  JPY 5,000" line per row.
+        self._cash_by_ccy: dict[str, dict[str, float]] = {}
         # Live TWS connection state per connection-label.  Updated by
         # ConnectionsView when the worker emits ``connection_status_changed``;
         # consumed by AccountListPanel to dim rows whose worker is offline
@@ -221,6 +225,30 @@ class AccountsTableModel(QAbstractTableModel):
                     pass
                 continue
 
+            # Per-account, per-currency cash from the reqAccountUpdatesMulti
+            # stream (account="" → all accounts).  Each real currency (USD,
+            # JPY, CAD, …) arrives as its own CashBalance row; "BASE" is the
+            # base-currency roll-up we don't want in the per-currency line.
+            if tag == "CashBalance":
+                if currency and currency != "BASE":
+                    try:
+                        self._cash_by_ccy.setdefault(
+                            account, {})[currency] = float(value)
+                    except (ValueError, TypeError):
+                        pass
+                    else:
+                        # Nudge the account's row so AccountListPanel re-reads
+                        # the cash map (CashBalance isn't a table column).  Never
+                        # insert from cash alone — NetLiquidation owns row
+                        # creation, and any group-consolidated ledger row that
+                        # slips through must not spawn a phantom account row.
+                        row_idx = self._row_map.get((label, account))
+                        if row_idx is not None:
+                            mi = self.index(row_idx, COL_NET_LIQ)
+                            self.dataChanged.emit(
+                                mi, mi, [Qt.ItemDataRole.DisplayRole])
+                continue
+
             col = _TAG_COL_MAP.get(tag)
             if col is None:
                 continue
@@ -265,6 +293,11 @@ class AccountsTableModel(QAbstractTableModel):
     def get_buying_power(self, account: str) -> float:
         """Return the last-known buying power for *account*, or 0.0."""
         return self._buying_power.get(account, 0.0)
+
+    def get_cash_by_currency(self, account: str) -> dict[str, float]:
+        """Return the last-known per-currency cash balances for *account*
+        (e.g. ``{"USD": 6300.0, "JPY": 5000.0}``), or an empty dict."""
+        return self._cash_by_ccy.get(account, {})
 
     def remove_rows_by_label(self, label: str) -> None:
         """Remove every row whose Connection column matches *label*."""

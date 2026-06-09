@@ -279,8 +279,11 @@ class IBWorkerThread(QThread):
         self._main_task: asyncio.Task | None = None
         self._first_connect_attempted = False
 
-        # De-dupe buffer keyed by (account, tag) → (value, currency)
-        self._buffer: dict[tuple[str, str], tuple[str, str]] = {}
+        # De-dupe buffer keyed by (account, tag, currency) → (value, currency).
+        # Currency is part of the key so the per-currency ledger rows from the
+        # ``$LEDGER:ALL`` summary tag (CashBalance in USD / JPY / CAD / …) are
+        # preserved instead of collapsing onto a single (account, tag) slot.
+        self._buffer: dict[tuple[str, str, str], tuple[str, str]] = {}
 
         # Portfolio buffer keyed by (account, conId) → position dict
         self._portfolio_buffer: dict[tuple[str, int], dict] = {}
@@ -776,6 +779,12 @@ class IBWorkerThread(QThread):
 
         self._ib = IB()
         self._ib.accountSummaryEvent += self._on_account_summary
+        # Per-account, per-currency account values (CashBalance in USD / JPY /
+        # CAD / …).  accountSummary's $LEDGER tag is group-consolidated
+        # (account="All"), so per-account cash has to come from the
+        # reqAccountUpdatesMulti stream which fires accountValueEvent keyed by
+        # the real account.
+        self._ib.accountValueEvent += self._on_account_value
         self._ib.pnlEvent += self._on_pnl
         self._ib.pnlSingleEvent += self._on_pnl_single
         self._ib.errorEvent += self._on_ib_error
@@ -937,12 +946,32 @@ class IBWorkerThread(QThread):
                     tws_log.info(
                         "[%s] API-CALL  accountSummaryAsync()", self._label)
                     for v in await self._ib.accountSummaryAsync():
-                        self._buffer[(v.account, v.tag)] = (
+                        self._buffer[(v.account, v.tag, v.currency)] = (
                             v.value, v.currency)
                     log.info("Worker %s buffer seeded with %d tag(s)",
                              self._label, len(self._buffer))
                     tws_log.info("[%s] API-RESP  accountSummaryAsync → %d tag(s)",
                                  self._label, len(self._buffer))
+
+                    # Per-account, per-currency cash via reqAccountUpdatesMulti,
+                    # which streams CashBalance per currency through
+                    # accountValueEvent — unlike $LEDGER:ALL in the account
+                    # summary, which only reports the group total.  One request
+                    # per account: the account="" wildcard is rejected on FA
+                    # connections ("Group name cannot be null", error 321) and
+                    # ib_async classifies that reject as a warning, leaving the
+                    # returned future unresolved — awaiting it hung this whole
+                    # setup block (reqPnL, positions, snapshots) forever.  The
+                    # subscription is live as soon as the request is sent, so
+                    # don't await the initial-download future at all; just
+                    # swallow its result so a late error can't warn unretrieved.
+                    for acct in self._ib.managedAccounts():
+                        fut = self._ib.reqAccountUpdatesMultiAsync(acct, "")
+                        fut.add_done_callback(
+                            lambda f: f.cancelled() or f.exception())
+                        tws_log.info(
+                            "[%s] API-CALL  reqAccountUpdatesMulti(account=%s)",
+                            self._label, acct)
 
                     # Subscribe to P&L stream for DailyPnL
                     for acct in self._ib.managedAccounts():
@@ -987,7 +1016,7 @@ class IBWorkerThread(QThread):
             # Emit account summary batch
             if self._buffer:
                 batch: list[tuple[str, str, str, str, str]] = []
-                for (account, tag), (value, currency) in self._buffer.items():
+                for (account, tag, _ccy), (value, currency) in self._buffer.items():
                     batch.append((self._label, account, tag, value, currency))
                 self._buffer.clear()
                 if batch:
@@ -2951,7 +2980,12 @@ class IBWorkerThread(QThread):
         ``accountSummaryEvent`` emits a single :class:`AccountValue` per call.
         """
         try:
-            self._buffer[(value.account, value.tag)] = (
+            # CashBalance from the summary's $LEDGER tag is group-consolidated
+            # (account="All"), not per-account — drop it here and rely on the
+            # per-account accountValueEvent stream instead.
+            if value.tag == "CashBalance":
+                return
+            self._buffer[(value.account, value.tag, value.currency)] = (
                 value.value, value.currency)
             tws_log.debug("[%s] EVENT     accountSummaryEvent → account=%s tag=%s "
                           "value=%s currency=%s",
@@ -2959,6 +2993,25 @@ class IBWorkerThread(QThread):
                           value.value, value.currency)
         except Exception:
             log.debug("Worker %s: bad AccountValue: %s", self._label, value)
+
+    def _on_account_value(self, value) -> None:
+        """Funnel per-account ``CashBalance`` ledger rows from the
+        reqAccountUpdatesMulti stream into the same buffer the account
+        summary uses, so the existing ``summary_batch_updated`` path carries
+        them to the UI.  Only CashBalance is forwarded — the multi stream
+        also emits dozens of other tags we don't surface — and the "BASE"
+        roll-up row is dropped so only real currencies reach the panel."""
+        try:
+            if value.tag != "CashBalance" or value.currency in ("", "BASE"):
+                return
+            self._buffer[(value.account, value.tag, value.currency)] = (
+                value.value, value.currency)
+            tws_log.debug("[%s] EVENT     accountValueEvent → account=%s "
+                          "CashBalance %s %s",
+                          self._label, value.account,
+                          value.value, value.currency)
+        except Exception:
+            log.debug("Worker %s: bad account value: %s", self._label, value)
 
     def _on_pnl(self, entry) -> None:
         """Handle pnlEvent – provides dailyPnL, realizedPnL, unrealizedPnL.
@@ -2973,8 +3026,18 @@ class IBWorkerThread(QThread):
                           self._label, acct,
                           entry.dailyPnL, entry.realizedPnL, entry.unrealizedPnL)
             daily = _safe_pnl(entry.dailyPnL)
+            # TEMP diagnostic: show raw vs sanitised dailyPnL once per account
+            # so we can see whether IB is sending the DBL_MAX "unset" sentinel.
+            if not hasattr(self, "_pnl_diag"):
+                self._pnl_diag = set()
+            if acct not in self._pnl_diag:
+                self._pnl_diag.add(acct)
+                log.info("Worker %s pnlEvent diag: acct=%s rawDaily=%r safeDaily=%r "
+                         "rawUnrl=%r rawReal=%r",
+                         self._label, acct, entry.dailyPnL, daily,
+                         entry.unrealizedPnL, entry.realizedPnL)
             if daily != 0.0:
-                self._buffer[(acct, "DailyPnL")] = (str(daily), "BASE")
+                self._buffer[(acct, "DailyPnL", "BASE")] = (str(daily), "BASE")
             # Emit account-level P&L signal for the UI position panel
             realized = _safe_pnl(entry.realizedPnL)
             unrealized = _safe_pnl(entry.unrealizedPnL)

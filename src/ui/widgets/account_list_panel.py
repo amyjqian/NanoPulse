@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import Qt, Signal, QMimeData, QModelIndex, QRect, QTimer
+from PySide6.QtCore import Qt, Signal, QMimeData, QModelIndex, QRect, QRectF, QTimer
 from PySide6.QtGui import QDrag, QFont, QPainter, QPen, QColor, QPainterPath
 from PySide6.QtWidgets import (
     QApplication,
@@ -59,6 +59,23 @@ _CHIP_SELECTED_BG    = "#0071e3"
 _CHIP_SELECTED_HOVER = "#0077ed"
 _CHIP_IDLE_BG        = "#3a3a4a"
 _CHIP_IDLE_HOVER     = "#4a4a5a"
+
+# ── Account-card design tokens (ACCOUNT_CARD_SPEC.md, dark theme) ──────────────
+_CARD_SURFACE      = "#121724"   # --surface  (card background)
+_CARD_SURFACE3     = "#232c40"   # --surface-3 (close hover)
+_CARD_SEL_BG       = "#17243d"   # accent-soft (0.12) pre-blended over --surface
+_CARD_TEXT         = "#eef2fb"   # --text   (name, total amount)
+_CARD_TEXT2        = "#9aa3ba"   # --text-2 (balance values)
+_CARD_TEXT3        = "#5f6982"   # --text-3 (currency codes, caps, close)
+_CARD_BORDER2      = "#2c3850"   # --border-2 (idle frame, empty checkbox)
+_CARD_ACCENT       = "#3b82f6"   # --accent  (selected frame + checkbox fill)
+_CARD_LOSS         = "#fb6f84"   # --loss    (negative figures)
+# Offline (disconnected) dim variants.
+_CARD_OFF_PRIMARY  = "#5f6982"
+_CARD_OFF_SECOND   = "#3a4358"
+
+# Real minus sign (U+2212) for negative figures, per spec.
+_MINUS = "−"
 
 
 def _apply_filter_chip_style(btn: QPushButton, selected: bool) -> None:
@@ -139,15 +156,18 @@ def _h_divider() -> QWidget:
 # ── Custom Checkbox (painted checkmark) ───────────────────────────────────────
 
 class _CheckmarkBox(QWidget):
-    """A custom-painted checkbox: unchecked = solid white square,
-    checked = dark square with white checkmark."""
+    """A custom-painted checkbox (ACCOUNT_CARD_SPEC.md):
+    unchecked = 26×26 rounded square, 2px ``--border-2`` outline, empty;
+    checked   = filled ``--accent`` square with a white checkmark."""
 
     toggled = Signal(bool)
 
     def __init__(self, checked: bool = True, parent=None):
         super().__init__(parent)
         self._checked = checked
-        self.setFixedSize(22, 22)
+        # Dim the fill/outline when the row's worker is offline.
+        self._enabled_look = True
+        self.setFixedSize(20, 20)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def isChecked(self) -> bool:
@@ -156,6 +176,11 @@ class _CheckmarkBox(QWidget):
     def setChecked(self, v: bool) -> None:
         if self._checked != v:
             self._checked = v
+            self.update()
+
+    def set_enabled_look(self, on: bool) -> None:
+        if self._enabled_look != bool(on):
+            self._enabled_look = bool(on)
             self.update()
 
     def mousePressEvent(self, event) -> None:
@@ -167,37 +192,36 @@ class _CheckmarkBox(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        sz = 18
-        x = (self.width() - sz) // 2
-        y = (self.height() - sz) // 2
-        rect = QRect(x, y, sz, sz)
-        radius = 4.0
+        radius = 6.0
+        rect = QRectF(1.5, 1.5, self.width() - 3.0, self.height() - 3.0)
+        w = self.width()
 
         if self._checked:
-            # Dark square background
+            # Filled accent square …
+            fill = _CARD_ACCENT if self._enabled_look else _CARD_OFF_SECOND
             p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor("#1a1a2e"))
+            p.setBrush(QColor(fill))
             p.drawRoundedRect(rect, radius, radius)
 
-            # White checkmark
-            pen = QPen(QColor("#ffffff"))
-            pen.setWidth(2)
+            # … with a white checkmark (polyline 20 6 · 9 17 · 4 12).
+            pen = QPen(QColor("#ffffff" if self._enabled_look else "#cdd1e6"))
+            pen.setWidthF(2.6)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
             p.setPen(pen)
             p.setBrush(Qt.BrushStyle.NoBrush)
-
-            # Checkmark path: ✓ shape
-            cx, cy = x + sz * 0.5, y + sz * 0.5
             path = QPainterPath()
-            path.moveTo(x + sz * 0.22, cy + sz * 0.02)
-            path.lineTo(x + sz * 0.42, cy + sz * 0.22)
-            path.lineTo(x + sz * 0.78, cy - sz * 0.22)
+            path.moveTo(w * 0.30, w * 0.52)
+            path.lineTo(w * 0.43, w * 0.66)
+            path.lineTo(w * 0.72, w * 0.34)
             p.drawPath(path)
         else:
-            # Solid white square with slight rounding
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor("#ffffff"))
+            # Empty square with a 2px outline.
+            outline = _CARD_BORDER2 if self._enabled_look else _CARD_OFF_SECOND
+            pen = QPen(QColor(outline))
+            pen.setWidthF(2.0)
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawRoundedRect(rect, radius, radius)
 
         p.end()
@@ -221,53 +245,87 @@ class _AccountRow(QFrame):
         # ``set_connected()`` call.  Updated by AccountListPanel on
         # ``dataChanged`` from AccountsTableModel.
         self._connected: bool = True
-        # Plain display name without the "⚠ " offline prefix; kept so
+        # Plain display name without the "WARN " offline prefix; kept so
         # ``set_connected(True)`` can restore the original text.
         self._base_name: str = alias if alias else account
+        # USD cash balance (shown under the name) + base-currency total sign.
+        self._usd: float | None = None
+        self._balance_neg: bool = self._parse_neg(balance)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 1, 8, 1)
-        layout.setSpacing(10)
+        # Faithful 2-row grid (ACCOUNT_CARD_SPEC.md):
+        #   col0 checkbox (spans both rows) | col1 left column (name / USD bal,
+        #   1fr) | col2 total (top-right) | col3 close (spans both rows).
+        grid = QGridLayout(self)
+        grid.setContentsMargins(10, 5, 10, 5)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(0)
+        grid.setColumnStretch(1, 1)   # the 1fr middle column
 
-        # Custom painted checkbox
         self._cb = _CheckmarkBox(checked)
         self._cb.toggled.connect(self._on_toggle)
-        layout.addWidget(self._cb)
+        grid.addWidget(self._cb, 0, 0, 2, 1, Qt.AlignmentFlag.AlignVCenter)
 
-        # Account name (bold white)
+        # Name — row 0, bottom-left so it hugs the USD line below it.
         self._name_lbl = QLabel(self._base_name)
-        self._name_lbl.setFont(
-            QFont("Helvetica Neue, Arial", 12, QFont.Weight.Bold))
-        self._name_lbl.setStyleSheet(
-            "color: #ffffff; background: transparent;")
-        layout.addWidget(self._name_lbl, stretch=1)
+        self._name_lbl.setFont(self._ui_font(11))
+        grid.addWidget(
+            self._name_lbl, 0, 1,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom)
 
-        # Balance (right, light grey, monospace)
+        # USD balance sub-line — row 1, top-left.  "USD" code + mono value.
+        self._sub_container = QWidget()
+        self._sub_container.setStyleSheet("background: transparent;")
+        sub = QHBoxLayout(self._sub_container)
+        sub.setContentsMargins(0, 0, 0, 0)
+        sub.setSpacing(5)
+        self._sub_code = QLabel("USD")
+        self._sub_code.setFont(self._ui_font(10))
+        sub.addWidget(self._sub_code, 0, Qt.AlignmentFlag.AlignBottom)
+        self._sub_val = QLabel("")
+        self._sub_val.setFont(self._mono_font(10, demibold=True))
+        sub.addWidget(self._sub_val, 0, Qt.AlignmentFlag.AlignBottom)
+        self._sub_container.hide()
+        grid.addWidget(
+            self._sub_container, 1, 1,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+
+        # Total — row 0, bottom-right (baseline-aligned with the name).
+        total = QWidget()
+        total.setStyleSheet("background: transparent;")
+        total_row = QHBoxLayout(total)
+        total_row.setContentsMargins(0, 0, 0, 0)
+        total_row.setSpacing(4)
         self._balance_lbl = QLabel(self._format_balance(balance))
-        self._balance_lbl.setFont(QFont("Menlo, Consolas, monospace", 11))
-        self._balance_lbl.setStyleSheet(
-            "color: #aaaaaa; background: transparent;")
-        layout.addWidget(self._balance_lbl)
+        self._balance_lbl.setFont(self._mono_font(11))
+        total_row.addWidget(self._balance_lbl, 0, Qt.AlignmentFlag.AlignBottom)
+        self._cap_lbl = QLabel("USD")
+        self._cap_lbl.setFont(self._ui_font(10))
+        total_row.addWidget(self._cap_lbl, 0, Qt.AlignmentFlag.AlignBottom)
+        grid.addWidget(
+            total, 0, 2,
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom)
 
-        # Remove (×) — flat, dark grey
-        x_btn = QPushButton("\u00d7")
-        x_btn.setFixedSize(22, 22)
-        x_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        x_btn.setStyleSheet("""
-            QPushButton {
-                background: transparent; color: #666666;
-                border: none; font-size: 15px; font-weight: bold;
-            }
-            QPushButton:hover { color: #F85149; }
-        """)
-        x_btn.clicked.connect(lambda: self.removed.emit(self._account))
-        layout.addWidget(x_btn)
+        # Close button — col 3, spanning both rows, vertically centered.
+        self._x_btn = QPushButton("×", self)
+        self._x_btn.setFixedSize(22, 22)
+        self._x_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._x_btn.setStyleSheet(
+            "QPushButton {"
+            f"  background: transparent; color: {_CARD_TEXT3};"
+            "  border: none; border-radius: 6px;"
+            "  font-size: 15px; font-weight: bold;"
+            "}"
+            "QPushButton:hover {"
+            f"  background: {_CARD_SURFACE3}; color: {_CARD_TEXT};"
+            "}")
+        self._x_btn.clicked.connect(lambda: self.removed.emit(self._account))
+        grid.addWidget(self._x_btn, 0, 3, 2, 1, Qt.AlignmentFlag.AlignVCenter)
 
         self._apply_card_style()
 
-    # ── Properties ────────────────────────────────────────────────────────────
+    # -- Properties ------------------------------------------------------------
 
     @property
     def account(self) -> str:
@@ -278,7 +336,17 @@ class _AccountRow(QFrame):
         return self._checked
 
     def set_balance(self, balance: str) -> None:
+        self._balance_neg = self._parse_neg(balance)
         self._balance_lbl.setText(self._format_balance(balance))
+        self._balance_lbl.setStyleSheet(
+            f"color: {self._big_color()}; background: transparent;")
+
+    def set_cash(self, cash: dict[str, float]) -> None:
+        """Pick out the USD cash balance and render it under the name.  No
+        USD entry hides the sub-line."""
+        usd = cash.get("USD")
+        self._usd = float(usd) if usd is not None else None
+        self._refresh_usd()
 
     def set_name(self, alias: str) -> None:
         self._base_name = alias if alias else self._account
@@ -291,8 +359,8 @@ class _AccountRow(QFrame):
 
     def set_connected(self, connected: bool) -> None:
         """Toggle the row's offline appearance.  When ``connected`` is
-        False the name label is prefixed with ``⚠ ``, every label is
-        dimmed, and a tooltip explains that orders will be skipped on
+        False the name label is prefixed with a warning glyph, every label
+        is dimmed, and a tooltip explains that orders will be skipped on
         this account.  When True, restores the live styling."""
         if self._connected == bool(connected):
             return
@@ -306,7 +374,7 @@ class _AccountRow(QFrame):
                 "Connection disconnected — orders will be skipped on this "
                 "account until the connection is restored.")
 
-    # ── Internal ──────────────────────────────────────────────────────────────
+    # -- Internal --------------------------------------------------------------
 
     def _refresh_name_label(self) -> None:
         if self._connected:
@@ -319,48 +387,96 @@ class _AccountRow(QFrame):
         self._apply_card_style()
         self.toggled.emit(self._account, checked)
 
+    @staticmethod
+    def _ui_font(pt: int) -> QFont:
+        # Same family/point-sizing as the positions view title font.
+        f = QFont("Helvetica Neue, Arial", pt)
+        f.setWeight(QFont.Weight.Bold)
+        return f
+
+    @staticmethod
+    def _mono_font(pt: int, demibold: bool = False) -> QFont:
+        # Same family/point-sizing as the positions view table/value font.
+        f = QFont("Menlo, Consolas, monospace", pt)
+        f.setWeight(QFont.Weight.DemiBold if demibold else QFont.Weight.Bold)
+        return f
+
+    def _big_color(self) -> str:
+        if not self._connected:
+            return _CARD_OFF_PRIMARY
+        return _CARD_LOSS if self._balance_neg else _CARD_TEXT
+
     def _apply_card_style(self) -> None:
         if not self._connected:
-            # Offline — desaturated frame and dim text on every label so
-            # the row clearly looks inert, regardless of the checked
-            # state.  Keeps borders distinguishable from idle rows.
-            self.setStyleSheet(f"""
-                _AccountRow {{
-                    background-color: {BG_ITEM_INACTIVE};
-                    border: 2px dashed #555555;
-                    border-radius: 4px;
-                }}
-            """)
-            self._name_lbl.setStyleSheet(
-                "color: #777777; background: transparent;")
-            self._balance_lbl.setStyleSheet(
-                "color: #555555; background: transparent;")
-            return
-        # Connected — restore the standard label styling …
-        self._name_lbl.setStyleSheet(
-            "color: #ffffff; background: transparent;")
-        self._balance_lbl.setStyleSheet(
-            "color: #aaaaaa; background: transparent;")
-        # … and the standard checked / unchecked card frame.
-        if self._checked:
-            self.setStyleSheet(f"""
-                _AccountRow {{
-                    background-color: {BG_ITEM_ACTIVE};
-                    border: 2px solid {BORDER_ACTIVE};
-                    border-radius: 4px;
-                }}
-            """)
+            # Offline -- dashed frame so the row reads as inert regardless of
+            # the checked state.
+            border = f"2px dashed {_CARD_BORDER2}"
+            bg = _CARD_SURFACE
+        elif self._checked:
+            border = f"2px solid {_CARD_ACCENT}"
+            bg = _CARD_SEL_BG
         else:
-            self.setStyleSheet(f"""
-                _AccountRow {{
-                    background-color: {BG_ITEM_INACTIVE};
-                    border: 2px solid {BORDER_INACTIVE};
-                    border-radius: 4px;
-                }}
-            """)
+            border = f"2px solid {_CARD_BORDER2}"
+            bg = _CARD_SURFACE
+        self.setStyleSheet(
+            "_AccountRow {"
+            f"  background-color: {bg};"
+            f"  border: {border};"
+            "  border-radius: 10px;"
+            "}")
+        self._refresh_colors()
+
+    def _refresh_colors(self) -> None:
+        """Recolour the name, total, cap, checkbox, and USD sub-line for the
+        current online/offline state."""
+        online = self._connected
+        name_c = _CARD_TEXT if online else _CARD_OFF_PRIMARY
+        cap_c = _CARD_TEXT3 if online else _CARD_OFF_SECOND
+        self._name_lbl.setStyleSheet(
+            f"color: {name_c}; background: transparent;")
+        self._cap_lbl.setStyleSheet(
+            f"color: {cap_c}; background: transparent;")
+        self._balance_lbl.setStyleSheet(
+            f"color: {self._big_color()}; background: transparent;")
+        self._cb.set_enabled_look(online)
+        self._refresh_usd()
+
+    def _refresh_usd(self) -> None:
+        """Render (or hide) the USD balance sub-line under the name."""
+        if self._usd is None:
+            self._sub_container.hide()
+            return
+        online = self._connected
+        code_c = _CARD_TEXT3 if online else _CARD_OFF_SECOND
+        if not online:
+            val_c = _CARD_OFF_SECOND
+        elif self._usd < 0:
+            val_c = _CARD_LOSS
+        else:
+            val_c = _CARD_TEXT2
+        self._sub_code.setStyleSheet(
+            f"color: {code_c}; background: transparent;")
+        self._sub_val.setText(self._fmt_amount(self._usd))
+        self._sub_val.setStyleSheet(
+            f"color: {val_c}; background: transparent;")
+        self._sub_container.show()
+
+    @staticmethod
+    def _fmt_amount(amount: float) -> str:
+        """Grouped integer with a real minus on negatives, e.g. ``-8,917``."""
+        s = f"{abs(amount):,.0f}"
+        return f"{_MINUS}{s}" if amount < 0 else s
+
+    @staticmethod
+    def _parse_neg(raw: str) -> bool:
+        try:
+            return float(raw) < 0
+        except (ValueError, TypeError):
+            return False
 
     @staticmethod
     def _format_balance(raw: str) -> str:
+        """Compact base-currency total: ``219k``, ``1.2M``, ``-12k``."""
         if not raw:
             return ""
         try:
@@ -369,12 +485,14 @@ class _AccountRow(QFrame):
             return raw
         if abs(val) > 1e100:
             return "-"
-        if abs(val) >= 1_000_000:
-            return f"{val / 1_000_000:.1f}M"
-        if abs(val) >= 1_000:
-            return f"{val / 1_000:.0f}k"
-        return f"{val:,.0f}"
-
+        a = abs(val)
+        if a >= 1_000_000:
+            s = f"{a / 1_000_000:.1f}M"
+        elif a >= 1_000:
+            s = f"{a / 1_000:.0f}k"
+        else:
+            s = f"{a:,.0f}"
+        return f"{_MINUS}{s}" if val < 0 else s
 
 # ── Group pill ────────────────────────────────────────────────────────────────
 
@@ -989,10 +1107,10 @@ class AccountListPanel(QWidget):
             if acct not in self._account_rows:
                 self._add_account_row(
                     acct, info["alias"], info["balance"], info["type"])
-            else:
-                r = self._account_rows[acct]
-                r.set_name(info["alias"] if info["alias"] else acct)
-                r.set_balance(info["balance"])
+            r = self._account_rows[acct]
+            r.set_name(info["alias"] if info["alias"] else acct)
+            r.set_balance(info["balance"])
+            r.set_cash(self._model.get_cash_by_currency(acct))
 
         # Remove rows whose account should no longer be visible (either
         # missing from the model entirely or filtered out by the active
@@ -1101,6 +1219,7 @@ class AccountListPanel(QWidget):
             if r:
                 r.set_balance(rd[COL_NET_LIQ])
                 r.set_name(rd[COL_ALIAS] if rd[COL_ALIAS] else rd[COL_ACCOUNT])
+                r.set_cash(self._model.get_cash_by_currency(rd[COL_ACCOUNT]))
                 net_liq_touched = True
         # ``set_connection_status`` on the model emits ``dataChanged`` to
         # signal a label-wide flip; refresh every row's offline indicator
