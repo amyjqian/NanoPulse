@@ -413,7 +413,9 @@ class _AccountRow(QFrame):
             border = f"2px dashed {_CARD_BORDER2}"
             bg = _CARD_SURFACE
         elif self._checked:
-            border = f"2px solid {_CARD_ACCENT}"
+            # Selected — keep the idle border colour (no accent ring); the
+            # filled checkbox + tinted background carry the selected state.
+            border = f"2px solid {_CARD_BORDER2}"
             bg = _CARD_SEL_BG
         else:
             border = f"2px solid {_CARD_BORDER2}"
@@ -703,8 +705,13 @@ class AccountListPanel(QWidget):
 
         # ── Scrollable account rows ───────────────────────────────────────────
         self._rows_container = QWidget()
+        # Object-name scope this rule.  A selector-less ``border: none``
+        # cascades to every descendant and would strip each _AccountRow's
+        # selected/idle border, so the card's frame colour never changes.
+        self._rows_container.setObjectName("AccountRowsContainer")
         self._rows_container.setStyleSheet(
-            "background: transparent; border: none;")
+            "QWidget#AccountRowsContainer "
+            "{ background: transparent; border: none; }")
         self._rows_layout = QVBoxLayout(self._rows_container)
         self._rows_layout.setContentsMargins(0, 0, 0, 0)
         self._rows_layout.setSpacing(4)
