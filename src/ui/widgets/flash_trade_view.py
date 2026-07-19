@@ -90,6 +90,10 @@ class FlashTradeView(QWidget):
                                    IBWorkerThread] = active_threads if active_threads is not None else {}
         self._accounts_model = accounts_model
         self._open_preferences_callback = open_preferences
+        # Role gating: admins may not place trades.  Set False for admin
+        # sessions via ``set_trading_allowed`` — enforced in
+        # ``_on_order_requested`` as defence-in-depth beyond hidden UI.
+        self._trading_allowed = True
         # label → worker instance wired
         self._connected_order_workers: dict[str, IBWorkerThread] = {}
         # label → worker for portfolio
@@ -278,6 +282,10 @@ class FlashTradeView(QWidget):
         if hasattr(self._book_trading, "refresh_subscriptions"):
             self._book_trading.refresh_subscriptions()
 
+    def set_trading_allowed(self, allowed: bool) -> None:
+        """Enable/disable order placement for this session (admins → False)."""
+        self._trading_allowed = bool(allowed)
+
     def _on_order_requested(self, payload: dict) -> None:
         """Handle Buy/Sell button click from OrderEntryPanel.
 
@@ -285,6 +293,12 @@ class FlashTradeView(QWidget):
         2. Look up saved contract details for the symbol.
         3. For each account, find the correct IBWorkerThread and place the order.
         """
+        # ── 0. Role gate: admins cannot place trades ──────────────────────
+        if not self._trading_allowed:
+            log.warning("FlashTrade: order blocked — current user cannot trade")
+            self.transient_status_message.emit(
+                "Trading is disabled for admin accounts.", 4000)
+            return
         # ── 1. Validate: get checked accounts ─────────────────────────────
         # Three account-resolution paths in order of priority:
         #   1. ``_flatten_account`` — single-account override used by the

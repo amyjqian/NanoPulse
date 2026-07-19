@@ -18,9 +18,55 @@ _DEFAULT_PATH = Path(__file__).resolve().parents[2] / "app_config.json"
 # Class-level auto-incrementing client ID (starting at 100).
 _next_client_id: int = 100
 
+# Per-user config selection.  When a user signs in, ``set_active_config`` points
+# this at ``app_config-<username>.json`` so every load/save helper below (all of
+# which fall back to ``_default_path()``) reads and writes that user's own file.
+# ``None`` = the shared base ``app_config.json`` (used before login / as the
+# seed template for a brand-new user's config).
+_active_path: Path | None = None
+
 
 def _default_path() -> Path:
-    return _DEFAULT_PATH
+    return _active_path if _active_path is not None else _DEFAULT_PATH
+
+
+def _sanitize_username(username: str) -> str:
+    """Filesystem-safe filename fragment for *username*."""
+    cleaned = "".join(
+        c if (c.isalnum() or c in "-_.") else "_" for c in username.strip()
+    )
+    return cleaned or "user"
+
+
+def user_config_path(username: str) -> Path:
+    """Return the config-file path for *username* (not necessarily existing)."""
+    return _DEFAULT_PATH.parent / f"app_config-{_sanitize_username(username)}.json"
+
+
+def set_active_config(username: str | None) -> None:
+    """Switch the active config file to *username*'s own ``app_config-*.json``.
+
+    Pass ``None`` (e.g. on sign-out) to fall back to the shared base file.
+    A brand-new user's file is seeded from the base ``app_config.json`` so they
+    start with the default connections/layout rather than an empty app.  The
+    per-user ``next_client_id`` is reloaded from the newly-active file.
+    """
+    global _active_path, _next_client_id
+    if not username:
+        _active_path = None
+    else:
+        target = user_config_path(username)
+        if not target.exists() and _DEFAULT_PATH.exists():
+            try:
+                _write_json(target, _read_json(_DEFAULT_PATH))  # seed from base
+                log.info("Seeded new config %s from base template", target.name)
+            except Exception:
+                log.exception("Failed to seed config for user %r", username)
+        _active_path = target
+    # Re-read next_client_id from whichever file is now active.
+    _next_client_id = 100
+    load_connections()
+    log.info("Active config → %s", _default_path())
 
 
 # ── Public API ────────────────────────────────────────────────────────────────

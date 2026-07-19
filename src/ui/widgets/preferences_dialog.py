@@ -782,12 +782,18 @@ class PreferencesDialog(QDialog):
     """Preferences dialog that auto-closes on focus loss and persists
     all settings to ``app_config.json``."""
 
-    def __init__(self, parent=None, *, columns_provider=None):
+    def __init__(self, parent=None, *, columns_provider=None, auth_context=None):
         super().__init__(parent)
-        self.setWindowTitle("Preferences")
+        self.setWindowTitle("Settings")
         self.resize(920, 540)
         self.setMinimumSize(800, 420)
         self._columns_provider = columns_provider
+        # auth_context (optional): {"user": User, "service": AuthService,
+        # "on_sign_out": callable}.  When present the sidebar grows a user
+        # chip + Sign out, and admins additionally get a "Users" page.
+        self._auth_context = auth_context or {}
+        self._auth_user = self._auth_context.get("user")
+        self._auth_service = self._auth_context.get("service")
         self.setStyleSheet(f"""
             QDialog {{
                 background: {_BG_DIALOG};
@@ -819,13 +825,37 @@ class PreferencesDialog(QDialog):
         main_lay.setSpacing(0)
 
         # ── Left sidebar ─────────────────────────────────────────────────────
+        # Wrap the section list in a container so a user chip + Sign out can
+        # sit pinned at the bottom when an auth context is supplied.
+        sidebar_host = QWidget()
+        sidebar_host.setFixedWidth(140)
+        sidebar_host.setStyleSheet(f"background: {_BG_SIDEBAR};")
+        sh_lay = QVBoxLayout(sidebar_host)
+        sh_lay.setContentsMargins(0, 0, 0, 0)
+        sh_lay.setSpacing(0)
+
         self._sidebar = _styled_sidebar()
         self._sidebar.addItem(QListWidgetItem("Display"))
         self._sidebar.addItem(QListWidgetItem("Trading"))
         self._sidebar.addItem(QListWidgetItem("Columns"))
+        # Admins additionally manage users.
+        self._has_users_page = bool(
+            self._auth_user is not None and self._auth_user.is_admin
+            and self._auth_service is not None)
+        if self._has_users_page:
+            self._sidebar.addItem(QListWidgetItem("Users"))
+        # Backup & Restore is available to any signed-in user.
+        self._has_backup_page = self._auth_user is not None
+        if self._has_backup_page:
+            self._sidebar.addItem(QListWidgetItem("Backup & Restore"))
         self._sidebar.setCurrentRow(0)
         self._sidebar.currentRowChanged.connect(self._on_page_changed)
-        main_lay.addWidget(self._sidebar)
+        sh_lay.addWidget(self._sidebar, stretch=1)
+
+        if self._auth_user is not None:
+            sh_lay.addWidget(self._build_sidebar_footer())
+
+        main_lay.addWidget(sidebar_host)
 
         # Vertical divider
         div = QFrame()
@@ -845,11 +875,99 @@ class PreferencesDialog(QDialog):
         self._stack.addWidget(self._display_page)
         self._stack.addWidget(self._trading_page)
         self._stack.addWidget(self._columns_page)
+
+        self._users_page = None
+        if self._has_users_page:
+            from src.ui.auth.users_page import UsersPage
+            self._users_page = UsersPage(self._auth_service)
+            self._stack.addWidget(self._users_page)
+
+        self._backup_page = None
+        if self._has_backup_page:
+            from .backup_page import BackupPage
+            self._backup_page = BackupPage(self._auth_user.username)
+            self._backup_page.reload_requested.connect(self._on_restore_reload)
+            self._stack.addWidget(self._backup_page)
+
         main_lay.addWidget(self._stack, stretch=1)
 
         # Auto-save: any change on either page persists to config immediately
         self._display_page.changed.connect(self._save)
         self._trading_page.changed.connect(self._save)
+
+    # ── Sidebar footer (user chip + change password + sign out) ───────────────
+
+    def _build_sidebar_footer(self) -> QWidget:
+        user = self._auth_user
+        foot = QWidget()
+        foot.setStyleSheet(f"background: {_BG_SIDEBAR};")
+        fl = QVBoxLayout(foot)
+        fl.setContentsMargins(10, 10, 10, 12)
+        fl.setSpacing(8)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"color: {_BORDER};")
+        sep.setFixedHeight(1)
+        fl.addWidget(sep)
+
+        chip = QHBoxLayout()
+        chip.setSpacing(9)
+        avatar = QLabel((user.display_name or user.username or "?")[:1].upper())
+        avatar.setFixedSize(26, 26)
+        avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        avatar.setStyleSheet(
+            f"background: {_ACCENT_BLUE}; color: #fff; border-radius: 13px;"
+            " font-weight: 700; font-size: 12px;")
+        chip.addWidget(avatar)
+        name_col = QVBoxLayout()
+        name_col.setSpacing(0)
+        name_lbl = QLabel(user.display_name or user.username)
+        name_lbl.setStyleSheet(
+            f"color: {_TEXT}; font-size: 12px; font-weight: 500; background: transparent;")
+        role_lbl = QLabel("Admin · no trading" if user.is_admin else "Trader")
+        role_lbl.setStyleSheet(
+            f"color: {_TEXT_DIM}; font-size: 11px; background: transparent;")
+        name_col.addWidget(name_lbl)
+        name_col.addWidget(role_lbl)
+        chip.addLayout(name_col)
+        chip.addStretch()
+        fl.addLayout(chip)
+
+        pw_btn = QPushButton("Change password")
+        pw_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        pw_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; border: 1px solid {_BORDER};"
+            f" border-radius: 6px; color: {_TEXT_DIM}; font-size: 12px; padding: 6px; }}"
+            f"QPushButton:hover {{ background: {_BG_SIDEBAR_HOVER}; color: {_TEXT}; }}")
+        pw_btn.clicked.connect(self._on_change_password)
+        fl.addWidget(pw_btn)
+
+        out_btn = QPushButton("Sign out")
+        out_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        out_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; border: 1px solid {_BORDER};"
+            f" border-radius: 6px; color: {_TEXT_DIM}; font-size: 12px; padding: 6px; }}"
+            f"QPushButton:hover {{ background: {_BG_SIDEBAR_HOVER}; color: {_TEXT}; }}")
+        out_btn.clicked.connect(self._on_sign_out)
+        fl.addWidget(out_btn)
+        return foot
+
+    def _on_change_password(self) -> None:
+        from src.ui.auth.change_pw_dialog import ChangePasswordDialog
+        ChangePasswordDialog(
+            self._auth_service, self._auth_user.username, self).exec()
+
+    def _on_sign_out(self) -> None:
+        cb = self._auth_context.get("on_sign_out")
+        self.close()
+        if callable(cb):
+            cb()
+
+    def _on_restore_reload(self) -> None:
+        """After a successful restore, return to Login so the freshly restored
+        accounts/config/databases take effect (same path as a sign-out)."""
+        self._on_sign_out()
 
     # ── Navigation ────────────────────────────────────────────────────────────
 
@@ -858,12 +976,22 @@ class PreferencesDialog(QDialog):
         # When jumping into Columns via the sidebar, land on the overview.
         if self._stack.currentWidget() is self._columns_page:
             self._columns_page.navigate_to("overview")
+        # Refresh the users table each time it's shown so it reflects any
+        # changes made in another session.
+        if self._users_page is not None and self._stack.currentWidget() is self._users_page:
+            self._users_page.refresh()
 
     def navigate_to(self, section: str, subview: str | None = None) -> None:
         """Programmatically switch to a sidebar section; for ``Columns`` you
         may additionally pass ``"flat"`` / ``"summary"`` / ``"overview"`` to
         land on a specific subview (used by the Trades gear button)."""
         section_to_row = {"Display": 0, "Trading": 1, "Columns": 2}
+        next_row = 3
+        if self._has_users_page:
+            section_to_row["Users"] = next_row
+            next_row += 1
+        if self._has_backup_page:
+            section_to_row["Backup & Restore"] = next_row
         row = section_to_row.get(section)
         if row is None:
             return
@@ -896,6 +1024,11 @@ class PreferencesDialog(QDialog):
           False — so a partially-dragged or second-monitor dialog stays open.
         """
         if not self.isVisible() or self.isActiveWindow():
+            return
+
+        # A modal child (Add-user dialog, Change-password dialog, QMessageBox)
+        # steals activation from this dialog — don't auto-close underneath it.
+        if QApplication.activeModalWidget() is not None:
             return
 
         parent = self.parent()

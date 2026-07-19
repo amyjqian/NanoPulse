@@ -47,8 +47,12 @@ venv.bak/
 # OS
 Thumbs.db
 
-# Local app config (connection settings)
+# Local app config (connection settings) — base + per-user files
 app_config.json
+app_config-*.json
+
+# User accounts DB (holds password hashes — never commit)
+data/users.db
 
 # Log files
 data/logs/

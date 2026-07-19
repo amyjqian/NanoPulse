@@ -44,7 +44,6 @@ _ICONS: dict[str, str] = {
     "Contracts":      "🔍",
     "Nano":           "⚡",
     "StrategyEditor": "📐",
-    "Executions":     "📊",
     "Settings":       "⚙",
 }
 
@@ -129,7 +128,7 @@ class TopTabBar(QWidget):
     # current tab is something else).
     accountsToggleRequested = Signal()
 
-    _TABS = ["Connect", "Contracts", "Nano", "StrategyEditor", "Executions", "Settings"]
+    _TABS = ["Connect", "Contracts", "Nano", "StrategyEditor", "Settings"]
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -219,6 +218,16 @@ class TopTabBar(QWidget):
         self._group_label.setText(f"{name} {int(selected_count)}")
         self._group_label.show()
 
+
+    def set_tab_visible(self, name: str, visible: bool) -> None:
+        """Show/hide a single tab button (used for role gating — an admin
+        cannot trade, so the Nano / StrategyEditor tabs are hidden)."""
+        btn = self._buttons.get(name)
+        if btn is not None:
+            btn.setVisible(visible)
+
+    def set_accounts_pill_visible(self, visible: bool) -> None:
+        self._accounts_pill.setVisible(visible)
 
     def _on_tab_click(self, name: str) -> None:
         for label, btn in self._buttons.items():

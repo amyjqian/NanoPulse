@@ -11,11 +11,10 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from PySide6.QtCore import QEvent, Qt, QTimer
+from PySide6.QtCore import QEvent, Qt, QTimer, Signal
 from PySide6.QtGui import QPainter, QColor
 
 from .widgets.top_tab_bar import TopTabBar
-from .widgets.canvas import Canvas
 from .widgets.statusbar import StatusBar
 from .widgets.accounts_model import AccountsTableModel
 from .widgets.connections_view import ConnectionsView
@@ -36,7 +35,6 @@ _PAGE_INDEX: dict[str, int] = {
     "Contracts":      1,
     "Nano":           2,
     "StrategyEditor": 3,
-    "Executions":     4,
 }
 
 
@@ -44,12 +42,20 @@ class MainWindow(QWidget):
     """Top-level window.  Uses plain QWidget (not QMainWindow) so there is
     zero hidden chrome from menuBar / statusBar / centralWidget plumbing."""
 
-    def __init__(self):
+    # Emitted when the signed-in user asks to sign out (from Preferences).
+    # The app controller listens and swaps back to the login window.
+    sign_out_requested = Signal()
+
+    def __init__(self, current_user=None, auth_service=None):
         super().__init__()
         self.setWindowTitle("NanoPulse")
         self.resize(1280, 840)
         self.setMinimumSize(900, 600)
         self.setContentsMargins(0, 0, 0, 0)
+
+        # Authenticated session (may be None for legacy / test construction).
+        self._current_user = current_user
+        self._auth_service = auth_service
 
         # Shared data structures
         self._accounts_model = AccountsTableModel(self)
@@ -62,6 +68,7 @@ class MainWindow(QWidget):
         _rd().reload_strategy_tiers()
 
         self._setup_ui()
+        self._apply_role_gating()
         self._restore_geometry()
 
         self._status_timer = QTimer(self)
@@ -147,8 +154,6 @@ class MainWindow(QWidget):
         self._strategy_editor = StrategyEditorView(
             parent=self,
         )                                                  # index 3 – StrategyEditor
-        self._exec_placeholder = Canvas(
-            self)              # index 4 – Executions
 
         # When contracts are added/removed, refresh the order entry dropdown
         self._contracts_view.contracts_changed.connect(
@@ -172,7 +177,6 @@ class MainWindow(QWidget):
         self._pages.addWidget(self._contracts_view)
         self._pages.addWidget(self._flash_trade)
         self._pages.addWidget(self._strategy_editor)
-        self._pages.addWidget(self._exec_placeholder)
         self._pages.setCurrentIndex(0)
 
         root_layout.addWidget(self._pages, stretch=1)
@@ -188,6 +192,31 @@ class MainWindow(QWidget):
         # gets a non-blocking confirmation that some accounts were skipped.
         self._flash_trade.transient_status_message.connect(
             self._status_bar.show_message)
+
+    # ── Role gating ─────────────────────────────────────────────────────────────
+
+    def _apply_role_gating(self) -> None:
+        """Admins manage users but cannot trade — hide the trade surfaces and
+        disable order placement.  Traders keep the full trading UI.  No user
+        (legacy / test construction) leaves everything visible."""
+        user = self._current_user
+        if user is None or user.can_trade:
+            return
+
+        # Admin session: hide trade tabs + Account pill, block order placement.
+        for tab in ("Nano", "StrategyEditor"):
+            self._tab_bar.set_tab_visible(tab, False)
+        self._tab_bar.set_accounts_pill_visible(False)
+        self._flash_trade.set_trading_allowed(False)
+
+        # Land on a non-trade page.
+        for label, btn in self._tab_bar._buttons.items():
+            btn.set_active(label == "Connect")
+        self._on_nav_changed("Connect")
+        log.info("Role gating applied for admin user %r", user.username)
+
+    def _request_sign_out(self) -> None:
+        self.sign_out_requested.emit()
 
     # ── Navigation ────────────────────────────────────────────────────────────
 
@@ -256,7 +285,15 @@ class MainWindow(QWidget):
             self._flash_trade.trades_panel,
             self._flash_trade.account_position,
         )
-        dlg = PreferencesDialog(self, columns_provider=provider)
+        auth_context = None
+        if self._current_user is not None:
+            auth_context = {
+                "user": self._current_user,
+                "service": self._auth_service,
+                "on_sign_out": self._request_sign_out,
+            }
+        dlg = PreferencesDialog(self, columns_provider=provider,
+                                auth_context=auth_context)
         if section is not None:
             dlg.navigate_to(section, subview)
         if modeless:
