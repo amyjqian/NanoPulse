@@ -94,6 +94,8 @@ class AppController(QObject):
         config_manager.set_active_config(user.username)
         from src.core.trading_prefs import trading_prefs
         trading_prefs.reload()
+        from src.core.cash_management import cash_prefs
+        cash_prefs.reload()
         self._start_auto_backup(user.username)
         self._main_window = MainWindow(current_user=user, auth_service=self._service)
         self._main_window.sign_out_requested.connect(self._on_sign_out)

@@ -78,6 +78,9 @@ _DEFAULTS: dict = {
         "sell_ask_offset": 0,
         "sell_ask_unit": "ticks",
     },
+    "cash_management": {
+        "sweep_symbol": "",
+    },
 }
 
 
@@ -404,6 +407,72 @@ class _DisplayPage(QWidget):
 
     def collect(self) -> dict:
         return {"theme": self._prefs.get("display", {}).get("theme", "Dark")}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Cash Management page  (sweep symbol)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class _CashManagementPage(QWidget):
+    """Cash-management settings — currently the sweep stock symbol."""
+
+    changed = Signal()
+
+    def __init__(self, prefs: dict, parent=None):
+        super().__init__(parent)
+        self._prefs = prefs
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(24, 16, 24, 16)
+        root.setSpacing(14)
+
+        title = QLabel("Cash Management")
+        title.setFont(_FONT_TITLE)
+        title.setStyleSheet(f"color: {_TEXT}; border: none;")
+        root.addWidget(title)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"color: {_BORDER};")
+        sep.setFixedHeight(1)
+        root.addWidget(sep)
+        root.addSpacing(6)
+
+        lbl = QLabel("Sweep symbol")
+        lbl.setFont(_FONT_SECTION)
+        lbl.setStyleSheet(f"color: {_TEXT_DIM}; border: none;")
+        root.addWidget(lbl)
+
+        desc = QLabel("The stock symbol used for cash-sweep operations.")
+        desc.setStyleSheet(
+            f"color: {_TEXT_DIM}; border: none; font-size: 11px;")
+        root.addWidget(desc)
+
+        cm = self._prefs.get("cash_management", {})
+        self._symbol = QLineEdit()
+        self._symbol.setText(str(cm.get("sweep_symbol", "") or ""))
+        self._symbol.setPlaceholderText("e.g. AAPL")
+        self._symbol.setFixedWidth(180)
+        self._symbol.setStyleSheet(_INPUT_QSS)
+        # Persist on Enter or when focus leaves the field.
+        self._symbol.editingFinished.connect(self._on_edit)
+        row = QHBoxLayout()
+        row.addWidget(self._symbol)
+        row.addStretch()
+        root.addLayout(row)
+        root.addStretch()
+
+    def _on_edit(self) -> None:
+        sym = self._symbol.text().strip().upper()
+        if sym != self._symbol.text():
+            self._symbol.setText(sym)
+        self._prefs.setdefault("cash_management", {})["sweep_symbol"] = sym
+        self.changed.emit()
+
+    def collect(self) -> dict:
+        return {"sweep_symbol": self._symbol.text().strip().upper()}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -838,6 +907,7 @@ class PreferencesDialog(QDialog):
         self._sidebar.addItem(QListWidgetItem("Display"))
         self._sidebar.addItem(QListWidgetItem("Trading"))
         self._sidebar.addItem(QListWidgetItem("Columns"))
+        self._sidebar.addItem(QListWidgetItem("Cash Management"))
         # Admins additionally manage users.
         self._has_users_page = bool(
             self._auth_user is not None and self._auth_user.is_admin
@@ -871,10 +941,12 @@ class PreferencesDialog(QDialog):
         self._display_page = _DisplayPage(self._prefs)
         self._trading_page = _TradingPage(self._prefs)
         self._columns_page = ColumnsPage(self._columns_provider, self)
+        self._cash_page = _CashManagementPage(self._prefs)
 
         self._stack.addWidget(self._display_page)
         self._stack.addWidget(self._trading_page)
         self._stack.addWidget(self._columns_page)
+        self._stack.addWidget(self._cash_page)
 
         self._users_page = None
         if self._has_users_page:
@@ -891,9 +963,10 @@ class PreferencesDialog(QDialog):
 
         main_lay.addWidget(self._stack, stretch=1)
 
-        # Auto-save: any change on either page persists to config immediately
+        # Auto-save: any change on a page persists to config immediately
         self._display_page.changed.connect(self._save)
         self._trading_page.changed.connect(self._save)
+        self._cash_page.changed.connect(self._save)
 
     # ── Sidebar footer (user chip + change password + sign out) ───────────────
 
@@ -985,8 +1058,9 @@ class PreferencesDialog(QDialog):
         """Programmatically switch to a sidebar section; for ``Columns`` you
         may additionally pass ``"flat"`` / ``"summary"`` / ``"overview"`` to
         land on a specific subview (used by the Trades gear button)."""
-        section_to_row = {"Display": 0, "Trading": 1, "Columns": 2}
-        next_row = 3
+        section_to_row = {"Display": 0, "Trading": 1, "Columns": 2,
+                          "Cash Management": 3}
+        next_row = 4
         if self._has_users_page:
             section_to_row["Users"] = next_row
             next_row += 1
@@ -1085,10 +1159,13 @@ class PreferencesDialog(QDialog):
         futures_data, stocks_data = self._trading_page.collect()
         self._prefs["trading_futures"] = futures_data
         self._prefs["trading_stocks"] = stocks_data
+        self._prefs["cash_management"] = self._cash_page.collect()
         config_manager.save_preferences(self._prefs)
 
-        # Push into the in-memory singleton so the next trade uses fresh values
+        # Push into the in-memory singletons so the next trade uses fresh values
         from src.core.trading_prefs import trading_prefs
         trading_prefs.update(futures=futures_data, stocks=stocks_data)
+        from src.core.cash_management import cash_prefs
+        cash_prefs.reload()
 
         log.info("Preferences saved")

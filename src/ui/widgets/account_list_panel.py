@@ -234,6 +234,7 @@ class _AccountRow(QFrame):
 
     toggled = Signal(str, bool)
     removed = Signal(str)
+    context_menu_requested = Signal(str, object)   # account, global QPoint
 
     def __init__(self, account: str, alias: str, balance: str,
                  acct_type: str, checked: bool = True, parent=None):
@@ -253,6 +254,12 @@ class _AccountRow(QFrame):
         self._balance_neg: bool = self._parse_neg(balance)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        # Right-click → cash-sweep context menu (built by AccountListPanel,
+        # which has the balances + sweep-symbol quote).
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(
+            lambda p: self.context_menu_requested.emit(
+                self._account, self.mapToGlobal(p)))
 
         # Faithful 2-row grid (ACCOUNT_CARD_SPEC.md):
         #   col0 checkbox (spans both rows) | col1 left column (name / USD bal,
@@ -609,6 +616,19 @@ class _GroupPill(QPushButton):
 
 # ── Main Panel ────────────────────────────────────────────────────────────────
 
+def _floor_to_5(shares: float) -> int:
+    """Round a share count DOWN to the nearest multiple of 5 (e.g. 911→910,
+    919→915).  Used for Sweep in so we never buy beyond the positive cash."""
+    return int(max(0.0, shares) // 5) * 5
+
+
+def _ceil_to_5(shares: float) -> int:
+    """Round a share count UP to the nearest multiple of 5 (e.g. 911→915,
+    919→920).  Used for Sweep out so we sell enough to cover the negative cash."""
+    import math
+    return int(math.ceil(max(0.0, shares) / 5.0)) * 5
+
+
 class AccountListPanel(QWidget):
     """Live account list with action buttons – wired to AccountsTableModel."""
 
@@ -621,11 +641,17 @@ class AccountListPanel(QWidget):
     # current selection no longer matches any saved group).  Payload
     # is the group name string or None.
     active_group_changed = Signal(object)
+    # Emitted when the user picks a cash-sweep action from an account's
+    # right-click menu: (account, direction "in"|"out", qty, symbol).
+    sweep_requested = Signal(str, str, int, str)
 
     def __init__(self, accounts_model: AccountsTableModel, parent=None):
         super().__init__(parent)
         self._model = accounts_model
         self._account_rows: dict[str, _AccountRow] = {}
+        # Callable(account, symbol) -> (price, held_shares) supplied by the
+        # host (FlashTradeView) so the sweep menu can size the order.
+        self._sweep_quote_provider = None
         self._unchecked: set[str] = set(
             config_manager.load_unchecked_accounts())
         self._hidden: set[str] = set(config_manager.load_hidden_accounts())
@@ -1167,6 +1193,7 @@ class AccountListPanel(QWidget):
         row = _AccountRow(account, alias, balance, acct_type, checked=checked)
         row.toggled.connect(self._on_row_toggled)
         row.removed.connect(self._on_row_removed)
+        row.context_menu_requested.connect(self._show_sweep_menu)
         # Apply the worker's current connection state so freshly added
         # rows for an offline label render dimmed from the start.
         row.set_connected(self._is_account_connected(account))
@@ -1404,6 +1431,81 @@ class AccountListPanel(QWidget):
     def _emit_selection_changed(self) -> None:
         """Broadcast the current selected-account set."""
         self.selection_changed.emit(self.get_selected_accounts())
+
+    # ── Cash-sweep context menu ────────────────────────────────────────────────
+
+    def set_sweep_quote_provider(self, provider) -> None:
+        """Register ``provider(account, symbol) -> (price, held_shares)`` used
+        to size the sweep order shown in the right-click menu."""
+        self._sweep_quote_provider = provider
+
+    def compute_sweep(self, account: str) -> dict:
+        """Pure computation for the sweep menu (kept separate so it's testable).
+
+        Returns ``{enabled, label, direction, qty, symbol}``:
+
+        * **Sweep in** when the account's USD balance is positive — buy
+          ``floor(USD / price)`` shares of the sweep symbol (rounded down to a
+          multiple of 5 so we never exceed the cash).
+        * **Sweep out** when the balance is negative — sell
+          ``ceil(|USD| / price)`` shares (rounded up to a multiple of 5 so we
+          cover the whole deficit), capped at the shares actually held.
+
+        ``enabled`` is False (with an explanatory ``label``) when there's no
+        sweep symbol configured, no live price, a flat balance, or the quantity
+        rounds to zero."""
+        from src.core.cash_management import cash_prefs
+
+        symbol = (cash_prefs.sweep_symbol or "").strip().upper()
+        if not symbol:
+            return {"enabled": False, "symbol": "", "direction": None, "qty": 0,
+                    "label": "Set a sweep symbol in Settings → Cash Management"}
+
+        usd = float(self._model.get_cash_by_currency(account).get("USD", 0.0) or 0.0)
+        price, held = 0.0, 0.0
+        if callable(self._sweep_quote_provider):
+            try:
+                price, held = self._sweep_quote_provider(account, symbol)
+            except Exception:  # noqa: BLE001 — never let a bad provider break the menu
+                price, held = 0.0, 0.0
+
+        direction = "in" if usd > 0 else "out" if usd < 0 else None
+        if direction is None or price <= 0:
+            reason = ("USD balance is flat" if direction is None
+                      else f"no live price for {symbol}")
+            return {"enabled": False, "symbol": symbol, "direction": direction,
+                    "qty": 0, "label": f"Sweep unavailable — {reason}"}
+
+        if direction == "in":
+            qty = _floor_to_5(usd / price)
+        else:
+            # Sweep out only makes sense if the account actually holds the
+            # sweep symbol — nothing to sell otherwise, so don't offer it.
+            if held <= 0:
+                return {"enabled": False, "symbol": symbol, "direction": "out",
+                        "qty": 0, "label": f"No {symbol} shares to sweep out"}
+            needed = _ceil_to_5(abs(usd) / price)
+            # Cover the whole deficit if we hold enough (rounded up to a
+            # multiple of 5); otherwise sell the entire position.
+            qty = needed if held >= needed else int(held)
+
+        if qty <= 0:
+            return {"enabled": False, "symbol": symbol, "direction": direction,
+                    "qty": 0, "label": f"Sweep {direction} — quantity rounds to 0"}
+
+        verb = "Sweep in" if direction == "in" else "Sweep out"
+        return {"enabled": True, "symbol": symbol, "direction": direction,
+                "qty": int(qty), "label": f"{verb} {qty:,} {symbol}"}
+
+    def _show_sweep_menu(self, account: str, global_pos) -> None:
+        """Build + show the account's cash-sweep right-click menu."""
+        info = self.compute_sweep(account)
+        menu = QMenu(self)
+        act = menu.addAction(info["label"])
+        act.setEnabled(info["enabled"])
+        if menu.exec(global_pos) is act and info["enabled"]:
+            self.sweep_requested.emit(
+                account, info["direction"], info["qty"], info["symbol"])
 
     def active_group(self) -> str | None:
         """Currently-active group name, or None when the selection

@@ -433,7 +433,7 @@ class AccountPositionModel(QAbstractTableModel):
         if math.isfinite(unrealized_pnl):
             ad["unrealized_pnl"] = unrealized_pnl
 
-        # Refresh the account header row live if it already exists
+        # Refresh the account header row live if it already exists …
         hrow = self._acct_row_map.get(account)
         if hrow is not None:
             left  = self.index(hrow, 0)
@@ -442,6 +442,18 @@ class AccountPositionModel(QAbstractTableModel):
                 Qt.ItemDataRole.DisplayRole,
                 Qt.ItemDataRole.ForegroundRole,
             ])
+        elif self._account_in_scope(account):
+            # … otherwise this is an in-scope account we now have summary data
+            # for but no header row yet (e.g. a selected account with no
+            # positions) → rebuild so its account-summary row appears.
+            self.rebuild()
+
+    def _account_in_scope(self, account: str) -> bool:
+        """Whether *account* would be shown given the current selection filter
+        (None = show all, set() = show nothing, {...} = only those listed)."""
+        if self._selected_accounts is None:
+            return True
+        return account in self._selected_accounts
 
     def clear(self) -> None:
         if self._rows:
@@ -465,6 +477,19 @@ class AccountPositionModel(QAbstractTableModel):
         pos = self._positions.get((account, con_id), {})
         return pos.get("local_symbol") or pos.get("symbol", "")
 
+    def position_qty_for_symbol(self, account: str, symbol: str) -> float:
+        """Total position quantity *account* holds in *symbol* (matched on
+        localSymbol or root symbol, case-insensitive).  0.0 if none/unknown."""
+        want = (symbol or "").upper()
+        total = 0.0
+        for (acct, _con_id), pos in self._positions.items():
+            if acct != account:
+                continue
+            sym = (pos.get("local_symbol") or pos.get("symbol") or "").upper()
+            if sym == want:
+                total += pos.get("position", 0) or 0
+        return total
+
     # ── Rebuild ───────────────────────────────────────────────────────────────
 
     def rebuild(self) -> None:
@@ -487,11 +512,25 @@ class AccountPositionModel(QAbstractTableModel):
                 continue
             acct_pos.setdefault(account, []).append((key, pos))
 
-        for account in sorted(acct_pos, key=self._name_sort_key):
+        # Accounts to render a summary header for: those with qualifying
+        # positions, plus every in-scope account we have account-summary data
+        # for — so a selected account with no positions still shows its Net /
+        # Excess / BP / Daily P&L header row (with no position rows beneath).
+        if self._selected_accounts is None:
+            scope = set(self._acct_data.keys())          # no filter → all known
+        else:
+            scope = set(self._selected_accounts)         # explicit selection
+        header_accounts = set(acct_pos.keys())
+        for acct in scope:
+            if acct in self._acct_data:
+                header_accounts.add(acct)
+
+        for account in sorted(header_accounts, key=self._name_sort_key):
             # Sort positions within the account by abs(market_value) desc,
             # with abs(position qty) as tiebreaker for rows where market
             # value hasn't arrived yet from pnlSingleEvent.
-            acct_pos[account].sort(
+            positions = acct_pos.get(account, [])
+            positions.sort(
                 key=lambda kv: (abs(kv[1].get("market_value", 0)),
                                 abs(kv[1].get("position", 0))),
                 reverse=True,
@@ -502,7 +541,7 @@ class AccountPositionModel(QAbstractTableModel):
             self._rows.append({"_row_type": ROW_TYPE_HEADER, "account": account})
 
             # Position rows
-            for key, pos in acct_pos[account]:
+            for key, pos in positions:
                 self._row_map[key] = len(self._rows)
                 p = dict(pos)
                 p["_row_type"] = ROW_TYPE_POSITION
@@ -517,8 +556,8 @@ class AccountPositionModel(QAbstractTableModel):
 
         self.endResetModel()
         log.debug(
-            "AccountPositionModel: rebuilt – %d accounts, %d positions",
-            len(acct_pos), len(self._row_map),
+            "AccountPositionModel: rebuilt – %d account header(s), %d positions",
+            len(header_accounts), len(self._row_map),
         )
 
     # ── In-place position update ───────────────────────────────────────────────

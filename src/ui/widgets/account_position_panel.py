@@ -44,7 +44,7 @@ from .account_position_model import (
     AccountPositionModel,
     IsFirstInGroupRole,
     RowTypeRole, FlattenRole, HeaderInfoRole, PositionKeyRole,
-    PositionRole, AccountHasPositionsRole,
+    PositionRole,
     ROW_TYPE_HEADER, ROW_TYPE_POSITION,
     COL_ACCOUNT, COL_SYMBOL, COL_POSITION,
     COL_AVG_PRICE, COL_LAST_PRICE,
@@ -224,7 +224,7 @@ class AccountHeaderInfoDelegate(QStyledItemDelegate):
         segments = [
             ("Daily P&L", daily_str,  _pnl_color(daily_pnl)),
             ("Net",       net_str,    QColor(TEXT)),
-            ("Excess",    excess_str, QColor(TEXT)),
+            ("EX",        excess_str, QColor(TEXT)),
             ("BP",        bp_str,     QColor(TEXT)),
         ]
 
@@ -368,12 +368,9 @@ class FlattenButtonDelegate(QStyledItemDelegate):
         fm = QFontMetrics(option.font)
 
         # ── HEADER ROW: single Flatten button ────────────────────────────
+        # Always shown at the account level — even for a flat account it still
+        # flattens/cancels anything open (and is a no-op otherwise).
         if self._is_header(index):
-            # Don't show Flatten when the account has no open positions
-            if not index.data(AccountHasPositionsRole):
-                painter.restore()
-                return
-
             btn_rect = self._hdr_button_rect(option.rect, fm)
             hovered  = bool(option.state & QStyle.StateFlag.State_MouseOver)
             pressed  = (self._pressed_row == index.row()
@@ -433,16 +430,27 @@ class FlattenButtonDelegate(QStyledItemDelegate):
         etype = event.type()
 
         # ── header row ────────────────────────────────────────────────────
+        # The account-level Flatten button is always clickable (works even when
+        # the account currently has no positions).  Only clicks that land on the
+        # button itself count — clicking the empty area to its right does
+        # nothing.
         if self._is_header(index):
-            if not index.data(AccountHasPositionsRole):
-                return False
+            fm       = QFontMetrics(option.font)
+            btn_rect = self._hdr_button_rect(option.rect, fm)
+            pos      = event.position().toPoint() if hasattr(event, "position") \
+                       else event.pos()
+
             if etype == QEvent.Type.MouseButtonPress:
-                self._pressed_row = index.row()
-                self._pressed_btn = -1
-                return True
+                if btn_rect.contains(pos):
+                    self._pressed_row = index.row()
+                    self._pressed_btn = -1
+                    return True
+                return False
+
             if etype == QEvent.Type.MouseButtonRelease:
                 was = (self._pressed_row == index.row()
-                       and self._pressed_btn == -1)
+                       and self._pressed_btn == -1
+                       and btn_rect.contains(pos))
                 self._pressed_row = None
                 self._pressed_btn = None
                 if was:
@@ -742,6 +750,10 @@ class AccountPositionPanel(QWidget):
     def get_symbol_for_position(self, account: str, con_id: int) -> str:
         """Return localSymbol (or root symbol) for the given (account, conId)."""
         return self._model.get_symbol_for_position(account, con_id)
+
+    def held_shares(self, account: str, symbol: str) -> float:
+        """Shares *account* currently holds in *symbol* (0.0 if none/unknown)."""
+        return self._model.position_qty_for_symbol(account, symbol)
 
     def set_selected_accounts(self, accounts: set) -> None:
         """Filter positions view to only the given selected accounts.

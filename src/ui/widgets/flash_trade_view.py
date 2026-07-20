@@ -237,10 +237,14 @@ class FlashTradeView(QWidget):
         # ── Wire account list → positions filter ──────────────────────────────
         if isinstance(self._account_list, AccountListPanel):
             self._account_list.selection_changed.connect(
-                self._account_position.set_selected_accounts)
+                self._on_positions_selection_changed)
+            # Cash-sweep right-click menu: provide the sweep-symbol quote and
+            # handle the chosen action.
+            self._account_list.set_sweep_quote_provider(self._sweep_quote)
+            self._account_list.sweep_requested.connect(self._on_sweep_requested)
             # Push the initial persisted selection so the view is correct
             # before the user clicks anything.
-            self._account_position.set_selected_accounts(
+            self._on_positions_selection_changed(
                 self._account_list.get_selected_accounts())
 
         # ── Wire position panel action buttons ───────────────────────────────
@@ -720,33 +724,92 @@ class FlashTradeView(QWidget):
         # for every position in the batch.
         if self._accounts_model is not None:
             seen_accounts: set[str] = set()
-            from .accounts_model import COL_NET_LIQ, COL_EXCESS_LIQ
             for pos in batch:
                 account = pos.get("account", "")
                 if not account or account in seen_accounts:
                     continue
                 seen_accounts.add(account)
-                # O(1): resolve label → row index directly
-                label = self._accounts_model.connection_for_account(account)
-                if label is None:
-                    continue
-                row_idx = self._accounts_model._row_map.get((label, account))
-                if row_idx is None:
-                    continue
-                row_data = self._accounts_model._table_data[row_idx]
-                try:
-                    bal = float(row_data[COL_NET_LIQ]) if row_data[COL_NET_LIQ] else 0
-                except (ValueError, TypeError):
-                    bal = 0
-                try:
-                    excess = float(row_data[COL_EXCESS_LIQ]) if row_data[COL_EXCESS_LIQ] else 0
-                except (ValueError, TypeError):
-                    excess = 0
-                bp = self._accounts_model.get_buying_power(account)
-                self._account_position.set_account_data(
-                    account, balance=bal,
-                    net_liq=bal, excess_liq=excess,
-                    buying_power=bp)
+                self._push_account_balances(account)
+
+    def _account_balances(self, account: str) -> tuple[float, float, float] | None:
+        """Look up (net_liq, excess_liq, buying_power) for *account* from the
+        shared accounts model, or ``None`` if the account isn't known there."""
+        if self._accounts_model is None:
+            return None
+        from .accounts_model import COL_NET_LIQ, COL_EXCESS_LIQ
+        label = self._accounts_model.connection_for_account(account)
+        if label is None:
+            return None
+        row_idx = self._accounts_model._row_map.get((label, account))
+        if row_idx is None:
+            return None
+        row_data = self._accounts_model._table_data[row_idx]
+
+        def _f(v) -> float:
+            try:
+                return float(v) if v else 0.0
+            except (ValueError, TypeError):
+                return 0.0
+
+        return (_f(row_data[COL_NET_LIQ]),
+                _f(row_data[COL_EXCESS_LIQ]),
+                self._accounts_model.get_buying_power(account))
+
+    def _push_account_balances(self, account: str) -> None:
+        """Push an account's Net Liq / Excess Liq / BP into the position panel
+        header — works for flat accounts too (they aren't in the position
+        batch, so their balances would otherwise never reach the panel)."""
+        bals = self._account_balances(account)
+        if bals is None:
+            return
+        net, excess, bp = bals
+        self._account_position.set_account_data(
+            account, balance=net, net_liq=net, excess_liq=excess, buying_power=bp)
+
+    def _on_positions_selection_changed(self, accounts) -> None:
+        """Selection changed → filter the positions view and immediately push
+        balances for the selected accounts so a flat account's Net/Excess/BP
+        show right away (rather than only after the next pnlEvent)."""
+        self._account_position.set_selected_accounts(accounts)
+        for account in (accounts or []):
+            self._push_account_balances(account)
+
+    # ── Cash sweep ────────────────────────────────────────────────────────────
+
+    def _sweep_symbol_price(self, symbol: str) -> float:
+        """Last price for *symbol* from the order-entry price cache (0 if the
+        symbol isn't subscribed / priced yet)."""
+        cached = self._order_entry._price_cache.get((symbol or "").upper())
+        return cached[0] if cached else 0.0
+
+    def _sweep_quote(self, account: str, symbol: str) -> tuple[float, float]:
+        """(price, held_shares) for the account's cash-sweep menu."""
+        price = self._sweep_symbol_price(symbol)
+        held = self._account_position.held_shares(account, symbol)
+        return price, held
+
+    def _on_sweep_requested(self, account: str, direction: str,
+                            qty: int, symbol: str) -> None:
+        """Cash-sweep menu action → place a MKT order for *symbol* on *account*.
+        Sweep in → BUY (park positive USD cash); Sweep out → SELL (cover
+        negative USD cash).  Routed through the normal order path (limit-cap /
+        RTH / prefs / admin-gate all apply)."""
+        if qty <= 0 or not symbol or not account:
+            log.warning("FlashTrade: sweep %s ignored — qty=%s symbol=%r acct=%r",
+                        direction, qty, symbol, account)
+            return
+        action = "BUY" if direction == "in" else "SELL"
+        payload = {
+            "action": action,
+            "type": "MKT",
+            "symbol": symbol,
+            "qty": int(qty),
+            "last_price": self._sweep_symbol_price(symbol),
+            "_target_accounts": [account],
+        }
+        log.info("FlashTrade: sweep %s → %s %d %s @MKT account=%s",
+                 direction, action, qty, symbol, account)
+        self._on_order_requested(payload)
 
     def _on_pnl_single_updated(self, account: str, con_id: int,
                                daily_pnl: float, realized_pnl: float,
@@ -758,11 +821,16 @@ class FlashTradeView(QWidget):
     def _on_account_pnl_updated(self, account: str, daily_pnl: float,
                                 realized_pnl: float,
                                 unrealized_pnl: float) -> None:
-        """Account-level P&L from pnlEvent → update account header row."""
+        """Account-level P&L from pnlEvent → update account header row.
+
+        pnlEvent fires per-account regardless of positions, so this is also the
+        moment to push Net Liq / Excess Liq / BP for flat accounts (which never
+        appear in the position batch)."""
         self._account_position.set_account_data(
             account, daily_pnl=daily_pnl,
             realized_pnl=realized_pnl,
             unrealized_pnl=unrealized_pnl)
+        self._push_account_balances(account)
 
     def _on_fill_updated(self, fill: dict) -> None:
         """Execution arrived (startup snapshot or live execDetailsEvent) →
@@ -1245,24 +1313,20 @@ class FlashTradeView(QWidget):
                 "FlashTrade: account flatten — no connected worker for %s", account)
             return
 
-        # Collect every non-zero position for this account
+        self._ensure_worker_connected(worker)
+
+        # ── Step 1: cancel ALL open orders for this account (no symbol filter).
+        # This runs even for a flat account so a header-row Flatten still clears
+        # any resting orders that have no matching position yet.
+        worker.cancel_all_for_account(account)
+        log.info("FlashTrade: cancel_all_for_account sent for %s", account)
+
+        # ── Step 2: close each non-zero position via the normal flatten path
         pos_keys = [
             (acct, con_id)
             for acct, con_id in self._account_position.get_position_keys()
             if acct == account
         ]
-        if not pos_keys:
-            log.warning(
-                "FlashTrade: account flatten %s — no open positions found", account)
-            return
-
-        self._ensure_worker_connected(worker)
-
-        # ── Step 1: cancel ALL open orders for this account (no symbol filter)
-        worker.cancel_all_for_account(account)
-        log.info("FlashTrade: cancel_all_for_account sent for %s", account)
-
-        # ── Step 2: close each non-zero position via the normal flatten path
         for _, con_id in pos_keys:
             symbol = self._account_position.get_symbol_for_position(account, con_id)
             if symbol:
@@ -1271,8 +1335,8 @@ class FlashTradeView(QWidget):
                     "FlashTrade: position flatten %s for account %s", symbol, account)
 
         log.info(
-            "FlashTrade: account flatten complete — %d position(s) in %s",
-            len(pos_keys), account)
+            "FlashTrade: account flatten complete — cancelled open orders, "
+            "%d position(s) closed in %s", len(pos_keys), account)
 
     def _on_position_close_requested(self, account: str,
                                      con_id: int, pct: int) -> None:
