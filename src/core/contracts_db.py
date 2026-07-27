@@ -46,22 +46,25 @@ _SEC_ORDER: dict[str, int] = {"STK": 0, "FUT": 1, "OPT": 2}
 # ── DDL ───────────────────────────────────────────────────────────────────────
 _DDL = """
 CREATE TABLE IF NOT EXISTS contracts (
-    conid        TEXT NOT NULL DEFAULT '',
-    symbol       TEXT NOT NULL DEFAULT '',
-    sec_type     TEXT NOT NULL DEFAULT '',
-    exchange     TEXT NOT NULL DEFAULT '',
-    currency     TEXT NOT NULL DEFAULT '',
-    expiry       TEXT NOT NULL DEFAULT '',
-    strike       TEXT NOT NULL DEFAULT '',
-    right        TEXT NOT NULL DEFAULT '',
-    local_symbol TEXT NOT NULL DEFAULT '',
-    multiplier   TEXT NOT NULL DEFAULT ''
+    conid            TEXT NOT NULL DEFAULT '',
+    symbol           TEXT NOT NULL DEFAULT '',
+    sec_type         TEXT NOT NULL DEFAULT '',
+    exchange         TEXT NOT NULL DEFAULT '',
+    currency         TEXT NOT NULL DEFAULT '',
+    expiry           TEXT NOT NULL DEFAULT '',
+    strike           TEXT NOT NULL DEFAULT '',
+    right            TEXT NOT NULL DEFAULT '',
+    local_symbol     TEXT NOT NULL DEFAULT '',
+    multiplier       TEXT NOT NULL DEFAULT '',
+    primary_exchange TEXT NOT NULL DEFAULT '',
+    name             TEXT NOT NULL DEFAULT ''
 )
 """
 
 _COLS = (
     "conid", "symbol", "sec_type", "exchange", "currency",
     "expiry", "strike", "right", "local_symbol", "multiplier",
+    "primary_exchange", "name",
 )
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -75,6 +78,13 @@ def _open() -> sqlite3.Connection:
 
 def _ensure(conn: sqlite3.Connection) -> None:
     conn.execute(_DDL)
+    # One-time column upgrades for DBs created before these columns
+    # existed (also covers DBs dropped in by Backup & Restore).
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(contracts)")}
+    for col in ("primary_exchange", "name"):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE contracts ADD COLUMN "
+                         f"{col} TEXT NOT NULL DEFAULT ''")
     conn.commit()
 
 
@@ -90,6 +100,8 @@ def _row_tuple(c: dict[str, Any]) -> tuple:
         c.get("right", ""),
         c.get("local_symbol", ""),
         c.get("multiplier", ""),
+        c.get("primary_exchange", ""),
+        c.get("name", ""),
     )
 
 

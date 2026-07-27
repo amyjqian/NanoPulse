@@ -41,13 +41,9 @@ from pathlib import Path
 from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import (
-    QDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
-    QListWidget,
-    QListWidgetItem,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -177,6 +173,10 @@ class BookTraderView(QWidget):
     reverse_requested = Signal(str)
     close_tier_requested = Signal(dict)
     active_symbol_changed = Signal(str)
+    # A saved futures contract was swapped for a different expiration via
+    # the search popup — FlashTradeView re-points both panels' market
+    # data at the new contract.
+    contract_replaced = Signal(str)
 
     def __init__(
         self,
@@ -771,6 +771,9 @@ class BookTraderView(QWidget):
             return
         self._symbols.remove(sym)
         config_manager.save_book_trader_symbols(self._symbols)
+        # Drop the STK contract from the universe too, unless the Order
+        # Entry chip bar or a hot button still needs it.
+        config_manager.remove_stock_contract_if_unused(sym)
         self._chip_bar.set_symbols(
             [(s, _sec_type_for(s)) for s in self._symbols])
         if self._active_symbol == sym:
@@ -783,6 +786,25 @@ class BookTraderView(QWidget):
                 self._active_symbol = None
                 config_manager.save_book_trader_active_symbol("")
                 self._ticker.clear()
+
+    def refresh_symbol_contract(self, sym: str) -> None:
+        """Re-point *sym*'s L1/L2 streams at its (possibly replaced)
+        saved contract.  Both subscription paths are symbol-keyed on the
+        worker, so an unsubscribe → subscribe cycle is required for the
+        new conId to take effect."""
+        sym = (sym or "").upper()
+        if sym not in {s.upper() for s in self._symbols}:
+            return
+        self._ensure_bg_worker()
+        if self._bg_worker is None:
+            return
+        self._bg_worker.unsubscribe_background_symbol(sym)
+        l1_params = self._build_l1_params_for(sym)
+        if l1_params is not None:
+            self._bg_worker.subscribe_background_symbols([l1_params])
+        if (self._active_symbol or "").upper() == sym:
+            self._bg_worker.unsubscribe_depth(self._active_symbol)
+            self._bg_worker.subscribe_depth(self._active_symbol)
 
     def _on_qty_changed(self, qty: int) -> None:
         self._active_qty = int(qty)
@@ -1238,128 +1260,44 @@ class BookTraderView(QWidget):
 
     # ── Add-symbol popup (searchable) ────────────────────────────────────────
 
+    def open_symbol_search(self) -> None:
+        """Public entry point for the global "/" shortcut (MainWindow)."""
+        self._show_add_symbol_popup()
+
     def _show_add_symbol_popup(self) -> None:
-        """Small searchable popup listing saved contracts the user hasn't
-        added to the chip bar yet.  Same UX as OrderEntryPanel's "+"
-        button popup; not shared because it's light and self-contained.
-        """
-        from src.core.reference_data import get_instance as _rd
-        added = {s.upper() for s in self._symbols}
-        seen: set[str] = set()
-        entries: list[tuple[str, str]] = []
-        for c in sorted(_rd().contracts, key=lambda x: x.get("symbol", "")):
-            sym = c.get("symbol", "")
-            if not sym or sym.upper() in added:
-                continue
-            sec = c.get("sec_type", "")
-            local = c.get("local_symbol", "")
-            exch = c.get("exchange", "")
-            key = f"{sym}_{local}_{sec}"
-            if key in seen:
-                continue
-            seen.add(key)
-            detail = local if local and local != sym else exch
-            label = (f"{sym}  –  {detail}  ({sec})"
-                     if detail else f"{sym}  ({sec})")
-            entries.append((label, sym))
+        """Searchable add-symbol popup: saved contracts appear instantly
+        and, as the user types, live IBKR stock matches stream in via
+        reqMatchingSymbols — no need to add the stock on the Contracts
+        tab first.  Picking an IBKR row auto-saves the contract."""
+        from src.ui.widgets.symbol_search_popup import (
+            SymbolSearchPopup,
+            apply_future_pick,
+            connected_workers_by_priority,
+            ensure_contract_saved,
+        )
+        dlg = SymbolSearchPopup(
+            self,
+            workers=connected_workers_by_priority(self._active_threads),
+            exclude={s.upper() for s in self._symbols})
 
-        dlg = QDialog(self)
-        dlg.setWindowFlags(Qt.WindowType.Popup)
-        dlg.setFixedWidth(260)
-        lay = QVBoxLayout(dlg)
-        lay.setContentsMargins(6, 6, 6, 6)
-        lay.setSpacing(4)
-
-        search = QLineEdit()
-        search.setPlaceholderText("Type to search…")
-        search.setStyleSheet(
-            f"QLineEdit{{background:{Theme.BG_INPUT};color:{Theme.TEXT};"
-            f"border:1px solid {Theme.BORDER};border-radius:3px;"
-            f"padding:4px 6px;font-size:12px}}"
-            f"QLineEdit:focus{{border-color:{Theme.ACCENT}}}")
-        lay.addWidget(search)
-
-        lst = QListWidget()
-        lst.setStyleSheet(
-            f"QListWidget{{background:{Theme.BG_INPUT};color:{Theme.TEXT};"
-            f"border:1px solid {Theme.BORDER};border-radius:3px;"
-            f"padding:2px;outline:none}}"
-            f"QListWidget::item{{padding:4px 6px;border-radius:2px}}"
-            f"QListWidget::item:selected{{background:#3a3f50}}")
-        lst.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        lay.addWidget(lst)
-
-        if not entries:
-            item = QListWidgetItem(
-                "(no more symbols — add via Contracts tab)")
-            item.setFlags(Qt.ItemFlag.NoItemFlags)
-            lst.addItem(item)
-        else:
-            for label, sym in entries:
-                item = QListWidgetItem(label)
-                item.setData(Qt.ItemDataRole.UserRole, sym)
-                lst.addItem(item)
-            lst.setCurrentRow(0)
-
-        def _apply_filter(text: str) -> None:
-            q = text.strip().lower()
-            first_visible = -1
-            for i in range(lst.count()):
-                it = lst.item(i)
-                if it.data(Qt.ItemDataRole.UserRole) is None:
-                    continue
-                visible = (not q) or (q in it.text().lower())
-                it.setHidden(not visible)
-                if visible and first_visible < 0:
-                    first_visible = i
-            if first_visible >= 0:
-                lst.setCurrentRow(first_visible)
-
-        def _commit_current() -> None:
-            it = lst.currentItem()
-            if it is None or it.isHidden():
+        def _picked(entry: dict) -> None:
+            if (entry.get("source") == "ibkr"
+                    and entry.get("sec_type") == "FUT"):
+                sym, replaced = apply_future_pick(self, entry)
+                if not sym:
+                    return  # user declined the replacement
+                self._add_symbol(sym)
+                if replaced:
+                    self.contract_replaced.emit(sym)
                 return
-            sym = it.data(Qt.ItemDataRole.UserRole)
-            if not sym:
-                return
-            dlg.close()
-            self._add_symbol(sym)
+            sym = ensure_contract_saved(entry)
+            if sym:
+                self._add_symbol(sym)
 
-        def _step(delta: int) -> None:
-            n = lst.count()
-            if n == 0:
-                return
-            row = lst.currentRow()
-            for _ in range(n):
-                row = (row + delta) % n
-                it = lst.item(row)
-                if it is not None and not it.isHidden() \
-                        and it.data(Qt.ItemDataRole.UserRole):
-                    lst.setCurrentRow(row)
-                    return
-
-        search.textChanged.connect(_apply_filter)
-        search.returnPressed.connect(_commit_current)
-        lst.itemDoubleClicked.connect(lambda _it: _commit_current())
-
-        def _key(event) -> None:
-            if event.key() == Qt.Key.Key_Down:
-                _step(+1)
-                event.accept()
-                return
-            if event.key() == Qt.Key.Key_Up:
-                _step(-1)
-                event.accept()
-                return
-            QLineEdit.keyPressEvent(search, event)
-        search.keyPressEvent = _key  # type: ignore[method-assign]
-
+        dlg.symbol_selected.connect(_picked)
         # Anchor below the ticker's "+" button.
         btn = self._ticker._btn_add      # noqa: SLF001 — private-ish, single-caller
-        pos = btn.mapToGlobal(btn.rect().bottomLeft())
-        dlg.move(pos)
-        dlg.show()
-        search.setFocus()
+        dlg.open_below(btn)
 
     def _add_symbol(self, sym: str) -> None:
         sym = (sym or "").strip().upper()

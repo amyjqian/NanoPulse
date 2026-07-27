@@ -251,6 +251,14 @@ class ContractsView(QWidget):
         self._active_btn_label: str = ""
         self._setup_ui()
         self._load_saved_contracts()
+        # Contracts can now change outside this page (search-popup
+        # auto-save, chip-removal cleanup).  Rebuild the saved table on
+        # those external changes — otherwise a later whole-table save
+        # from this page would resurrect deleted rows.  The flag skips
+        # the rebuild for this page's own saves.
+        self._saving_contracts = False
+        from src.core.reference_data import get_instance as _rd
+        _rd().contracts_changed.connect(self._on_external_contracts_changed)
 
     def _setup_ui(self) -> None:
         self.setStyleSheet(
@@ -1071,9 +1079,24 @@ class ContractsView(QWidget):
         _SEC_ORDER = {"STK": 0, "FUT": 1, "OPT": 2}
         contracts.sort(key=lambda c: (_SEC_ORDER.get(
             c.get("sec_type", ""), 9), c.get("symbol", "")))
+        # The table doesn't display primary_exchange / name — carry them
+        # over from the stored rows (matched by conid) so a table save
+        # doesn't wipe them.
+        stored = {str(c.get("conid", "")): c
+                  for c in config_manager.load_contracts()
+                  if c.get("conid")}
+        for c in contracts:
+            prev = stored.get(str(c.get("conid", "")))
+            if prev is not None:
+                c["primary_exchange"] = prev.get("primary_exchange", "")
+                c["name"] = prev.get("name", "")
         config_manager.save_contracts(contracts)
         from src.core.reference_data import get_instance as _rd
-        _rd().reload_contracts()
+        self._saving_contracts = True
+        try:
+            _rd().reload_contracts()
+        finally:
+            self._saving_contracts = False
         self.contracts_changed.emit()
 
     def _cell(self, row: int, col: int) -> str:
@@ -1093,6 +1116,12 @@ class ContractsView(QWidget):
         """Clear and rebuild the table from the (sorted) persisted contracts."""
         self._saved_table.setRowCount(0)
         self._load_saved_contracts()
+
+    def _on_external_contracts_changed(self) -> None:
+        """Contracts changed outside this page — rebuild the saved table."""
+        if self._saving_contracts:
+            return
+        self._reload_saved_table()
 
     # ── Paint ─────────────────────────────────────────────────────────────────
 

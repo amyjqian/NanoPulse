@@ -225,6 +225,14 @@ class FlashTradeView(QWidget):
         self._book_trading.close_tier_requested.connect(
             self._on_close_tier_requested)
 
+        # ── Futures expiration replaced via the search popup ─────────────────
+        # Whichever panel hosted the pick, both panels' market data must
+        # re-point at the new contract (chips are root-symbol-keyed).
+        self._order_entry.contract_replaced.connect(
+            self._on_contract_replaced)
+        self._book_trading.contract_replaced.connect(
+            self._on_contract_replaced)
+
         # ── Wire order status cancel button → cancel logic ───────────────────
         self._order_status.cancel_requested.connect(self._on_cancel_requested)
         self._order_status.refresh_requested.connect(
@@ -1162,6 +1170,13 @@ class FlashTradeView(QWidget):
                 count += 1
         log.info("FlashTrade: close_%d%% '%s' → %d worker(s) accounts=%s",
                  pct, symbol, count, sorted(checked))
+
+    def _on_contract_replaced(self, sym: str) -> None:
+        """A futures root was re-pointed at a different expiration —
+        refresh market data in both panels regardless of which one
+        hosted the pick."""
+        self._order_entry.refresh_symbol_contract(sym)
+        self._book_trading.refresh_symbol_contract(sym)
 
     def _on_close_tier_requested(self, data: dict) -> None:
         """Take Profit / Stop Loss header button clicked → submit an exit

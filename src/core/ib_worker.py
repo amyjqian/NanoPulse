@@ -208,6 +208,28 @@ def _contract_to_dict(contract) -> dict:
     return d
 
 
+def _matching_symbols_to_dicts(descriptions) -> list[dict]:
+    """Convert reqMatchingSymbols ContractDescription objects to plain
+    dicts safe to ship across the thread boundary.  ``name`` (company /
+    fund name) is only populated by recent TWS builds, hence getattr."""
+    results: list[dict] = []
+    for desc in descriptions or []:
+        c = getattr(desc, "contract", None)
+        if c is None or not getattr(c, "symbol", ""):
+            continue
+        results.append({
+            "conid": getattr(c, "conId", 0),
+            "symbol": c.symbol,
+            "sec_type": getattr(c, "secType", ""),
+            "primary_exchange": getattr(c, "primaryExchange", ""),
+            "currency": getattr(c, "currency", ""),
+            "name": getattr(c, "description", "") or "",
+            "derivative_sec_types":
+                list(getattr(desc, "derivativeSecTypes", None) or []),
+        })
+    return results
+
+
 class IBWorkerThread(QThread):
     """One thread ↔ one TWS/Gateway connection."""
 
@@ -218,6 +240,10 @@ class IBWorkerThread(QThread):
     # list[dict] from reqContractDetails
     browse_results = Signal(list)
     browse_failed = Signal(str)                    # error message
+    # (token, list[dict]) from reqMatchingSymbols — token lets the UI
+    # discard responses that arrive after the user has kept typing.
+    symbol_search_results = Signal(int, list)
+    symbol_search_failed = Signal(int, str)        # (token, error message)
     price_updated = Signal(str, float)             # (symbol, last_price)
     bid_ask_updated = Signal(str, float, float)    # (symbol, bid, ask)
     # (symbol) – e.g. error 10197
@@ -585,6 +611,22 @@ class IBWorkerThread(QThread):
             log.warning(
                 "Worker %s: request_browse but loop not ready", self._label)
             self.browse_failed.emit("Worker event loop not ready.")
+
+    def request_symbol_search(self, token: int, pattern: str) -> None:
+        """Thread-safe: fuzzy symbol lookup via reqMatchingSymbols.
+
+        *token* is echoed back on the result/failure signal so the UI
+        can ignore responses that are stale by the time they arrive.
+        """
+        if self._loop is not None and not self._loop.is_closed():
+            asyncio.run_coroutine_threadsafe(
+                self._do_symbol_search(token, pattern), self._loop)
+        else:
+            log.warning(
+                "Worker %s: request_symbol_search but loop not ready",
+                self._label)
+            self.symbol_search_failed.emit(
+                token, "Worker event loop not ready.")
 
     def request_market_data(self, params: dict) -> None:
         """Thread-safe: subscribe to live market data for a contract.
@@ -1122,6 +1164,7 @@ class IBWorkerThread(QThread):
                         "right": getattr(q, "right", ""),
                         "local_symbol": q.localSymbol,
                         "multiplier": getattr(q, "multiplier", ""),
+                        "primary_exchange": getattr(q, "primaryExchange", ""),
                     }]
                     log.info("Worker %s qualified STK: %s → conId=%s",
                              self._label, q.symbol, q.conId)
@@ -1165,6 +1208,7 @@ class IBWorkerThread(QThread):
                         "right": getattr(q, "right", ""),
                         "local_symbol": q.localSymbol,
                         "multiplier": getattr(q, "multiplier", ""),
+                        "primary_exchange": getattr(q, "primaryExchange", ""),
                     })
 
                 log.info("Worker %s browse returned %d contract(s) for %s",
@@ -1187,6 +1231,43 @@ class IBWorkerThread(QThread):
             log.exception("Worker %s browse failed: %s", self._label, exc)
             tws_log.error("[%s] API-ERR   browse failed: %s", self._label, exc)
             self.browse_failed.emit(str(exc))
+
+    async def _do_symbol_search(self, token: int, pattern: str) -> None:
+        """Fuzzy-match *pattern* against IB's symbol universe.
+
+        Emits ``symbol_search_results(token, list[dict])`` on success or
+        ``symbol_search_failed(token, msg)`` on any error.  IB rate-limits
+        reqMatchingSymbols to roughly one call per second — the caller
+        (SymbolSearchPopup) debounces keystrokes to stay under that.
+        """
+        if self._ib is None or not self._ib.isConnected():
+            self.symbol_search_failed.emit(token, "Not connected to TWS.")
+            return
+
+        _TIMEOUT = 10  # seconds
+
+        try:
+            tws_log.info("[%s] API-CALL  reqMatchingSymbolsAsync(pattern=%s)",
+                         self._label, pattern)
+            descriptions = await asyncio.wait_for(
+                self._ib.reqMatchingSymbolsAsync(pattern), timeout=_TIMEOUT)
+            results = _matching_symbols_to_dicts(descriptions)
+            tws_log.info(
+                "[%s] API-RESP  reqMatchingSymbolsAsync → %d match(es) "
+                "for '%s'", self._label, len(results), pattern)
+            self.symbol_search_results.emit(token, results)
+        except asyncio.TimeoutError:
+            tws_log.error(
+                "[%s] API-ERR   symbol search timed out after %ds for '%s'",
+                self._label, _TIMEOUT, pattern)
+            self.symbol_search_failed.emit(
+                token, f"Search timed out after {_TIMEOUT}s.")
+        except Exception as exc:
+            log.exception("Worker %s symbol search failed: %s",
+                          self._label, exc)
+            tws_log.error("[%s] API-ERR   symbol search failed: %s",
+                          self._label, exc)
+            self.symbol_search_failed.emit(token, str(exc))
 
     # ── Order placement ───────────────────────────────────────────────────────
 
@@ -1222,12 +1303,15 @@ class IBWorkerThread(QThread):
                 c.multiplier = params["multiplier"]
 
             # Stocks: route to IBEOS (IBKR Overnight ATS) during overnight
-            # session (20:00–03:59 ET), otherwise SMART.
+            # session (20:00–03:59 ET), otherwise SMART.  IBEOS is a
+            # US-only venue — non-USD stocks (e.g. Toronto/CAD) always
+            # stay on SMART or TWS would reject the order.
             sec_type = params.get("sec_type", "")
             if sec_type == "STK":
                 now_et = datetime.now(_ET)
                 hour = now_et.hour
-                if hour >= 20 or hour < 4:
+                is_usd = (c.currency or "USD").upper() == "USD"
+                if (hour >= 20 or hour < 4) and is_usd:
                     c.exchange = "IBEOS"
                     log.info("Worker %s: STK overnight → exchange=IBEOS (ET %02d:%02d)",
                              self._label, hour, now_et.minute)

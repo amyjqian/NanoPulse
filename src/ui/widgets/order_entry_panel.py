@@ -51,7 +51,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.core import config_manager
-from src.ui.widgets.order_panel_parts import DraggableChip
+from src.ui.widgets.order_panel_parts import DraggableChip, attach_exchange_badge
 
 log = logging.getLogger(__name__)
 
@@ -2882,6 +2882,11 @@ class OrderEntryPanel(QWidget):
     #   (symbol: str, pct: int) – close *pct* percent of the position.
     close_pct_requested = Signal(str, int)
 
+    # A saved futures contract was swapped for a different expiration via
+    # the search popup — FlashTradeView re-points both panels' market
+    # data at the new contract.
+    contract_replaced = Signal(str)
+
     # Emitted when user clicks the Take Profit / Stop Loss header button.
     # Payload:
     #   {"side": "tp"|"sl", "symbol": str, "qty": int,
@@ -3986,6 +3991,7 @@ class OrderEntryPanel(QWidget):
         btn.setFixedHeight(self._CHIP_HEIGHT)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         _apply_chip_style(btn, sym == self._active_symbol)
+        attach_exchange_badge(btn, sym)
         btn.clicked.connect(lambda checked, s=sym: self._on_symbol_clicked(s))
         btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         btn.customContextMenuRequested.connect(
@@ -4090,11 +4096,35 @@ class OrderEntryPanel(QWidget):
             self._last_ask = 0.0
         self._refresh_price_change_display()
 
+    def refresh_symbol_contract(self, sym: str) -> None:
+        """Re-point *sym*'s market-data stream at its (possibly replaced)
+        saved contract.  The bg-subscription skip-list is keyed by
+        symbol, so an unsubscribe → subscribe cycle is required for the
+        worker to pick up the new conId."""
+        sym = (sym or "").upper()
+        if sym not in self._symbols:
+            return
+        self._price_cache.pop(sym, None)
+        if (self._bg_worker is not None
+                and self._bg_worker.isRunning()
+                and self._bg_worker.is_ib_connected):
+            self._bg_worker.unsubscribe_background_symbol(sym)
+            params = self._build_bg_params_for_symbol(sym)
+            if params:
+                self._bg_worker.subscribe_background_symbols([params])
+        if self._active_symbol == sym:
+            self._update_symbol_display()
+            self._refresh_action_labels()
+            self._reload_tier_sections()
+
     def _remove_symbol(self, sym: str) -> None:
         """Right-click removes a symbol button."""
         if sym in self._symbols:
             self._symbols.remove(sym)
             config_manager.save_order_entry_symbols(self._symbols)
+            # Drop the STK contract from the universe too, unless the
+            # Book Trader chip bar or a hot button still needs it.
+            config_manager.remove_stock_contract_if_unused(sym)
         # Unsubscribe from background stream
         if self._bg_worker is not None:
             self._bg_worker.unsubscribe_background_symbol(sym)
@@ -4918,141 +4948,43 @@ class OrderEntryPanel(QWidget):
 
     # ── Add-Symbol dropdown (type-to-filter popup triggered by "+") ──────────
 
+    def open_symbol_search(self) -> None:
+        """Public entry point for the global Shift+/ shortcut (MainWindow)."""
+        self._show_add_symbol_menu()
+
     def _show_add_symbol_menu(self) -> None:
-        """Pop up a searchable list of every saved contract that isn't
-        already on the symbol-chip bar.  The search field at the top
-        filters the list case-insensitively as the user types (matching
-        against symbol, local symbol, and sec_type); Up / Down navigates
-        the list, Enter / double-click adds the symbol via the existing
-        ``_add_symbol`` path, Esc closes the popup.
-        """
-        from src.core.reference_data import get_instance as _rd
+        """Searchable add-symbol popup: saved contracts appear instantly
+        and, as the user types, live IBKR stock matches stream in via
+        reqMatchingSymbols — no need to add the stock on the Contracts
+        tab first.  Picking an IBKR row auto-saves the contract, then
+        the symbol is added via the existing ``_add_symbol`` path."""
+        from src.ui.widgets.symbol_search_popup import (
+            SymbolSearchPopup,
+            apply_future_pick,
+            connected_workers_by_priority,
+            ensure_contract_saved,
+        )
+        dlg = SymbolSearchPopup(
+            self,
+            workers=connected_workers_by_priority(self._active_threads),
+            exclude={s.upper() for s in self._symbols})
 
-        # Collect available contracts (skip ones already on the bar).
-        added_upper = {s.upper() for s in self._symbols}
-        seen_keys: set[str] = set()
-        entries: list[tuple[str, str]] = []  # (label, symbol)
-        for c in sorted(_rd().contracts, key=lambda x: x.get("symbol", "")):
-            sym = c.get("symbol", "")
-            if not sym or sym.upper() in added_upper:
-                continue
-            sec = c.get("sec_type", "")
-            local = c.get("local_symbol", "")
-            exchange = c.get("exchange", "")
-            key = f"{sym}_{local}_{sec}"
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            detail = local if local and local != sym else exchange
-            label = (f"{sym}  –  {detail}  ({sec})"
-                     if detail else f"{sym}  ({sec})")
-            entries.append((label, sym))
-
-        # Build the popup.  QDialog with Popup window flag so clicking
-        # outside closes it automatically (same affordance as QMenu).
-        from PySide6.QtWidgets import QDialog
-        dlg = QDialog(self)
-        dlg.setWindowFlags(Qt.WindowType.Popup)
-        dlg.setFixedWidth(260)
-
-        lay = QVBoxLayout(dlg)
-        lay.setContentsMargins(6, 6, 6, 6)
-        lay.setSpacing(4)
-
-        search = QLineEdit()
-        search.setPlaceholderText("Type to search…")
-        search.setStyleSheet(
-            f"QLineEdit{{background:{Theme.BG_INPUT};color:{Theme.TEXT};"
-            f"border:1px solid {Theme.BORDER};border-radius:3px;"
-            f"padding:4px 6px;font-size:12px}}"
-            f"QLineEdit:focus{{border-color:{Theme.ACCENT}}}")
-        lay.addWidget(search)
-
-        lst = QListWidget()
-        lst.setStyleSheet(
-            f"QListWidget{{background:{Theme.BG_INPUT};color:{Theme.TEXT};"
-            f"border:1px solid {Theme.BORDER};border-radius:3px;"
-            f"padding:2px;outline:none}}"
-            f"QListWidget::item{{padding:4px 6px;border-radius:2px}}"
-            f"QListWidget::item:selected{{background:#3a3f50}}")
-        lst.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        lay.addWidget(lst)
-
-        if not entries:
-            item = QListWidgetItem(
-                "(no more symbols — add via Contracts tab)")
-            item.setFlags(Qt.ItemFlag.NoItemFlags)
-            lst.addItem(item)
-        else:
-            for label, sym in entries:
-                item = QListWidgetItem(label)
-                item.setData(Qt.ItemDataRole.UserRole, sym)
-                lst.addItem(item)
-            lst.setCurrentRow(0)
-
-        def _apply_filter(text: str) -> None:
-            query = text.strip().lower()
-            first_visible = -1
-            for i in range(lst.count()):
-                it = lst.item(i)
-                if it.data(Qt.ItemDataRole.UserRole) is None:
-                    continue
-                visible = (not query) or (query in it.text().lower())
-                it.setHidden(not visible)
-                if visible and first_visible < 0:
-                    first_visible = i
-            if first_visible >= 0:
-                lst.setCurrentRow(first_visible)
-
-        def _commit_current() -> None:
-            it = lst.currentItem()
-            if it is None or it.isHidden():
+        def _picked(entry: dict) -> None:
+            if (entry.get("source") == "ibkr"
+                    and entry.get("sec_type") == "FUT"):
+                sym, replaced = apply_future_pick(self, entry)
+                if not sym:
+                    return  # user declined the replacement
+                self._add_symbol(sym)
+                if replaced:
+                    self.contract_replaced.emit(sym)
                 return
-            sym = it.data(Qt.ItemDataRole.UserRole)
-            if not sym:
-                return
-            dlg.close()
-            self._add_symbol(sym)
+            sym = ensure_contract_saved(entry)
+            if sym:
+                self._add_symbol(sym)
 
-        def _step(delta: int) -> None:
-            n = lst.count()
-            if n == 0:
-                return
-            row = lst.currentRow()
-            for _ in range(n):
-                row = (row + delta) % n
-                it = lst.item(row)
-                if it is not None and not it.isHidden() \
-                        and it.data(Qt.ItemDataRole.UserRole):
-                    lst.setCurrentRow(row)
-                    return
-
-        # Wire search → filter, Enter → commit, Esc → close (via Popup),
-        # double-click on list → commit, Up/Down → navigate.
-        search.textChanged.connect(_apply_filter)
-        search.returnPressed.connect(_commit_current)
-        lst.itemDoubleClicked.connect(lambda _it: _commit_current())
-
-        # Capture Up/Down in the search field so the user can navigate
-        # the list without leaving the text input.
-        def _search_key_event(event) -> None:
-            if event.key() == Qt.Key.Key_Down:
-                _step(+1)
-                event.accept()
-                return
-            if event.key() == Qt.Key.Key_Up:
-                _step(-1)
-                event.accept()
-                return
-            QLineEdit.keyPressEvent(search, event)
-        search.keyPressEvent = _search_key_event  # type: ignore[method-assign]
-
-        # Anchor beneath the + button.
-        pos = self._btn_add_symbol.mapToGlobal(
-            self._btn_add_symbol.rect().bottomLeft())
-        dlg.move(pos)
-        dlg.show()
-        search.setFocus()
+        dlg.symbol_selected.connect(_picked)
+        dlg.open_below(self._btn_add_symbol)
 
     def _update_bid_ask_buttons(self, bid: float, ask: float) -> None:
         """Keep @Bid / @Ask button labels in sync with the current quantity.

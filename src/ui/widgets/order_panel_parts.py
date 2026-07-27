@@ -239,6 +239,39 @@ class TickerStrip(QWidget):
 #  SymbolChipBar
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Primary-exchange codes that count as Toronto Stock Exchange.  IB
+# reports Toronto as "TSE"; "TSX" kept as a defensive alias.
+_TORONTO_EXCHANGES = frozenset({"TSE", "TSX"})
+
+
+def attach_exchange_badge(btn: QPushButton, symbol: str) -> None:
+    """Overlay a tiny superscript letter at the chip's top-right corner
+    marking the stock's primary listing exchange — currently just "T"
+    for Toronto (TSE) listings.  No-op for anything else.
+
+    Uses a layout on the button itself so the letter tracks the corner
+    through resizes without a custom paintEvent.
+    """
+    try:
+        from src.core.reference_data import get_instance as _rd
+        if _rd().get_primary_exchange(symbol) not in _TORONTO_EXCHANGES:
+            return
+    except Exception:
+        return
+    badge = QLabel("T", btn)
+    badge.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+    badge.setStyleSheet(
+        "background:transparent;color:rgba(255,255,255,0.8);"
+        "font-size:8px;font-weight:bold;border:none;padding:0")
+    lay = QHBoxLayout(btn)
+    lay.setContentsMargins(0, 1, 3, 0)
+    lay.setSpacing(0)
+    lay.addStretch(1)
+    lay.addWidget(
+        badge, 0,
+        Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight)
+
+
 def _apply_chip_style(btn: QPushButton, selected: bool) -> None:
     """Apply blue-selected or grey-unselected style to a symbol chip.
 
@@ -465,6 +498,7 @@ class SymbolChipBar(QWidget):
         btn.setFixedHeight(self._CHIP_HEIGHT)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         _apply_chip_style(btn, sym == self._active)
+        attach_exchange_badge(btn, sym)
         btn.clicked.connect(lambda _checked, s=sym: self._on_click(s))
         btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         btn.customContextMenuRequested.connect(

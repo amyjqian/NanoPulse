@@ -116,6 +116,15 @@ class ReferenceData(QObject):
         log.info("ReferenceData: %d contract(s) loaded", len(self.contracts))
         self.contracts_changed.emit()
 
+    def get_primary_exchange(self, symbol: str) -> str:
+        """Primary listing exchange for *symbol* (e.g. "TSE" for a
+        Toronto stock) — "" when unknown or not stored."""
+        for c in self.contracts_by_symbol.get(symbol.upper(), []):
+            pe = c.get("primary_exchange", "")
+            if pe:
+                return pe
+        return ""
+
     def get_sec_type(self, symbol: str) -> str:
         """Best-effort sec_type — priority: STK > FUT > OPT > '?'."""
         q = symbol.upper()

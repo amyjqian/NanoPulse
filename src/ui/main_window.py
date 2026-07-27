@@ -6,8 +6,13 @@ from __future__ import annotations
 import logging
 
 from PySide6.QtWidgets import (
+    QAbstractSpinBox,
+    QApplication,
     QFrame,
+    QLineEdit,
+    QPlainTextEdit,
     QStackedWidget,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -68,6 +73,7 @@ class MainWindow(QWidget):
         _rd().reload_strategy_tiers()
 
         self._setup_ui()
+        self._setup_shortcuts()
         self._apply_role_gating()
         self._restore_geometry()
 
@@ -192,6 +198,69 @@ class MainWindow(QWidget):
         # gets a non-blocking confirmation that some accounts were skipped.
         self._flash_trade.transient_status_message.connect(
             self._status_bar.show_message)
+
+    # ── Keyboard shortcuts ───────────────────────────────────────────────────
+
+    def _setup_shortcuts(self) -> None:
+        """Window-wide symbol-search hotkeys:
+
+        * ``/``        → ladder (Book Trader) symbol search
+        * ``Shift+/``  → stock order view (OrderEntry) symbol search
+
+        Implemented as an application event filter rather than
+        QShortcut because Shift+/ arrives as the ``?`` key and
+        QShortcut's shift-modified matching is platform-dependent.
+        Both keys are suppressed while a text-entry widget has focus so
+        typing a literal "/" or "?" in an input never hijacks the
+        keystroke.
+        """
+        QApplication.instance().installEventFilter(self)
+
+    def eventFilter(self, obj, event):  # noqa: N802 – Qt override
+        if (event.type() == QEvent.Type.KeyPress
+                and isinstance(obj, QWidget)
+                and not event.isAutoRepeat()
+                and event.key() in (Qt.Key.Key_Slash, Qt.Key.Key_Question)
+                and QApplication.activeWindow() is self):
+            fw = QApplication.focusWidget()
+            if not isinstance(fw, (QLineEdit, QTextEdit, QPlainTextEdit,
+                                   QAbstractSpinBox)):
+                self._open_symbol_search(
+                    "ladder" if event.key() == Qt.Key.Key_Slash
+                    else "order")
+                return True
+        return super().eventFilter(obj, event)
+
+    def _open_symbol_search(self, target: str) -> None:
+        """Open the add-symbol search popup on the Nano page.
+
+        Navigates to the Nano tab first if needed so the popup can
+        anchor to its visible "+" button.  No-op for admin sessions
+        (no trade surfaces) and while the user is typing in an input.
+        """
+        fw = QApplication.focusWidget()
+        if isinstance(fw, (QLineEdit, QTextEdit, QPlainTextEdit,
+                           QAbstractSpinBox)):
+            return
+        user = self._current_user
+        if user is not None and not user.can_trade:
+            return
+
+        def _open() -> None:
+            if target == "ladder":
+                self._flash_trade._book_trading.open_symbol_search()
+            else:
+                self._flash_trade._order_entry.open_symbol_search()
+
+        if self._pages.currentIndex() != _PAGE_INDEX["Nano"]:
+            for label, btn in self._tab_bar._buttons.items():
+                btn.set_active(label == "Nano")
+            self._on_nav_changed("Nano")
+            # Let the page-switch layout settle before anchoring the
+            # popup to the "+" button's on-screen position.
+            QTimer.singleShot(0, _open)
+        else:
+            _open()
 
     # ── Role gating ─────────────────────────────────────────────────────────────
 

@@ -211,6 +211,47 @@ def save_contracts(
     _save(contracts)
 
 
+def remove_stock_contract_if_unused(
+    symbol: str, path: Path | str | None = None,
+) -> bool:
+    """Delete *symbol*'s STK contract(s) from the contracts DB after a
+    chip-bar removal — but only when nothing else still references the
+    symbol:
+
+    * the Order Entry chip list,
+    * the Book Trader chip list,
+    * any enabled hot button.
+
+    FUT/OPT contracts are never touched: those are curated on the
+    Contracts page (with expiries picked by hand) and removing a chip
+    shouldn't destroy them.  Reloads ReferenceData — which emits
+    ``contracts_changed`` — when a row is deleted.  Returns True if
+    something was deleted.
+    """
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return False
+    used = {s.upper() for s in load_order_entry_symbols(path)}
+    used |= {s.upper() for s in load_book_trader_symbols(path)}
+    for b in load_hot_buttons(path):
+        if not b.get("disabled"):
+            used.add(b.get("symbol", "").upper())
+    if sym in used:
+        return False
+    contracts = load_contracts()
+    kept = [c for c in contracts
+            if c.get("sec_type") != "STK"
+            or c.get("symbol", "").upper() != sym]
+    if len(kept) == len(contracts):
+        return False
+    save_contracts(kept)
+    log.info("Removed STK contract %s from contracts DB "
+             "(chip removed, no remaining references)", sym)
+    from src.core.reference_data import get_instance as _rd
+    _rd().reload_contracts()
+    return True
+
+
 # ── Layout persistence ────────────────────────────────────────────────────────
 
 
