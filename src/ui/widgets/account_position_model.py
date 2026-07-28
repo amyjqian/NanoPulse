@@ -477,6 +477,28 @@ class AccountPositionModel(QAbstractTableModel):
         pos = self._positions.get((account, con_id), {})
         return pos.get("local_symbol") or pos.get("symbol", "")
 
+    def position_data(self, account: str, con_id: int) -> dict | None:
+        """Full position dict for (account, con_id), or None if unknown."""
+        pos = self._positions.get((account, int(con_id)))
+        return dict(pos) if pos is not None else None
+
+    def position_for_symbol(self, account: str, symbol: str) -> dict | None:
+        """Full position dict for the *account*'s STK holding in *symbol*
+        (matched on root or local symbol, case-insensitive), or None.
+
+        Used by the Options Income ticket for share counts, cost basis
+        and the underlying conId."""
+        want = (symbol or "").upper()
+        for (acct, _con_id), pos in self._positions.items():
+            if acct != account:
+                continue
+            if (pos.get("sec_type") or "STK") != "STK":
+                continue
+            sym = (pos.get("symbol") or pos.get("local_symbol") or "").upper()
+            if sym == want:
+                return dict(pos)
+        return None
+
     def position_qty_for_symbol(self, account: str, symbol: str) -> float:
         """Total position quantity *account* holds in *symbol* (matched on
         localSymbol or root symbol, case-insensitive).  0.0 if none/unknown."""

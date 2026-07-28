@@ -254,6 +254,11 @@ class FlashTradeView(QWidget):
         # Position-row buttons: Flatten (100%) · 25% · 50% · 75%
         self._account_position.position_close_requested.connect(
             self._on_position_close_requested)
+        # Context menus: Options income (account rows + STK rows) / sweeps
+        self._account_position.account_action_requested.connect(
+            self._on_account_action_requested)
+        self._account_position.position_action_requested.connect(
+            self._on_position_action_requested)
 
         # ── Wire account-list action buttons ─────────────────────────────────
         # 25% · 50% · 75% · Flatten · Reverse · Cancel
@@ -462,6 +467,17 @@ class FlashTradeView(QWidget):
                      action, order_type, symbol, limit_price)
             order_type = "LMT"
 
+        elif order_type == "LMT":
+            # Explicit passthrough limit — price fully specified by the
+            # caller (Options Income ticket).  No prefs, no cap, no anchor.
+            limit_price = float(payload.get("limit_price", 0))
+            if limit_price <= 0:
+                log.warning("FlashTrade: %s LMT but limit_price=%.4f – "
+                            "aborting", action, limit_price)
+                return
+            log.info("FlashTrade: %s LMT %s @ %.4f (passthrough)",
+                     action, symbol, limit_price)
+
         elif order_type == "MKT" and last_price > 0:
             # MKT → cap with a limit if Limit Cap Offset is set
             cap_value = float(prefs.get("limit_cap", 0))
@@ -547,7 +563,60 @@ class FlashTradeView(QWidget):
             params["profit_take"] = payload.get("profit_take")
             params["stop_loss"] = payload.get("stop_loss")
             params["trailing"] = payload.get("trailing")
-            worker.place_order(params)
+            if payload.get("_what_if_check"):
+                # Options-income orders run a whatIf margin pre-check on
+                # the worker before transmitting (§6 of the spec).
+                worker.place_option_order(params)
+            else:
+                worker.place_order(params)
+
+    def _on_account_action_requested(self, data: dict) -> None:
+        """Positions-panel account context menu → route the action."""
+        account = str(data.get("account") or "")
+        if account and data.get("action") == "options_income":
+            self._open_options_ticket(account)
+
+    def _on_position_action_requested(self, data: dict) -> None:
+        """STK position-row context menu → Options income pre-filled."""
+        if data.get("action") != "options_income":
+            return
+        account = str(data.get("account") or "")
+        if account:
+            self._open_options_ticket(account,
+                                      symbol=data.get("symbol") or None)
+
+    def _open_options_ticket(self, account: str,
+                             symbol: str | None = None) -> None:
+        """Open the Options Income ticket pre-filled with *account* (and
+        optionally *symbol*).  Orders route back through
+        ``_on_order_requested`` so role-gating and blotter wiring apply."""
+        if not self._trading_allowed:
+            log.warning(
+                "FlashTrade: options ticket blocked — user cannot trade")
+            self.transient_status_message.emit(
+                "Trading is disabled for admin accounts.", 4000)
+            return
+        from src.ui.widgets.options_income import OptionsIncomeTicket
+
+        def _buying_power(acct: str) -> float:
+            if self._accounts_model is None:
+                return 0.0
+            return float(self._accounts_model.get_buying_power(acct) or 0.0)
+
+        worker = self._find_worker_for_account(account)
+        if worker is not None:
+            self._ensure_worker_connected(worker)
+
+        ticket = OptionsIncomeTicket(
+            account=account,
+            get_worker=self._find_worker_for_account,
+            get_buying_power=_buying_power,
+            get_position=self._account_position.position_for_symbol,
+            symbol=symbol,
+            parent=self,
+        )
+        ticket.order_ready.connect(self._on_order_requested)
+        ticket.exec()
 
     def _find_worker_for_account(self, account: str) -> IBWorkerThread | None:
         """Look up the correct worker thread for a given account ID."""
