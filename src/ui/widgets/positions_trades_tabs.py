@@ -86,8 +86,8 @@ class PositionsTradesTabs(QTabWidget):
         # scroll buttons (which themselves also eat horizontal space).
         self.tabBar().setUsesScrollButtons(False)
         self.setElideMode(Qt.TextElideMode.ElideRight)
-        self.addTab(positions_widget, "POSITIONS")
-        self.addTab(trades_widget, "TRADES")
+        self.addTab(positions_widget, "Pos")
+        self.addTab(trades_widget, "Trds")
 
         self._corner_stack = QStackedWidget(self)
         # Index 0 → Positions bar; Index 1 → Trades bar.  An empty widget

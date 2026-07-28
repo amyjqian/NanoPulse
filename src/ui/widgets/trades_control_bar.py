@@ -77,7 +77,6 @@ _BAR_QSS = f"""
         border: 1px solid {BORDER};
         border-radius: 4px;
         padding: 2px 6px;
-        min-width: 90px;
         font-family: "Helvetica Neue", Arial, sans-serif;
         font-size: 11px;
     }}
@@ -100,7 +99,8 @@ _BAR_QSS = f"""
         padding: 3px 8px;
         font-family: "Helvetica Neue", Arial, sans-serif;
         font-size: 11px;
-        min-width: 120px;
+        min-width: 60px;
+        max-width: 60px;
     }}
     QLineEdit#tbSearch:focus {{
         border-color: {ACCENT};
@@ -158,7 +158,7 @@ class TradesControlBar(QWidget):
         # Visible-trade count.  Host panel updates this whenever the
         # flat proxy's rowCount changes (fills arrive, filter/search
         # changes).  Sits left of the Summary toggle.
-        self._trades_count_label = QLabel("0 trades", self)
+        self._trades_count_label = QLabel("0 trds", self)
         self._trades_count_label.setObjectName("tbTradeCount")
         self._trades_count_label.setProperty("hasTrades", False)
         lay.addWidget(self._trades_count_label)
@@ -191,8 +191,12 @@ class TradesControlBar(QWidget):
         # time_of_day) when applying the filter.
         self._date_combo = QComboBox(self)
         self._date_combo.setObjectName("tbDateCombo")
+        # Width tracks the widest item ("Last N Days") instead of a
+        # hard-coded min-width.
+        self._date_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToContents)
         self._date_combo.addItem("Evening",   "evening")
-        self._date_combo.addItem("Afternoon", "afternoon")
+        self._date_combo.addItem("Noon",      "afternoon")
         self._date_combo.addItem("Morning",   "morning")
         self._date_combo.addItem("Today",     "today")
         for n in range(2, 8):
@@ -235,7 +239,7 @@ class TradesControlBar(QWidget):
     def setTradeCount(self, n: int) -> None:
         n = max(0, int(n))
         self._trades_count_label.setText(
-            f"{n:,} trade" + ("s" if n != 1 else ""))
+            f"{n:,} trd" + ("s" if n != 1 else ""))
         # Trigger QSS re-evaluation so the color pops when there are
         # trades and dims back to muted grey when the view is empty.
         self._trades_count_label.setProperty("hasTrades", n > 0)

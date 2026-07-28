@@ -131,11 +131,11 @@ def test_hide_multiple_selected_summary_rows(qtbot):
     assert remaining == {"CCC"}
     assert model.hidden_count() == 2
     # Counter reflects only CCC's single fill now.
-    assert "1 trade" in bar._trades_count_label.text()
+    assert "1 trd" in bar._trades_count_label.text()
 
     model.restore_hidden()
     assert model.hidden_count() == 0
-    assert "3 trades" in bar._trades_count_label.text()
+    assert "3 trds" in bar._trades_count_label.text()
 
 
 def test_hide_multiple_selected_flat_rows(qtbot):
@@ -152,7 +152,7 @@ def test_hide_multiple_selected_flat_rows(qtbot):
     table = panel._flat_table
     proxy = panel._flat_proxy
     assert proxy.rowCount() == 3
-    assert "3 trades" in bar._trades_count_label.text()
+    assert "3 trds" in bar._trades_count_label.text()
 
     # Select the first two fill rows.
     sm = table.selectionModel()
@@ -164,12 +164,12 @@ def test_hide_multiple_selected_flat_rows(qtbot):
     panel._hide_selected_flat_rows()
     assert proxy.rowCount() == 1
     assert proxy.hiddenCount() == 2
-    assert "1 trade" in bar._trades_count_label.text()
+    assert "1 trd" in bar._trades_count_label.text()
 
     proxy.restoreHidden()
     assert proxy.rowCount() == 3
     assert proxy.hiddenCount() == 0
-    assert "3 trades" in bar._trades_count_label.text()
+    assert "3 trds" in bar._trades_count_label.text()
 
 
 def test_flat_hide_propagates_to_summary(qtbot):
@@ -233,20 +233,20 @@ def test_summary_view_trade_count_tracks_hide(qtbot):
     panel.add_fill(_fill("e3", "BBB", "BOT", 5, 200.0, con_id=2))
 
     # Flat view (default) counts every fill.
-    assert "3 trades" in bar._trades_count_label.text()
+    assert "3 trds" in bar._trades_count_label.text()
 
     # Switch to summary view — same fill count while nothing is hidden.
     bar.setSummary(True)
-    assert "3 trades" in bar._trades_count_label.text()
+    assert "3 trds" in bar._trades_count_label.text()
 
     # Hiding AAA (2 fills) drops the count to BBB's single fill.
     panel._summary_model.hide_symbol(panel._summary_model.row_key(0))
-    assert "1 trade" in bar._trades_count_label.text()
+    assert "1 trd" in bar._trades_count_label.text()
 
     # Restoring brings the count back.
     panel._summary_model.restore_hidden()
-    assert "3 trades" in bar._trades_count_label.text()
+    assert "3 trds" in bar._trades_count_label.text()
 
     # Toggling back to flat re-sources the count from the flat proxy.
     bar.setSummary(False)
-    assert "3 trades" in bar._trades_count_label.text()
+    assert "3 trds" in bar._trades_count_label.text()
