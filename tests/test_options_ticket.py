@@ -96,15 +96,21 @@ def _contracts(right: str) -> list[dict]:
 
 @pytest.fixture(autouse=True)
 def _isolate_chip_settings(monkeypatch):
-    """Keep the chip bar off the real QSettings during tests."""
+    """Keep the chip bar off the real QSettings and the ticket geometry
+    off the real config JSON during tests."""
     monkeypatch.setattr(SymbolChipBar, "_load_chips",
                         staticmethod(lambda: list(DEFAULT_CHIPS)))
     monkeypatch.setattr(SymbolChipBar, "_save_chips",
                         lambda self: None)
+    from src.core import config_manager
+    monkeypatch.setattr(config_manager, "load_layout",
+                        lambda path=None: {})
+    monkeypatch.setattr(config_manager, "save_layout",
+                        lambda layout, path=None: None)
 
 
 def _make(qtbot, *, shares=300.0, bp=2_523_356.0, symbol="NVDA",
-          worker=None):
+          is_margin=True, worker=None):
     worker = worker if worker is not None else FakeWorker()
 
     def get_position(_acct, sym):
@@ -120,6 +126,7 @@ def _make(qtbot, *, shares=300.0, bp=2_523_356.0, symbol="NVDA",
         get_buying_power=lambda a: bp,
         get_position=get_position,
         symbol=symbol,
+        is_margin=is_margin,
     )
     qtbot.addWidget(t)
     return t, worker
@@ -145,6 +152,21 @@ def _deliver_selected_quote(t, w, bid=3.04, ask=3.16):
 
 # ── Flow ─────────────────────────────────────────────────────────────────────
 
+def test_account_level_open_selects_no_chip(qtbot):
+    # Right-click at account level → no symbol → nothing pre-selected,
+    # no chain requested until the user picks a chip.
+    t, w = _make(qtbot, symbol=None)
+    assert t._chips.active_symbol() == ""
+    assert not w.chain_calls
+    # Placeholder expiries: the next four calendar Fridays still show.
+    assert len(t._expiry._chips) == 4
+    from datetime import datetime as _dt
+    assert all(_dt.strptime(e.ymd, "%Y%m%d").weekday() == 4
+               for e in t._expiry._chips)
+    t._chips.select("NVDA")
+    assert w.chain_calls
+
+
 def test_chain_flow_populates_defaults(qtbot):
     t, w = _make(qtbot)
     assert w.chain_calls, "chain requested on open"
@@ -157,14 +179,80 @@ def test_chain_flow_populates_defaults(qtbot):
     assert w.contract_calls[-1][1]["right"] == "C"
     _deliver_contracts(t, w)
     model = t._chain_view.chain_model
-    assert model.rowCount() == 6
-    assert model.row_data(0)["strike"] == 182.5
-    assert model.row_data(0)["tag"] == "OTM"
-    # Default selection = 3rd row (≈0.30-delta zone).
+    # 13 strikes (10-OTM + 5-ITM windows cover the whole test chain)
+    # plus the ATM separator row between the OTM and ITM blocks.
+    assert model.rowCount() == 14
+    seps = [i for i in range(model.rowCount())
+            if model.row_data(i).get("sep")]
+    assert seps == [8]                     # 182.5 above, 180 below
+    assert model.row_data(8)["label"] == "NVDA 182.40"
+    # Descending — highest strike on top.
+    strikes = [model.row_data(i)["strike"] for i in range(model.rowCount())
+               if not model.row_data(i).get("sep")]
+    assert strikes == sorted(strikes, reverse=True)
+    assert strikes[0] == 200.0 and strikes[-1] == 170.0
+    # Default selection ≈ two strikes OTM of the money (anchor 182.5,
+    # minus two on the descending ladder → 187.5).
     assert t._selected_leg["strike"] == 187.5
-    # Quote batch = 6 strikes + the underlying.
+    # Quote batch = 13 strikes + the underlying (no separator).
     conids = [c["conid"] for c in w.quote_calls[-1][1]]
-    assert UNDERLYING_CONID in conids and len(conids) == 7
+    assert UNDERLYING_CONID in conids and len(conids) == 14
+
+
+def test_symbol_change_resets_expiry_to_nearest_week(qtbot):
+    t, w = _make(qtbot)
+    _deliver_chain(t, w)
+    # User picks a later weekly…
+    t._expiry._pick(t._expiry._chips[2])
+    assert t._expiry.selected().dte == 17
+    # …then switches symbol: the new chain defaults back to the
+    # nearest weekly even though the same expiry date is listed.
+    t._chips.select("TSLA")
+    _deliver_chain(t, w)
+    assert t._expiry.selected().dte == 3
+
+
+def test_sep_row_not_selectable_and_tracks_spot(qtbot):
+    from PySide6.QtCore import Qt
+    t, w = _make(qtbot)
+    _deliver_chain(t, w)
+    _deliver_contracts(t, w)
+    model = t._chain_view.chain_model
+    # Separator carries no flags → mouse/keyboard can't land on it.
+    assert model.flags(model.index(8, 0)) == Qt.ItemFlag.NoItemFlags
+    # select_row(sep) snaps to the nearest strike row instead.
+    t._chain_view.select_row(8)
+    assert t._selected_leg["strike"] in (182.5, 180.0)
+    # Underlying quote moves the spot → separator label follows.
+    token = w.quote_calls[-1][0]
+    w.option_quote_updated.emit(token, UNDERLYING_CONID,
+                                {"bid": 183.0, "ask": 183.2, "last": 183.1,
+                                 "close": 181.0, "delta": 0.0})
+    assert model.row_data(8)["label"] == "NVDA 183.10"
+
+
+def test_large_chain_shows_50_per_side_but_windows_quotes(qtbot):
+    t, w = _make(qtbot)
+    _deliver_chain(t, w)
+    token = w.contract_calls[-1][0]
+    big = []
+    for i in range(1, 161):                            # strikes 2.5 … 400
+        s = 2.5 * i
+        big.append({"conid": 20000 + i, "symbol": "NVDA", "sec_type": "OPT",
+                    "exchange": "SMART", "currency": "USD",
+                    "expiry": _ymd(17), "strike": s, "right": "C",
+                    "local_symbol": f"NVDA {s:g}C", "multiplier": "100",
+                    "trading_class": "NVDA", "min_tick": 0.01})
+    w.option_contracts_results.emit(token, big)
+    model = t._chain_view.chain_model
+    assert model.rowCount() == 101                     # 50+50 strikes + sep
+    # Quote batch is windowed around the selection, not the whole chain
+    # (IB market-data lines are a shared, limited resource).
+    subs = w.quote_calls[-1][1]
+    conids = [c["conid"] for c in subs]
+    assert UNDERLYING_CONID in conids
+    assert t._selected_leg["conid"] in conids
+    assert len(subs) <= 2 * t._QUOTE_PAD + 2
 
 
 def test_quote_sets_price_and_figures(qtbot):
@@ -173,17 +261,20 @@ def test_quote_sets_price_and_figures(qtbot):
     _deliver_contracts(t, w)
     _deliver_selected_quote(t, w)          # bid 3.04 / ask 3.16 → mid 3.10
     assert t._rail.price() == Decimal("3.10")
-    row = t._chain_view.chain_model.row_data(2)
+    model = t._chain_view.chain_model
+    row = model.row_data(model.row_for_conid(t._selected_leg["conid"]))
     assert row["credit"] == 310.0
     assert row["delta"] == 0.29
-    assert "SELL 1 NVDA" in t._rail._order_line.text()
-    assert "187.5 CALL @ 3.10" in t._rail._order_line.text()
+    assert (row["bid"], row["ask"], row["last"]) == (3.04, 3.16, 3.08)
+    assert t._rail._order_line.text().startswith("NVDA ")
+    assert t._rail._order_line.text().endswith("187.5 CALL")
     assert t._rail._sell_btn.isEnabled()
     assert t._rail._credit_lbl.text() == "+$310.00"
 
 
 def test_cc_max_qty_from_shares(qtbot):
-    t, w = _make(qtbot, shares=300.0)
+    # Cash account → covered only: MAX bound by shares.
+    t, w = _make(qtbot, shares=300.0, is_margin=False)
     _deliver_chain(t, w)
     _deliver_contracts(t, w)
     assert t._max_qty() == 3
@@ -196,7 +287,8 @@ def test_cc_max_qty_from_shares(qtbot):
 
 
 def test_cc_ineligible_under_100_shares(qtbot):
-    t, w = _make(qtbot, shares=40.0)
+    # Cash account with <100 shares cannot sell calls at all.
+    t, w = _make(qtbot, shares=40.0, is_margin=False)
     _deliver_chain(t, w)
     _deliver_contracts(t, w)
     _deliver_selected_quote(t, w)
@@ -204,18 +296,95 @@ def test_cc_ineligible_under_100_shares(qtbot):
     assert t._rail._sell_btn.text() == "Not enough shares"
 
 
+def test_margin_account_can_sell_naked_calls(qtbot):
+    # Margin account, no shares → sell call still eligible; MAX comes
+    # from the ~20%-of-underlying margin estimate.
+    t, w = _make(qtbot, shares=0.0, bp=100_000.0)
+    _deliver_chain(t, w)
+    _deliver_contracts(t, w)
+    # No position → the spot arrives via the underlying quote stream.
+    token = w.quote_calls[-1][0]
+    w.option_quote_updated.emit(token, UNDERLYING_CONID,
+                                {"bid": 182.3, "ask": 182.5, "last": 182.40,
+                                 "close": 181.0, "delta": 0.0})
+    # naked cap = 100,000 // (0.20 × 182.40 × 100) = 27
+    assert t._max_qty() == 27
+    _deliver_selected_quote(t, w)
+    assert t._rail._sell_btn.isEnabled()
+
+
+def test_cash_account_cannot_sell_puts(qtbot):
+    t, w = _make(qtbot, is_margin=False)
+    _deliver_chain(t, w)
+    _deliver_contracts(t, w)
+    t._right_toggle._pick("P")
+    _deliver_contracts(t, w, right="P")
+    _deliver_selected_quote(t, w)
+    assert not t._rail._sell_btn.isEnabled()
+    assert t._rail._sell_btn.text() == "Not enough buying power"
+    # Buying the same put is fine on a cash account.
+    t._rail._pick_side("BUY")
+    _deliver_contracts(t, w, right="P")
+    _deliver_selected_quote(t, w)
+    assert t._rail._sell_btn.isEnabled()
+
+
 def test_csp_max_qty_from_buying_power(qtbot):
     t, w = _make(qtbot, bp=2_523_356.0)
     _deliver_chain(t, w)
     _deliver_contracts(t, w)
-    t._cards._select("CSP")
-    # Strategy switch re-requests contracts with right=P.
+    t._right_toggle._pick("P")
+    # Right switch re-requests contracts with right=P.
     assert w.contract_calls[-1][1]["right"] == "P"
     _deliver_contracts(t, w, right="P")
-    # Default put row = closest below spot (descending list row 2 = 177.5).
+    # Default put ≈ two strikes OTM below the money.
     strike = t._selected_leg["strike"]
-    assert strike == 177.5
+    assert strike == 175.0
     assert t._max_qty() == int(2_523_356 // (strike * 100))
+
+
+def test_buy_call_flow(qtbot):
+    t, w = _make(qtbot, bp=10_000.0)
+    _deliver_chain(t, w)
+    _deliver_contracts(t, w)
+    t._rail._pick_side("BUY")
+    assert w.contract_calls[-1][1]["right"] == "C"
+    _deliver_contracts(t, w)
+    _deliver_selected_quote(t, w)          # mid 3.10
+    # Long-side cap = BP // (premium × 100) = 10,000 // 310 = 32.
+    assert t._max_qty() == 32
+    assert t._rail._sell_btn.text() == "Submit order"
+    # Premium yield is an income metric — blank on long strategies.
+    model = t._chain_view.chain_model
+    row = model.row_for_conid(t._selected_leg["conid"])
+    assert model.row_data(row)["yield_pct"] is None
+
+    payloads = []
+    t.order_ready.connect(payloads.append)
+    t._rail._sell_btn.click()
+    assert len(payloads) == 1
+    p = payloads[0]
+    assert p["action"] == "BUY"
+    assert p["type"] == "LMT"
+    assert p["limit_price"] == 3.10
+    assert p["_resolved_contract"]["right"] == "C"
+
+
+def test_buy_put_requests_puts(qtbot):
+    t, w = _make(qtbot)
+    _deliver_chain(t, w)
+    _deliver_contracts(t, w)
+    t._rail._pick_side("BUY")
+    t._right_toggle._pick("P")
+    assert w.contract_calls[-1][1]["right"] == "P"
+    _deliver_contracts(t, w, right="P")
+    _deliver_selected_quote(t, w)
+    assert t._rail._sell_btn.text() == "Submit order"
+    payloads = []
+    t.order_ready.connect(payloads.append)
+    t._rail._sell_btn.click()
+    assert payloads and payloads[0]["action"] == "BUY"
+    assert payloads[0]["_resolved_contract"]["right"] == "P"
 
 
 def test_price_syncs_three_ways(qtbot):
@@ -236,6 +405,71 @@ def test_price_syncs_three_ways(qtbot):
     assert rail.price() == Decimal("3.04")
     rail._pick_anchor("ASK")
     assert rail.price() == Decimal("3.16")
+
+
+def test_delta_keeps_last_known_value(qtbot):
+    # A later computation tick with an empty delta must NOT blank a row's
+    # previously-known delta (IB sends partial greek computations).
+    t, w = _make(qtbot)
+    _deliver_chain(t, w)
+    _deliver_contracts(t, w)
+    _deliver_selected_quote(t, w)          # delta 0.29
+    token = w.quote_calls[-1][0]
+    conid = t._selected_leg["conid"]
+    w.option_quote_updated.emit(token, conid,
+                                {"bid": 3.05, "ask": 3.15, "last": 3.10,
+                                 "close": 0.0, "delta": 0.0})
+    model = t._chain_view.chain_model
+    row = model.row_data(model.row_for_conid(conid))
+    assert row["delta"] == 0.29            # kept, not blanked
+    assert row["bid"] == 3.05              # quote fields still updated
+
+
+def test_delta_falls_back_to_bs_estimate(qtbot):
+    # No IB greek computation for the leg → delta estimated from the mid
+    # premium via Black-Scholes; a real IB delta overrides it later.
+    t, w = _make(qtbot)
+    _deliver_chain(t, w)
+    _deliver_contracts(t, w)
+    token = w.quote_calls[-1][0]
+    conid = t._selected_leg["conid"]
+    w.option_quote_updated.emit(token, conid,
+                                {"bid": 3.04, "ask": 3.16, "last": 3.10,
+                                 "close": 0.0, "delta": 0.0})
+    model = t._chain_view.chain_model
+    row = model.row_data(model.row_for_conid(conid))
+    assert 0.05 < row["delta"] < 0.7        # plausible OTM-call estimate
+    assert not row.get("delta_ib")
+    # IB's own computation wins once it arrives.
+    w.option_quote_updated.emit(token, conid,
+                                {"bid": 3.04, "ask": 3.16, "last": 3.10,
+                                 "close": 0.0, "delta": 0.29})
+    assert row["delta"] == 0.29
+    assert row["delta_ib"]
+
+
+def test_zero_bid_shown_and_missing_fields_keep_values(qtbot):
+    from src.ui.widgets.options_income.chain_table import COL_BID, COL_LAST
+    t, w = _make(qtbot)
+    _deliver_chain(t, w)
+    _deliver_contracts(t, w)
+    token = w.quote_calls[-1][0]
+    conid = t._selected_leg["conid"]
+    model = t._chain_view.chain_model
+    row = model.row_for_conid(conid)
+    # A real zero bid (deep OTM, no buyers) renders 0.00; a field IB
+    # never sent (None) stays "—".
+    w.option_quote_updated.emit(token, conid,
+                                {"bid": 0.0, "ask": 0.05, "last": None,
+                                 "close": None, "delta": 0.0})
+    assert model.data(model.index(row, COL_BID)) == "0.00"
+    assert model.data(model.index(row, COL_LAST)) == "—"
+    # A later tick missing bid/ask must not blank the known values.
+    w.option_quote_updated.emit(token, conid,
+                                {"bid": None, "ask": None, "last": 0.04,
+                                 "close": None, "delta": 0.0})
+    rd = model.row_data(row)
+    assert (rd["bid"], rd["ask"], rd["last"]) == (0.0, 0.05, 0.04)
 
 
 def test_stale_tokens_ignored(qtbot):
@@ -266,10 +500,52 @@ def test_submit_payload_shape(qtbot):
     assert p["_target_accounts"] == ["mgn-jack-02"]
     assert p["_what_if_check"] is True
     rc = p["_resolved_contract"]
-    assert rc["conid"] == 9007          # 187.5 call
+    assert rc["conid"] == 9007          # 187.5 call (default leg)
     assert rc["right"] == "C"
     assert rc["strike"] == 187.5
     assert p["profit_take"] is None and p["stop_loss"] is None
+
+
+def test_market_order_submit(qtbot):
+    t, w = _make(qtbot)
+    _deliver_chain(t, w)
+    _deliver_contracts(t, w)
+    _deliver_selected_quote(t, w)
+    rail = t._rail
+    rail._pick_anchor("MKT")
+    # Market mode: price input greys out, Mkt chip active, sell enabled.
+    assert rail.is_market()
+    assert not rail._px_edit.isEnabled()
+    assert rail._sell_btn.isEnabled()
+
+    payloads = []
+    t.order_ready.connect(payloads.append)
+    rail._sell_btn.click()
+    assert len(payloads) == 1
+    p = payloads[0]
+    assert p["type"] == "MKT"
+    assert p["limit_price"] == 0.0
+    assert p["last_price"] == 3.10          # mid rides along as estimate
+    # Picking a price anchor drops back to a limit order.
+    rail._pick_anchor("BID")
+    assert not rail.is_market()
+    assert rail._px_edit.isEnabled()
+
+
+def test_window_size_persisted_across_opens(qtbot, monkeypatch):
+    from src.core import config_manager
+    store = {}
+    monkeypatch.setattr(config_manager, "load_layout",
+                        lambda path=None: dict(store))
+    monkeypatch.setattr(config_manager, "save_layout",
+                        lambda layout, path=None: store.update(layout))
+    t, w = _make(qtbot)
+    t.resize(1200, 800)
+    t.reject()
+    assert store["options_ticket"] == {"w": 1200, "h": 800}
+    # A new ticket restores the remembered size.
+    t2, _ = _make(qtbot)
+    assert (t2.width(), t2.height()) == (1200, 800)
 
 
 def test_close_cancels_quotes(qtbot):
@@ -279,6 +555,62 @@ def test_close_cancels_quotes(qtbot):
     before = w.quote_cancels
     t.reject()
     assert w.quote_cancels > before
+
+
+# ── Symbol chips: position group + searched group ────────────────────────────
+
+def test_position_chips_top5_over_100_shares(qtbot, monkeypatch):
+    monkeypatch.setattr(SymbolChipBar, "_load_chips",
+                        staticmethod(lambda: []))
+    positions = [
+        {"symbol": "MU", "position": 300.0, "market_value": 249_000.0},
+        {"symbol": "NVDA", "position": 200.0, "market_value": 39_000.0},
+        {"symbol": "TSLA", "position": 300.0, "market_value": 91_000.0},
+        {"symbol": "SPCX", "position": 500.0, "market_value": 58_000.0},
+        {"symbol": "MSFT", "position": 55.0, "market_value": 99_000.0},
+        {"symbol": "BIL", "position": 100.0, "market_value": 9_000.0},
+        {"symbol": "GOOG", "position": 150.0, "market_value": 25_000.0},
+    ]
+    bar = SymbolChipBar(lambda s: 0.0, get_positions=lambda: positions)
+    qtbot.addWidget(bar)
+    # Top-5 by market value among holdings ≥100 shares; MSFT (55 sh)
+    # excluded even though its market value ranks high.
+    assert bar._order == ["MU", "TSLA", "SPCX", "NVDA", "GOOG"]
+    assert bar.active_symbol() == ""      # nothing selected until the user picks
+
+
+def test_searched_chips_append_right_persist_and_reorder(qtbot, monkeypatch):
+    monkeypatch.setattr(SymbolChipBar, "_load_chips",
+                        staticmethod(lambda: []))
+    saved = []
+    monkeypatch.setattr(
+        SymbolChipBar, "_save_chips",
+        lambda self: saved.append(list(self._custom)))
+    positions = [
+        {"symbol": "MU", "position": 300.0, "market_value": 100.0},
+        {"symbol": "TSLA", "position": 200.0, "market_value": 50.0},
+    ]
+    bar = SymbolChipBar(lambda s: 0.0, get_positions=lambda: positions)
+    qtbot.addWidget(bar)
+    assert bar._order == ["MU", "TSLA"]
+    # A searched symbol lands to the right of the position chips and
+    # is persisted; a symbol already shown as a position chip is not
+    # duplicated into the searched group.
+    bar.select("QQQ")
+    assert bar._order == ["MU", "TSLA", "QQQ"]
+    assert saved[-1] == ["QQQ"]
+    bar.select("TSLA")
+    assert bar._order == ["MU", "TSLA", "QQQ"]
+    assert saved[-1] == ["QQQ"]
+    # Ladder-style drag reorder: drop QQQ onto MU → takes MU's slot.
+    bar._on_chip_drop("QQQ", "MU")
+    assert bar._order == ["QQQ", "MU", "TSLA"]
+    # Right-click removes a searched chip outright; position chips stay.
+    bar._remove_chip("MU")
+    assert bar._order == ["QQQ", "MU", "TSLA"]
+    bar._remove_chip("QQQ")
+    assert bar._order == ["MU", "TSLA"]
+    assert saved[-1] == []
 
 
 # ── Model accessor ───────────────────────────────────────────────────────────

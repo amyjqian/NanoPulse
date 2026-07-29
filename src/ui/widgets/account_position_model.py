@@ -482,6 +482,21 @@ class AccountPositionModel(QAbstractTableModel):
         pos = self._positions.get((account, int(con_id)))
         return dict(pos) if pos is not None else None
 
+    def stk_positions_for_account(self, account: str) -> list[dict]:
+        """All non-flat STK positions held by *account*.
+
+        Used by the Options Income ticket to build its position chips."""
+        out = []
+        for (acct, _con_id), pos in self._positions.items():
+            if acct != account:
+                continue
+            if (pos.get("sec_type") or "STK") != "STK":
+                continue
+            if not (pos.get("position") or 0):
+                continue
+            out.append(dict(pos))
+        return out
+
     def position_for_symbol(self, account: str, symbol: str) -> dict | None:
         """Full position dict for the *account*'s STK holding in *symbol*
         (matched on root or local symbol, case-insensitive), or None.

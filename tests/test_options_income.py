@@ -99,6 +99,29 @@ def test_organize_expirations_chips_and_more():
     assert "(45d)" in more[0].long_label
 
 
+def test_organize_expirations_chips_are_week_ending():
+    # Tue 2026-07-28; QQQ-style chain with Mon/Wed dailies mixed in.
+    # Chips are one per week — the LAST expiration of each week, i.e.
+    # the Fridays (Jul 31, Aug 7, 14, 21); dailies stay in More.
+    today = date(2026, 7, 28)
+    listed = [_ymd(today, d) for d in (1, 3, 6, 8, 10, 17, 24, 31, 45, 80)]
+    chips, more = oi.organize_expirations(listed, today)
+    assert [e.chip_label for e in chips] == \
+        ["Jul 31", "Aug 7", "Aug 14", "Aug 21"]
+    assert [e.dte for e in more] == [1, 6, 8, 31, 45, 80]
+
+
+def test_organize_expirations_holiday_week_uses_thursday():
+    # A week whose last listed expiration is Thursday (Friday holiday)
+    # still yields exactly one chip for that week.
+    today = date(2026, 7, 28)
+    listed = ["20260730", "20260807", "20260814", "20260821"]   # Thu + 3 Fri
+    chips, more = oi.organize_expirations(listed, today)
+    assert [e.chip_label for e in chips] == \
+        ["Jul 30", "Aug 7", "Aug 14", "Aug 21"]
+    assert more == []
+
+
 def test_organize_expirations_empty():
     chips, more = oi.organize_expirations([], date.today())
     assert chips == [] and more == []
@@ -110,21 +133,69 @@ _STRIKES = [170.0, 172.5, 175.0, 177.5, 180.0, 182.5, 185.0, 187.5,
             190.0, 192.5, 195.0, 197.5, 200.0]
 
 
-def test_pick_strikes_calls_otm_ascending():
+def test_pick_strikes_calls_otm_and_itm_windows():
+    # 4 nearest OTM calls at/above spot + 2 nearest ITM below, high → low.
+    picked = oi.pick_strikes(_STRIKES, 182.40, "C", n=4, n_itm=2)
+    assert picked == [190.0, 187.5, 185.0, 182.5, 180.0, 177.5]
+
+
+def test_pick_strikes_puts_otm_and_itm_windows():
+    # 4 nearest OTM puts at/below spot + 2 nearest ITM above, high → low.
+    picked = oi.pick_strikes(_STRIKES, 182.40, "P", n=4, n_itm=2)
+    assert picked == [185.0, 182.5, 180.0, 177.5, 175.0, 172.5]
+
+
+def test_pick_strikes_defaults_cover_both_sides():
+    # Default 50 OTM + 50 ITM windows swallow this 13-strike chain whole.
     picked = oi.pick_strikes(_STRIKES, 182.40, "C")
-    assert picked == [182.5, 185.0, 187.5, 190.0, 192.5, 195.0]
+    assert picked == sorted(_STRIKES, reverse=True)
 
 
-def test_pick_strikes_puts_otm_descending():
-    # 5 OTM strikes below spot + one ITM pad above, list stays descending.
-    picked = oi.pick_strikes(_STRIKES, 182.40, "P")
-    assert picked == [182.5, 180.0, 177.5, 175.0, 172.5, 170.0]
+def test_pick_strikes_default_window_50_per_side():
+    strikes = [2.5 * i for i in range(1, 161)]        # 2.5 … 400
+    picked = oi.pick_strikes(strikes, 182.40, "C")
+    assert len(picked) == 100
+    assert sum(1 for s in picked if s >= 182.40) == 50
+    assert sum(1 for s in picked if s < 182.40) == 50
 
 
 def test_pick_strikes_pads_with_itm_when_otm_short():
-    # Only 2 OTM calls above 196 → padded with the 4 nearest ITM below.
-    picked = oi.pick_strikes(_STRIKES, 196.0, "C")
-    assert picked == [187.5, 190.0, 192.5, 195.0, 197.5, 200.0]
+    # Only 2 OTM calls above 196 → the ITM side fills the shortfall.
+    picked = oi.pick_strikes(_STRIKES, 196.0, "C", n=4, n_itm=2)
+    assert picked == [200.0, 197.5, 195.0, 192.5, 190.0, 187.5]
+
+
+def test_pick_strikes_pads_with_otm_when_itm_short():
+    # Only 2 ITM calls below 173 → the OTM side fills the shortfall.
+    picked = oi.pick_strikes(_STRIKES, 173.0, "C", n=4, n_itm=4)
+    assert picked == [187.5, 185.0, 182.5, 180.0, 177.5, 175.0,
+                      172.5, 170.0]
+
+
+def test_bs_delta_roundtrip_atm():
+    # Invert a premium generated at a known vol; ATM 30d call delta ≈ 0.53.
+    prem = oi.bs_price(100.0, 100.0, 30 / 365, 0.30, "C")
+    d = oi.bs_delta(100.0, 100.0, 30, prem, "C")
+    assert 0.50 < d < 0.56
+    prem_p = oi.bs_price(100.0, 100.0, 30 / 365, 0.30, "P")
+    dp = oi.bs_delta(100.0, 100.0, 30, prem_p, "P")
+    assert -0.50 < dp < -0.42
+
+
+def test_bs_delta_monotonic_across_strikes():
+    lo = oi.bs_delta(100.0, 90.0, 30,
+                     oi.bs_price(100.0, 90.0, 30 / 365, 0.30, "C"), "C")
+    hi = oi.bs_delta(100.0, 110.0, 30,
+                     oi.bs_price(100.0, 110.0, 30 / 365, 0.30, "C"), "C")
+    assert lo > hi > 0
+
+
+def test_bs_delta_degenerate_inputs():
+    assert oi.bs_delta(0, 100, 30, 1.0, "C") == 0.0
+    assert oi.bs_delta(100, 100, 0, 1.0, "C") == 0.0
+    assert oi.bs_delta(100, 100, 30, 0.0, "C") == 0.0
+    # Premium at parity → deep ITM.
+    assert oi.bs_delta(150.0, 100.0, 30, 50.0, "C") == 1.0
 
 
 def test_moneyness_tags():

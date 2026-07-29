@@ -323,6 +323,12 @@ class IBWorkerThread(QThread):
         self._opt_tickers: dict[int, object] = {}
         self._ticker_to_opt_conid: dict[int, int] = {}
         self._opt_quote_token: int = 0
+        # Last batch params so the ticket can be resubscribed after an
+        # entitlement error, and a sticky flag set once IB reports the
+        # account has no live subscription (error 354) — from then on the
+        # ticket subscribes delayed-frozen (type 4) instead of frozen (2).
+        self._opt_quote_contracts: list[dict] = []
+        self._opt_delayed_fallback: bool = False
 
         # Background market data cache: multiple simultaneous subscriptions
         self._bg_tickers: dict[str, object] = {}  # symbol → ib_async Ticker
@@ -1430,9 +1436,19 @@ class IBWorkerThread(QThread):
 
         await self._do_cancel_option_quotes()
         self._opt_quote_token = token
+        self._opt_quote_contracts = list(contracts)
         try:
             from ib_async import Contract
-            self._ib.reqMarketDataType(3)  # delayed as fallback
+            # 2 = frozen: live when entitled, and after the close IB serves
+            # the LAST RECORDED bid/ask instead of the -1 "no market"
+            # sentinel — so the ladder keeps meaningful bid/ask outside
+            # market hours.  Type 4 (delayed-frozen) does NOT do this for
+            # live-entitled accounts: IB upgrades it to plain live (1) and
+            # the frozen close quotes never arrive.  If the account has no
+            # live subscription, type 2 fails with error 354 — _on_ib_error
+            # then flips _opt_delayed_fallback and resubscribes with 4.
+            self._ib.reqMarketDataType(
+                4 if self._opt_delayed_fallback else 2)
             for params in contracts:
                 conid = int(params.get("conid", 0))
                 if conid <= 0:
@@ -1479,24 +1495,34 @@ class IBWorkerThread(QThread):
 
         Runs on the worker's asyncio thread — must only emit Qt signals.
         """
-        def _clean(v) -> float:
+        def _clean(v) -> float | None:
+            """None = IB sent no data (nan / -1 sentinel / DBL_MAX).
+            0.0 passes through — a deep-OTM option with no buyers has a
+            REAL zero bid, and the ladder shows it as 0.00, not "—"."""
             try:
                 f = float(v)
             except (TypeError, ValueError):
-                return 0.0
-            if math.isnan(f) or f <= 0 or f >= _IB_DBL_MAX:
-                return 0.0
+                return None
+            if math.isnan(f) or f < 0 or f >= _IB_DBL_MAX:
+                return None
             return f
 
+        # IB streams separate greek computations for model / last / bid /
+        # ask (ticks 13 / 12 / 10 / 11) and any of them can carry an empty
+        # delta.  Prefer the model computation, then fall back to the
+        # others so the ladder fills in as soon as ANY computation lands.
         delta = 0.0
-        greeks = getattr(ticker, "modelGreeks", None)
-        if greeks is not None:
+        for attr in ("modelGreeks", "lastGreeks", "bidGreeks", "askGreeks"):
+            greeks = getattr(ticker, attr, None)
+            if greeks is None:
+                continue
             try:
                 d = float(getattr(greeks, "delta", 0.0) or 0.0)
-                if math.isfinite(d) and abs(d) <= 1.0:
-                    delta = d
             except (TypeError, ValueError):
-                pass
+                continue
+            if d and math.isfinite(d) and abs(d) <= 1.0:
+                delta = d
+                break
 
         self.option_quote_updated.emit(self._opt_quote_token, conid, {
             "bid": _clean(getattr(ticker, "bid", None)),
@@ -1570,26 +1596,51 @@ class IBWorkerThread(QThread):
                 "error": "Not connected to TWS."})
             return
 
+        # Pre-generate the orderRef so the pre-check row in the Orders
+        # view and the transmitted order share one blotter key — the
+        # real order's first status simply takes over the row.
+        params = dict(params)
+        order_ref = _generate_order_ref()
+        params["order_ref"] = order_ref
+        order_key = f"{account}_{order_ref}"
+        self._emit_opt_precheck_status(order_key, order_ref, params,
+                                       "Margin check")
+
+        def _precheck_failed(msg: str) -> None:
+            self._order_error_messages[order_ref] = msg
+            self._emit_opt_precheck_status(order_key, order_ref, params,
+                                           "Rejected")
+            self.option_order_result.emit({
+                "ok": False, "account": account, "symbol": symbol,
+                "error": msg})
+
         try:
-            from ib_async import Contract, LimitOrder
+            from ib_async import Contract, LimitOrder, MarketOrder
+            # conId + exchange ONLY — TWS rejects option requests that
+            # carry redundant identifiers (secType/localSymbol) next to
+            # a conId with error 478 ("Parameters in request conflicts
+            # with contract parameters received by contract id").
             c = Contract(conId=int(params.get("conid", 0)))
             c.exchange = params.get("exchange") or "SMART"
             c.currency = params.get("currency") or "USD"
-            if params.get("sec_type"):
-                c.secType = params["sec_type"]
-            if params.get("local_symbol"):
-                c.localSymbol = params["local_symbol"]
 
-            probe = LimitOrder(
-                params.get("action", "SELL"),
-                int(params.get("qty", 0)),
-                float(params.get("limit_price", 0.0)))
+            if (params.get("order_type") or "LMT") == "MKT":
+                # A zero-price LimitOrder probe would be rejected outright.
+                probe = MarketOrder(
+                    params.get("action", "SELL"),
+                    int(params.get("qty", 0)))
+            else:
+                probe = LimitOrder(
+                    params.get("action", "SELL"),
+                    int(params.get("qty", 0)),
+                    float(params.get("limit_price", 0.0)))
             probe.account = account
             probe.tif = params.get("tif", "DAY")
 
             tws_log.info("[%s] API-CALL  whatIfOrderAsync(%s %s ×%s @ %s "
                          "acct=%s)", self._label, probe.action, symbol,
-                         probe.totalQuantity, probe.lmtPrice, account)
+                         probe.totalQuantity,
+                         getattr(probe, "lmtPrice", "") or "MKT", account)
             state = await asyncio.wait_for(
                 self._ib.whatIfOrderAsync(c, probe), timeout=15)
 
@@ -1601,9 +1652,7 @@ class IBWorkerThread(QThread):
                     return 0.0
 
             if state is None or not getattr(state, "initMarginChange", ""):
-                self.option_order_result.emit({
-                    "ok": False, "account": account, "symbol": symbol,
-                    "error": "Margin pre-check rejected by TWS."})
+                _precheck_failed("Margin pre-check rejected by TWS.")
                 tws_log.warning("[%s] API-RESP  whatIfOrder → rejected",
                                 self._label)
                 return
@@ -1618,20 +1667,44 @@ class IBWorkerThread(QThread):
                          "maintMargin=%s", self._label,
                          result["init_margin"], result["maint_margin"])
         except asyncio.TimeoutError:
-            self.option_order_result.emit({
-                "ok": False, "account": account, "symbol": symbol,
-                "error": "Margin pre-check timed out."})
+            _precheck_failed("Margin pre-check timed out.")
             return
         except Exception as exc:
             log.exception("Worker %s whatIf pre-check failed: %s",
                           self._label, exc)
-            self.option_order_result.emit({
-                "ok": False, "account": account, "symbol": symbol,
-                "error": str(exc)})
+            _precheck_failed(str(exc))
             return
 
         await self._do_place_order(params)
         self.option_order_result.emit(result)
+
+    def _emit_opt_precheck_status(self, order_id: str, order_ref: str,
+                                  params: dict, status: str) -> None:
+        """Synthetic Orders-view row for the options whatIf pre-check.
+
+        Keyed exactly like the real order (``account_orderRef``) so the
+        transmitted order's first status update takes over the row; a
+        failed pre-check leaves it as Rejected with the reason."""
+        now = datetime.now(_ET)
+        lmt = params.get("limit_price", 0)
+        self.order_status_updated.emit({
+            "order_id": order_id,
+            "order_ref": order_ref,
+            "symbol": (params.get("local_symbol")
+                       or params.get("symbol", "")),
+            "account": params.get("account", ""),
+            "action": params.get("action", ""),
+            "order_type": params.get("order_type", "LMT"),
+            "quantity": str(int(params.get("qty", 0) or 0)),
+            "limit_price": str(lmt) if lmt else "–",
+            "stop_price": "–",
+            "tif": params.get("tif", "DAY"),
+            "fill_price": "–",
+            "status": status,
+            "time": now.strftime("%H:%M:%S"),
+            "time_sort": now.isoformat(),
+            "error_message": self._order_error_messages.get(order_ref, ""),
+        })
 
     # ── Order placement ───────────────────────────────────────────────────────
 
@@ -1654,21 +1727,30 @@ class IBWorkerThread(QThread):
 
             c = Contract(conId=conid)
             c.exchange = params.get("exchange") or "SMART"
-            # Populate symbol fields so the Trade object kept by ib_async
-            # retains them across reqAllOpenOrdersAsync() snapshots (ib_async
-            # does NOT overwrite the contract on existing Trade objects).
-            c.symbol = params.get("symbol", "")
-            c.secType = params.get("sec_type", "")
             c.currency = params.get("currency", "USD")
-            c.localSymbol = params.get("local_symbol", "")
-            if params.get("expiry"):
-                c.lastTradeDateOrContractMonth = params["expiry"]
-            if params.get("multiplier"):
-                c.multiplier = params["multiplier"]
+            sec_type = params.get("sec_type", "")
+            if sec_type == "OPT":
+                # Options: conId + exchange ONLY.  TWS rejects option
+                # orders whose request carries redundant identifiers
+                # (symbol/secType/localSymbol/expiry) alongside a conId
+                # with error 478.  The blotter reads its fields from
+                # *params*, so the lean contract loses nothing.
+                pass
+            else:
+                # Populate symbol fields so the Trade object kept by
+                # ib_async retains them across reqAllOpenOrdersAsync()
+                # snapshots (ib_async does NOT overwrite the contract on
+                # existing Trade objects).
+                c.symbol = params.get("symbol", "")
+                c.secType = sec_type
+                c.localSymbol = params.get("local_symbol", "")
+                if params.get("expiry"):
+                    c.lastTradeDateOrContractMonth = params["expiry"]
+                if params.get("multiplier"):
+                    c.multiplier = params["multiplier"]
 
             # Stocks: route to IBEOS (IBKR Overnight ATS) during overnight
             # session (20:00–03:59 ET), otherwise SMART.
-            sec_type = params.get("sec_type", "")
             if sec_type == "STK":
                 now_et = datetime.now(_ET)
                 hour = now_et.hour
@@ -1726,7 +1808,9 @@ class IBWorkerThread(QThread):
 
             order.account = account
             order.tif = tif
-            order.orderRef = _generate_order_ref()
+            # place_option_order pre-generates the ref so its pre-check
+            # blotter row and the real order share one key.
+            order.orderRef = params.get("order_ref") or _generate_order_ref()
 
             # Stocks: configure extended-hours flags based on exchange and
             # current time of day (Eastern).
@@ -3040,10 +3124,13 @@ class IBWorkerThread(QThread):
             if params.get("multiplier"):
                 c.multiplier = params["multiplier"]
 
-            # Request delayed streaming data as fallback when real-time is
-            # unavailable (e.g. error 10197 "competing live session").
-            # Type 3 = delayed: streams 15-min delayed ticks continuously.
-            self._ib.reqMarketDataType(3)
+            # Request delayed-frozen fallback when real-time is unavailable
+            # (e.g. error 10197 "competing live session").  Type 4 = live
+            # when entitled → delayed → frozen close values after hours.
+            # NOTE: the market-data type is CONNECTION-GLOBAL — every call
+            # site in this worker must use the same type, or the last one
+            # wins and knocks the others out of frozen mode.
+            self._ib.reqMarketDataType(4)
 
             self._active_price_symbol = params.get("symbol", "")
             ticker = self._ib.reqMktData(c, genericTickList="", snapshot=False)
@@ -3092,7 +3179,9 @@ class IBWorkerThread(QThread):
 
         from ib_async import Contract
 
-        self._ib.reqMarketDataType(3)  # delayed as fallback
+        # 4 = delayed-frozen fallback (connection-global — keep every call
+        # site on the same type; see _do_market_data).
+        self._ib.reqMarketDataType(4)
 
         for params in params_list:
             sym = params.get("symbol", "")
@@ -3665,6 +3754,20 @@ class IBWorkerThread(QThread):
         tws_log.warning("[%s] EVENT     errorEvent → reqId=%s errorCode=%s "
                         "errorString=%s contract=%s",
                         self._label, reqId, errorCode, errorString, contract)
+
+        # Error 354 — "Requested market data is not subscribed."  The
+        # options ticket first tries frozen data (type 2), which needs a
+        # live entitlement; accounts with delayed-only data get 354 back.
+        # Flip to delayed-frozen (type 4) once and resubscribe the batch.
+        if (errorCode == 354
+                and not self._opt_delayed_fallback
+                and getattr(contract, "conId", 0) in self._opt_tickers):
+            self._opt_delayed_fallback = True
+            log.warning("Worker %s: no live entitlement for options ticket "
+                        "(error 354) – resubscribing with delayed-frozen data",
+                        self._label)
+            asyncio.ensure_future(self._do_option_quotes(
+                self._opt_quote_token, self._opt_quote_contracts))
 
         if errorCode == 10197 and self._active_ticker is not None:
             # "No market data during competing live session"

@@ -607,12 +607,18 @@ class FlashTradeView(QWidget):
         if worker is not None:
             self._ensure_worker_connected(worker)
 
+        alias = ""
+        if self._accounts_model is not None:
+            alias = self._accounts_model._aliases.get(account, "")
         ticket = OptionsIncomeTicket(
             account=account,
             get_worker=self._find_worker_for_account,
             get_buying_power=_buying_power,
             get_position=self._account_position.position_for_symbol,
             symbol=symbol,
+            display_account=alias or account,
+            get_account_positions=lambda:
+                self._account_position.stk_positions_for_account(account),
             parent=self,
         )
         ticket.order_ready.connect(self._on_order_requested)

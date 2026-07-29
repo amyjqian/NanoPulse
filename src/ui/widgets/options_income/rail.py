@@ -7,7 +7,7 @@ Three zones inside a fixed-width column:
   * scrolling middle — break-even, outcome (if called away / if
     assigned), coverage note;
   * static footer  — credit received, collateral reserved, annualized,
-    then Cancel + Sell to Open.
+    then Cancel + Submit order.
 
 The rail is a pure view: it owns the qty/price input state and emits
 signals; every derived number is pushed in by the ticket.
@@ -55,6 +55,8 @@ _ANCHOR_HINTS = {
     "BID": "At the bid — fills fastest, gives up the spread.",
     "MID": "Mid-market — the usual starting point; work it down if it sits.",
     "ASK": "At the ask — best credit, may not fill.",
+    "MKT": "Market — fills at the best available price; credit shown is "
+           "an estimate.",
 }
 
 
@@ -69,12 +71,14 @@ def _caption(parent: QWidget, text: str) -> QLabel:
 class OrderRail(QWidget):
     qty_changed = Signal(int)
     price_changed = Signal(object)       # Decimal
+    side_changed = Signal(str)           # "BUY" | "SELL"
     submit_clicked = Signal()
     cancel_clicked = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedWidth(330)
+        self._action = "SELL"      # order side — drives submit button
         self._qty = 1
         self._max_qty = 0
         self._tick = Decimal("0.01")
@@ -83,6 +87,7 @@ class OrderRail(QWidget):
         self._mid = Decimal("0")
         self._ask = Decimal("0")
         self._anchor = "MID"
+        self._market = False       # True → submit as a MKT order
         self.setStyleSheet(
             f"OrderRail{{ background:{Theme.BG_MAIN};"
             f" border:1px solid {Theme.BORDER}; border-radius:8px; }}")
@@ -96,7 +101,23 @@ class OrderRail(QWidget):
         outer.setSpacing(8)
 
         # ── Zone 1: static header ───────────────────────────────────────
-        outer.addWidget(_caption(self, "ORDER"))
+        # ORDER caption with the Buy / Sell side toggle on its right
+        # (strategy = side × Calls/Puts toggle).
+        caprow = QHBoxLayout()
+        caprow.setSpacing(6)
+        caprow.addWidget(_caption(self, "ORDER"))
+        caprow.addStretch(1)
+        self._side_btns: dict[str, QPushButton] = {}
+        for key in ("BUY", "SELL"):
+            b = QPushButton(key.capitalize(), self)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setFixedWidth(64)
+            b.clicked.connect(lambda _c=False, k=key: self._pick_side(k))
+            self._side_btns[key] = b
+            caprow.addWidget(b)
+        outer.addLayout(caprow)
+        self._restyle_side()
+
         self._order_line = QLabel("—", self)
         self._order_line.setStyleSheet(
             f"color:{Theme.TEXT}; font-size:12px; font-weight:bold;")
@@ -165,11 +186,11 @@ class OrderRail(QWidget):
         prow.addWidget(self._px_plus)
         outer.addLayout(prow)
 
-        # Bid / Mid / Ask anchor chips
+        # Bid / Mid / Ask / Mkt anchor chips
         arow = QHBoxLayout()
         arow.setSpacing(6)
         self._anchor_btns: dict[str, QPushButton] = {}
-        for key in ("BID", "MID", "ASK"):
+        for key in ("BID", "MID", "ASK", "MKT"):
             btn = QPushButton(key.capitalize(), self)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.clicked.connect(lambda _c=False, k=key: self._pick_anchor(k))
@@ -209,12 +230,13 @@ class OrderRail(QWidget):
 
         # ── Zone 3: static footer ───────────────────────────────────────
         frow = QHBoxLayout()
-        flabel = QLabel("Credit received", self)
-        flabel.setStyleSheet(f"color:{Theme.TEXT_DIM}; font-size:11px;")
+        self._footer_cap = QLabel("Credit received", self)
+        self._footer_cap.setStyleSheet(
+            f"color:{Theme.TEXT_DIM}; font-size:11px;")
         self._credit_lbl = QLabel("—", self)
         self._credit_lbl.setStyleSheet(
             f"color:{Theme.ACCENT}; font-size:14px; font-weight:bold;")
-        frow.addWidget(flabel)
+        frow.addWidget(self._footer_cap)
         frow.addStretch(1)
         frow.addWidget(self._credit_lbl)
         outer.addLayout(frow)
@@ -240,7 +262,7 @@ class OrderRail(QWidget):
             " border-radius:6px; padding:9px 16px; font-size:11px; }"
             "QPushButton:hover{ color:#e6e9ef; }")
         self._cancel_btn.clicked.connect(self.cancel_clicked.emit)
-        self._sell_btn = QPushButton("Sell to Open", self)
+        self._sell_btn = QPushButton("Submit order", self)
         self._sell_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._sell_btn.setStyleSheet(
             f"QPushButton{{ background:{Theme.CLR_SELL}; color:#ffffff;"
@@ -331,7 +353,25 @@ class OrderRail(QWidget):
                         else key.capitalize())
         self._refresh_anchor_chips()
 
+    def is_market(self) -> bool:
+        return self._market
+
+    def _set_market(self, on: bool) -> None:
+        """Toggle market mode: the limit-price input greys out and the
+        submitted order becomes MKT instead of LMT."""
+        if self._market == on:
+            self._refresh_anchor_chips()
+            return
+        self._market = on
+        for w in (self._px_minus, self._px_plus, self._px_edit):
+            w.setEnabled(not on)
+        if on:
+            self._anchor = "MKT"
+        self._refresh_anchor_chips()
+        self.price_changed.emit(self._price)   # host recomputes
+
     def _step_price(self, direction: int) -> None:
+        self._set_market(False)
         step = self._tick if self._tick > 0 else Decimal("0.01")
         new = max(Decimal(0), self._price + step * direction)
         self._anchor = ""
@@ -340,6 +380,7 @@ class OrderRail(QWidget):
     def _on_price_typed(self) -> None:
         # Round partial entries like "3." to 2 dp so the math never sees
         # an invalid intermediate (§4.6).
+        self._set_market(False)
         try:
             typed = to_dec(self._px_edit.text() or "0")
         except Exception:
@@ -348,20 +389,28 @@ class OrderRail(QWidget):
         self.set_price(typed)
 
     def _pick_anchor(self, key: str) -> None:
+        if key == "MKT":
+            self._set_market(True)
+            return
         val = {"BID": self._bid, "MID": self._mid, "ASK": self._ask}[key]
         if val <= 0:
             return
+        self._set_market(False)
         self.set_price(val, anchor=key)
 
     def _refresh_anchor_chips(self) -> None:
-        # An anchor chip stays lit while the price still equals its value.
-        current = {"BID": self._bid, "MID": self._mid,
-                   "ASK": self._ask}
+        # An anchor chip stays lit while the price still equals its value;
+        # market mode wins outright.
         active = ""
-        for key, val in current.items():
-            if val > 0 and snap_to_tick(val, self._tick) == self._price:
-                if self._anchor == key or not active:
-                    active = key
+        if self._market:
+            active = "MKT"
+        else:
+            current = {"BID": self._bid, "MID": self._mid,
+                       "ASK": self._ask}
+            for key, val in current.items():
+                if val > 0 and snap_to_tick(val, self._tick) == self._price:
+                    if self._anchor == key or not active:
+                        active = key
         for key, btn in self._anchor_btns.items():
             btn.setStyleSheet(_CHIP_ON if key == active else _CHIP_OFF)
         if active:
@@ -387,9 +436,50 @@ class OrderRail(QWidget):
         self._reserved_lbl.setText(reserved_text)
         self._ann_lbl.setText(ann_text)
 
+    def action(self) -> str:
+        return self._action
+
+    def _pick_side(self, key: str) -> None:
+        if key == self._action:
+            return
+        self.set_action(key)
+        self.side_changed.emit(key)
+
+    def _restyle_side(self) -> None:
+        for key, b in self._side_btns.items():
+            if key != self._action:
+                b.setStyleSheet(_CHIP_OFF)
+                continue
+            color = Theme.CLR_BUY if key == "BUY" else Theme.CLR_SELL
+            b.setStyleSheet(
+                f"QPushButton{{ background:{color}; color:#ffffff;"
+                " border:none; border-radius:5px; padding:5px 8px;"
+                " font-size:11px; font-weight:bold; }")
+
+    def set_action(self, action: str) -> None:
+        """"BUY" or "SELL" — flips the submit button and footer caption."""
+        action = "BUY" if action == "BUY" else "SELL"
+        if action == self._action:
+            return
+        self._action = action
+        self._restyle_side()
+        color = Theme.CLR_BUY if action == "BUY" else Theme.CLR_SELL
+        self._sell_btn.setStyleSheet(
+            f"QPushButton{{ background:{color}; color:#ffffff;"
+            " border:none; border-radius:6px; padding:9px 16px;"
+            " font-size:12px; font-weight:bold; }"
+            "QPushButton:disabled{ background:#3a3f4d; color:#5a6478; }")
+        self._footer_cap.setText("Cost" if action == "BUY"
+                                 else "Credit received")
+        if self._sell_btn.isEnabled():
+            self._sell_btn.setText(self._submit_label())
+
+    def _submit_label(self) -> str:
+        return "Submit order"
+
     def set_sell_enabled(self, enabled: bool, reason: str = "") -> None:
         """Disabled state replaces the label with the reason (§4.7)."""
         self._sell_btn.setEnabled(enabled)
-        self._sell_btn.setText("Sell to Open" if enabled
-                               else (reason or "Sell to Open"))
+        self._sell_btn.setText(self._submit_label() if enabled
+                               else (reason or self._submit_label()))
         self._sell_btn.setToolTip("" if enabled else reason)

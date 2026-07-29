@@ -1,5 +1,6 @@
 """
-Options-income domain logic — covered calls (CC) and cash-secured puts (CSP).
+Options-income domain logic — sell covered calls (CC) / cash-secured
+puts (CSP), and buy long calls (BC) / long puts (BP).
 
 Pure functions, no Qt: pricing math (Decimal — money never touches float
 until display), collateral eligibility, expiry organisation and strike
@@ -17,14 +18,21 @@ Conventions
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
 MULT = 100  # standard US equity option multiplier
 
-STRATEGY_CC = "CC"
-STRATEGY_CSP = "CSP"
+STRATEGY_CC = "CC"    # sell covered call
+STRATEGY_CSP = "CSP"  # sell cash-secured put
+STRATEGY_BC = "BC"    # buy call
+STRATEGY_BP = "BP"    # buy put
+
+# right / order side per strategy
+STRATEGY_RIGHT = {"BC": "C", "CC": "C", "BP": "P", "CSP": "P"}
+STRATEGY_ACTION = {"BC": "BUY", "CC": "SELL", "BP": "BUY", "CSP": "SELL"}
 
 
 # ── Decimal helpers ───────────────────────────────────────────────────────────
@@ -81,6 +89,16 @@ def collateral_csp(strike, qty: int, mult: int = MULT) -> Decimal:
     return to_dec(strike) * mult * int(qty)
 
 
+def break_even_long_call(strike, px) -> Decimal:
+    """Long call break-even: strike + premium."""
+    return to_dec(strike) + to_dec(px)
+
+
+def break_even_long_put(strike, px) -> Decimal:
+    """Long put break-even: strike − premium."""
+    return to_dec(strike) - to_dec(px)
+
+
 def yield_pct(px, ref) -> Decimal:
     """Premium yield in percent: px / ref × 100.
 
@@ -132,17 +150,69 @@ class StrategyStatus:
     reason: str = ""  # Sell-button label when ineligible
 
 
-def cc_status(shares) -> StrategyStatus:
+_NAKED_MARGIN_PCT = 0.20   # rough initial-margin estimate per short option
+
+
+def naked_capacity(buying_power, ref_price, mult: int = MULT) -> int:
+    """Contracts a MARGIN account can short against buying power, at a
+    rough 20%-of-underlying initial-margin estimate per contract.  Only
+    an estimate for the MAX button — the worker's whatIf pre-check is
+    the authoritative gate before transmit."""
+    try:
+        bp, ref = float(buying_power), float(ref_price)
+    except (TypeError, ValueError):
+        return 0
+    if bp <= 0 or ref <= 0:
+        return 0
+    return int(bp // (_NAKED_MARGIN_PCT * ref * mult))
+
+
+def cc_status(shares, *, is_margin: bool = False,
+              buying_power=0.0) -> StrategyStatus:
+    """Sell-call eligibility.  Cash accounts need 100 shares (covered
+    only); margin accounts may also sell naked, backed by margin."""
     cap = cc_capacity(shares)
     shs = int(float(shares or 0))
     if cap > 0:
         return StrategyStatus(
             True, "ELIGIBLE",
             f"Collateral: {shs:,} shares held · covers {cap}")
+    bp = float(buying_power or 0)
+    if is_margin and bp > 0:
+        return StrategyStatus(
+            True, "MARGIN",
+            f"Collateral: margin · BP {bp:,.0f}")
     return StrategyStatus(
         False, "NEEDS 100 SH",
         f"Collateral: {shs:,} shares held · needs 100",
         reason="Not enough shares")
+
+
+def buy_capacity(buying_power, premium, mult: int = MULT) -> int:
+    """Max long contracts: floor(BP / (premium × mult)).
+
+    0 while no premium is known — the cap resolves once a quote lands."""
+    try:
+        bp, px = float(buying_power), float(premium)
+    except (TypeError, ValueError):
+        return 0
+    if bp <= 0 or px <= 0:
+        return 0
+    return int(bp // (px * mult))
+
+
+def buy_status(buying_power) -> StrategyStatus:
+    """Long call / long put eligibility: any buying power will do —
+    the per-contract cost cap is enforced by :func:`buy_capacity`."""
+    bp = float(buying_power or 0)
+    if bp > 0:
+        return StrategyStatus(
+            True, "ELIGIBLE",
+            f"Cost: paid from buying power · BP {bp:,.0f}")
+    return StrategyStatus(
+        False, "NO BUYING POWER",
+        f"Cost: paid from buying power · BP {bp:,.0f}",
+        reason="Not enough buying power")
 
 
 def csp_status(buying_power, *, is_margin: bool = True) -> StrategyStatus:
@@ -179,62 +249,131 @@ def _parse_ymd(s: str) -> date | None:
         return None
 
 
+def upcoming_fridays(today: date, n: int = 4) -> list[str]:
+    """The next *n* Friday dates as YYYYMMDD, starting with this week's
+    (today itself when it's a Friday).  Placeholder expiries for the
+    ticket before any chain has loaded."""
+    first = today + timedelta(days=(4 - today.weekday()) % 7)
+    return [(first + timedelta(weeks=i)).strftime("%Y%m%d")
+            for i in range(n)]
+
+
 def organize_expirations(
     expirations: list[str], today: date, n_chips: int = 4,
 ) -> tuple[list[Expiry], list[Expiry]]:
     """Split listed *expirations* into ``(chips, more)``.
 
-    Chips are the next *n_chips* listed expirations that fall on the next
-    upcoming Fridays (per spec).  Because exchange holidays shift a weekly
-    expiry to Thursday, any listed expiry within the chip horizon counts —
-    we simply take the first *n_chips* future listed expirations, which in
-    practice are the next four weeklies.  Everything later goes to *more*
-    (remaining weeklies, monthlies, LEAPS) in ascending order.
+    Chips are the next *n_chips* WEEK-ENDING expirations — one per
+    calendar week, the last listed expiration of that week.  That's the
+    Friday weekly on a normal week and the Thursday on holiday-shifted
+    weeks, and it holds even for symbols with Mon–Fri dailies
+    (QQQ/SPY), so the chip row always reads like
+    ``Jul 31 · Aug 7 · Aug 14 · Aug 21``.  Every other future
+    expiration (dailies, later weeklies, monthlies, LEAPS) goes to
+    *more* in ascending order.
     """
     future: list[Expiry] = []
+    week_last: dict[tuple[int, int], Expiry] = {}
     for s in sorted(set(expirations or [])):
         d = _parse_ymd(s)
         if d is None or d < today:
             continue
         dte = (d - today).days
-        future.append(Expiry(
+        e = Expiry(
             ymd=s, dte=dte,
             chip_label=d.strftime("%b %d").replace(" 0", " "),
             long_label=f"{d.strftime('%b %d, %Y').replace(' 0', ' ')} "
                        f"({dte}d)",
-        ))
-    return future[:n_chips], future[n_chips:]
+        )
+        future.append(e)
+        iso = d.isocalendar()
+        week_last[(iso[0], iso[1])] = e   # ascending → last of week wins
+
+    chips = [week_last[k] for k in sorted(week_last)[:n_chips]]
+    chip_ymds = {e.ymd for e in chips}
+    more = [e for e in future if e.ymd not in chip_ymds]
+    return chips, more
 
 
 # ── Strikes (§4.4) ────────────────────────────────────────────────────────────
 
 def pick_strikes(strikes: list[float], spot: float, right: str,
-                 n: int = 6) -> list[float]:
-    """Pick *n* OTM-biased strikes from the listed *strikes*.
+                 n: int = 50, n_itm: int = 50) -> list[float]:
+    """Pick an ATM-centred ladder from the listed *strikes*, sorted
+    **descending** (highest strike first — the ladder reads top-down).
 
-    Calls: the *n* lowest strikes at/above spot (ascending — closest
-    first).  Puts: the *n* highest strikes at/below spot (descending —
-    closest first).  When fewer OTM strikes exist, pad with the nearest
-    ITM ones so the table always shows *n* rows if the chain allows.
+    Takes the *n* nearest OTM strikes plus the *n_itm* nearest ITM
+    strikes around *spot* (calls: OTM at/above spot, ITM below; puts
+    mirrored).  When one side of the chain runs short, the other side
+    fills in so the ladder still shows n + n_itm rows when the chain
+    allows.
     """
     ss = sorted(set(float(s) for s in (strikes or []) if float(s) > 0))
     if not ss or spot <= 0:
-        return ss[:n]
+        return sorted(ss[:n + n_itm], reverse=True)
     if right == "C":
-        otm = [s for s in ss if s >= spot]
-        itm = [s for s in ss if s < spot]
-        out = otm[:n]
-        if len(out) < n:                      # pad with nearest ITM below
-            out = list(reversed(itm[-(n - len(out)):])) + out
-            out.sort()
-        return out
-    otm = [s for s in ss if s <= spot]
-    itm = [s for s in ss if s > spot]
-    out = list(reversed(otm))[:n]             # descending, closest first
-    if len(out) < n:                          # pad with nearest ITM above,
-        pad = itm[:n - len(out)]              # keeping the list descending
-        out = list(reversed(pad)) + out
-    return out
+        otm = [s for s in ss if s >= spot]           # nearest first
+        itm = [s for s in ss if s < spot][::-1]      # nearest first
+    else:
+        otm = [s for s in ss if s <= spot][::-1]     # nearest first
+        itm = [s for s in ss if s > spot]            # nearest first
+    out = (otm[:n + max(0, n_itm - len(itm))]
+           + itm[:n_itm + max(0, n - len(otm))])
+    return sorted(out, reverse=True)
+
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def bs_price(spot: float, strike: float, t_years: float, vol: float,
+             right: str, r: float = 0.04) -> float:
+    """Black-Scholes European option price (no dividends)."""
+    if spot <= 0 or strike <= 0 or t_years <= 0 or vol <= 0:
+        return 0.0
+    sq = vol * math.sqrt(t_years)
+    d1 = (math.log(spot / strike) + (r + vol * vol / 2) * t_years) / sq
+    d2 = d1 - sq
+    disc = math.exp(-r * t_years)
+    if right == "C":
+        return spot * _norm_cdf(d1) - strike * disc * _norm_cdf(d2)
+    return strike * disc * _norm_cdf(-d2) - spot * _norm_cdf(-d1)
+
+
+def bs_delta(spot: float, strike: float, dte_days: int, premium: float,
+             right: str, r: float = 0.04) -> float:
+    """Estimate delta from the option's *premium* (mid) via implied vol.
+
+    Fallback for when IB hasn't streamed a greek computation for a
+    strike (common on delayed/paper data): bisect Black-Scholes for the
+    implied vol matching *premium*, then return N(d1) (calls) or
+    N(d1)−1 (puts).  Returns 0.0 when inputs can't support an estimate.
+    """
+    t = max(0, int(dte_days)) / 365.0
+    if spot <= 0 or strike <= 0 or premium <= 0 or t <= 0:
+        return 0.0
+    intrinsic = max(0.0, spot - strike) if right == "C" \
+        else max(0.0, strike - spot)
+    if premium <= intrinsic + 1e-9:
+        # No time value left — the option trades at parity.
+        return (1.0 if right == "C" else -1.0) if intrinsic > 0 else 0.0
+
+    lo, hi = 1e-3, 5.0
+    if premium >= bs_price(spot, strike, t, hi, right, r):
+        vol = hi
+    else:
+        for _ in range(60):
+            mid_vol = (lo + hi) / 2
+            if bs_price(spot, strike, t, mid_vol, right, r) < premium:
+                lo = mid_vol
+            else:
+                hi = mid_vol
+        vol = (lo + hi) / 2
+
+    sq = vol * math.sqrt(t)
+    d1 = (math.log(spot / strike) + (r + vol * vol / 2) * t) / sq
+    delta = _norm_cdf(d1) if right == "C" else _norm_cdf(d1) - 1.0
+    return round(delta, 4)
 
 
 def moneyness(strike: float, spot: float, right: str) -> str:
