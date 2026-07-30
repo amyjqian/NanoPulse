@@ -34,6 +34,8 @@ class TestMatchingSymbolsToDicts:
             "primary_exchange": "NASDAQ",
             "currency": "USD",
             "name": "Alphabet Inc (Class A)",
+            "description": "Alphabet Inc (Class A)",
+            "has_options": True,
             "derivative_sec_types": ["OPT"],
         }]
 

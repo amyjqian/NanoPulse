@@ -217,15 +217,19 @@ def _matching_symbols_to_dicts(descriptions) -> list[dict]:
         c = getattr(desc, "contract", None)
         if c is None or not getattr(c, "symbol", ""):
             continue
+        deriv = list(getattr(desc, "derivativeSecTypes", None) or [])
+        name = getattr(c, "description", "") or ""
         results.append({
             "conid": getattr(c, "conId", 0),
             "symbol": c.symbol,
             "sec_type": getattr(c, "secType", ""),
             "primary_exchange": getattr(c, "primaryExchange", ""),
             "currency": getattr(c, "currency", ""),
-            "name": getattr(c, "description", "") or "",
-            "derivative_sec_types":
-                list(getattr(desc, "derivativeSecTypes", None) or []),
+            "name": name,
+            # Aliases consumed by the options-income ticket search.
+            "description": name,
+            "has_options": "OPT" in [s.upper() for s in deriv],
+            "derivative_sec_types": deriv,
         })
     return results
 
@@ -244,6 +248,23 @@ class IBWorkerThread(QThread):
     # discard responses that arrive after the user has kept typing.
     symbol_search_results = Signal(int, list)
     symbol_search_failed = Signal(int, str)        # (token, error message)
+    # ── Options-income ticket plumbing.  All tokened: the token is echoed
+    # back so the ticket can drop responses that are stale after the user
+    # switched symbol / expiry / strategy.
+    # (token, chain dict) from reqSecDefOptParams
+    option_chain_results = Signal(int, dict)
+    option_chain_failed = Signal(int, str)
+    # (token, list[contract dict]) from reqContractDetails — every listed
+    # strike for one (symbol, expiry, right)
+    option_contracts_results = Signal(int, list)
+    option_contracts_failed = Signal(int, str)
+    # (token, conid, {bid, ask, last, close, delta}) per subscribed option
+    # (the underlying rides along with delta=0)
+    option_quote_updated = Signal(int, int, dict)
+    option_quotes_failed = Signal(int, str)
+    # Result of place_option_order's whatIf pre-check + transmit:
+    # {ok, account, symbol, error?, init_margin?, maint_margin?}
+    option_order_result = Signal(dict)
     price_updated = Signal(str, float)             # (symbol, last_price)
     bid_ask_updated = Signal(str, float, float)    # (symbol, bid, ask)
     # (symbol) – e.g. error 10197
@@ -321,6 +342,20 @@ class IBWorkerThread(QThread):
         # Background market data subscription state
         self._active_ticker = None
         self._active_price_symbol: str = ""
+
+        # Options-income ticket quote subscriptions (one batch at a time):
+        # conid → Ticker, plus an id(ticker) → conid reverse index for the
+        # O(1) pendingTickers hot path.  Separate from _active_ticker /
+        # _bg_tickers so the ticket never disturbs order-entry data.
+        self._opt_tickers: dict[int, object] = {}
+        self._ticker_to_opt_conid: dict[int, int] = {}
+        self._opt_quote_token: int = 0
+        # Last batch params so the ticket can be resubscribed after an
+        # entitlement error, and a sticky flag set once IB reports the
+        # account has no live subscription (error 354) — from then on the
+        # ticket subscribes delayed-frozen (type 4) instead of frozen (2).
+        self._opt_quote_contracts: list[dict] = []
+        self._opt_delayed_fallback: bool = False
 
         # Background market data cache: multiple simultaneous subscriptions
         self._bg_tickers: dict[str, object] = {}  # symbol → ib_async Ticker
@@ -649,6 +684,73 @@ class IBWorkerThread(QThread):
         else:
             self._active_ticker = None
 
+    # ── Options-income ticket requests (all tokened) ──────────────────────
+
+    def request_option_chain(self, token: int, params: dict) -> None:
+        """Thread-safe: expirations/strikes via reqSecDefOptParams.
+
+        *params*: ``symbol`` (root), ``con_id`` (underlying conId),
+        optional ``sec_type`` (default STK).
+        """
+        if self._loop is not None and not self._loop.is_closed():
+            asyncio.run_coroutine_threadsafe(
+                self._do_option_chain(token, params), self._loop)
+        else:
+            self.option_chain_failed.emit(
+                token, "Worker event loop not ready.")
+
+    def request_option_contracts(self, token: int, params: dict) -> None:
+        """Thread-safe: resolve every listed strike for one
+        (symbol, expiry, right) via reqContractDetails.
+
+        *params*: symbol, expiry (YYYYMMDD), right ("C"/"P"),
+        optional currency, trading_class.
+        """
+        if self._loop is not None and not self._loop.is_closed():
+            asyncio.run_coroutine_threadsafe(
+                self._do_option_contracts(token, params), self._loop)
+        else:
+            self.option_contracts_failed.emit(
+                token, "Worker event loop not ready.")
+
+    def request_option_quotes(self, token: int,
+                              contracts: list[dict]) -> None:
+        """Thread-safe: subscribe bid/ask/last(/delta) for a batch of
+        contracts (the visible strikes + the underlying).  Replaces any
+        previous batch."""
+        if self._loop is not None and not self._loop.is_closed():
+            asyncio.run_coroutine_threadsafe(
+                self._do_option_quotes(token, list(contracts)), self._loop)
+        else:
+            self.option_quotes_failed.emit(
+                token, "Worker event loop not ready.")
+
+    def cancel_option_quotes(self) -> None:
+        """Thread-safe: drop the ticket's quote batch (dialog closed)."""
+        if self._loop is not None and not self._loop.is_closed():
+            asyncio.run_coroutine_threadsafe(
+                self._do_cancel_option_quotes(), self._loop)
+        else:
+            self._opt_tickers.clear()
+            self._ticker_to_opt_conid.clear()
+
+    def place_option_order(self, params: dict) -> None:
+        """Thread-safe: whatIf margin pre-check, then place the order.
+
+        Same *params* shape as :meth:`place_order`; emits
+        ``option_order_result`` with the pre-check outcome.  The real
+        transmit goes through the normal ``_do_place_order`` path so
+        order-ref generation / status wiring stay identical.
+        """
+        if self._loop is not None and not self._loop.is_closed():
+            asyncio.run_coroutine_threadsafe(
+                self._do_place_option_order(params), self._loop)
+        else:
+            self.option_order_result.emit({
+                "ok": False, "account": params.get("account", ""),
+                "symbol": params.get("symbol", ""),
+                "error": "Worker event loop not ready."})
+
     def place_order(self, params: dict) -> None:
         """Thread-safe: place an order on the worker's IB connection.
 
@@ -962,6 +1064,8 @@ class IBWorkerThread(QThread):
                 self._bg_tickers.clear()
                 self._bg_last_bid_ask.clear()   # bid/ask cache stale after reconnect
                 self._ticker_to_sym.clear()         # RC #6: clear reverse index
+                self._opt_tickers.clear()           # options ticket subs dropped
+                self._ticker_to_opt_conid.clear()
                 # Depth-of-market state (BookTrader) — IB drops L2 subs on
                 # disconnect so the local state becomes stale.  UI will
                 # re-subscribe on the next active-symbol change.
@@ -1232,13 +1336,246 @@ class IBWorkerThread(QThread):
             tws_log.error("[%s] API-ERR   browse failed: %s", self._label, exc)
             self.browse_failed.emit(str(exc))
 
+    # ── Options-income ticket coroutines ──────────────────────────────────────
+
+    async def _do_option_chain(self, token: int, params: dict) -> None:
+        """Fetch option expirations + strikes for one underlying.
+
+        Emits ``option_chain_results(token, dict)`` with sorted
+        ``expirations`` (YYYYMMDD) and ``strikes`` (floats) from the SMART
+        chain (fallback: first exchange returned).
+        """
+        if self._ib is None or not self._ib.isConnected():
+            self.option_chain_failed.emit(token, "Not connected to TWS.")
+            return
+
+        _TIMEOUT = 15
+        symbol = params.get("symbol", "")
+        con_id = int(params.get("con_id", 0))
+        try:
+            # A chip symbol with no position has no known conId — qualify
+            # the stock first (reqSecDefOptParams requires underlyingConId).
+            if con_id <= 0:
+                from ib_async import Stock
+                qualified = await asyncio.wait_for(
+                    self._ib.qualifyContractsAsync(
+                        Stock(symbol, "SMART", "USD")),
+                    timeout=_TIMEOUT)
+                if not qualified or not qualified[0].conId:
+                    self.option_chain_failed.emit(
+                        token, f"Could not resolve underlying {symbol}.")
+                    return
+                con_id = int(qualified[0].conId)
+
+            tws_log.info("[%s] API-CALL  reqSecDefOptParamsAsync(symbol=%s, "
+                         "underlyingConId=%d)", self._label, symbol, con_id)
+            chains = await asyncio.wait_for(
+                self._ib.reqSecDefOptParamsAsync(
+                    underlyingSymbol=symbol,
+                    futFopExchange="",
+                    underlyingSecType=params.get("sec_type", "STK"),
+                    underlyingConId=con_id),
+                timeout=_TIMEOUT)
+            if not chains:
+                self.option_chain_failed.emit(
+                    token, f"No option chain for {symbol}.")
+                return
+            oc = next((c for c in chains if c.exchange == "SMART"),
+                      chains[0])
+            result = {
+                "symbol": symbol,
+                "underlying_conid": con_id,
+                "exchange": oc.exchange,
+                "trading_class": oc.tradingClass,
+                "multiplier": oc.multiplier,
+                "expirations": sorted(oc.expirations),
+                "strikes": sorted(float(s) for s in oc.strikes),
+            }
+            tws_log.info("[%s] API-RESP  reqSecDefOptParamsAsync → %s: %d "
+                         "expiration(s), %d strike(s)", self._label, symbol,
+                         len(result["expirations"]), len(result["strikes"]))
+            self.option_chain_results.emit(token, result)
+        except asyncio.TimeoutError:
+            self.option_chain_failed.emit(
+                token, f"Option chain timed out after {_TIMEOUT}s.")
+        except Exception as exc:
+            log.exception("Worker %s option chain failed: %s",
+                          self._label, exc)
+            self.option_chain_failed.emit(token, str(exc))
+
+    async def _do_option_contracts(self, token: int, params: dict) -> None:
+        """Resolve every listed strike for one (symbol, expiry, right).
+
+        One reqContractDetails call without a strike filter — the ticket
+        filters to its visible strikes locally.  Emits contract dicts
+        (browse shape) plus ``min_tick``.
+        """
+        if self._ib is None or not self._ib.isConnected():
+            self.option_contracts_failed.emit(token, "Not connected to TWS.")
+            return
+
+        _TIMEOUT = 15
+        try:
+            from ib_async import Contract
+            c = Contract()
+            c.secType = "OPT"
+            c.symbol = params.get("symbol", "")
+            c.lastTradeDateOrContractMonth = params.get("expiry", "")
+            c.right = params.get("right", "")
+            c.exchange = "SMART"
+            c.currency = params.get("currency") or "USD"
+            if params.get("trading_class"):
+                c.tradingClass = params["trading_class"]
+
+            tws_log.info("[%s] API-CALL  reqContractDetailsAsync(OPT %s %s "
+                         "%s tc=%s)", self._label, c.symbol,
+                         c.lastTradeDateOrContractMonth, c.right,
+                         c.tradingClass)
+            details = await asyncio.wait_for(
+                self._ib.reqContractDetailsAsync(c), timeout=_TIMEOUT)
+
+            results = []
+            for d in details or []:
+                q = d.contract
+                results.append({
+                    "conid": q.conId,
+                    "symbol": q.symbol,
+                    "sec_type": q.secType,
+                    "exchange": q.exchange,
+                    "currency": q.currency,
+                    "expiry": getattr(q, "lastTradeDateOrContractMonth", ""),
+                    "strike": float(getattr(q, "strike", 0.0)),
+                    "right": getattr(q, "right", ""),
+                    "local_symbol": q.localSymbol,
+                    "multiplier": getattr(q, "multiplier", ""),
+                    "trading_class": getattr(q, "tradingClass", ""),
+                    "min_tick": float(getattr(d, "minTick", 0.0) or 0.0),
+                })
+            tws_log.info("[%s] API-RESP  reqContractDetailsAsync → %d option "
+                         "contract(s) for %s", self._label, len(results),
+                         c.symbol)
+            self.option_contracts_results.emit(token, results)
+        except asyncio.TimeoutError:
+            self.option_contracts_failed.emit(
+                token, f"Contract lookup timed out after {_TIMEOUT}s.")
+        except Exception as exc:
+            log.exception("Worker %s option contracts failed: %s",
+                          self._label, exc)
+            self.option_contracts_failed.emit(token, str(exc))
+
+    async def _do_option_quotes(self, token: int,
+                                contracts: list[dict]) -> None:
+        """Subscribe the ticket's quote batch (visible strikes + underlying)."""
+        if self._ib is None or not self._ib.isConnected():
+            self.option_quotes_failed.emit(token, "Not connected to TWS.")
+            return
+
+        await self._do_cancel_option_quotes()
+        self._opt_quote_token = token
+        self._opt_quote_contracts = list(contracts)
+        try:
+            from ib_async import Contract
+            # 2 = frozen: live when entitled, and after the close IB serves
+            # the LAST RECORDED bid/ask instead of the -1 "no market"
+            # sentinel — so the ladder keeps meaningful bid/ask outside
+            # market hours.  Type 4 (delayed-frozen) does NOT do this for
+            # live-entitled accounts: IB upgrades it to plain live (1) and
+            # the frozen close quotes never arrive.  If the account has no
+            # live subscription, type 2 fails with error 354 — _on_ib_error
+            # then flips _opt_delayed_fallback and resubscribes with 4.
+            self._ib.reqMarketDataType(
+                4 if self._opt_delayed_fallback else 2)
+            for params in contracts:
+                conid = int(params.get("conid", 0))
+                if conid <= 0:
+                    continue
+                c = Contract(conId=conid)
+                c.exchange = params.get("exchange") or "SMART"
+                c.currency = params.get("currency") or "USD"
+                if params.get("sec_type"):
+                    c.secType = params["sec_type"]
+                if params.get("local_symbol"):
+                    c.localSymbol = params["local_symbol"]
+                ticker = self._ib.reqMktData(c, genericTickList="",
+                                             snapshot=False)
+                self._opt_tickers[conid] = ticker
+                self._ticker_to_opt_conid[id(ticker)] = conid
+                # Emit immediately when ib_async already has cached data.
+                self._emit_opt_quote(conid, ticker)
+            tws_log.info("[%s] API-CALL  reqMktData ×%d [options ticket]",
+                         self._label, len(self._opt_tickers))
+        except Exception as exc:
+            log.warning("Worker %s: option quote batch failed: %s",
+                        self._label, exc)
+            self.option_quotes_failed.emit(token, str(exc))
+
+    async def _do_cancel_option_quotes(self) -> None:
+        """Cancel every ticket quote subscription."""
+        tickers = list(self._opt_tickers.values())
+        self._opt_tickers.clear()
+        self._ticker_to_opt_conid.clear()
+        if not tickers:
+            return
+        if self._ib is not None and self._ib.isConnected():
+            for ticker in tickers:
+                try:
+                    self._ib.cancelMktData(ticker.contract)
+                except Exception as exc:
+                    log.debug("Worker %s: cancel option quote error: %s",
+                              self._label, exc)
+            tws_log.info("[%s] API-CALL  cancelMktData ×%d [options ticket]",
+                         self._label, len(tickers))
+
+    def _emit_opt_quote(self, conid: int, ticker) -> None:
+        """Scrub sentinels and emit one option_quote_updated.
+
+        Runs on the worker's asyncio thread — must only emit Qt signals.
+        """
+        def _clean(v) -> float | None:
+            """None = IB sent no data (nan / -1 sentinel / DBL_MAX).
+            0.0 passes through — a deep-OTM option with no buyers has a
+            REAL zero bid, and the ladder shows it as 0.00, not "—"."""
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                return None
+            if math.isnan(f) or f < 0 or f >= _IB_DBL_MAX:
+                return None
+            return f
+
+        # IB streams separate greek computations for model / last / bid /
+        # ask (ticks 13 / 12 / 10 / 11) and any of them can carry an empty
+        # delta.  Prefer the model computation, then fall back to the
+        # others so the ladder fills in as soon as ANY computation lands.
+        delta = 0.0
+        for attr in ("modelGreeks", "lastGreeks", "bidGreeks", "askGreeks"):
+            greeks = getattr(ticker, attr, None)
+            if greeks is None:
+                continue
+            try:
+                d = float(getattr(greeks, "delta", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if d and math.isfinite(d) and abs(d) <= 1.0:
+                delta = d
+                break
+
+        self.option_quote_updated.emit(self._opt_quote_token, conid, {
+            "bid": _clean(getattr(ticker, "bid", None)),
+            "ask": _clean(getattr(ticker, "ask", None)),
+            "last": _clean(getattr(ticker, "last", None)),
+            "close": _clean(getattr(ticker, "close", None)),
+            "delta": delta,
+        })
+
     async def _do_symbol_search(self, token: int, pattern: str) -> None:
         """Fuzzy-match *pattern* against IB's symbol universe.
 
         Emits ``symbol_search_results(token, list[dict])`` on success or
         ``symbol_search_failed(token, msg)`` on any error.  IB rate-limits
-        reqMatchingSymbols to roughly one call per second — the caller
-        (SymbolSearchPopup) debounces keystrokes to stay under that.
+        reqMatchingSymbols to roughly one call per second — the callers
+        (SymbolSearchPopup, options ticket) debounce keystrokes to stay
+        under that.
         """
         if self._ib is None or not self._ib.isConnected():
             self.symbol_search_failed.emit(token, "Not connected to TWS.")
@@ -1269,6 +1606,132 @@ class IBWorkerThread(QThread):
                           self._label, exc)
             self.symbol_search_failed.emit(token, str(exc))
 
+    async def _do_place_option_order(self, params: dict) -> None:
+        """whatIf margin pre-check, then transmit through _do_place_order.
+
+        The whatIf probe uses the same conId-first contract and a plain
+        LimitOrder mirror of the real order.  If IB rejects the probe (or
+        it times out) nothing is transmitted and ``option_order_result``
+        carries the error; on success the margin deltas ride along.
+        """
+        account = params.get("account", "")
+        symbol = params.get("symbol", "")
+        if self._ib is None or not self._ib.isConnected():
+            self.option_order_result.emit({
+                "ok": False, "account": account, "symbol": symbol,
+                "error": "Not connected to TWS."})
+            return
+
+        # Pre-generate the orderRef so the pre-check row in the Orders
+        # view and the transmitted order share one blotter key — the
+        # real order's first status simply takes over the row.
+        params = dict(params)
+        order_ref = _generate_order_ref()
+        params["order_ref"] = order_ref
+        order_key = f"{account}_{order_ref}"
+        self._emit_opt_precheck_status(order_key, order_ref, params,
+                                       "Margin check")
+
+        def _precheck_failed(msg: str) -> None:
+            self._order_error_messages[order_ref] = msg
+            self._emit_opt_precheck_status(order_key, order_ref, params,
+                                           "Rejected")
+            self.option_order_result.emit({
+                "ok": False, "account": account, "symbol": symbol,
+                "error": msg})
+
+        try:
+            from ib_async import Contract, LimitOrder, MarketOrder
+            # conId + exchange ONLY — TWS rejects option requests that
+            # carry redundant identifiers (secType/localSymbol) next to
+            # a conId with error 478 ("Parameters in request conflicts
+            # with contract parameters received by contract id").
+            c = Contract(conId=int(params.get("conid", 0)))
+            c.exchange = params.get("exchange") or "SMART"
+            c.currency = params.get("currency") or "USD"
+
+            if (params.get("order_type") or "LMT") == "MKT":
+                # A zero-price LimitOrder probe would be rejected outright.
+                probe = MarketOrder(
+                    params.get("action", "SELL"),
+                    int(params.get("qty", 0)))
+            else:
+                probe = LimitOrder(
+                    params.get("action", "SELL"),
+                    int(params.get("qty", 0)),
+                    float(params.get("limit_price", 0.0)))
+            probe.account = account
+            probe.tif = params.get("tif", "DAY")
+
+            tws_log.info("[%s] API-CALL  whatIfOrderAsync(%s %s ×%s @ %s "
+                         "acct=%s)", self._label, probe.action, symbol,
+                         probe.totalQuantity,
+                         getattr(probe, "lmtPrice", "") or "MKT", account)
+            state = await asyncio.wait_for(
+                self._ib.whatIfOrderAsync(c, probe), timeout=15)
+
+            def _margin(v) -> float:
+                try:
+                    f = float(v)
+                    return 0.0 if abs(f) >= _IB_DBL_MAX else f
+                except (TypeError, ValueError):
+                    return 0.0
+
+            if state is None or not getattr(state, "initMarginChange", ""):
+                _precheck_failed("Margin pre-check rejected by TWS.")
+                tws_log.warning("[%s] API-RESP  whatIfOrder → rejected",
+                                self._label)
+                return
+
+            result = {
+                "ok": True, "account": account, "symbol": symbol,
+                "init_margin": _margin(getattr(state, "initMarginChange", 0)),
+                "maint_margin": _margin(
+                    getattr(state, "maintMarginChange", 0)),
+            }
+            tws_log.info("[%s] API-RESP  whatIfOrder → ok initMargin=%s "
+                         "maintMargin=%s", self._label,
+                         result["init_margin"], result["maint_margin"])
+        except asyncio.TimeoutError:
+            _precheck_failed("Margin pre-check timed out.")
+            return
+        except Exception as exc:
+            log.exception("Worker %s whatIf pre-check failed: %s",
+                          self._label, exc)
+            _precheck_failed(str(exc))
+            return
+
+        await self._do_place_order(params)
+        self.option_order_result.emit(result)
+
+    def _emit_opt_precheck_status(self, order_id: str, order_ref: str,
+                                  params: dict, status: str) -> None:
+        """Synthetic Orders-view row for the options whatIf pre-check.
+
+        Keyed exactly like the real order (``account_orderRef``) so the
+        transmitted order's first status update takes over the row; a
+        failed pre-check leaves it as Rejected with the reason."""
+        now = datetime.now(_ET)
+        lmt = params.get("limit_price", 0)
+        self.order_status_updated.emit({
+            "order_id": order_id,
+            "order_ref": order_ref,
+            "symbol": (params.get("local_symbol")
+                       or params.get("symbol", "")),
+            "account": params.get("account", ""),
+            "action": params.get("action", ""),
+            "order_type": params.get("order_type", "LMT"),
+            "quantity": str(int(params.get("qty", 0) or 0)),
+            "limit_price": str(lmt) if lmt else "–",
+            "stop_price": "–",
+            "tif": params.get("tif", "DAY"),
+            "fill_price": "–",
+            "status": status,
+            "time": now.strftime("%H:%M:%S"),
+            "time_sort": now.isoformat(),
+            "error_message": self._order_error_messages.get(order_ref, ""),
+        })
+
     # ── Order placement ───────────────────────────────────────────────────────
 
     async def _do_place_order(self, params: dict) -> None:
@@ -1290,23 +1753,32 @@ class IBWorkerThread(QThread):
 
             c = Contract(conId=conid)
             c.exchange = params.get("exchange") or "SMART"
-            # Populate symbol fields so the Trade object kept by ib_async
-            # retains them across reqAllOpenOrdersAsync() snapshots (ib_async
-            # does NOT overwrite the contract on existing Trade objects).
-            c.symbol = params.get("symbol", "")
-            c.secType = params.get("sec_type", "")
             c.currency = params.get("currency", "USD")
-            c.localSymbol = params.get("local_symbol", "")
-            if params.get("expiry"):
-                c.lastTradeDateOrContractMonth = params["expiry"]
-            if params.get("multiplier"):
-                c.multiplier = params["multiplier"]
+            sec_type = params.get("sec_type", "")
+            if sec_type == "OPT":
+                # Options: conId + exchange ONLY.  TWS rejects option
+                # orders whose request carries redundant identifiers
+                # (symbol/secType/localSymbol/expiry) alongside a conId
+                # with error 478.  The blotter reads its fields from
+                # *params*, so the lean contract loses nothing.
+                pass
+            else:
+                # Populate symbol fields so the Trade object kept by
+                # ib_async retains them across reqAllOpenOrdersAsync()
+                # snapshots (ib_async does NOT overwrite the contract on
+                # existing Trade objects).
+                c.symbol = params.get("symbol", "")
+                c.secType = sec_type
+                c.localSymbol = params.get("local_symbol", "")
+                if params.get("expiry"):
+                    c.lastTradeDateOrContractMonth = params["expiry"]
+                if params.get("multiplier"):
+                    c.multiplier = params["multiplier"]
 
             # Stocks: route to IBEOS (IBKR Overnight ATS) during overnight
             # session (20:00–03:59 ET), otherwise SMART.  IBEOS is a
             # US-only venue — non-USD stocks (e.g. Toronto/CAD) always
             # stay on SMART or TWS would reject the order.
-            sec_type = params.get("sec_type", "")
             if sec_type == "STK":
                 now_et = datetime.now(_ET)
                 hour = now_et.hour
@@ -1365,7 +1837,9 @@ class IBWorkerThread(QThread):
 
             order.account = account
             order.tif = tif
-            order.orderRef = _generate_order_ref()
+            # place_option_order pre-generates the ref so its pre-check
+            # blotter row and the real order share one key.
+            order.orderRef = params.get("order_ref") or _generate_order_ref()
 
             # Stocks: configure extended-hours flags based on exchange and
             # current time of day (Eastern).
@@ -2626,6 +3100,12 @@ class IBWorkerThread(QThread):
                     and ticker is self._active_ticker):
                 self._on_price_update(ticker)
 
+            # Options-income ticket quote batch (O(1) reverse index)
+            if self._ticker_to_opt_conid:
+                conid = self._ticker_to_opt_conid.get(id(ticker))
+                if conid:
+                    self._emit_opt_quote(conid, ticker)
+
             # RC #6: O(1) reverse-index lookup instead of O(M) linear scan.
             # Previously iterated over every entry in _bg_tickers on each tick,
             # which scaled quadratically as background subscriptions grew.
@@ -2673,10 +3153,13 @@ class IBWorkerThread(QThread):
             if params.get("multiplier"):
                 c.multiplier = params["multiplier"]
 
-            # Request delayed streaming data as fallback when real-time is
-            # unavailable (e.g. error 10197 "competing live session").
-            # Type 3 = delayed: streams 15-min delayed ticks continuously.
-            self._ib.reqMarketDataType(3)
+            # Request delayed-frozen fallback when real-time is unavailable
+            # (e.g. error 10197 "competing live session").  Type 4 = live
+            # when entitled → delayed → frozen close values after hours.
+            # NOTE: the market-data type is CONNECTION-GLOBAL — every call
+            # site in this worker must use the same type, or the last one
+            # wins and knocks the others out of frozen mode.
+            self._ib.reqMarketDataType(4)
 
             self._active_price_symbol = params.get("symbol", "")
             ticker = self._ib.reqMktData(c, genericTickList="", snapshot=False)
@@ -2725,7 +3208,9 @@ class IBWorkerThread(QThread):
 
         from ib_async import Contract
 
-        self._ib.reqMarketDataType(3)  # delayed as fallback
+        # 4 = delayed-frozen fallback (connection-global — keep every call
+        # site on the same type; see _do_market_data).
+        self._ib.reqMarketDataType(4)
 
         for params in params_list:
             sym = params.get("symbol", "")
@@ -3298,6 +3783,20 @@ class IBWorkerThread(QThread):
         tws_log.warning("[%s] EVENT     errorEvent → reqId=%s errorCode=%s "
                         "errorString=%s contract=%s",
                         self._label, reqId, errorCode, errorString, contract)
+
+        # Error 354 — "Requested market data is not subscribed."  The
+        # options ticket first tries frozen data (type 2), which needs a
+        # live entitlement; accounts with delayed-only data get 354 back.
+        # Flip to delayed-frozen (type 4) once and resubscribe the batch.
+        if (errorCode == 354
+                and not self._opt_delayed_fallback
+                and getattr(contract, "conId", 0) in self._opt_tickers):
+            self._opt_delayed_fallback = True
+            log.warning("Worker %s: no live entitlement for options ticket "
+                        "(error 354) – resubscribing with delayed-frozen data",
+                        self._label)
+            asyncio.ensure_future(self._do_option_quotes(
+                self._opt_quote_token, self._opt_quote_contracts))
 
         if errorCode == 10197 and self._active_ticker is not None:
             # "No market data during competing live session"
