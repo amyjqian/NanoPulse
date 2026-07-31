@@ -1,13 +1,9 @@
 """
 Options Income ticket — right-hand order rail (§3, §4.5–4.7).
 
-Three zones inside a fixed-width column:
-  * static header  — order line, contracts stepper + MAX, limit price
-    (stepper / typed entry / Bid-Mid-Ask chips) + anchor hint;
-  * scrolling middle — break-even, outcome (if called away / if
-    assigned), coverage note;
-  * static footer  — credit received, collateral reserved, annualized,
-    then Cancel + Submit order.
+One compact top-aligned block inside a fixed-width column: order line,
+contracts stepper + MAX, limit price (stepper / typed entry /
+Bid-Mid-Ask chips), then Cancel + Submit order directly beneath.
 
 The rail is a pure view: it owns the qty/price input state and emits
 signals; every derived number is pushed in by the ticket.
@@ -19,18 +15,18 @@ from decimal import Decimal
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QDoubleValidator
 from PySide6.QtWidgets import (
-    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPushButton,
-    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
 
 from src.ui.theme import Theme
 from src.core.options_income import snap_to_tick, to_dec
+
+from .parts import _symbol_chip_style
 
 ACCENT_BLUE = "#0071e3"
 
@@ -51,15 +47,6 @@ _CHIP_OFF = (
     " padding:4px 8px; font-size:10px; }"
     "QPushButton:hover{ border-color:#4A4E58; }")
 
-_ANCHOR_HINTS = {
-    "BID": "At the bid — fills fastest, gives up the spread.",
-    "MID": "Mid-market — the usual starting point; work it down if it sits.",
-    "ASK": "At the ask — best credit, may not fill.",
-    "MKT": "Market — fills at the best available price; credit shown is "
-           "an estimate.",
-}
-
-
 def _caption(parent: QWidget, text: str) -> QLabel:
     lbl = QLabel(text, parent)
     lbl.setStyleSheet(
@@ -77,7 +64,10 @@ class OrderRail(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedWidth(330)
+        # The rail fills the top pane of the ticket's right-hand column
+        # (min 300 px wide); an internal bottom stretch keeps the
+        # controls hugging the top whatever the pane height.
+        self.setMinimumWidth(300)
         self._action = "SELL"      # order side — drives submit button
         self._qty = 1
         self._max_qty = 0
@@ -198,69 +188,22 @@ class OrderRail(QWidget):
             arow.addWidget(btn, stretch=1)
         outer.addLayout(arow)
 
-        self._hint = QLabel(_ANCHOR_HINTS["MID"], self)
-        self._hint.setWordWrap(True)
-        self._hint.setStyleSheet(
-            f"color:{Theme.TEXT_DIM}; font-size:10px;")
-        outer.addWidget(self._hint)
-
-        # ── Zone 2: scrolling middle ────────────────────────────────────
-        self._detail_area = QScrollArea(self)
-        self._detail_area.setWidgetResizable(True)
-        self._detail_area.setFrameShape(QFrame.Shape.NoFrame)
-        self._detail_area.setStyleSheet(
-            "QScrollArea{ background:transparent; border:none;"
-            f" border-top:1px solid {Theme.BORDER};"
-            f" border-bottom:1px solid {Theme.BORDER}; }}")
-        detail = QWidget(self._detail_area)
-        detail.setStyleSheet("background:transparent;")
-        dlay = QVBoxLayout(detail)
-        dlay.setContentsMargins(0, 8, 0, 8)
-        dlay.setSpacing(6)
-        self._be_row = self._kv_row(dlay, "Break-even")
-        self._outcome_row = self._kv_row(dlay, "If called away")
-        self._note = QLabel("", detail)
-        self._note.setWordWrap(True)
-        self._note.setStyleSheet(
-            f"color:{Theme.TEXT_DIM}; font-size:10px;")
-        dlay.addWidget(self._note)
-        dlay.addStretch(1)
-        self._detail_area.setWidget(detail)
-        outer.addWidget(self._detail_area, stretch=1)
-
-        # ── Zone 3: static footer ───────────────────────────────────────
-        frow = QHBoxLayout()
-        self._footer_cap = QLabel("Credit received", self)
-        self._footer_cap.setStyleSheet(
-            f"color:{Theme.TEXT_DIM}; font-size:11px;")
-        self._credit_lbl = QLabel("—", self)
-        self._credit_lbl.setStyleSheet(
-            f"color:{Theme.ACCENT}; font-size:14px; font-weight:bold;")
-        frow.addWidget(self._footer_cap)
-        frow.addStretch(1)
-        frow.addWidget(self._credit_lbl)
-        outer.addLayout(frow)
-
-        srow = QHBoxLayout()
-        self._reserved_lbl = QLabel("", self)
-        self._reserved_lbl.setStyleSheet(
-            f"color:{Theme.TEXT_DIM}; font-size:10px;")
-        self._ann_lbl = QLabel("", self)
-        self._ann_lbl.setStyleSheet(
-            f"color:{Theme.TEXT_DIM}; font-size:10px;")
-        srow.addWidget(self._reserved_lbl)
-        srow.addStretch(1)
-        srow.addWidget(self._ann_lbl)
-        outer.addLayout(srow)
-
+        # Close + Submit sit right under the price anchors, keeping the
+        # whole order flow in one compact block.
         brow = QHBoxLayout()
         brow.setSpacing(8)
         self._cancel_btn = QPushButton("Cancel", self)
         self._cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        # Same look as the order-entry panel's Cancel action button
+        # (order_entry_panel._make_btn with Theme.CLR_CANCEL).
         self._cancel_btn.setStyleSheet(
-            "QPushButton{ background:#262a36; color:#aab1c0; border:none;"
-            " border-radius:6px; padding:9px 16px; font-size:11px; }"
-            "QPushButton:hover{ color:#e6e9ef; }")
+            f"QPushButton{{ background:{Theme.CLR_CANCEL}; color:#ffffff;"
+            " border:none; border-radius:6px; padding:9px 16px;"
+            " font-size:11px; font-weight:bold; }"
+            f"QPushButton:hover{{ background:{Theme.CLR_CANCEL};"
+            " border:1px solid #ffffff30; }"
+            f"QPushButton:pressed{{ background:{Theme.CLR_CANCEL};"
+            " border:1px solid #ffffff60; }")
         self._cancel_btn.clicked.connect(self.cancel_clicked.emit)
         self._sell_btn = QPushButton("Submit order", self)
         self._sell_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -270,23 +213,12 @@ class OrderRail(QWidget):
             " font-size:12px; font-weight:bold; }"
             "QPushButton:disabled{ background:#3a3f4d; color:#5a6478; }")
         self._sell_btn.clicked.connect(self.submit_clicked.emit)
-        brow.addWidget(self._cancel_btn)
+        # Equal-width pair — both take an identical share of the row.
+        brow.addWidget(self._cancel_btn, stretch=1)
         brow.addWidget(self._sell_btn, stretch=1)
         outer.addLayout(brow)
+        outer.addStretch(1)
         self._refresh_anchor_chips()
-
-    def _kv_row(self, layout: QVBoxLayout, label: str) -> tuple[QLabel, QLabel]:
-        row = QHBoxLayout()
-        k = QLabel(label, self)
-        k.setStyleSheet(f"color:{Theme.TEXT_DIM}; font-size:11px;")
-        v = QLabel("—", self)
-        v.setStyleSheet(f"color:{Theme.TEXT}; font-size:11px;"
-                        " font-weight:bold;")
-        row.addWidget(k)
-        row.addStretch(1)
-        row.addWidget(v)
-        layout.addLayout(row)
-        return k, v
 
     # ── Qty ─────────────────────────────────────────────────────────────────
 
@@ -302,6 +234,11 @@ class OrderRail(QWidget):
             self._set_qty(1)
         else:
             self._refresh_qty()
+
+    def reset_qty(self) -> None:
+        """Snap back to the minimum size (after a submit — the next order
+        must be sized deliberately)."""
+        self._set_qty(1)
 
     def _step_qty(self, delta: int) -> None:
         self._set_qty(self._qty + delta)
@@ -413,28 +350,11 @@ class OrderRail(QWidget):
                         active = key
         for key, btn in self._anchor_btns.items():
             btn.setStyleSheet(_CHIP_ON if key == active else _CHIP_OFF)
-        if active:
-            self._hint.setText(_ANCHOR_HINTS[active])
 
     # ── Derived-value setters (pushed by the ticket) ────────────────────────
 
     def set_order_line(self, text: str) -> None:
         self._order_line.setText(text)
-
-    def set_detail(self, be_label: str, be_value: str,
-                   outcome_label: str, outcome_value: str,
-                   note: str) -> None:
-        self._be_row[0].setText(be_label)
-        self._be_row[1].setText(be_value)
-        self._outcome_row[0].setText(outcome_label)
-        self._outcome_row[1].setText(outcome_value)
-        self._note.setText(note)
-
-    def set_footer(self, credit_text: str, reserved_text: str,
-                   ann_text: str) -> None:
-        self._credit_lbl.setText(credit_text)
-        self._reserved_lbl.setText(reserved_text)
-        self._ann_lbl.setText(ann_text)
 
     def action(self) -> str:
         return self._action
@@ -457,7 +377,7 @@ class OrderRail(QWidget):
                 " font-size:11px; font-weight:bold; }")
 
     def set_action(self, action: str) -> None:
-        """"BUY" or "SELL" — flips the submit button and footer caption."""
+        """"BUY" or "SELL" — flips the submit button colour."""
         action = "BUY" if action == "BUY" else "SELL"
         if action == self._action:
             return
@@ -469,13 +389,17 @@ class OrderRail(QWidget):
             " border:none; border-radius:6px; padding:9px 16px;"
             " font-size:12px; font-weight:bold; }"
             "QPushButton:disabled{ background:#3a3f4d; color:#5a6478; }")
-        self._footer_cap.setText("Cost" if action == "BUY"
-                                 else "Credit received")
         if self._sell_btn.isEnabled():
             self._sell_btn.setText(self._submit_label())
 
     def _submit_label(self) -> str:
         return "Submit order"
+
+    def set_cancel_label(self, text: str) -> None:
+        """Relabel the footer's dismiss button — after the first submit
+        "Cancel" reads as "cancel my order", so the ticket flips it to
+        "Close"."""
+        self._cancel_btn.setText(text)
 
     def set_sell_enabled(self, enabled: bool, reason: str = "") -> None:
         """Disabled state replaces the label with the reason (§4.7)."""

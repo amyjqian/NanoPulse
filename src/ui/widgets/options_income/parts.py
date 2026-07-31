@@ -36,21 +36,6 @@ from src.core.options_income import Expiry
 log = logging.getLogger(__name__)
 
 ACCENT_BLUE = "#0071e3"          # active-selection blue used app-wide
-_CHIP_QSS = (
-    "QPushButton{{ background:{bg}; color:{fg};"
-    " border:1px solid {border}; border-radius:6px;"
-    " padding:5px 12px; font-size:11px; {extra} }}"
-    "QPushButton:hover{{ border-color:#4A4E58; }}"
-)
-
-
-def _chip_style(active: bool) -> str:
-    if active:
-        return _CHIP_QSS.format(
-            bg="rgba(0,113,227,0.16)", fg=Theme.TEXT,
-            border=ACCENT_BLUE, extra="font-weight:bold;")
-    return _CHIP_QSS.format(
-        bg="#262a36", fg=Theme.TEXT_DIM, border=Theme.BORDER, extra="")
 
 
 def _symbol_chip_style(active: bool) -> str:
@@ -447,11 +432,6 @@ class ExpirySelector(QWidget):
         row = QHBoxLayout(self)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(6)
-        cap = QLabel("EXPIRY", self)
-        cap.setStyleSheet(
-            f"color:{Theme.TEXT_DIM}; font-size:10px; font-weight:bold;"
-            " letter-spacing:1px;")
-        row.addWidget(cap)
         self._chip_row = QHBoxLayout()
         self._chip_row.setSpacing(6)
         row.addLayout(self._chip_row)
@@ -521,15 +501,12 @@ class ExpirySelector(QWidget):
             self._more_btn.rect().bottomLeft()))
 
     def _restyle(self) -> None:
+        # Solid-blue active / grey inactive — same look as the symbol
+        # chips above (and the Book Trader / order-entry chip rows).
         sel = self._selected.ymd if self._selected else None
         for e, btn in zip(self._chips, self._buttons):
-            active = e.ymd == sel
-            fg_dte = ACCENT_BLUE if active else Theme.TEXT_DIM
             btn.setText(f"{e.chip_label} {e.dte}d")
-            btn.setStyleSheet(_chip_style(active)
-                              + f"QPushButton{{ color:{Theme.TEXT}; }}"
-                              if active else _chip_style(False))
-            _ = fg_dte  # dte tint folded into chip style
+            btn.setStyleSheet(_symbol_chip_style(e.ymd == sel))
         # When a dropdown expiry is selected, surface it on the More button
         # so the selection stays visible.
         more_sel = (self._selected is not None
@@ -538,7 +515,7 @@ class ExpirySelector(QWidget):
         if more_sel:
             self._more_btn.setText(
                 f"{self._selected.chip_label} {self._selected.dte}d ▾")
-            self._more_btn.setStyleSheet(_chip_style(True))
+            self._more_btn.setStyleSheet(_symbol_chip_style(True))
         else:
             self._more_btn.setText("More ▾")
-            self._more_btn.setStyleSheet(_chip_style(False))
+            self._more_btn.setStyleSheet(_symbol_chip_style(False))

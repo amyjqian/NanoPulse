@@ -19,7 +19,15 @@ from __future__ import annotations
 import logging
 import math
 
-from PySide6.QtCore import QEvent, QRect, QSettings, QSize, Qt, Signal
+from PySide6.QtCore import (
+    QEvent,
+    QRect,
+    QSettings,
+    QSize,
+    Qt,
+    QTimer,
+    Signal,
+)
 from src.core import config_manager
 from PySide6.QtGui import (
     QBrush, QColor, QFont, QFontMetrics, QKeySequence, QPainter, QPen,
@@ -296,15 +304,41 @@ class FlattenButtonDelegate(QStyledItemDelegate):
     position_close_clicked   = Signal(str, int, int)
 
     # ── header-row button geometry ────────────────────────────────────────────
-    _HDR_TEXT    = "Flatten"
-    _HDR_H_PAD   = 8
-    _HDR_V_PAD   = 2
-    _HDR_RADIUS  = 3
+    _HDR_TEXT       = "Flatten"
+    _HDR_ARMED_TEXT = "Confirm?"
+    _HDR_H_PAD      = 8
+    _HDR_V_PAD      = 2
+    _HDR_RADIUS     = 3
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._pressed_row: int | None = None
         self._pressed_btn: int | None = None   # index into _POS_BTNS (position rows)
+        # Misclick guard for the account-level Flatten (it closes ALL
+        # positions + orders): the first click only ARMS the button
+        # ("Flatten" → red "Sure?"); a second click within the window
+        # actually flattens, else it quietly reverts.
+        self._armed_acct: str | None = None
+        self._confirm_timer = QTimer(self)
+        self._confirm_timer.setSingleShot(True)
+        self._confirm_timer.setInterval(3000)
+        self._confirm_timer.timeout.connect(self._disarm_confirm)
+
+    def _repaint_view(self) -> None:
+        view = self.parent()
+        if view is not None and hasattr(view, "viewport"):
+            view.viewport().update()
+
+    def _arm_confirm(self, acct: str) -> None:
+        self._armed_acct = acct
+        self._confirm_timer.start()
+        self._repaint_view()
+
+    def _disarm_confirm(self) -> None:
+        self._confirm_timer.stop()
+        if self._armed_acct is not None:
+            self._armed_acct = None
+            self._repaint_view()
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -316,12 +350,17 @@ class FlattenButtonDelegate(QStyledItemDelegate):
     def _is_position(index) -> bool:
         return index.data(RowTypeRole) == ROW_TYPE_POSITION
 
+    def _hdr_button_width(self) -> int:
+        """Sized to exactly fit the wider label ("Confirm?"), measured
+        with the font the buttons are actually painted in — shared by
+        the header button and the position-row Flatten button."""
+        bfm = QFontMetrics(
+            QFont("Helvetica Neue, Arial", 10, QFont.Weight.Bold))
+        # Snug fit: just the label plus a few px of breathing room.
+        return bfm.horizontalAdvance(self._HDR_ARMED_TEXT) + 2 * 3
+
     def _hdr_button_rect(self, cell_rect: QRect, fm: QFontMetrics) -> QRect:
-        # Match the position-row Flatten button width so the two Flatten
-        # buttons line up across header and position rows.
-        tw = max(fm.horizontalAdvance(lbl) + 2 * _POS_BTN_H_PAD
-                 for lbl, *_ in _POS_BTNS)
-        tw = int(tw * 0.7)
+        tw = self._hdr_button_width()
         th = int((fm.height() + 2 * self._HDR_V_PAD) * 1.4)
         x  = cell_rect.x() + 6
         y  = cell_rect.y() + (cell_rect.height() - th) // 2
@@ -329,23 +368,25 @@ class FlattenButtonDelegate(QStyledItemDelegate):
 
     def _pos_button_rects(self, cell_rect: QRect,
                           fm: QFontMetrics) -> list[QRect]:
-        """Return a list of QRect for each position-row action button.
-        All buttons share the same width (widest label wins)."""
-        btn_w   = max(fm.horizontalAdvance(lbl) + 2 * _POS_BTN_H_PAD
-                      for lbl, *_ in _POS_BTNS)
-        btn_w   = int(btn_w * 0.7)
-        n       = len(_POS_BTNS)
-        total_w = btn_w * n + _POS_BTN_GAP * (n - 1)
-        btn_h   = min(int((fm.height() + 2 * _POS_BTN_V_PAD) * 1.4),
-                      cell_rect.height() - 4)
+        """Return a QRect per position-row action button.  Flatten
+        matches the account-level button's width so the two line up;
+        the percentage buttons keep the original shared width (widest
+        label wins, including "Flatten")."""
+        pct_w = max(fm.horizontalAdvance(lbl) + 2 * _POS_BTN_H_PAD
+                    for lbl, *_ in _POS_BTNS)
+        pct_w = int(pct_w * 0.7)
+        widths = ([self._hdr_button_width()]
+                  + [pct_w] * (len(_POS_BTNS) - 1))
+        btn_h = min(int((fm.height() + 2 * _POS_BTN_V_PAD) * 1.4),
+                    cell_rect.height() - 4)
 
         x = cell_rect.x() + 6
         y = cell_rect.y() + (cell_rect.height() - btn_h)  // 2
 
         rects = []
-        for _ in _POS_BTNS:
-            rects.append(QRect(x, y, btn_w, btn_h))
-            x += btn_w + _POS_BTN_GAP
+        for w in widths:
+            rects.append(QRect(x, y, w, btn_h))
+            x += w + _POS_BTN_GAP
         return rects
 
     # ── paint ─────────────────────────────────────────────────────────────────
@@ -375,9 +416,14 @@ class FlattenButtonDelegate(QStyledItemDelegate):
             hovered  = bool(option.state & QStyle.StateFlag.State_MouseOver)
             pressed  = (self._pressed_row == index.row()
                         and self._pressed_btn == -1)
+            armed    = (self._armed_acct is not None
+                        and index.data(FlattenRole) == self._armed_acct)
 
-            # Reuse the same colours as the position-row Flatten button
+            # Reuse the same colours as the position-row Flatten button;
+            # armed state flips to red ("Sure?") until confirmed/expired.
             _lbl, bg_n, bg_h, bg_p, _pct = _POS_BTNS[0]
+            if armed:
+                bg_n, bg_h, bg_p = "#cc3333", "#d94444", "#b32d2d"
             bg = (QColor(bg_p) if pressed
                   else QColor(bg_h) if hovered
                   else QColor(bg_n))
@@ -389,7 +435,8 @@ class FlattenButtonDelegate(QStyledItemDelegate):
             painter.setPen(QColor("#ffffff"))
             painter.setFont(QFont("Helvetica Neue, Arial", 10, QFont.Weight.Bold))
             painter.drawText(btn_rect, Qt.AlignmentFlag.AlignCenter,
-                             self._HDR_TEXT)
+                             self._HDR_ARMED_TEXT if armed
+                             else self._HDR_TEXT)
 
             painter.restore()
             return
@@ -456,7 +503,14 @@ class FlattenButtonDelegate(QStyledItemDelegate):
                 if was:
                     acct = index.data(FlattenRole)
                     if acct:
-                        self.flatten_clicked.emit(acct)
+                        if self._armed_acct == acct:
+                            # Second click within the window → flatten.
+                            self._disarm_confirm()
+                            self.flatten_clicked.emit(acct)
+                        else:
+                            # First click (or a different account's
+                            # button) only arms — never flattens.
+                            self._arm_confirm(acct)
                 return was
 
         # ── position row ──────────────────────────────────────────────────

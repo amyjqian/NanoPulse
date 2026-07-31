@@ -15,12 +15,18 @@ derived figure (Decimal) on any change, and emits an
 ``_what_if_check`` asks FlashTradeView to route through
 ``worker.place_option_order`` (whatIf margin pre-check before transmit).
 All worker responses are tokened; stale ones are dropped.
+
+The dialog stays open after a submit so several orders can be placed
+back-to-back — only the Close button / ✕ dismiss it.  Each submitted
+order is tracked in the "This session" strip (``SessionOrdersStrip``)
+with its live status, and can be cancelled from there while still open.
 """
 from __future__ import annotations
 
 import logging
 from datetime import date, datetime
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
@@ -28,7 +34,9 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QSplitter,
     QVBoxLayout,
+    QWidget,
 )
 
 from src.ui.theme import Theme
@@ -38,8 +46,16 @@ from src.core import options_income as oi
 from .chain_table import ChainView
 from .parts import ExpirySelector, RightToggle, SymbolChipBar
 from .rail import OrderRail
+from .session_strip import SessionOrdersStrip
 
 log = logging.getLogger(__name__)
+
+_ET = ZoneInfo("America/New_York")
+
+# Layout keys for the ladder | rail divider and the rail-column's
+# order-entry / session-orders divider.
+_SPLIT_KEY = "options_ticket_splitter"
+_RIGHT_SPLIT_KEY = "options_ticket_right_splitter"
 
 _RIGHT = oi.STRATEGY_RIGHT       # strategy → "C" | "P"
 _ACTION = oi.STRATEGY_ACTION     # strategy → "BUY" | "SELL"
@@ -86,6 +102,7 @@ class OptionsIncomeTicket(QDialog):
         self._chain: dict | None = None
         self._selected_leg: dict | None = None
         self._price_pending = True   # reset price to mid on next leg quote
+        self._session_refs: set[str] = set()   # orderRefs placed here
 
         self.setWindowTitle("Options income")
         self.setModal(True)
@@ -186,12 +203,14 @@ class OptionsIncomeTicket(QDialog):
         erow.addWidget(self._expiry, stretch=1)
         outer.addLayout(erow)
 
-        # ── Chain table + order rail ────────────────────────────────────
-        body = QHBoxLayout()
-        body.setSpacing(12)
-        self._chain_view = ChainView(self)
+        # ── Chain table | order rail — resizable, remembered split ──────
+        self._body_split = QSplitter(Qt.Orientation.Horizontal, self)
+        self._body_split.setHandleWidth(2)
+        self._body_split.setStyleSheet(
+            f"QSplitter::handle {{ background: {Theme.BORDER}; }}")
+        self._chain_view = ChainView(self._body_split)
         self._chain_view.row_selected.connect(self._on_row_selected)
-        body.addWidget(self._chain_view, stretch=1)
+        self._body_split.addWidget(self._chain_view)
         # Scrolling shifts which strikes stream quotes (debounced so a
         # fling doesn't churn reqMktData/cancelMktData on every pixel).
         self._scroll_debounce = QTimer(self)
@@ -203,11 +222,62 @@ class OptionsIncomeTicket(QDialog):
         self._rail = OrderRail(self)
         self._rail.qty_changed.connect(lambda _n: self._recompute())
         self._rail.price_changed.connect(lambda _p: self._recompute())
-        self._rail.side_changed.connect(self._on_strategy_changed)
+        self._rail.side_changed.connect(self._on_side_changed)
         self._rail.cancel_clicked.connect(self.reject)
         self._rail.submit_clicked.connect(self._on_submit)
-        body.addWidget(self._rail)
-        outer.addLayout(body, stretch=1)
+        # Post-submit lockout: the ticket stays open for the next order,
+        # so the submit button is held disabled briefly to swallow
+        # double-clicks (parented to the dialog so it dies with it).
+        self._submit_relock = QTimer(self)
+        self._submit_relock.setSingleShot(True)
+        self._submit_relock.setInterval(1500)
+        self._submit_relock.timeout.connect(self._recompute)
+        # Right pane, itself split top | bottom: order entry (the rail)
+        # above, the "This session" strip — live status + Cancel for the
+        # orders submitted from this window (hidden until the first
+        # submit) — below, with its own draggable divider.
+        right_host = QWidget(self._body_split)
+        right = QVBoxLayout(right_host)
+        right.setContentsMargins(10, 0, 0, 0)
+        right.setSpacing(0)
+        self._right_split = QSplitter(Qt.Orientation.Vertical, right_host)
+        self._right_split.setHandleWidth(2)
+        self._right_split.setStyleSheet(
+            f"QSplitter::handle {{ background: {Theme.BORDER}; }}")
+        self._right_split.addWidget(self._rail)
+        self._session = SessionOrdersStrip(self._right_split)
+        self._session.cancel_requested.connect(self._on_cancel_order)
+        self._right_split.addWidget(self._session)
+        self._right_split.setStretchFactor(0, 1)   # extra height → rail
+        self._right_split.setStretchFactor(1, 0)
+        self._right_split.setCollapsible(0, False)
+        self._right_split.setCollapsible(1, False)
+        right.addWidget(self._right_split)
+        self._body_split.addWidget(right_host)
+        self._body_split.setStretchFactor(0, 1)   # extra width → ladder
+        self._body_split.setStretchFactor(1, 0)
+        self._body_split.setCollapsible(0, False)
+        self._body_split.setCollapsible(1, False)
+        outer.addWidget(self._body_split, stretch=1)
+        # Restore the last divider positions; save them (debounced — a
+        # drag emits splitterMoved per pixel) whenever one moves.
+        try:
+            layout = config_manager.load_layout()
+            sizes = [int(s) for s in (layout.get(_SPLIT_KEY) or [])]
+            if len(sizes) == 2 and all(s > 0 for s in sizes):
+                self._body_split.setSizes(sizes)
+            self._apply_right_split_sizes(layout)
+        except Exception:
+            log.debug("Options ticket: could not restore splitter",
+                      exc_info=True)
+        self._split_save = QTimer(self)
+        self._split_save.setSingleShot(True)
+        self._split_save.setInterval(400)
+        self._split_save.timeout.connect(self._save_splitter)
+        self._body_split.splitterMoved.connect(
+            lambda _pos, _idx: self._split_save.start())
+        self._right_split.splitterMoved.connect(
+            lambda _pos, _idx: self._split_save.start())
 
         # Status line (chain errors, offline account, …)
         self._status = QLabel("", self)
@@ -233,6 +303,7 @@ class OptionsIncomeTicket(QDialog):
         w.option_contracts_failed.connect(self._on_request_failed)
         w.option_quote_updated.connect(self._on_quote)
         w.symbol_search_results.connect(self._chips.set_search_results)
+        w.order_status_updated.connect(self._on_order_status)
         self._wired = True
 
     def _unwire(self) -> None:
@@ -246,6 +317,7 @@ class OptionsIncomeTicket(QDialog):
             (w.option_contracts_failed, self._on_request_failed),
             (w.option_quote_updated, self._on_quote),
             (w.symbol_search_results, self._chips.set_search_results),
+            (w.order_status_updated, self._on_order_status),
         ):
             try:
                 sig.disconnect(slot)
@@ -258,14 +330,48 @@ class OptionsIncomeTicket(QDialog):
         self._wired = False
 
     def _save_geometry(self) -> None:
-        """Remember the user-chosen window size across opens."""
+        """Remember the user-chosen window size + divider across opens."""
         try:
             layout = config_manager.load_layout()
             layout["options_ticket"] = {"w": self.width(),
                                         "h": self.height()}
+            self._collect_splitter_sizes(layout)
             config_manager.save_layout(layout)
         except Exception:
             log.debug("Options ticket: could not save size", exc_info=True)
+
+    def _apply_right_split_sizes(self, layout: dict | None = None) -> None:
+        """Apply the saved order-entry / session-orders divider (only
+        meaningful once the strip is visible — a hidden pane is 0)."""
+        try:
+            if layout is None:
+                layout = config_manager.load_layout()
+            sizes = [int(s) for s in (layout.get(_RIGHT_SPLIT_KEY) or [])]
+            if len(sizes) == 2 and all(s > 0 for s in sizes):
+                self._right_split.setSizes(sizes)
+        except Exception:
+            log.debug("Options ticket: could not restore right splitter",
+                      exc_info=True)
+
+    def _collect_splitter_sizes(self, layout: dict) -> None:
+        sizes = [int(s) for s in self._body_split.sizes()]
+        if len(sizes) == 2 and all(s > 0 for s in sizes):
+            layout[_SPLIT_KEY] = sizes
+        # Skip while the strip is hidden — its pane reads 0 and would
+        # wipe the user's chosen height.
+        if not self._session.isHidden():
+            rsizes = [int(s) for s in self._right_split.sizes()]
+            if len(rsizes) == 2 and all(s > 0 for s in rsizes):
+                layout[_RIGHT_SPLIT_KEY] = rsizes
+
+    def _save_splitter(self) -> None:
+        try:
+            layout = config_manager.load_layout()
+            self._collect_splitter_sizes(layout)
+            config_manager.save_layout(layout)
+        except Exception:
+            log.debug("Options ticket: could not save splitter",
+                      exc_info=True)
 
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt override)
         self._save_geometry()
@@ -597,13 +703,69 @@ class OptionsIncomeTicket(QDialog):
         self._set_status(msg, error=True)
         self._recompute()
 
+    # ── Session orders (status stream + cancel) ─────────────────────────────
+
+    def _on_order_status(self, d: dict) -> None:
+        """Worker order-status stream → update this window's strip rows.
+
+        Every order on the connection flows through here; only refs
+        submitted from this ticket are picked up (random 4-letter tags
+        make collisions with other windows practically impossible)."""
+        ref = str(d.get("order_ref") or "")
+        if ref not in self._session_refs:
+            return
+        self._session.update_order(
+            ref, str(d.get("status") or ""),
+            str(d.get("fill_price") or "–"),
+            str(d.get("error_message") or ""))
+
+    def _on_cancel_order(self, ref: str) -> None:
+        if self._worker is not None:
+            # Worker blotter key format: "{account}_{orderRef}".
+            self._worker.cancel_order(f"{self._account}_{ref}")
+
     # ── Selection changes ───────────────────────────────────────────────────
 
     def _on_strategy_changed(self, _key: str) -> None:
+        """Call ↔ Put — different contracts, so the strike list must be
+        re-fetched from TWS."""
         self._price_pending = True
         self._selected_leg = None
         self._request_contracts()
         self._recompute()
+
+    def _on_side_changed(self, _side: str) -> None:
+        """Buy ↔ Sell — same (expiry, right) strike list, so no TWS
+        round-trip / "Loading strikes…": keep the selection and price,
+        just re-derive the ladder figures and the rail state locally."""
+        self._refresh_row_figures()
+        self._recompute()
+
+    def _refresh_row_figures(self) -> None:
+        """Recompute yield/ann on cached row mids for the current
+        strategy (income metrics blank on long strategies)."""
+        model = self._chain_view.chain_model
+        strategy = self._strategy()
+        sell = _ACTION[strategy] == "SELL"
+        exp = self._expiry.selected()
+        dte = exp.dte if exp else 0
+        for i in range(model.rowCount()):
+            rd = model.row_data(i) or {}
+            if rd.get("sep"):
+                continue
+            mid = rd.get("mid") or 0
+            if mid <= 0:
+                continue
+            if sell:
+                ref = (self._spot if strategy == "CC"
+                       else float(rd.get("strike") or 0))
+                y = oi.yield_pct(mid, ref)
+                model.update_row(i, {
+                    "yield_pct": float(y),
+                    "ann_pct": float(oi.annualized_pct(y, dte)),
+                })
+            else:
+                model.update_row(i, {"yield_pct": None, "ann_pct": None})
 
     def _on_expiry_changed(self, _ymd: str) -> None:
         self._price_pending = True
@@ -664,19 +826,16 @@ class OptionsIncomeTicket(QDialog):
 
     def _recompute(self) -> None:
         strategy = self._strategy()
-        action = _ACTION[strategy]
         status = self._current_status()
         leg = self._selected_leg
         exp = self._expiry.selected()
         max_qty = self._max_qty()
         self._rail.set_max_qty(max_qty)
-        qty = self._rail.qty()
         px = self._rail.price()
         market = self._rail.is_market()
         if market and px <= 0 and leg:
             # Market order before any quote arrived — estimate at mid.
             px = oi.to_dec(leg.get("mid") or 0)
-        mult = self._leg_multiplier()
 
         if leg and exp:
             strike = leg["strike"]
@@ -687,77 +846,6 @@ class OptionsIncomeTicket(QDialog):
                 f"{self._symbol} {exp.chip_label} {strike:g} {word}")
         else:
             self._rail.set_order_line("—")
-
-        if leg and px > 0:
-            strike = oi.to_dec(leg["strike"])
-            total = oi.credit(px, qty, mult)
-            if strategy == "CC":
-                be = oi.break_even_cc(self._basis, px)
-                outcome = oi.if_called_away(
-                    strike, self._basis, px, qty, mult)
-                if qty * mult <= self._shares:
-                    note = (f"Covered — {qty * mult} of your "
-                            f"{int(self._shares):,} shares back this "
-                            "position; they stay in the account unless "
-                            "assigned.")
-                    reserved = (f"Shares reserved {qty * mult} of "
-                                f"{int(self._shares):,}")
-                else:
-                    covered_sh = int(self._shares) // mult * mult
-                    note = (f"{covered_sh:,} shares cover part of this "
-                            "position; the remainder is margin-backed "
-                            "(naked) — IB's margin check runs before "
-                            "transmit.")
-                    reserved = f"Shares {covered_sh:,} + margin"
-                self._rail.set_detail(
-                    "Break-even", f"${be:,.2f}",
-                    "If called away", f"{'+' if outcome >= 0 else ''}"
-                                      f"${outcome:,.0f}", note)
-            elif strategy == "CSP":
-                be = oi.break_even_csp(strike, px)
-                cost = oi.if_assigned_cost(strike, px, qty, mult)
-                self._rail.set_detail(
-                    "Break-even", f"${be:,.2f}",
-                    "If assigned, cost", f"${cost:,.0f}",
-                    f"Cash-secured — ${float(oi.collateral_csp(strike, qty, mult)):,.0f} "
-                    "of buying power backs this position until expiry "
-                    "or close.")
-                reserved = (f"BP reserved "
-                            f"${float(oi.collateral_csp(strike, qty, mult)):,.0f}")
-            elif strategy == "BC":
-                be = oi.break_even_long_call(strike, px)
-                self._rail.set_detail(
-                    "Break-even", f"${be:,.2f}",
-                    "Max loss", f"−${total:,.0f}",
-                    f"Long call — the right to buy {qty * mult} shares "
-                    f"at {float(strike):g} until expiry; risk is limited "
-                    "to the premium paid.")
-                reserved = f"Cost ${total:,.0f} from buying power"
-            else:                                      # BP — long put
-                be = oi.break_even_long_put(strike, px)
-                self._rail.set_detail(
-                    "Break-even", f"${be:,.2f}",
-                    "Max loss", f"−${total:,.0f}",
-                    f"Long put — the right to sell {qty * mult} shares "
-                    f"at {float(strike):g} until expiry; risk is limited "
-                    "to the premium paid.")
-                reserved = f"Cost ${total:,.0f} from buying power"
-            if action == "SELL":
-                ref = self._spot if strategy == "CC" else float(strike)
-                y = oi.yield_pct(px, ref)
-                ann = oi.annualized_pct(y, exp.dte if exp else 0)
-                self._rail.set_footer(
-                    f"+${total:,.2f}", reserved,
-                    f"Ann. {ann:.1f}%" if ann else "")
-            else:
-                self._rail.set_footer(f"−${total:,.2f}", reserved, "")
-        else:
-            self._rail.set_detail(
-                "Break-even", "—",
-                {"CC": "If called away", "CSP": "If assigned, cost",
-                 "BC": "Max loss", "BP": "Max loss"}[strategy],
-                "—", "")
-            self._rail.set_footer("—", "", "")
 
         # Submit button state (§4.7): ineligible reason wins, then leg/qty/px.
         if not status.eligible:
@@ -804,7 +892,13 @@ class OptionsIncomeTicket(QDialog):
         except ValueError:
             return
         contract = dict(leg.get("contract") or {})
+        # Pre-generate the orderRef (worker format) so the session strip
+        # can match this order in the order_status_updated stream and
+        # cancel it while open.
+        from src.core.ib_worker import _generate_order_ref
+        order_ref = _generate_order_ref()
         payload = {
+            "order_ref": order_ref,
             "action": _ACTION[self._strategy()],
             "type": "MKT" if market else "LMT",
             "symbol": contract.get("symbol", self._symbol),
@@ -833,4 +927,27 @@ class OptionsIncomeTicket(QDialog):
         log.info("OptionsIncomeTicket: %s → %s",
                  self._strategy(), payload)
         self.order_ready.emit(payload)
-        self.accept()
+        # The ticket stays open for the next order — only Close/✕
+        # dismiss it.  The submitted order lands in the session strip
+        # (live status + Cancel while open), qty snaps back to 1 so the
+        # next order is sized deliberately, and the submit button is
+        # held down briefly so a double-click can't transmit twice.
+        self._session_refs.add(order_ref)
+        first_order = self._session.isHidden()
+        self._session.add_order(order_ref, {
+            "time": datetime.now(_ET).strftime("%H:%M:%S"),
+            "action": payload["action"],
+            "qty": int(qty),
+            "symbol": self._symbol,
+            "strike": float(leg.get("strike") or 0.0),
+            "right": self._right_toggle.right(),
+            "price": "MKT" if market else f"{px:.2f}",
+        })
+        if first_order:
+            # The strip's pane was collapsed while hidden — sizes set
+            # then don't stick, so apply the saved divider now.
+            self._apply_right_split_sizes()
+        self._rail.reset_qty()
+        self._rail.set_cancel_label("Close")
+        self._rail.set_sell_enabled(False, "Order submitted ✓")
+        self._submit_relock.start()

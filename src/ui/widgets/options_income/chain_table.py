@@ -9,12 +9,14 @@ selected row.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from PySide6.QtCore import (
     QAbstractTableModel,
     QModelIndex,
     Qt,
+    QTimer,
     Signal,
 )
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
@@ -26,8 +28,15 @@ from PySide6.QtWidgets import (
 )
 
 from src.ui.theme import Theme
+from src.core import config_manager
+
+log = logging.getLogger(__name__)
 
 ACCENT_BLUE = "#0071e3"
+
+# User-dragged column widths persist across opens under this layout key
+# (same per-user store as the ticket's window size).
+_COL_LAYOUT_KEY = "options_chain_columns"
 
 COL_STRIKE = 0
 COL_BID = 1
@@ -241,8 +250,11 @@ class ChainView(QTableView):
         self.verticalHeader().setVisible(False)
         self.verticalHeader().setDefaultSectionSize(34)
         hh = self.horizontalHeader()
-        hh.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        hh.setSectionResizeMode(COL_STRIKE, QHeaderView.ResizeMode.Stretch)
+        # Interactive = user-draggable column edges; the last column
+        # absorbs the leftover so the ladder always fills its width.
+        hh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        hh.setStretchLastSection(True)
+        hh.setMinimumSectionSize(48)
         hh.setHighlightSections(False)
         self.setStyleSheet(
             f"QTableView{{ background:{Theme.BG_MAIN}; color:{Theme.TEXT};"
@@ -259,6 +271,75 @@ class ChainView(QTableView):
             lambda cur, _prev: self.row_selected.emit(cur.row()))
         # Separator rows render as a thin rule, not a full-height row.
         self._model.modelReset.connect(self._apply_sep_heights)
+
+        # ── Column-width persistence ────────────────────────────────────
+        # Saved widths apply immediately; otherwise the first layout pass
+        # equal-splits the viewport (the pre-Interactive look) and only
+        # user drags after that are recorded (debounced — a drag emits
+        # sectionResized per pixel).
+        self._applying_widths = False
+        self._widths_ready = False
+        self._save_debounce = QTimer(self)
+        self._save_debounce.setSingleShot(True)
+        self._save_debounce.setInterval(400)
+        self._save_debounce.timeout.connect(self._save_widths)
+        saved = self._load_widths()
+        if saved:
+            self._apply_widths(saved)
+            self._widths_ready = True
+        hh.sectionResized.connect(self._on_section_resized)
+
+    # ── Column widths ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _load_widths() -> list[int] | None:
+        try:
+            cols = config_manager.load_layout().get(_COL_LAYOUT_KEY) or []
+            widths = [int(w) for w in cols]
+            if len(widths) == NUM_COLS and all(w > 0 for w in widths):
+                return widths
+        except Exception:
+            log.debug("ChainView: could not load column widths",
+                      exc_info=True)
+        return None
+
+    def _apply_widths(self, widths: list[int]) -> None:
+        self._applying_widths = True
+        try:
+            for col in range(NUM_COLS - 1):     # last column stretches
+                self.setColumnWidth(col, widths[col])
+        finally:
+            self._applying_widths = False
+
+    def _on_section_resized(self, *_args) -> None:
+        if self._widths_ready and not self._applying_widths:
+            self._save_debounce.start()
+
+    def _save_widths(self) -> None:
+        try:
+            layout = config_manager.load_layout()
+            layout[_COL_LAYOUT_KEY] = [self.columnWidth(c)
+                                       for c in range(NUM_COLS)]
+            config_manager.save_layout(layout)
+        except Exception:
+            log.debug("ChainView: could not save column widths",
+                      exc_info=True)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        super().resizeEvent(event)
+        if not self._widths_ready and self.viewport().width() > 200:
+            # First open with nothing saved — equal split across columns.
+            self._apply_widths(
+                [max(48, self.viewport().width() // NUM_COLS)] * NUM_COLS)
+            self._widths_ready = True
+
+    def hideEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        # Flush a pending debounced save so a drag right before closing
+        # the ticket isn't lost.
+        if self._save_debounce.isActive():
+            self._save_debounce.stop()
+            self._save_widths()
+        super().hideEvent(event)
 
     def _apply_sep_heights(self) -> None:
         for i in range(self._model.rowCount()):

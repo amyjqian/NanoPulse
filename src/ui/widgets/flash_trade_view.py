@@ -535,6 +535,10 @@ class FlashTradeView(QWidget):
                 "order_type": order_type,
                 "tif": "DAY"
             }
+            if payload.get("order_ref"):
+                # Options ticket pre-generates the ref so its session
+                # strip can follow this order's status stream/cancel it.
+                params["order_ref"] = payload["order_ref"]
             if limit_price is not None:
                 params["limit_price"] = limit_price
             if adaptive_priority is not None:

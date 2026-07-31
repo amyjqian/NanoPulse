@@ -27,6 +27,7 @@ class FakeWorker(QObject):
     symbol_search_results = Signal(int, list)
     symbol_search_failed = Signal(int, str)
     option_order_result = Signal(dict)
+    order_status_updated = Signal(dict)
 
     def __init__(self):
         super().__init__()
@@ -34,6 +35,7 @@ class FakeWorker(QObject):
         self.contract_calls: list[tuple[int, dict]] = []
         self.quote_calls: list[tuple[int, list]] = []
         self.search_calls: list[tuple[int, str]] = []
+        self.cancel_order_calls: list[str] = []
         self.quote_cancels = 0
 
     def request_option_chain(self, token, params):
@@ -50,6 +52,9 @@ class FakeWorker(QObject):
 
     def request_symbol_search(self, token, pattern):
         self.search_calls.append((token, pattern))
+
+    def cancel_order(self, order_id):
+        self.cancel_order_calls.append(order_id)
 
 
 UNDERLYING_CONID = 4815747
@@ -269,7 +274,6 @@ def test_quote_sets_price_and_figures(qtbot):
     assert t._rail._order_line.text().startswith("NVDA ")
     assert t._rail._order_line.text().endswith("187.5 CALL")
     assert t._rail._sell_btn.isEnabled()
-    assert t._rail._credit_lbl.text() == "+$310.00"
 
 
 def test_cc_max_qty_from_shares(qtbot):
@@ -368,6 +372,30 @@ def test_buy_call_flow(qtbot):
     assert p["type"] == "LMT"
     assert p["limit_price"] == 3.10
     assert p["_resolved_contract"]["right"] == "C"
+
+
+def test_side_switch_reuses_loaded_strikes(qtbot):
+    # Buy ↔ Sell keeps the same (expiry, right) contracts — no re-fetch,
+    # no "Loading strikes…", selection and price preserved.
+    t, w = _make(qtbot)
+    _deliver_chain(t, w)
+    _deliver_contracts(t, w)
+    _deliver_selected_quote(t, w)          # mid 3.10
+    n_calls = len(w.contract_calls)
+    leg = t._selected_leg
+    model = t._chain_view.chain_model
+    row = model.row_for_conid(leg["conid"])
+
+    t._rail._pick_side("BUY")
+    assert len(w.contract_calls) == n_calls
+    assert t._selected_leg is leg
+    assert t._rail.price() == Decimal("3.10")
+    assert model.row_data(row)["yield_pct"] is None      # blank for longs
+
+    t._rail._pick_side("SELL")
+    assert len(w.contract_calls) == n_calls
+    # Yield re-derived from the cached mid: 3.10 / 182.40 × 100.
+    assert model.row_data(row)["yield_pct"] == 1.70
 
 
 def test_buy_put_requests_puts(qtbot):
@@ -530,6 +558,199 @@ def test_market_order_submit(qtbot):
     rail._pick_anchor("BID")
     assert not rail.is_market()
     assert rail._px_edit.isEnabled()
+
+
+def _status_event(ref, status, *, account="mgn-jack-02", fill="–", err=""):
+    return {"order_id": f"{account}_{ref}", "order_ref": ref,
+            "symbol": "NVDA 187.5C", "account": account, "action": "SELL",
+            "order_type": "LMT", "quantity": "2", "limit_price": "3.10",
+            "stop_price": "–", "tif": "DAY", "fill_price": fill,
+            "status": status, "time": "10:30:45",
+            "time_sort": "2026-01-01T10:30:45", "error_message": err}
+
+
+def test_submit_keeps_ticket_open_and_tracks_session(qtbot):
+    t, w = _make(qtbot)
+    _deliver_chain(t, w)
+    _deliver_contracts(t, w)
+    _deliver_selected_quote(t, w)
+    t._rail._set_qty(2)
+
+    payloads = []
+    t.order_ready.connect(payloads.append)
+    t._rail._sell_btn.click()
+
+    p = payloads[0]
+    # The ticket pre-generates a worker-format orderRef for tracking.
+    assert p["order_ref"].startswith("nano_")
+    # Dialog is still up (not accepted) and ready for the next order.
+    assert t.result() == 0
+    assert not t._session.isHidden()
+    assert p["order_ref"] in t._session._rows
+    # Qty snaps back to 1; submit is locked out briefly; Cancel → Close.
+    assert t._rail.qty() == 1
+    assert not t._rail._sell_btn.isEnabled()
+    assert t._rail._sell_btn.text() == "Order submitted ✓"
+    assert t._rail._cancel_btn.text() == "Close"
+    # The relock timer re-enables through the normal recompute path.
+    t._submit_relock.stop()
+    t._recompute()
+    assert t._rail._sell_btn.isEnabled()
+
+
+def test_session_strip_status_flow_and_cancel(qtbot):
+    t, w = _make(qtbot)
+    _deliver_chain(t, w)
+    _deliver_contracts(t, w)
+    _deliver_selected_quote(t, w)
+
+    payloads = []
+    t.order_ready.connect(payloads.append)
+    t._rail._sell_btn.click()
+    ref = payloads[0]["order_ref"]
+    assert ref in t._session._rows
+
+    # Pre-check → open: Cancel appears only once the order is at TWS.
+    w.order_status_updated.emit(_status_event(ref, "Margin check"))
+    assert not t._session.can_cancel(ref)
+    w.order_status_updated.emit(_status_event(ref, "Submitted"))
+    assert t._session.can_cancel(ref)
+    assert t._session.status_text(ref) == "Submitted"
+
+    # Cancel click → worker.cancel_order with the blotter key.
+    t._session.request_cancel(ref)
+    assert w.cancel_order_calls == [f"mgn-jack-02_{ref}"]
+    assert not t._session.can_cancel(ref)       # double-click guard
+    t._session.request_cancel(ref)              # no second worker call
+    assert len(w.cancel_order_calls) == 1
+    w.order_status_updated.emit(_status_event(ref, "Cancelled"))
+    assert not t._session.can_cancel(ref)
+    assert t._session.status_text(ref) == "Cancelled"
+
+    # Statuses for other windows' orders are ignored.
+    w.order_status_updated.emit(_status_event("nano_0731_093000_zzzz",
+                                              "Submitted"))
+    assert "nano_0731_093000_zzzz" not in t._session._rows
+
+
+def test_cancel_requires_confirm_click(qtbot):
+    from src.ui.widgets.options_income.session_strip import COL_CANCEL
+    t, w = _make(qtbot)
+    _deliver_chain(t, w)
+    _deliver_contracts(t, w)
+    _deliver_selected_quote(t, w)
+    payloads = []
+    t.order_ready.connect(payloads.append)
+    t._rail._sell_btn.click()
+    ref = payloads[0]["order_ref"]
+    w.order_status_updated.emit(_status_event(ref, "Submitted"))
+
+    strip = t._session
+    idx = strip._model.index(0, COL_CANCEL)
+    # First click only ARMS — nothing sent to the worker.
+    strip._on_clicked(idx)
+    assert w.cancel_order_calls == []
+    assert strip._rows[ref]["confirm"] is True
+    assert strip._confirm_timer.isActive()
+    # Second click confirms → cancel goes out.
+    strip._on_clicked(idx)
+    assert w.cancel_order_calls == [f"mgn-jack-02_{ref}"]
+    assert strip._rows[ref]["confirm"] is False
+
+    # Re-arm after the order re-opens, then let the window lapse.
+    w.order_status_updated.emit(_status_event(ref, "Submitted"))
+    strip._on_clicked(idx)
+    assert strip._rows[ref]["confirm"] is True
+    strip._disarm_confirm()                    # timer timeout path
+    assert strip._rows[ref]["confirm"] is False
+    assert len(w.cancel_order_calls) == 1      # nothing extra sent
+    # A status event under an armed confirm also disarms.
+    strip._on_clicked(idx)
+    w.order_status_updated.emit(_status_event(ref, "Submitted"))
+    assert strip._rows[ref]["confirm"] is False
+
+
+def test_session_strip_fill_and_reject(qtbot):
+    t, w = _make(qtbot)
+    _deliver_chain(t, w)
+    _deliver_contracts(t, w)
+    _deliver_selected_quote(t, w)
+
+    payloads = []
+    t.order_ready.connect(payloads.append)
+    t._rail._sell_btn.click()
+    ref = payloads[0]["order_ref"]
+
+    w.order_status_updated.emit(_status_event(ref, "Filled", fill="3.12"))
+    assert t._session.status_text(ref) == "Filled @ 3.12"
+    assert not t._session.can_cancel(ref)
+
+    # Second order from the same window gets its own row (newest on
+    # top); a whatIf rejection surfaces with the reason as tooltip.
+    t._submit_relock.stop()
+    t._recompute()
+    t._rail._sell_btn.click()
+    ref2 = payloads[1]["order_ref"]
+    assert ref2 != ref and len(t._session._rows) == 2
+    assert t._session._model.row_data(0)["ref"] == ref2
+    w.order_status_updated.emit(
+        _status_event(ref2, "Rejected", err="Insufficient margin"))
+    assert t._session.status_text(ref2) == "Rejected"
+    assert t._session._rows[ref2]["error"] == "Insufficient margin"
+    assert not t._session.can_cancel(ref2)
+
+
+def test_chain_column_widths_persist_across_opens(qtbot, monkeypatch):
+    from src.core import config_manager
+    store = {}
+    monkeypatch.setattr(config_manager, "load_layout",
+                        lambda path=None: dict(store))
+    monkeypatch.setattr(config_manager, "save_layout",
+                        lambda layout, path=None: store.update(layout))
+
+    t, w = _make(qtbot)
+    view = t._chain_view
+    # Simulate the first layout pass having run (offscreen widgets never
+    # get a real resizeEvent), then a user drag on the BID column.
+    view._widths_ready = True
+    view.setColumnWidth(1, 153)
+    assert view._save_debounce.isActive()      # drag → debounced save
+    view._save_debounce.stop()
+    view._save_widths()
+    assert store["options_chain_columns"][1] == 153
+
+    # A fresh ticket restores the saved widths immediately.
+    t2, w2 = _make(qtbot)
+    assert t2._chain_view._widths_ready
+    assert t2._chain_view.columnWidth(1) == 153
+
+
+def test_body_splitter_sizes_persist(qtbot, monkeypatch):
+    from src.core import config_manager
+    store = {}
+    monkeypatch.setattr(config_manager, "load_layout",
+                        lambda path=None: dict(store))
+    monkeypatch.setattr(config_manager, "save_layout",
+                        lambda layout, path=None: store.update(layout))
+
+    t, w = _make(qtbot)
+    t.resize(1200, 700)
+    t.show()
+    qtbot.waitExposed(t)
+    t._body_split.setSizes([700, 398])
+    t._save_splitter()
+    saved = store["options_ticket_splitter"]
+    assert saved == [int(s) for s in t._body_split.sizes()]
+    assert len(saved) == 2 and all(s > 0 for s in saved)
+    t.close()
+
+    # A fresh ticket applies the saved divider position on construction
+    # (pending sizes land on the first real layout pass, i.e. show).
+    t2, w2 = _make(qtbot)
+    t2.resize(1200, 700)
+    t2.show()
+    qtbot.waitExposed(t2)
+    assert t2._body_split.sizes() == saved
 
 
 def test_window_size_persisted_across_opens(qtbot, monkeypatch):

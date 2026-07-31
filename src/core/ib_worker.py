@@ -1624,9 +1624,11 @@ class IBWorkerThread(QThread):
 
         # Pre-generate the orderRef so the pre-check row in the Orders
         # view and the transmitted order share one blotter key — the
-        # real order's first status simply takes over the row.
+        # real order's first status simply takes over the row.  A caller
+        # may pre-supply the ref (the Options Income ticket does, to
+        # track its session orders); it must follow the nano_* format.
         params = dict(params)
-        order_ref = _generate_order_ref()
+        order_ref = params.get("order_ref") or _generate_order_ref()
         params["order_ref"] = order_ref
         order_key = f"{account}_{order_ref}"
         self._emit_opt_precheck_status(order_key, order_ref, params,
