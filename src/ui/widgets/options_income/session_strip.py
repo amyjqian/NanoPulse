@@ -28,18 +28,18 @@ from PySide6.QtWidgets import QAbstractItemView, QHeaderView, QTableView
 
 from src.ui.theme import Theme
 from src.core import config_manager
-
-log = logging.getLogger(__name__)
-
-# User-dragged column widths persist across opens under this layout key
-# (same per-user store as the ladder's columns and the dividers).
-_COL_LAYOUT_KEY = "options_session_columns"
 from src.ui.widgets.order_status_model import (
     FILTER_CANCELLED,
     FILTER_COMPLETED,
     FILTER_OPEN,
     STATUS_CATEGORY,
 )
+
+log = logging.getLogger(__name__)
+
+# User-dragged column widths persist across opens under this layout key
+# (same per-user store as the ladder's columns and the dividers).
+_COL_LAYOUT_KEY = "options_session_columns"
 
 COL_TIME = 0
 COL_ACTION = 1
@@ -232,17 +232,13 @@ class SessionOrdersStrip(QTableView):
         self._drag_col = -1                  # column being edge-dragged
         self._drag_start_x = 0
         self._drag_start_w = 0
-        # Same dark table styling as the strike ladder (ChainView).
+        # Same dark table styling as the strike ladder (ChainView);
+        # no header rules — the header row is hidden.
         self.setStyleSheet(
             f"QTableView{{ background:{Theme.BG_MAIN}; color:{Theme.TEXT};"
             f" border:1px solid {Theme.BORDER}; border-radius:6px;"
             " selection-background-color:rgba(0,113,227,0.14);"
-            f" selection-color:{Theme.TEXT}; }}"
-            f"QHeaderView::section{{ background:{Theme.BG_MAIN};"
-            f" color:{Theme.TEXT_DIM}; border:none;"
-            f" border-bottom:1px solid {Theme.BORDER};"
-            " padding:6px 8px; font-size:10px; font-weight:bold;"
-            " letter-spacing:1px; }")
+            f" selection-color:{Theme.TEXT}; }}")
         self.clicked.connect(self._on_clicked)
 
         # Misclick guard: the first click on a Cancel cell only ARMS it

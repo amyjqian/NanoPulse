@@ -26,8 +26,6 @@ from PySide6.QtWidgets import (
 from src.ui.theme import Theme
 from src.core.options_income import snap_to_tick, to_dec
 
-from .parts import _symbol_chip_style
-
 ACCENT_BLUE = "#0071e3"
 
 _STEP_BTN_QSS = (

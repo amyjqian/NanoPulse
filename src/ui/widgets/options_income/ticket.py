@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime
-from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from PySide6.QtCore import Qt, QTimer, Signal
@@ -650,8 +649,6 @@ class OptionsIncomeTicket(QDialog):
         strike = rd.get("strike", 0.0)
         exp = self._expiry.selected()
         dte = exp.dte if exp else 0
-        strategy = self._strategy()
-        ref = self._spot if strategy == "CC" else strike
         mult = self._leg_multiplier(rd)
         patch = {k: v for k, v in
                  (("bid", bid), ("ask", ask), ("last", last))
@@ -673,16 +670,7 @@ class OptionsIncomeTicket(QDialog):
                 patch["delta"] = est
         if mid > 0:
             patch["credit"] = float(oi.credit(mid, 1, mult))
-            if _ACTION[strategy] == "SELL":
-                y = oi.yield_pct(mid, ref)
-                patch.update({
-                    "yield_pct": float(y),
-                    "ann_pct": float(oi.annualized_pct(y, dte)),
-                })
-            else:
-                # Premium yield is an income (selling) metric — blank
-                # for long strategies.
-                patch.update({"yield_pct": None, "ann_pct": None})
+            patch.update(self._income_figures(mid, strike, dte))
         model.update_row(row, patch)
 
         if (self._selected_leg is not None
@@ -741,31 +729,29 @@ class OptionsIncomeTicket(QDialog):
         self._refresh_row_figures()
         self._recompute()
 
-    def _refresh_row_figures(self) -> None:
-        """Recompute yield/ann on cached row mids for the current
-        strategy (income metrics blank on long strategies)."""
-        model = self._chain_view.chain_model
+    def _income_figures(self, mid: float, strike: float, dte: int) -> dict:
+        """Per-row YIELD/ANN display fields for the current strategy —
+        premium yield is an income (selling) metric, blank on longs."""
         strategy = self._strategy()
-        sell = _ACTION[strategy] == "SELL"
+        if _ACTION[strategy] != "SELL":
+            return {"yield_pct": None, "ann_pct": None}
+        ref = self._spot if strategy == "CC" else strike
+        y = oi.yield_pct(mid, ref)
+        return {"yield_pct": float(y),
+                "ann_pct": float(oi.annualized_pct(y, dte))}
+
+    def _refresh_row_figures(self) -> None:
+        """Re-derive yield/ann from cached row mids (side toggled)."""
+        model = self._chain_view.chain_model
         exp = self._expiry.selected()
         dte = exp.dte if exp else 0
         for i in range(model.rowCount()):
             rd = model.row_data(i) or {}
-            if rd.get("sep"):
-                continue
             mid = rd.get("mid") or 0
-            if mid <= 0:
+            if rd.get("sep") or mid <= 0:
                 continue
-            if sell:
-                ref = (self._spot if strategy == "CC"
-                       else float(rd.get("strike") or 0))
-                y = oi.yield_pct(mid, ref)
-                model.update_row(i, {
-                    "yield_pct": float(y),
-                    "ann_pct": float(oi.annualized_pct(y, dte)),
-                })
-            else:
-                model.update_row(i, {"yield_pct": None, "ann_pct": None})
+            model.update_row(i, self._income_figures(
+                mid, float(rd.get("strike") or 0), dte))
 
     def _on_expiry_changed(self, _ymd: str) -> None:
         self._price_pending = True
