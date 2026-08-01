@@ -274,6 +274,51 @@ class FlashTradeView(QWidget):
             self._account_list.action_requested.connect(
                 self._on_account_list_action)
 
+        # ── Percent-of-account sizing context (SH/% toggle) ──────────────
+        # Both size rows resolve %-of-NLV previews against the checked
+        # accounts; re-resolve on selection changes and (debounced —
+        # summary batches arrive 4×/s per worker) on model updates.
+        self._order_entry.set_percent_context(self._percent_sizing_accounts)
+        if hasattr(self._book_trading, "set_percent_context"):
+            self._book_trading.set_percent_context(
+                self._percent_sizing_accounts)
+        self._pct_refresh_debounce = QTimer(self)
+        self._pct_refresh_debounce.setSingleShot(True)
+        self._pct_refresh_debounce.setInterval(500)
+        self._pct_refresh_debounce.timeout.connect(
+            self._refresh_percent_previews)
+        if isinstance(self._account_list, AccountListPanel):
+            self._account_list.selection_changed.connect(
+                lambda _s: self._refresh_percent_previews())
+        if self._accounts_model is not None:
+            self._accounts_model.dataChanged.connect(
+                lambda *_a: self._pct_refresh_debounce.start())
+
+    def _percent_sizing_accounts(
+            self, symbol: str) -> list[tuple[str, float, float, float]]:
+        """[(account, net_liq, buying_power, held_shares)] for the
+        checked accounts — the provider both size rows resolve percent
+        previews against.  *held_shares* is the account's STK position
+        in *symbol* (the SELL side's basis)."""
+        if (self._accounts_model is None
+                or not isinstance(self._account_list, AccountListPanel)):
+            return []
+        out = []
+        for a in self._account_list.get_selected_accounts():
+            pos = self._account_position.position_for_symbol(a, symbol) \
+                if symbol else None
+            held = float((pos or {}).get("position") or 0.0)
+            out.append((a,
+                        self._accounts_model.get_net_liquidation(a),
+                        self._accounts_model.get_buying_power(a),
+                        held))
+        return out
+
+    def _refresh_percent_previews(self) -> None:
+        self._order_entry.refresh_percent_preview()
+        if hasattr(self._book_trading, "refresh_percent_preview"):
+            self._book_trading.refresh_percent_preview()
+
     @property
     def trades_panel(self) -> TradesPanel:
         """Host-side accessor so MainWindow can use it as a ColumnsProvider."""
@@ -394,6 +439,29 @@ class FlashTradeView(QWidget):
         last_price = payload.get("last_price", 0.0)
         sec_type = contract.get("sec_type", "")
 
+        # ── Percent-of-account sizing (SH/% toggle) ───────────────────────
+        # Only the plain Buy/Sell paths ever stamp ``qty_pct``.  Sizing
+        # is SIDE-AWARE and per account inside the fan-out loop below:
+        # BUY resolves pct of the account's NetLiquidation at the live
+        # price; SELL resolves pct of the account's position in this
+        # symbol (price-free, never opens a short).
+        qty_pct = payload.get("qty_pct")
+        pct_price = 0.0
+        if qty_pct and sec_type == "FUT":
+            # Belt-and-braces — the UI never offers % for futures.
+            log.warning("FlashTrade: qty_pct on a FUT order ignored")
+            qty_pct = None
+        if qty_pct and action != "SELL":
+            pct_price = (float(last_price) if last_price > 0
+                         else float(payload.get("limit_price") or 0.0))
+            if pct_price <= 0:
+                log.warning("FlashTrade: percent sizing without a live "
+                            "price – aborting order")
+                self.transient_status_message.emit(
+                    "Percent sizing needs a live price — order not sent.",
+                    5000)
+                return
+
         # ── Resolve preferences and tick size up-front ────────────────────
         from src.utils.helpers import (
             calculate_capped_price, calculate_offset, tick_size_for_contract,
@@ -502,6 +570,7 @@ class FlashTradeView(QWidget):
                  action, order_type, qty, symbol, len(accounts), accounts)
 
         # ── 3. Route to correct worker for each account ───────────────────
+        pct_skipped: list[str] = []
         for account in accounts:
             worker = self._find_worker_for_account(account)
             if not worker:
@@ -511,6 +580,51 @@ class FlashTradeView(QWidget):
 
             # Ensure order_status_updated signal is wired for this worker
             self._ensure_worker_connected(worker)
+
+            acct_qty = qty
+            if qty_pct and action == "SELL":
+                # SELL: pct of this account's position in the symbol
+                # (ceil, capped at held — mirrors close-pct).  Flat or
+                # short holders are SKIPPED, never shorted.
+                from src.core.percent_sizing import sell_shares_from_position
+                root = contract.get("symbol", "") or symbol
+                pos = self._account_position.position_for_symbol(
+                    account, root)
+                held = float((pos or {}).get("position") or 0.0)
+                acct_qty = sell_shares_from_position(qty_pct, held)
+                if acct_qty <= 0:
+                    log.warning("FlashTrade: %s holds no %s – percent "
+                                "sell skipped", account, root)
+                    pct_skipped.append(account)
+                    continue
+                log.info("FlashTrade: sell %s%% of %s's %s position "
+                         "(%s) → %d share(s)", qty_pct, account, root,
+                         held, acct_qty)
+            elif qty_pct:
+                # BUY: resolve this account's own share count from its
+                # own NetLiquidation.  An account without NLV data is
+                # SKIPPED — silently trading a guessed size is worse
+                # than not trading it.
+                from src.core.percent_sizing import resolve_percent_qty
+                nlv = (self._accounts_model.get_net_liquidation(account)
+                       if self._accounts_model else 0.0)
+                if nlv <= 0:
+                    log.warning("FlashTrade: %s has no NetLiquidation "
+                                "data – percent order skipped", account)
+                    pct_skipped.append(account)
+                    continue
+                bp = (self._accounts_model.get_buying_power(account)
+                      if self._accounts_model else 0.0)
+                acct_qty = resolve_percent_qty(qty_pct, nlv, pct_price, bp)
+                if acct_qty <= 0:
+                    log.warning("FlashTrade: %s%% of %s resolves to 0 "
+                                "shares for %s – skipped",
+                                qty_pct, nlv, account)
+                    pct_skipped.append(account)
+                    continue
+                log.info("FlashTrade: %s%% of %s → %d share(s) for %s "
+                         "@ %.4f", qty_pct, account, acct_qty, symbol,
+                         pct_price)
 
             params = {
                 "conid": int(conid),
@@ -531,7 +645,7 @@ class FlashTradeView(QWidget):
                 "multiplier": contract.get("multiplier", ""),
                 "account": account,
                 "action": action,
-                "qty": qty,
+                "qty": acct_qty,
                 "order_type": order_type,
                 "tif": "DAY"
             }
@@ -581,6 +695,12 @@ class FlashTradeView(QWidget):
                 worker.place_option_order(params)
             else:
                 worker.place_order(params)
+
+        if pct_skipped:
+            self.transient_status_message.emit(
+                f"Percent sizing skipped {len(pct_skipped)} account(s) "
+                f"(no Net Liq data or size resolved to 0): "
+                f"{', '.join(pct_skipped)}", 6000)
 
     def _on_account_action_requested(self, data: dict) -> None:
         """Positions-panel account context menu → route the action."""
@@ -823,23 +943,10 @@ class FlashTradeView(QWidget):
         shared accounts model, or ``None`` if the account isn't known there."""
         if self._accounts_model is None:
             return None
-        from .accounts_model import COL_NET_LIQ, COL_EXCESS_LIQ
-        label = self._accounts_model.connection_for_account(account)
-        if label is None:
+        if self._accounts_model.connection_for_account(account) is None:
             return None
-        row_idx = self._accounts_model._row_map.get((label, account))
-        if row_idx is None:
-            return None
-        row_data = self._accounts_model._table_data[row_idx]
-
-        def _f(v) -> float:
-            try:
-                return float(v) if v else 0.0
-            except (ValueError, TypeError):
-                return 0.0
-
-        return (_f(row_data[COL_NET_LIQ]),
-                _f(row_data[COL_EXCESS_LIQ]),
+        return (self._accounts_model.get_net_liquidation(account),
+                self._accounts_model.get_excess_liquidity(account),
                 self._accounts_model.get_buying_power(account))
 
     def _push_account_balances(self, account: str) -> None:

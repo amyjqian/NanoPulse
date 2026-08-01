@@ -180,8 +180,15 @@ class SymbolChipBar(QWidget):
         self._search.setStyleSheet(
             f"QLineEdit{{ background:#262a36; color:{Theme.TEXT};"
             f" border:1px solid {Theme.BORDER}; border-radius:6px;"
-            " padding:5px 10px; font-size:11px; }"
+            " padding:2px 10px; font-size:11px; }"
             f"QLineEdit:focus{{ border-color:{ACCENT_BLUE}; }}")
+        # The search box was the tall element in the row (28 px vs the
+        # chips' 23) — pin it to the chips' own height so the whole bar
+        # matches the account panel's group-chip strip.
+        probe = QPushButton("X")
+        probe.setStyleSheet(_symbol_chip_style(False))
+        self._search.setFixedHeight(probe.sizeHint().height())
+        probe.deleteLater()
         self._search.textEdited.connect(self._on_search_edited)
         self._search.returnPressed.connect(self._pick_first_result)
         row.addWidget(self._search)

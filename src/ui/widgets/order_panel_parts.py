@@ -32,6 +32,17 @@ from PySide6.QtWidgets import (
 )
 
 from src.ui.theme import Theme
+from src.ui.widgets.size_unit_parts import (
+    PCT_DEFAULT,
+    PCT_POPUP,
+    PCT_PRESETS,
+    UNIT_PCT,
+    UNIT_SH,
+    PercentSizingContext,
+    apply_sized_chip_style,
+    apply_unit_toggle_style,
+    make_unit_toggle,
+)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -545,25 +556,53 @@ class QtyChipRow(QWidget):
     integer-input widget comes from ``order_entry_panel._QtyInput`` —
     reused directly so the popup-ladder behaviour is identical across
     panels.
+
+    With ``allow_percent=True`` (stocks only) the row grows an SH/%
+    unit toggle (spec: NanoPulse-Ladder-Percent-Sizing.md).  Percent
+    mode recolors the row gold and sizes as percent of account net
+    liquidation, resolved through :class:`PercentSizingContext`.
+    ``qty_changed`` still always carries **resolved shares** — in
+    percent mode that is the conservative preview count — so every
+    existing consumer (hover badge, tier sections) keeps pure share
+    semantics.  The unit is never persisted: every ``set_presets``
+    (launch / symbol switch) resets to shares.
     """
 
-    qty_changed = Signal(int)
+    qty_changed = Signal(int)        # resolved shares, both units
+    # Per-side % readouts ("B:1,946", "S:150"); empty strings in share
+    # mode or when a side doesn't resolve.
+    preview_changed = Signal(str, str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._active_qty: int = 0
         self._default: int = 0
         self._presets: list[int] = []
+        self._share_popup: list[int] = []
         self._buttons: list[QPushButton] = []
+
+        self._unit: str = UNIT_SH
+        self._allow_percent = False
+        self._active_pct: int = PCT_DEFAULT
+        self._pct_ctx = PercentSizingContext()
+        # Per-unit memory (spec §3.2/3.3): selected chip and custom text
+        # survive a toggle round-trip independently per unit.
+        self._sel_by_unit: dict[str, int | None] = {}
+        self._custom_by_unit: dict[str, str] = {}
 
         self._layout = QHBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.setSpacing(4)
         # _QtyInput lazily imported to avoid a hard cycle at module load.
         from src.ui.widgets.order_entry_panel import _QtyInput  # noqa: WPS433
+        self._qty_input_max = _QtyInput._MAX_DEFAULT
         self._custom = _QtyInput()
         self._custom.textChanged.connect(self._on_custom_text)
         self._custom.returnPressed.connect(self._on_custom_enter)
+        self._custom.focusChanged.connect(self._on_custom_focus)
+        self._btn_unit = make_unit_toggle()
+        self._btn_unit.clicked.connect(self._on_unit_toggled)
+        self._btn_unit.hide()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -572,47 +611,111 @@ class QtyChipRow(QWidget):
         presets: Sequence[int],
         default: int,
         popup_vals: Sequence[int] | None = None,
+        *,
+        allow_percent: bool = False,
     ) -> None:
         """Rebuild the preset chips with *presets*; *default* is the qty
         selected initially.  *popup_vals* seeds the _QtyInput's arrow-
-        dropdown ladder."""
-        # Clear current widgets from the layout
+        dropdown ladder.  *allow_percent* shows the SH/% toggle (host
+        passes True only for stock symbols)."""
+        # Clear current widgets from the layout.  The custom input AND
+        # the unit toggle are long-lived — deleting the toggle here
+        # would leave a dangling C++ object after the first symbol
+        # switch.
         while self._layout.count():
             item = self._layout.takeAt(0)
             w = item.widget() if item else None
-            if w is not None and w is not self._custom:
+            if w is not None and w is not self._custom \
+                    and w is not self._btn_unit:
                 w.deleteLater()
         self._buttons.clear()
 
         self._presets = list(presets)
         self._default = int(default)
         self._active_qty = self._default
+        self._share_popup = list(popup_vals) if popup_vals is not None else []
+        self._allow_percent = bool(allow_percent)
+        # Unit always resets to shares (spec §3.1 — never persisted).
+        self._unit = UNIT_SH
+        self._active_pct = PCT_DEFAULT
+        self._sel_by_unit = {UNIT_SH: self._default, UNIT_PCT: PCT_DEFAULT}
+        self._custom_by_unit = {UNIT_SH: "", UNIT_PCT: ""}
 
         if popup_vals is not None:
             self._custom.set_presets(list(popup_vals))
-
-        for v in self._presets:
-            btn = QPushButton(str(v))
-            btn.setFixedHeight(28)
-            btn.setMinimumWidth(36)
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setSizePolicy(
-                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            _apply_chip_style(btn, v == self._default)
-            btn.clicked.connect(
-                lambda _checked, q=v: self._on_preset(q))
-            self._buttons.append(btn)
-            self._layout.addWidget(btn)
-
+        self._custom.set_max_value(self._qty_input_max)
+        self._custom.set_accent(None)
         self._custom.blockSignals(True)
         self._custom.clear()
         self._custom.blockSignals(False)
+
+        if self._allow_percent:
+            apply_unit_toggle_style(self._btn_unit, self._unit)
+            self._btn_unit.show()
+            self._layout.addWidget(self._btn_unit)
+        else:
+            self._btn_unit.hide()
         self._layout.addWidget(self._custom)
+        self._build_chip_buttons()
+
+    def set_percent_context(self, accounts_provider) -> None:
+        """*accounts_provider(symbol) -> [(account, nlv, bp, held)]*."""
+        self._pct_ctx.set_accounts_provider(accounts_provider)
+
+    def set_price_provider(self, price_provider) -> None:
+        """*price_provider() -> float* — last price of the active symbol."""
+        self._pct_ctx.set_price_provider(price_provider)
+
+    def set_symbol_provider(self, symbol_provider) -> None:
+        """*symbol_provider() -> str* — the host's active symbol (the
+        SELL side resolves against each account's holding of it)."""
+        self._pct_ctx.set_symbol_provider(symbol_provider)
+
+    def percent_side_qty(self, action: str) -> int:
+        """Per-side conservative resolved count in % mode (BUY → NLV
+        basis, SELL → position basis); 0 in share mode or unresolved."""
+        if self._unit != UNIT_PCT:
+            return 0
+        return self._pct_ctx.side_qty(self._active_pct, action)
+
+    def account_count(self) -> int:
+        """Number of checked accounts the host's provider reports (the
+        fan-out places one order per account, so share mode's true
+        total = qty × this)."""
+        return len(self._pct_ctx.accounts())
+
+    def percent_side_total(self, action: str) -> int:
+        """Per-side TOTAL resolved shares across all checked accounts
+        in % mode; 0 in share mode or unresolved."""
+        if self._unit != UNIT_PCT:
+            return 0
+        return (self._pct_ctx.sell_preview_total(self._active_pct)
+                if action == "SELL"
+                else self._pct_ctx.preview_total(self._active_pct))
+
+    def refresh_percent_preview(self) -> None:
+        """Re-resolve percent mode against fresh price/account data
+        (no-op in share mode).  Host calls this on price ticks, account
+        selection changes and summary updates."""
+        if self._unit != UNIT_PCT:
+            return
+        self._restyle(self._current_chip())
+        self._emit_state()
+
+    def current_unit(self) -> str:
+        return self._unit
+
+    def current_percent(self) -> int | None:
+        """The active percent in % mode, None in share mode."""
+        return self._active_pct if self._unit == UNIT_PCT else None
 
     def set_qty(self, qty: int) -> None:
         """Programmatically set the active qty (no signal emitted).  Used
         by the host to sync from an external source (e.g. keyboard shortcut)
-        without triggering re-entrant order logic."""
+        without triggering re-entrant order logic.  Share mode only —
+        percent mode owns its own state."""
+        if self._unit == UNIT_PCT:
+            return
         qty = int(qty)
         if qty <= 0:
             return
@@ -620,17 +723,107 @@ class QtyChipRow(QWidget):
         self._restyle(qty)
 
     def current_qty(self) -> int:
+        """Resolved shares.  Percent mode resolves live via the context
+        (conservative smallest-account preview; 0 when unresolvable)."""
+        if self._unit == UNIT_PCT:
+            return self._pct_ctx.preview_qty(self._active_pct)
         return self._active_qty
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
-    def _on_preset(self, qty: int) -> None:
-        self._active_qty = qty
+    def _build_chip_buttons(self) -> None:
+        """(Re)build the preset chips for the current unit, keeping the
+        toggle at the head of the row and the custom input at the tail."""
+        for btn in self._buttons:
+            self._layout.removeWidget(btn)
+            btn.deleteLater()
+        self._buttons.clear()
+
+        values = (list(PCT_PRESETS) if self._unit == UNIT_PCT
+                  else self._presets)
+        sel = self._current_chip()
+        insert_at = self._layout.indexOf(self._custom)
+        for v in values:
+            # Plain numbers in both units — the gold row + gold toggle
+            # carry the "this is percent" signal, not a % suffix.
+            btn = QPushButton(str(v))
+            btn.setProperty("qty_value", v)
+            btn.setFixedHeight(28)
+            btn.setMinimumWidth(36)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setSizePolicy(
+                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            btn.clicked.connect(
+                lambda _checked, q=v: self._on_preset(q))
+            self._buttons.append(btn)
+            self._layout.insertWidget(insert_at, btn)
+            insert_at += 1
+        self._restyle(sel)
+
+    def _current_chip(self) -> int | None:
+        """The chip that should show selected: None while a custom value
+        is active in the current unit."""
+        if self._custom_by_unit.get(self._unit):
+            return None
+        return self._sel_by_unit.get(self._unit)
+
+    def _emit_state(self) -> None:
+        self.qty_changed.emit(self.current_qty())
+        if self._unit == UNIT_PCT:
+            buy = self._pct_ctx.preview_total(self._active_pct)
+            sell = self._pct_ctx.sell_preview_total(self._active_pct)
+            self.preview_changed.emit(
+                f"B:{buy:,}" if buy > 0 else "",
+                f"S:{sell:,}" if sell > 0 else "")
+        else:
+            self.preview_changed.emit("", "")
+
+    def _on_unit_toggled(self) -> None:
+        # Snapshot the outgoing unit's custom text, flip, restore the
+        # incoming unit's remembered state (spec §3.3 — carrying one
+        # number across the toggle would turn 750 shares into 750%).
+        self._custom_by_unit[self._unit] = self._custom.text().strip()
+        self._unit = UNIT_PCT if self._unit == UNIT_SH else UNIT_SH
+        pct_mode = self._unit == UNIT_PCT
+        apply_unit_toggle_style(self._btn_unit, self._unit)
+
+        self._custom.set_max_value(100 if pct_mode else self._qty_input_max)
+        self._custom.set_presets(
+            list(PCT_POPUP) if pct_mode else list(self._share_popup))
+        self._custom.set_accent(Theme.CLR_PCT if pct_mode else None)
+        remembered = self._custom_by_unit.get(self._unit, "")
+        self._custom.blockSignals(True)
+        if remembered:
+            self._custom.setText(remembered)
+        else:
+            self._custom.clear()
+        self._custom.blockSignals(False)
+
+        if pct_mode:
+            self._active_pct = (int(remembered) if remembered
+                                else self._sel_by_unit.get(UNIT_PCT)
+                                or PCT_DEFAULT)
+            self._active_pct = min(100, max(1, self._active_pct))
+        else:
+            self._active_qty = (int(remembered) if remembered
+                                else self._sel_by_unit.get(UNIT_SH)
+                                or self._default)
+
+        self._build_chip_buttons()
+        self._emit_state()
+
+    def _on_preset(self, value: int) -> None:
         self._custom.blockSignals(True)
         self._custom.clear()
         self._custom.blockSignals(False)
-        self._restyle(qty)
-        self.qty_changed.emit(qty)
+        self._custom_by_unit[self._unit] = ""
+        self._sel_by_unit[self._unit] = value
+        if self._unit == UNIT_PCT:
+            self._active_pct = value
+        else:
+            self._active_qty = value
+        self._restyle(value)
+        self._emit_state()
 
     def _on_custom_text(self, text: str) -> None:
         text = text.strip()
@@ -642,9 +835,43 @@ class QtyChipRow(QWidget):
             return
         if qty <= 0:
             return
-        self._active_qty = qty
+        self._custom_by_unit[self._unit] = text
+        if self._unit == UNIT_PCT:
+            self._active_pct = min(qty, 100)
+        else:
+            self._active_qty = qty
         self._restyle(None)  # no preset is "current" when custom is active
-        self.qty_changed.emit(qty)
+        self._emit_state()
+
+    def _on_custom_focus(self, focused: bool) -> None:
+        """Entering the custom field drops the chip highlight (the field
+        is now the active input).  On the way out: a typed value that
+        matches a preset is adopted BY the preset (chip lights up, field
+        clears), and an empty field restores the previous highlight."""
+        if focused:
+            self._restyle(None)
+            return
+        self._adopt_matching_preset()
+        if not self._custom.text().strip():
+            self._restyle(self._current_chip())
+
+    def _adopt_matching_preset(self) -> None:
+        """Typed value == an existing chip → normalize onto the chip
+        (same size either way; one selected element, not two)."""
+        text = self._custom.text().strip()
+        if not text:
+            return
+        try:
+            v = int(text)
+        except ValueError:
+            return
+        values = (list(PCT_PRESETS) if self._unit == UNIT_PCT
+                  else self._presets)
+        if v not in values:
+            return
+        self._custom.clear()
+        self._custom_by_unit[self._unit] = ""
+        self._sel_by_unit[self._unit] = v
 
     def _on_custom_enter(self) -> None:
         text = self._custom.text().strip()
@@ -653,18 +880,31 @@ class QtyChipRow(QWidget):
                 return
         except ValueError:
             pass
-        # Invalid on Enter → reset to default.
+        # Invalid on Enter → reset to the current unit's default.
         self._custom.blockSignals(True)
         self._custom.clear()
         self._custom.blockSignals(False)
-        self._active_qty = self._default
-        self._restyle(self._default)
-        self.qty_changed.emit(self._default)
+        self._custom_by_unit[self._unit] = ""
+        if self._unit == UNIT_PCT:
+            self._active_pct = PCT_DEFAULT
+            self._sel_by_unit[UNIT_PCT] = PCT_DEFAULT
+            self._restyle(PCT_DEFAULT)
+        else:
+            self._active_qty = self._default
+            self._sel_by_unit[UNIT_SH] = self._default
+            self._restyle(self._default)
+        self._emit_state()
 
     def _restyle(self, active: int | None) -> None:
+        pct_mode = self._unit == UNIT_PCT
         for btn in self._buttons:
-            try:
-                v = int(btn.text())
-            except ValueError:
-                v = None
-            _apply_chip_style(btn, active is not None and v == active)
+            v = btn.property("qty_value")
+            enabled = True
+            if pct_mode:
+                # A chip stays clickable when EITHER side resolves —
+                # buy needs NLV + live price, sell only needs a held
+                # position (spec §4).
+                enabled = self._pct_ctx.chip_enabled(int(v))
+            apply_sized_chip_style(
+                btn, active is not None and v == active,
+                self._unit, enabled=enabled)

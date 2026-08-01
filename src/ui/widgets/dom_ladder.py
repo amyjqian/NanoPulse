@@ -655,11 +655,14 @@ class DOMLadderDelegate(QStyledItemDelegate):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class DOMLadderView(QTableView):
-    """Anchored price ladder.  Emits ``ladder_clicked(action, price)``
-    where ``action == "BUY"`` for a bid-size cell click and ``"SELL"``
-    for an ask-size cell click; price-column clicks are ignored."""
+    """Anchored price ladder.  Emits ``ladder_clicked(action, price,
+    add_only)`` where ``action == "BUY"`` for a bid-size cell click and
+    ``"SELL"`` for an ask-size cell click; price-column clicks are
+    ignored.  ``add_only`` is True for Shift+left-click or right-click —
+    the host stacks a NEW order instead of toggling/moving resting
+    ones."""
 
-    ladder_clicked = Signal(str, float)
+    ladder_clicked = Signal(str, float, bool)
 
     def __init__(self, parent=None, *, model: DOMLadderModel | None = None) -> None:
         super().__init__(parent)
@@ -733,18 +736,20 @@ class DOMLadderView(QTableView):
         self.setMouseTracking(True)
         self._hover_badge = QLabel(self.viewport())
         self._hover_badge.setObjectName("ladderHoverBadge")
+        self._hover_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._hover_badge.setFont(QFont("Helvetica Neue, Arial", 10, QFont.Weight.Bold))
         self._hover_badge.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self._hover_badge.hide()
         # Optional providers — host (BookTraderView) wires these so the
         # badge can read the current order qty + armed-tier summary.
-        self._qty_provider: Callable[[], int] | None = None
+        self._qty_provider: Callable[[str], int] | None = None
         self._armed_summary_provider: Callable[[], str] | None = None
 
-    def set_qty_provider(self, fn: Callable[[], int]) -> None:
-        """Register a callable returning the current order qty.  Used
-        by the hover badge to render ``"Buy {qty}"`` / ``"Sell {qty}"``."""
+    def set_qty_provider(self, fn: Callable[[str], int]) -> None:
+        """Register a callable *fn(side)* ("BUY"/"SELL") returning the
+        order qty for that side.  Used by the hover badge to render
+        ``"Buy {qty}"`` / ``"Sell {qty}"``."""
         self._qty_provider = fn
 
     def set_armed_summary_provider(self, fn: Callable[[], str]) -> None:
@@ -800,17 +805,20 @@ class DOMLadderView(QTableView):
         """
         if side == "BUY":
             bg, fg = "#1A2A1A", "#3FB950"
-            verb = "Buy"
+            verb = "B"
         else:
             bg, fg = "#2A1818", "#F85149"
-            verb = "Sell"
+            verb = "S"
         qty = 1
         if self._qty_provider is not None:
             try:
-                qty = int(self._qty_provider() or 1)
+                # Side-aware: percent mode resolves different share
+                # counts for Buy (net-liq basis) and Sell (position
+                # basis).  0 renders as 0 — the click is blocked anyway.
+                qty = int(self._qty_provider(side))
             except (TypeError, ValueError):
                 qty = 1
-        primary = f"{verb} {qty}"
+        primary = f"{verb} {qty:,}"
         secondary = ""
         if self._armed_summary_provider is not None:
             try:
@@ -825,6 +833,11 @@ class DOMLadderView(QTableView):
             f"border:1px solid {fg};border-radius:3px;"
             f"padding:2px 6px}}")
         self._hover_badge.adjustSize()
+        # QSS padding (2px 6px) + 1px border are NOT part of a QLabel's
+        # sizeHint — without this allowance longer texts ("Buy 13,449")
+        # clip at both edges.
+        self._hover_badge.resize(self._hover_badge.width() + 16,
+                                 self._hover_badge.height() + 6)
         bw = self._hover_badge.width()
         bh = self._hover_badge.height()
         # BUY hovers sit in the left bid column → place the badge to the
@@ -875,7 +888,8 @@ class DOMLadderView(QTableView):
         click."""
         pos = event.position().toPoint()
         idx = self.indexAt(pos)
-        if idx.isValid():
+        if idx.isValid() and event.button() in (Qt.MouseButton.LeftButton,
+                                                Qt.MouseButton.RightButton):
             row = idx.row()
             col = idx.column()
             prices = self._model.prices
@@ -886,7 +900,13 @@ class DOMLadderView(QTableView):
                 side = self._side_at(pos, col, rect)
                 if side is not None:
                     price = float(prices[row])
-                    self.ladder_clicked.emit(side, price)
+                    # Shift+left or right button = ADD an order at this
+                    # rung without touching resting ones.
+                    add_only = (
+                        bool(event.modifiers()
+                             & Qt.KeyboardModifier.ShiftModifier)
+                        or event.button() == Qt.MouseButton.RightButton)
+                    self.ladder_clicked.emit(side, price, add_only)
         super().mousePressEvent(event)
 
     def _scroll_to_last(self) -> None:

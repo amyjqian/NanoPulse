@@ -292,9 +292,18 @@ class BookTraderView(QWidget):
         root.addSpacing(7)
 
         # ── Qty chip row ──────────────────────────────────────────────────────
+        # The SH/% percent-of-account toggle is stocks-only: futures
+        # size in contracts against margin (notional percent math is
+        # meaningless there) and options carry multiplier semantics —
+        # both keep today's plain share/contract row (spec §4).
         self._qty_row = QtyChipRow()
         presets, default, popup = _presets_for_sec(self._active_sec_type)
-        self._qty_row.set_presets(presets, default, popup)
+        self._qty_row.set_presets(
+            presets, default, popup,
+            allow_percent=(self._active_sec_type == "STK"))
+        self._qty_row.set_price_provider(lambda: self._last_price)
+        self._qty_row.set_symbol_provider(lambda: self._active_symbol or "")
+        self._qty_row.preview_changed.connect(self._on_qty_preview_changed)
         self._active_qty = default
         root.addWidget(self._qty_row)
 
@@ -342,13 +351,24 @@ class BookTraderView(QWidget):
         self._cmb_tick = QComboBox()
         self._cmb_tick.setFixedHeight(24)
         self._cmb_tick.setMaximumWidth(86)
+        # combobox-popup:0 forces Qt's list-view popup instead of the
+        # native macOS menu — the native one ignores the dark styling
+        # and flashes a white panel.  The popup palette matches the
+        # qty-input dropdown ladder (#1E222A / #0071e3 highlight).
         self._cmb_tick.setStyleSheet(
             f"QComboBox{{background:{Theme.BG_INPUT};color:{Theme.TEXT};"
             f"border:1px solid {Theme.BORDER};border-radius:3px;"
-            f"padding:1px 6px;font-size:11px}}"
+            f"padding:1px 6px;font-size:11px;combobox-popup:0}}"
             f"QComboBox:hover{{border-color:{Theme.ACCENT}}}"
-            f"QComboBox QAbstractItemView{{background:{Theme.BG_INPUT};"
-            f"color:{Theme.TEXT};selection-background-color:#3a3f50}}")
+            "QComboBox::drop-down{border:none;width:16px}"
+            "QComboBox QAbstractItemView{background:#1E222A;"
+            f"color:{Theme.TEXT};border:1px solid #3a3f50;"
+            "border-radius:4px;outline:none;padding:2px;font-size:12px}"
+            "QComboBox QAbstractItemView::item{padding:3px 10px;"
+            "border:none;min-height:20px}"
+            "QComboBox QAbstractItemView::item:hover,"
+            "QComboBox QAbstractItemView::item:selected"
+            "{background:#0071e3;color:white;border-radius:3px}")
         self._cmb_tick.currentTextChanged.connect(self._on_tick_changed)
 
         # Lock button — when locked the ladder auto-scrolls so the
@@ -398,14 +418,47 @@ class BookTraderView(QWidget):
         # Centre cell groups the tick-aggregation combo and the lock
         # button side-by-side under a single stretch slot; outer cells
         # hold the BID SZ / ASK SZ labels.
+        # Percent-mode safety readouts (spec §5): each side's resolved
+        # share count must be on screen BEFORE any rung click.  Hidden
+        # in share mode so the header stays pixel-identical to today.
+        # Header = 5 slots: Bid Size · B:… · [lock+interval] · S:… ·
+        # Ask Size, with the interval group staying dead-centre (three
+        # equal-stretch thirds).
+        _pct_ss = (
+            "color: {clr}; border: none; font-size: 11px; "
+            "font-family: 'Helvetica Neue', Arial; font-weight: bold;")
+        self._lbl_pct_buy = QLabel("")
+        self._lbl_pct_buy.setStyleSheet(_pct_ss.format(clr=Theme.ACCENT))
+        self._lbl_pct_buy.hide()
+        self._lbl_pct_sell = QLabel("")
+        self._lbl_pct_sell.setStyleSheet(_pct_ss.format(clr="#F85149"))
+        self._lbl_pct_sell.hide()
+
+        left_box = QHBoxLayout()
+        left_box.setContentsMargins(0, 0, 0, 0)
+        left_box.setSpacing(4)
+        left_box.addWidget(self._lbl_bid_hdr)
+        left_box.addStretch(1)
+        left_box.addWidget(self._lbl_pct_buy)
+
         centre_box = QHBoxLayout()
         centre_box.setContentsMargins(0, 0, 0, 0)
         centre_box.setSpacing(4)
+        centre_box.addStretch(1)
         centre_box.addWidget(self._btn_lock)
         centre_box.addWidget(self._cmb_tick)
-        hdr.addWidget(self._lbl_bid_hdr, stretch=1)
+        centre_box.addStretch(1)
+
+        right_box = QHBoxLayout()
+        right_box.setContentsMargins(0, 0, 0, 0)
+        right_box.setSpacing(4)
+        right_box.addWidget(self._lbl_pct_sell)
+        right_box.addStretch(1)
+        right_box.addWidget(self._lbl_ask_hdr)
+
+        hdr.addLayout(left_box, stretch=1)
         hdr.addLayout(centre_box, stretch=1)
-        hdr.addWidget(self._lbl_ask_hdr, stretch=1)
+        hdr.addLayout(right_box, stretch=1)
         root.addLayout(hdr)
 
         # ── DOM ladder ────────────────────────────────────────────────────────
@@ -420,7 +473,7 @@ class BookTraderView(QWidget):
         # Hover badge content — ``Buy {qty}`` / ``Sell {qty}`` plus a
         # second line listing armed TP / SL / TS amounts so the trader
         # sees exactly what a click would submit.
-        self._ladder.set_qty_provider(lambda: self._active_qty)
+        self._ladder.set_qty_provider(self._ladder_badge_qty)
         self._ladder.set_armed_summary_provider(self._format_attached_summary)
         # Populate tick combo for the initial contract.
         self._populate_tick_combo()
@@ -533,6 +586,9 @@ class BookTraderView(QWidget):
         # ``_l2_seen`` flips True the real depth takes over.
         if not self._l2_ok or not self._l2_seen:
             self._render_l1_depth()
+        # Percent sizing re-resolves on every tick (no-op in SH mode;
+        # bg ticks are already throttled upstream).
+        self._qty_row.refresh_percent_preview()
 
     def feed_depth(
         self,
@@ -708,7 +764,10 @@ class BookTraderView(QWidget):
         self._ticker.set_symbol(sym)
         self._chip_bar.set_active(sym)
         presets, default, popup = _presets_for_sec(self._active_sec_type)
-        self._qty_row.set_presets(presets, default, popup)
+        # allow_percent resets the row to SH mode too (never persisted).
+        self._qty_row.set_presets(
+            presets, default, popup,
+            allow_percent=(self._active_sec_type == "STK"))
         self._active_qty = default
         # New symbol → reset last price and ladder centre; real data
         # will arrive on the next tick.
@@ -888,7 +947,8 @@ class BookTraderView(QWidget):
             self._bg_worker.unsubscribe_depth(self._active_symbol)
             self._bg_worker.subscribe_depth(self._active_symbol)
 
-    def _on_ladder_clicked(self, action: str, price: float) -> None:
+    def _on_ladder_clicked(self, action: str, price: float,
+                           add_only: bool = False) -> None:
         """Click on a bid-size or ask-size cell.
 
         Behaviour mirrors pro DOM ladders:
@@ -899,69 +959,73 @@ class BookTraderView(QWidget):
         * Click on a different price while a same-side LMT is resting
           → cancel the old order and place a new one at the click
           (move the order).
+        * Shift+left-click or right-click (*add_only*) → STACK a new
+          LMT at the rung without touching any resting order — for
+          laddering multiple orders at different prices.
 
         Only plain LMT orders are considered — STP / STP LMT protective
         orders are left alone so a casual click doesn't drop a stop.
         """
         if not self._active_symbol or price <= 0:
             return
-        tick = self._model.tick_size
-        tol = (tick / 2) if tick > 0 else 0.01
+        if not add_only:
+            tick = self._model.tick_size
+            tol = (tick / 2) if tick > 0 else 0.01
 
-        # Match the active symbol against both bare and local symbols
-        # (futures' order blotter uses the local symbol, e.g. "MNQM6").
-        accepted: set[str] = {self._active_symbol.upper()}
-        try:
-            from src.core.reference_data import get_instance as _rd
-            for c in _rd().contracts_by_symbol.get(
-                    self._active_symbol.upper(), []):
-                local = (c.get("local_symbol") or "").upper()
-                if local:
-                    accepted.add(local)
-        except Exception:
-            pass
-
-        # Collect resting same-side LMTs for this symbol — keeping
-        # (order_id, price) so we can match against the click.
-        same_side_lmt: list[tuple[str, float]] = []
-        for oid, od in self._live_orders.items():
-            if (od.get("symbol") or "").upper() not in accepted:
-                continue
-            if (od.get("action") or "").upper() != action:
-                continue
-            if (od.get("order_type") or "").upper() != "LMT":
-                continue
+            # Match the active symbol against both bare and local symbols
+            # (futures' order blotter uses the local symbol, e.g. "MNQM6").
+            accepted: set[str] = {self._active_symbol.upper()}
             try:
-                op = float(od.get("limit_price") or 0.0)
-            except (TypeError, ValueError):
-                continue
-            if op <= 0:
-                continue
-            same_side_lmt.append((oid, op))
+                from src.core.reference_data import get_instance as _rd
+                for c in _rd().contracts_by_symbol.get(
+                        self._active_symbol.upper(), []):
+                    local = (c.get("local_symbol") or "").upper()
+                    if local:
+                        accepted.add(local)
+            except Exception:
+                pass
 
-        # Click on existing order's price → cancel-only (toggle off).
-        # Collect every matching order before returning — multi-account
-        # fan-out leaves one resting LMT per account at the same price,
-        # and the user expects a single click to cancel the whole batch
-        # (otherwise the toggle takes N clicks to clear N accounts).
-        matches = [oid for oid, op in same_side_lmt
-                   if abs(op - price) < tol]
-        if matches:
-            log.info("BookTrader: click on resting %s LMT %s @ %.4f "
-                     "— cancelling %d order(s)", action,
-                     self._active_symbol, price, len(matches))
-            for oid in matches:
+            # Collect resting same-side LMTs for this symbol — keeping
+            # (order_id, price) so we can match against the click.
+            same_side_lmt: list[tuple[str, float]] = []
+            for oid, od in self._live_orders.items():
+                if (od.get("symbol") or "").upper() not in accepted:
+                    continue
+                if (od.get("action") or "").upper() != action:
+                    continue
+                if (od.get("order_type") or "").upper() != "LMT":
+                    continue
+                try:
+                    op = float(od.get("limit_price") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if op <= 0:
+                    continue
+                same_side_lmt.append((oid, op))
+
+            # Click on existing order's price → cancel-only (toggle off).
+            # Collect every matching order before returning — multi-account
+            # fan-out leaves one resting LMT per account at the same price,
+            # and the user expects a single click to cancel the whole batch
+            # (otherwise the toggle takes N clicks to clear N accounts).
+            matches = [oid for oid, op in same_side_lmt
+                       if abs(op - price) < tol]
+            if matches:
+                log.info("BookTrader: click on resting %s LMT %s @ %.4f "
+                         "— cancelling %d order(s)", action,
+                         self._active_symbol, price, len(matches))
+                for oid in matches:
+                    self.cancel_order_requested.emit(oid)
+                return
+
+            # Click on different price while a same-side LMT rests → cancel
+            # the old order(s) before placing the new one.  Cancels fire
+            # first; TWS handles the two operations independently.
+            for oid, op in same_side_lmt:
+                log.info("BookTrader: move %s LMT for %s from %.4f to %.4f "
+                         "— cancelling old order", action,
+                         self._active_symbol, op, price)
                 self.cancel_order_requested.emit(oid)
-            return
-
-        # Click on different price while a same-side LMT rests → cancel
-        # the old order(s) before placing the new one.  Cancels fire
-        # first; TWS handles the two operations independently.
-        for oid, op in same_side_lmt:
-            log.info("BookTrader: move %s LMT for %s from %.4f to %.4f "
-                     "— cancelling old order", action,
-                     self._active_symbol, op, price)
-            self.cancel_order_requested.emit(oid)
 
         # Build payload in the same shape OrderEntryPanel emits for a
         # BID_LMT / ASK_LMT order so FlashTradeView's existing
@@ -982,6 +1046,23 @@ class BookTraderView(QWidget):
             "trailing": self._tr_section.get_value()
                 if hasattr(self, "_tr_section") else None,
         }
+        pct = self._qty_row.current_percent()
+        if pct is not None:
+            # Percent mode is SIDE-AWARE: BUY resolves against each
+            # account's net liq, SELL against each account's position in
+            # this symbol (never opens a short).  qty carries the
+            # conservative per-side preview; the real per-account counts
+            # are resolved in FlashTradeView's fan-out.
+            side_qty = self._qty_row.percent_side_qty(action)
+            if side_qty <= 0:
+                log.warning("BookTrader: %s %s%% resolves to 0 shares "
+                            "(no %s) — ladder click ignored",
+                            action, pct,
+                            "position held" if action == "SELL"
+                            else "price/account data")
+                return
+            payload["qty"] = side_qty
+            payload["qty_pct"] = int(pct)
         log.info("BookTrader: ladder click → %s %s @ %.4f",
                  action, self._active_symbol, price)
         self.order_requested.emit(payload)
@@ -1000,13 +1081,48 @@ class BookTraderView(QWidget):
             offset_pts = raw_val
         if offset_pts <= 0:
             return
+        # Close-tier (like flatten / reverse / cancel) must never
+        # inherit percent semantics — it consumes the resolved-share
+        # snapshot, matching the on-screen readout.
+        qty = int(self._qty_row.current_qty())
+        if qty <= 0:
+            log.warning("BookTrader: close-tier skipped — qty unresolved")
+            return
         self.close_tier_requested.emit({
             "side": side,
             "symbol": self._active_symbol,
-            "qty": int(self._qty_row.current_qty()),
+            "qty": qty,
             "offset_pts": offset_pts,
             "last_price": float(self._last_price),
         })
+
+    # ── Percent sizing (SH/% toggle) ─────────────────────────────────────────
+
+    def set_percent_context(self, accounts_provider) -> None:
+        """Host (FlashTradeView) pushes the checked-accounts provider:
+        ``fn() -> [(account, net_liq, buying_power)]``."""
+        self._qty_row.set_percent_context(accounts_provider)
+
+    def refresh_percent_preview(self) -> None:
+        """Re-resolve the % readout (account selection / summary change)."""
+        self._qty_row.refresh_percent_preview()
+
+    def _ladder_badge_qty(self, side: str) -> int:
+        """Hover-badge count for *side* ("BUY"/"SELL") — always the
+        TOTAL a click would transmit.  % mode: per-side resolved total
+        across the checked accounts.  Share mode: the active qty × the
+        number of checked accounts (the fan-out places one order per
+        account)."""
+        if self._qty_row.current_percent() is not None:
+            return self._qty_row.percent_side_total(side)
+        return self._active_qty * max(1, self._qty_row.account_count())
+
+    def _on_qty_preview_changed(self, buy_text: str,
+                                sell_text: str) -> None:
+        self._lbl_pct_buy.setText(buy_text)
+        self._lbl_pct_buy.setVisible(bool(buy_text))
+        self._lbl_pct_sell.setText(sell_text)
+        self._lbl_pct_sell.setVisible(bool(sell_text))
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

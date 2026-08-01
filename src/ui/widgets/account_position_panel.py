@@ -862,6 +862,11 @@ class AccountPositionPanel(QWidget):
         """Full STK position dict for (account, symbol), or None."""
         return self._model.position_for_symbol(account, symbol)
 
+    def stk_positions_for_account(self, account: str) -> list[dict]:
+        """All non-flat STK positions for *account* (model delegate —
+        FlashTradeView hands this to the Options Income ticket)."""
+        return self._model.stk_positions_for_account(account)
+
     def held_shares(self, account: str, symbol: str) -> float:
         """Shares *account* currently holds in *symbol* (0.0 if none/unknown)."""
         return self._model.position_qty_for_symbol(account, symbol)

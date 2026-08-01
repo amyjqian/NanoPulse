@@ -52,6 +52,17 @@ from PySide6.QtWidgets import (
 
 from src.core import config_manager
 from src.ui.widgets.order_panel_parts import DraggableChip, attach_exchange_badge
+from src.ui.widgets.size_unit_parts import (
+    PCT_DEFAULT,
+    PCT_POPUP,
+    PCT_PRESETS,
+    UNIT_PCT,
+    UNIT_SH,
+    PercentSizingContext,
+    apply_sized_chip_style,
+    apply_unit_toggle_style,
+    make_unit_toggle,
+)
 
 log = logging.getLogger(__name__)
 
@@ -564,6 +575,7 @@ class TickPriceInput(QWidget):
             | Qt.WindowType.WindowStaysOnTopHint
         )
         popup.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        popup.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         popup.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         popup.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         popup.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
@@ -802,12 +814,22 @@ class _QtyInput(QWidget):
     _BTN_W        = 18
     _VISIBLE_ROWS = 10
     _ROW_H        = 22
+    _MAX_DEFAULT  = 999_999_999
 
     textChanged   = Signal(str)
     returnPressed = Signal()
+    focusChanged  = Signal(bool)   # edit gained (True) / lost focus
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        # The input renders as ONE rounded component: this widget is the
+        # styled container (background + border + radius); the edit and
+        # the arrow column sit transparent inside it, split by a thin
+        # separator line.
+        self.setObjectName("qtyInputBox")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._accent:               str | None         = None
+        self._max:                  int                = self._MAX_DEFAULT
         self._presets:              list[int]          = []
         self._popup:                QListWidget | None = None
         self._arrow_w:              QWidget     | None = None
@@ -830,27 +852,21 @@ class _QtyInput(QWidget):
         self._edit.setSizePolicy(
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         # Reject non-numeric keystrokes at input time
-        self._edit.setValidator(QIntValidator(1, 999_999_999, self._edit))
-        self._edit.setStyleSheet(
-            "QLineEdit{background:#3a3a4a;color:#ccc;border:none;"
-            "border-radius:6px 0 0 6px;padding:2px 6px;font-size:11px}"
-            "QLineEdit:focus{background:#4a4a5a;color:white}"
-        )
+        self._edit.setValidator(QIntValidator(1, self._MAX_DEFAULT,
+                                              self._edit))
         self._edit.textChanged.connect(self._relay_text)
+        # Text presence drives the selected-look — restyle on every edit.
+        self._edit.textChanged.connect(lambda _t: self._apply_styles())
         self._edit.returnPressed.connect(self._close_popup)
         self._edit.returnPressed.connect(self.returnPressed.emit)
         self._edit.installEventFilter(self)
 
-        _arrow_ss = (
-            "QToolButton{background:#3a3a4a;color:#aaa;border:none;"
-            "font-size:7px;padding:0;margin:0}"
-            "QToolButton:hover{background:#4a4a5a;color:white}"
-            "QToolButton:pressed{background:#0071e3;color:white}"
-        )
         self._btn_up = QToolButton()
         self._btn_up.setText("▲")
         self._btn_up.setFixedSize(self._BTN_W, self._CHIP_H // 2)
-        self._btn_up.setStyleSheet(_arrow_ss)
+        # Steppers must not steal focus from the edit — a FocusOut here
+        # would trigger the host row's leave-the-field handling mid-step.
+        self._btn_up.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._btn_up.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_up.setAutoRepeat(True)
         self._btn_up.setAutoRepeatDelay(400)
@@ -860,7 +876,7 @@ class _QtyInput(QWidget):
         self._btn_dn = QToolButton()
         self._btn_dn.setText("▼")
         self._btn_dn.setFixedSize(self._BTN_W, self._CHIP_H // 2)
-        self._btn_dn.setStyleSheet(_arrow_ss)
+        self._btn_dn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._btn_dn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_dn.setAutoRepeat(True)
         self._btn_dn.setAutoRepeatDelay(400)
@@ -874,9 +890,7 @@ class _QtyInput(QWidget):
         arrow_col.addWidget(self._btn_dn)
 
         self._arrow_w = QWidget()
-        self._arrow_w.setFixedSize(self._BTN_W, self._CHIP_H)
-        self._arrow_w.setStyleSheet(
-            "QWidget{background:#3a3a4a;border:none;border-radius:0 6px 6px 0}")
+        self._arrow_w.setFixedSize(self._BTN_W, self._CHIP_H - 2)
         self._arrow_w.setLayout(arrow_col)
 
         lay.addWidget(self._edit, 1)
@@ -885,11 +899,100 @@ class _QtyInput(QWidget):
         self.setFixedHeight(self._CHIP_H)
         self.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._apply_styles()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def set_presets(self, values: list[int]) -> None:
         self._presets = values
+
+    def set_max_value(self, top: int) -> None:
+        """Cap typed/stepped values — percent mode passes 100, share
+        mode restores the wide default (spec §3.3)."""
+        self._max = max(1, int(top))
+        v = self._edit.validator()
+        if v is not None:
+            v.setTop(self._max)
+
+    def set_accent(self, color: str | None) -> None:
+        """Unit styling for the whole input.  ``None`` = share mode
+        (grey); a color = percent mode (the percent chips' dark-gold
+        palette, hint "%").  Focus flips the entire box to the
+        selected-chip look — solid accent with near-black text."""
+        self._accent = color
+        self._edit.setPlaceholderText("Qty" if color is None else "%")
+        self._apply_styles()
+
+    def _palette(self) -> dict:
+        """Colors for the current unit × active state.
+
+        "Active" = the user is in the field OR it holds a typed value
+        (i.e. the custom value is the working size) — either way the
+        box renders like a SELECTED chip of the current unit, so the
+        selection survives the cursor moving elsewhere."""
+        active = self._edit.hasFocus() or bool(self._edit.text().strip())
+        if self._accent is None:                      # share mode
+            if active:                                # selected-chip blue
+                return {
+                    "box_bg": "#0071e3",
+                    "border": "#0077ed",
+                    "text": "white",
+                    "bold": True,
+                    "arrow": "white",
+                    "arrow_hover": "white",
+                    "sep": "#0077ed",
+                }
+            return {                                  # idle grey
+                "box_bg": "#3a3a4a",
+                "border": "#4a4a5a",
+                "text": "#ccc",
+                "bold": False,
+                "arrow": "#aaa",
+                "arrow_hover": "white",
+                "sep": "#4a4a5a",
+            }
+        if active:                                    # % : solid gold
+            return {
+                "box_bg": self._accent,
+                "border": Theme.CLR_PCT_BORDER,
+                "text": Theme.CLR_PCT_ON,
+                "bold": True,
+                "arrow": Theme.CLR_PCT_ON,
+                "arrow_hover": Theme.CLR_PCT_ON,
+                "sep": Theme.CLR_PCT_BORDER,
+            }
+        return {                                      # % idle: dark gold
+            "box_bg": Theme.CLR_PCT_BG,
+            "border": "#4a4126",
+            "text": Theme.CLR_PCT_TEXT,
+            "bold": False,
+            "arrow": Theme.CLR_PCT_TEXT,
+            "arrow_hover": Theme.CLR_PCT_BORDER,
+            "sep": "#4a4126",
+        }
+
+    def _apply_styles(self) -> None:
+        """One rounded box: background/border/radius live on the
+        container; edit + arrows are transparent inside it, with a thin
+        separator line between number and arrows."""
+        p = self._palette()
+        weight = "font-weight:bold;" if p["bold"] else ""
+        self.setStyleSheet(
+            f"QWidget#qtyInputBox{{background:{p['box_bg']};"
+            f"border:1px solid {p['border']};border-radius:6px}}")
+        self._edit.setStyleSheet(
+            f"QLineEdit{{background:transparent;color:{p['text']};"
+            f"border:none;padding:2px 6px;font-size:11px;{weight}}}")
+        arrow = (
+            f"QToolButton{{background:transparent;color:{p['arrow']};"
+            "border:none;font-size:7px;padding:0;margin:0}"
+            f"QToolButton:hover{{color:{p['arrow_hover']}}}"
+            f"QToolButton:pressed{{color:{p['arrow_hover']}}}")
+        self._btn_up.setStyleSheet(arrow)
+        self._btn_dn.setStyleSheet(arrow)
+        self._arrow_w.setStyleSheet(
+            f"QWidget{{background:transparent;border:none;"
+            f"border-left:1px solid {p['sep']}}}")
 
     def text(self) -> str:
         return self._edit.text()
@@ -898,9 +1001,13 @@ class _QtyInput(QWidget):
         self._edit.blockSignals(True)
         self._edit.clear()
         self._edit.blockSignals(False)
+        # blockSignals suppresses the restyle hook too — reapply so the
+        # box drops its selected look the moment the value is cleared.
+        self._apply_styles()
 
     def setText(self, txt: str) -> None:
         self._edit.setText(txt)
+        self._apply_styles()
 
     def setPlaceholderText(self, txt: str) -> None:
         self._edit.setPlaceholderText(txt)
@@ -919,11 +1026,30 @@ class _QtyInput(QWidget):
             return None
 
     def _on_up(self) -> None:
+        """Step UP through the dropdown ladder (1…10, 20, 30 … 100,
+        200 … — same values the popup shows).  A value between rungs
+        snaps to the next larger rung.  Falls back to ±1 when no ladder
+        is set.  In percent mode the ladder is 1–100, so this is ±1."""
         v = self._current_value()
-        self._edit.setText("1" if v is None else str(v + 1))
+        ladder = sorted(p for p in self._presets if p <= self._max)
+        if ladder:
+            nxt = (ladder[0] if v is None
+                   else next((p for p in ladder if p > v), ladder[-1]))
+            self._edit.setText(str(max(nxt, v or 0)))
+            return
+        self._edit.setText("1" if v is None else str(min(v + 1, self._max)))
 
     def _on_dn(self) -> None:
+        """Step DOWN through the dropdown ladder (see :meth:`_on_up`)."""
         v = self._current_value()
+        ladder = sorted(p for p in self._presets if p <= self._max)
+        if ladder:
+            if v is None:
+                return
+            prev = next((p for p in reversed(ladder) if p < v), None)
+            if prev is not None:
+                self._edit.setText(str(prev))
+            return
         if v is not None and v > 1:
             self._edit.setText(str(v - 1))
 
@@ -931,25 +1057,70 @@ class _QtyInput(QWidget):
 
     def eventFilter(self, obj, event) -> bool:          # noqa: N802
         t = event.type()
+        # Focus recolors the whole box (the edit itself is transparent)
+        # and notifies the host row so it can drop the chip highlight
+        # while the user is in the field.  A FocusOut caused by the
+        # component's own popup stealing activation is NOT "leaving the
+        # field" — without this guard, picking a preset-valued entry
+        # from the dropdown momentarily adopts its chip (visible flash)
+        # before the next pick overwrites the text again.
+        # Keyboard stepping: ↑/↓ in the edit behave like the ▲/▼ buttons
+        # (±1, clamped to the unit's max).
+        if obj is self._edit and t == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Up:
+                self._on_up()
+                return True
+            if event.key() == Qt.Key.Key_Down:
+                self._on_dn()
+                return True
+        if obj is self._edit and t == QEvent.Type.FocusIn:
+            # Watch app-wide clicks while engaged — on macOS most
+            # widgets don't take focus on click, so "user clicked
+            # somewhere else" must be detected from the click itself.
+            self._install_app_filter()
+            self._apply_styles()
+            self.focusChanged.emit(True)
+        if obj is self._edit and t == QEvent.Type.FocusOut:
+            self._apply_styles()
+            if not (self._popup is not None and self._popup.isVisible()):
+                self._remove_app_filter()
+                self.focusChanged.emit(False)
         # Close when the main window is dragged/moved
         if obj is self._tracked_win and t == QEvent.Type.Move:
             self._close_popup()
             return False
-        # Close on click outside the popup
-        if (self._popup is not None and self._popup.isVisible()
-                and t == QEvent.Type.MouseButtonPress
-                and obj is not self._popup):
+        # Click outside popup + component → dismiss the popup AND treat
+        # it as leaving the field (forces the FocusOut that drives the
+        # host row's chip adoption, which never arrives on its own when
+        # the clicked widget doesn't accept click-focus).
+        if t == QEvent.Type.MouseButtonPress and self._app_filter_installed:
             try:
                 gpos = event.globalPosition().toPoint()  # type: ignore[attr-defined]
             except AttributeError:
                 gpos = event.globalPos()                  # type: ignore[attr-defined]
-            if not self._popup.geometry().contains(gpos):
-                self._close_popup()
-                return False
+            from PySide6.QtCore import QPoint as _QP, QRect as _QR
+            in_popup = (self._popup is not None and self._popup.isVisible()
+                        and self._popup.geometry().contains(gpos))
+            in_self = _QR(self.mapToGlobal(_QP(0, 0)),
+                          self.size()).contains(gpos)
+            if not in_popup:
+                if self._popup is not None and self._popup.isVisible():
+                    self._close_popup()
+                if not in_self and self._edit.hasFocus():
+                    self._edit.clearFocus()
         if obj is self._edit and t == QEvent.Type.MouseButtonPress:
             if self._popup is None or not self._popup.isVisible():
                 QTimer.singleShot(50, self._show_popup)
         return False
+
+    def _install_app_filter(self) -> None:
+        if self._app_filter_installed:
+            return
+        from PySide6.QtWidgets import QApplication as _QApp
+        app = _QApp.instance()
+        if app:
+            app.installEventFilter(self)
+            self._app_filter_installed = True
 
     def _remove_app_filter(self) -> None:
         if self._app_filter_installed:
@@ -962,6 +1133,17 @@ class _QtyInput(QWidget):
                     pass
             self._app_filter_installed = False
 
+    def _release_app_filter_if_left(self) -> None:
+        """Drop the app filter only once the edit is no longer focused —
+        the filter's click-outside watch must survive popup teardown
+        while the user is still typing in the field."""
+        try:
+            engaged = self._edit.hasFocus()
+        except RuntimeError:
+            engaged = False
+        if not engaged:
+            self._remove_app_filter()
+
     def _remove_win_filter(self) -> None:
         if self._win_filter_installed and self._tracked_win is not None:
             try:
@@ -972,7 +1154,7 @@ class _QtyInput(QWidget):
             self._tracked_win = None
 
     def _close_popup(self) -> None:
-        self._remove_app_filter()
+        self._release_app_filter_if_left()
         self._remove_win_filter()
         if self._popup is not None:
             try:
@@ -985,7 +1167,7 @@ class _QtyInput(QWidget):
 
     def _on_popup_destroyed(self) -> None:
         self._popup = None
-        self._remove_app_filter()
+        self._release_app_filter_if_left()
         self._remove_win_filter()
 
     def _show_popup(self) -> None:
@@ -1004,16 +1186,22 @@ class _QtyInput(QWidget):
             | Qt.WindowType.WindowStaysOnTopHint
         )
         popup.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        popup.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         popup.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         popup.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         popup.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        # NOTE: do NOT set WA_TranslucentBackground here — on macOS it
+        # stops the QListWidget painting its stylesheet background
+        # entirely (items float transparent over the app).  The radius
+        # corners paint on the solid window fill instead.
         popup.setStyleSheet("""
             QListWidget {
                 background: #1E222A; color: #C9D1D9;
-                border: 1px solid #3a3f50; border-radius: 4px;
+                border: 1px solid #3a3f50; border-radius: 6px;
                 font-size: 12px; outline: none;
             }
-            QListWidget::item            { padding: 3px 14px; border: none; }
+            QListWidget::item            { padding: 3px 12px; border: none;
+                                           border-radius: 4px; }
             QListWidget::item:selected,
             QListWidget::item:hover      { background: #0071e3; color: white; }
         """)
@@ -1065,10 +1253,7 @@ class _QtyInput(QWidget):
             popup.scrollToBottom()
 
         # Track app-level clicks for outside-dismiss
-        app = _QApp.instance()
-        if app:
-            app.installEventFilter(self)
-            self._app_filter_installed = True
+        self._install_app_filter()
 
         # Track top-level window moves to dismiss popup
         top_win = self.window()
@@ -1080,6 +1265,10 @@ class _QtyInput(QWidget):
     def _on_popup_item(self, item: QListWidgetItem) -> None:
         self._edit.setText(item.text())
         self._close_popup()
+        # The popup click may have taken activation — hand focus back to
+        # the edit so the component stays "engaged" (the chip-adoption
+        # logic runs only when the user genuinely leaves the field).
+        self._edit.setFocus()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2929,6 +3118,22 @@ class OrderEntryPanel(QWidget):
         else:
             self._active_symbol = self._symbols[0] if self._symbols else None
         self._active_qty: int = 1
+        # SH/% unit state (spec: NanoPulse-Ladder-Percent-Sizing.md).
+        # Never persisted — every launch / symbol switch resets to SH.
+        self._qty_unit: str = UNIT_SH
+        self._active_pct: int = PCT_DEFAULT
+        self._qty_sel_by_unit: dict[str, int | None] = {}
+        self._qty_custom_by_unit: dict[str, str] = {}
+        self._qty_share_presets: list[int] = []
+        self._qty_share_popup: list[int] = []
+        self._qty_share_default: int = 1
+        self._btn_qty_unit: QPushButton | None = None
+        self._pct_ctx = PercentSizingContext()
+        self._pct_ctx.set_price_provider(
+            lambda: self._price_cache.get(
+                (self._active_symbol or "").upper(), (0.0, 0.0, 0.0))[0])
+        self._pct_ctx.set_symbol_provider(
+            lambda: self._active_symbol or "")
         self._sym_buttons: dict[str, QPushButton] = {}
         # In-memory cache of the user's TP / SL / Trail selections per
         # symbol — keyed by uppercase symbol, value is a dict
@@ -4139,7 +4344,9 @@ class OrderEntryPanel(QWidget):
     # ── Quantity buttons ──────────────────────────────────────────────────────
 
     def _rebuild_qty_buttons(self) -> None:
-        """Rebuild qty row: preset chips + _QtyInput, sized to the asset class."""
+        """Rebuild qty row: unit toggle (stocks only) + preset chips +
+        _QtyInput, sized to the asset class.  Every rebuild resets the
+        unit to shares — percent mode is never persisted (spec §3.1)."""
         while self._qty_layout.count():
             item = self._qty_layout.takeAt(0)
             if item and item.widget():
@@ -4155,48 +4362,181 @@ class OrderEntryPanel(QWidget):
             popup_vals = _FUT_QTY_POPUP
             default    = _FUT_DEFAULT
 
+        self._qty_unit = UNIT_SH
+        self._active_pct = PCT_DEFAULT
+        self._qty_sel_by_unit = {UNIT_SH: default, UNIT_PCT: PCT_DEFAULT}
+        self._qty_custom_by_unit = {UNIT_SH: "", UNIT_PCT: ""}
+        self._qty_share_presets = list(presets)
+        self._qty_share_popup = list(popup_vals)
+        self._qty_share_default = default
         self._active_qty = default
         self._qty_btn_group: list[QPushButton] = []
 
-        for q in presets:
-            btn = QPushButton(str(q))
-            btn.setFixedHeight(28)
-            btn.setMinimumWidth(36)
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setSizePolicy(
-                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            _apply_chip_style(btn, q == default)
-            btn.clicked.connect(lambda checked, v=q: self._on_qty_preset(v))
-            self._qty_btn_group.append(btn)
-            self._qty_layout.addWidget(btn)
+        # SH/% percent-of-account toggle — stocks only: futures size in
+        # contracts against margin (notional percent is meaningless) and
+        # options carry multiplier semantics, so both keep today's row.
+        self._btn_qty_unit = None
+        if sec == "STK":
+            self._btn_qty_unit = make_unit_toggle()
+            self._btn_qty_unit.clicked.connect(self._on_qty_unit_toggled)
+            self._qty_layout.addWidget(self._btn_qty_unit)
 
         self._custom_qty = _QtyInput()
         self._custom_qty.set_presets(popup_vals)
         self._custom_qty.textChanged.connect(self._on_custom_qty)
         self._custom_qty.returnPressed.connect(self._on_custom_qty_enter)
+        self._custom_qty.focusChanged.connect(self._on_custom_qty_focus)
         self._qty_layout.addWidget(self._custom_qty)
+        self._build_qty_chips()
 
-        if hasattr(self, "_pt_section"):
-            self._pt_section.set_qty(self._active_qty)
-        if hasattr(self, "_sl_section"):
-            self._sl_section.set_qty(self._active_qty)
-        if hasattr(self, "_tr_section"):
-            self._tr_section.set_qty(self._active_qty)
+        self._push_tier_qty(self._active_qty)
 
-    def _on_qty_preset(self, qty: int) -> None:
-        self._active_qty = qty
-        self._custom_qty.blockSignals(True)
-        self._custom_qty.clear()
-        self._custom_qty.blockSignals(False)
+    def _build_qty_chips(self) -> None:
+        """(Re)build the preset chips for the current unit, between the
+        toggle and the custom input."""
         for btn in self._qty_btn_group:
-            _apply_chip_style(btn, int(btn.text()) == qty)
-        self._refresh_action_labels()
+            self._qty_layout.removeWidget(btn)
+            btn.deleteLater()
+        self._qty_btn_group = []
+        pct_mode = self._qty_unit == UNIT_PCT
+        values = list(PCT_PRESETS) if pct_mode else self._qty_share_presets
+        insert_at = self._qty_layout.indexOf(self._custom_qty)
+        for q in values:
+            # Plain numbers in both units — the gold row + gold toggle
+            # carry the "this is percent" signal, not a % suffix.
+            btn = QPushButton(str(q))
+            btn.setProperty("qty_value", q)
+            btn.setFixedHeight(28)
+            btn.setMinimumWidth(36)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setSizePolicy(
+                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            btn.clicked.connect(lambda checked, v=q: self._on_qty_preset(v))
+            self._qty_btn_group.append(btn)
+            self._qty_layout.insertWidget(insert_at, btn)
+            insert_at += 1
+        self._restyle_qty_chips()
+
+    def _qty_active_chip(self) -> int | None:
+        """Chip that should render selected — None while a custom value
+        is active in the current unit."""
+        if self._qty_custom_by_unit.get(self._qty_unit):
+            return None
+        return self._qty_sel_by_unit.get(self._qty_unit)
+
+    def _on_custom_qty_focus(self, focused: bool) -> None:
+        """Entering the custom field drops the chip highlight (the field
+        is now the active input).  On the way out: a typed value that
+        matches a preset is adopted BY the preset (chip lights up, field
+        clears), and an empty field restores the previous highlight."""
+        if focused:
+            self._restyle_qty_chips(force_none=True)
+            return
+        text = self._custom_qty.text().strip()
+        if text:
+            try:
+                v = int(text)
+            except ValueError:
+                v = None
+            values = (list(PCT_PRESETS) if self._qty_unit == UNIT_PCT
+                      else self._qty_share_presets)
+            if v in values:
+                self._custom_qty.clear()
+                self._qty_custom_by_unit[self._qty_unit] = ""
+                self._qty_sel_by_unit[self._qty_unit] = v
+        if not self._custom_qty.text().strip():
+            self._restyle_qty_chips()
+
+    def _restyle_qty_chips(self, force_none: bool = False) -> None:
+        active = None if force_none else self._qty_active_chip()
+        pct_mode = self._qty_unit == UNIT_PCT
+        for btn in self._qty_btn_group:
+            v = btn.property("qty_value")
+            enabled = True
+            if pct_mode:
+                # A chip stays clickable when EITHER side resolves —
+                # buy needs NLV + live price, sell only needs a held
+                # position (spec §4).
+                enabled = self._pct_ctx.chip_enabled(int(v))
+            apply_sized_chip_style(
+                btn, active is not None and v == active,
+                self._qty_unit, enabled=enabled)
+
+    def _push_tier_qty(self, qty: int) -> None:
         if hasattr(self, "_pt_section"):
             self._pt_section.set_qty(qty)
         if hasattr(self, "_sl_section"):
             self._sl_section.set_qty(qty)
         if hasattr(self, "_tr_section"):
             self._tr_section.set_qty(qty)
+
+    def set_percent_context(self, accounts_provider) -> None:
+        """Host pushes the checked-accounts provider:
+        ``fn() -> [(account, net_liq, buying_power)]``."""
+        self._pct_ctx.set_accounts_provider(accounts_provider)
+
+    def refresh_percent_preview(self) -> None:
+        """Re-resolve size previews against fresh price/account data.
+        In share mode only the button labels change (their total tracks
+        the checked-account count)."""
+        if self._qty_unit != UNIT_PCT:
+            self._refresh_action_labels()
+            return
+        self._active_qty = self._pct_ctx.preview_qty(self._active_pct)
+        self._restyle_qty_chips()
+        self._refresh_action_labels()
+        self._push_tier_qty(self._active_qty)
+
+    def _on_qty_unit_toggled(self) -> None:
+        """SH ↔ % — swap labels/colors/spinner and restore the incoming
+        unit's remembered state (spec §3.3: values never carry across)."""
+        self._qty_custom_by_unit[self._qty_unit] = (
+            self._custom_qty.text().strip())
+        self._qty_unit = UNIT_PCT if self._qty_unit == UNIT_SH else UNIT_SH
+        pct_mode = self._qty_unit == UNIT_PCT
+        apply_unit_toggle_style(self._btn_qty_unit, self._qty_unit)
+
+        self._custom_qty.set_max_value(
+            100 if pct_mode else _QtyInput._MAX_DEFAULT)
+        self._custom_qty.set_presets(
+            list(PCT_POPUP) if pct_mode else list(self._qty_share_popup))
+        self._custom_qty.set_accent(Theme.CLR_PCT if pct_mode else None)
+        remembered = self._qty_custom_by_unit.get(self._qty_unit, "")
+        self._custom_qty.blockSignals(True)
+        if remembered:
+            self._custom_qty.setText(remembered)
+        else:
+            self._custom_qty.clear()
+        self._custom_qty.blockSignals(False)
+
+        if pct_mode:
+            pct = int(remembered) if remembered else (
+                self._qty_sel_by_unit.get(UNIT_PCT) or PCT_DEFAULT)
+            self._active_pct = min(100, max(1, pct))
+            self._active_qty = self._pct_ctx.preview_qty(self._active_pct)
+        else:
+            self._active_qty = int(remembered) if remembered else (
+                self._qty_sel_by_unit.get(UNIT_SH)
+                or self._qty_share_default)
+
+        self._build_qty_chips()
+        self._refresh_action_labels()
+        self._push_tier_qty(self._active_qty)
+
+    def _on_qty_preset(self, qty: int) -> None:
+        self._custom_qty.blockSignals(True)
+        self._custom_qty.clear()
+        self._custom_qty.blockSignals(False)
+        self._qty_custom_by_unit[self._qty_unit] = ""
+        self._qty_sel_by_unit[self._qty_unit] = qty
+        if self._qty_unit == UNIT_PCT:
+            self._active_pct = qty
+            self._active_qty = self._pct_ctx.preview_qty(qty)
+        else:
+            self._active_qty = qty
+        self._restyle_qty_chips()
+        self._refresh_action_labels()
+        self._push_tier_qty(self._active_qty)
 
     def _on_custom_qty(self, text: str) -> None:
         text = text.strip()
@@ -4205,16 +4545,17 @@ class OrderEntryPanel(QWidget):
         try:
             qty = int(text)
             if qty > 0:
-                self._active_qty = qty
-                for btn in self._qty_btn_group:
-                    _apply_chip_style(btn, False)
+                self._qty_custom_by_unit[self._qty_unit] = text
+                self._qty_sel_by_unit[self._qty_unit] = None
+                if self._qty_unit == UNIT_PCT:
+                    self._active_pct = min(qty, 100)
+                    self._active_qty = self._pct_ctx.preview_qty(
+                        self._active_pct)
+                else:
+                    self._active_qty = qty
+                self._restyle_qty_chips()
                 self._refresh_action_labels()
-                if hasattr(self, "_pt_section"):
-                    self._pt_section.set_qty(qty)
-                if hasattr(self, "_sl_section"):
-                    self._sl_section.set_qty(qty)
-                if hasattr(self, "_tr_section"):
-                    self._tr_section.set_qty(qty)
+                self._push_tier_qty(self._active_qty)
                 return
         except ValueError:
             pass
@@ -4222,19 +4563,20 @@ class OrderEntryPanel(QWidget):
         self._reset_qty_to_default()
 
     def _reset_qty_to_default(self) -> None:
-        """Restore qty state to the asset-class default and refresh UI."""
-        sec = _sec_type_for(self._active_symbol or "")
-        default = _STK_DEFAULT if sec == "STK" else _FUT_DEFAULT
-        self._active_qty = default
-        for btn in self._qty_btn_group:
-            _apply_chip_style(btn, int(btn.text()) == default)
+        """Restore qty state to the current unit's default and refresh UI."""
+        self._qty_custom_by_unit[self._qty_unit] = ""
+        if self._qty_unit == UNIT_PCT:
+            self._active_pct = PCT_DEFAULT
+            self._qty_sel_by_unit[UNIT_PCT] = PCT_DEFAULT
+            self._active_qty = self._pct_ctx.preview_qty(PCT_DEFAULT)
+        else:
+            sec = _sec_type_for(self._active_symbol or "")
+            default = _STK_DEFAULT if sec == "STK" else _FUT_DEFAULT
+            self._active_qty = default
+            self._qty_sel_by_unit[UNIT_SH] = default
+        self._restyle_qty_chips()
         self._refresh_action_labels()
-        if hasattr(self, "_pt_section"):
-            self._pt_section.set_qty(default)
-        if hasattr(self, "_sl_section"):
-            self._sl_section.set_qty(default)
-        if hasattr(self, "_tr_section"):
-            self._tr_section.set_qty(default)
+        self._push_tier_qty(self._active_qty)
 
     def _on_custom_qty_enter(self) -> None:
         """Clear the custom qty field on Enter if its content is invalid."""
@@ -4251,15 +4593,28 @@ class OrderEntryPanel(QWidget):
     # ── Action label refresh ──────────────────────────────────────────────────
 
     def _refresh_action_labels(self) -> None:
-        q = self._active_qty
-        self._btn_buy_mkt.setPrimary(f"Buy {q} @MKT")
-        self._btn_sell_mkt.setPrimary(f"Sell {q} @MKT")
-        self._btn_buy_mid.setPrimary(f"Buy {q} @Mid")
-        self._btn_sell_mid.setPrimary(f"Sell {q} @Mid")
-        self._btn_buy_bid.setPrimary(f"Buy {q} @Bid +1t")
-        self._btn_sell_ask.setPrimary(f"Sell {q} @Ask -1t")
-        self._btn_buy_bid_lmt.setPrimary(f"Buy {q} @Bid Limit")
-        self._btn_sell_ask_lmt.setPrimary(f"Sell {q} @Ask Limit")
+        # Percent mode shows each side's resolved TOTAL share count
+        # (across all checked accounts) — the §5 safety readout: size
+        # is visible BEFORE the click.  Buy resolves from net liq, Sell
+        # from the accounts' positions in the active symbol.
+        if self._qty_unit == UNIT_PCT:
+            buy_total = self._pct_ctx.preview_total(self._active_pct)
+            sell_total = self._pct_ctx.sell_preview_total(self._active_pct)
+            qb = f"{self._active_pct}% ≈{buy_total:,}"
+            qs = f"{self._active_pct}% ≈{sell_total:,}"
+        else:
+            # Share mode shows the TOTAL a click transmits: qty × the
+            # number of checked accounts (one order per account).
+            n = max(1, len(self._pct_ctx.accounts()))
+            qb = qs = f"{self._active_qty * n:,}"
+        self._btn_buy_mkt.setPrimary(f"Buy {qb} @MKT")
+        self._btn_sell_mkt.setPrimary(f"Sell {qs} @MKT")
+        self._btn_buy_mid.setPrimary(f"Buy {qb} @Mid")
+        self._btn_sell_mid.setPrimary(f"Sell {qs} @Mid")
+        self._btn_buy_bid.setPrimary(f"Buy {qb} @Bid +1t")
+        self._btn_sell_ask.setPrimary(f"Sell {qs} @Ask -1t")
+        self._btn_buy_bid_lmt.setPrimary(f"Buy {qb} @Bid Limit")
+        self._btn_sell_ask_lmt.setPrimary(f"Sell {qs} @Ask Limit")
         # Secondary line — shows TP / SL / Trail amounts armed for this
         # bracket.  Hidden when nothing is armed.
         secondary = self._format_armed_summary()
@@ -4541,6 +4896,8 @@ class OrderEntryPanel(QWidget):
             "stop_loss":   self._sl_section.get_value() if hasattr(self, "_sl_section") else None,
             "trailing":    self._tr_section.get_value() if hasattr(self, "_tr_section") else None,
         }
+        if not self._attach_percent_sizing(payload, sec):
+            return
         log.info("Order requested: %s", payload)
         self.order_requested.emit(payload)
 
@@ -4595,9 +4952,34 @@ class OrderEntryPanel(QWidget):
             "stop_loss":   self._sl_section.get_value() if hasattr(self, "_sl_section") else None,
             "trailing":    self._tr_section.get_value() if hasattr(self, "_tr_section") else None,
         }
+        if not self._attach_percent_sizing(payload, sec):
+            return
         log.info("Order requested (%s): %s @ %.4f",
                  order_type, self._active_symbol, price)
         self.order_requested.emit(payload)
+
+    def _attach_percent_sizing(self, payload: dict, sec: str) -> bool:
+        """Stamp ``qty_pct`` on Buy/Sell payloads in percent mode.
+
+        SIDE-AWARE: BUY resolves pct-of-net-liq (needs a live price),
+        SELL resolves pct-of-position (needs a holding — never opens a
+        short).  Returns False (blocking the order) when the clicked
+        side resolves to 0 for every checked account.  Only the plain
+        Buy/Sell paths call this — flatten / cancel / close-pct / hot
+        buttons must never inherit percent semantics."""
+        if self._qty_unit != UNIT_PCT or sec != "STK":
+            return True
+        action = str(payload.get("action") or "BUY")
+        side_qty = self._pct_ctx.side_qty(self._active_pct, action)
+        if side_qty <= 0:
+            log.warning("OrderEntry: %s %s%% resolves to 0 shares (%s) "
+                        "— order blocked", action, self._active_pct,
+                        "no position held" if action == "SELL"
+                        else "no price/account data")
+            return False
+        payload["qty"] = side_qty        # conservative per-side fallback
+        payload["qty_pct"] = int(self._active_pct)
+        return True
 
     # ── TWS fallback lookup ─────────────────────────────────────────────────────
 
@@ -4898,6 +5280,9 @@ class OrderEntryPanel(QWidget):
             self._update_bid_ask_display(self._last_bid, self._last_ask)
             self._update_bid_ask_buttons(self._last_bid, self._last_ask)
             self._refresh_price_change_display()
+            # Percent sizing re-resolves on every tick of the active
+            # symbol (no-op in share mode).
+            self.refresh_percent_preview()
 
     def _update_bid_ask_display(self, bid: float, ask: float) -> None:
         """Refresh the bid and ask labels on the compact ticker strip."""

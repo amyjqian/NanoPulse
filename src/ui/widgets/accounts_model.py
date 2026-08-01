@@ -294,6 +294,29 @@ class AccountsTableModel(QAbstractTableModel):
         """Return the last-known buying power for *account*, or 0.0."""
         return self._buying_power.get(account, 0.0)
 
+    def _get_financial_col(self, account: str, col: int) -> float:
+        """Float value of a financial column for *account*, 0.0 when the
+        account is unknown or the tag hasn't arrived yet."""
+        label = self._acct_to_label.get(account)
+        if label is None:
+            return 0.0
+        row_idx = self._row_map.get((label, account))
+        if row_idx is None:
+            return 0.0
+        try:
+            return float(self._table_data[row_idx][col] or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def get_net_liquidation(self, account: str) -> float:
+        """Last-known NetLiquidation for *account*, or 0.0.  The base for
+        percent-of-account order sizing."""
+        return self._get_financial_col(account, COL_NET_LIQ)
+
+    def get_excess_liquidity(self, account: str) -> float:
+        """Last-known ExcessLiquidity for *account*, or 0.0."""
+        return self._get_financial_col(account, COL_EXCESS_LIQ)
+
     def get_cash_by_currency(self, account: str) -> dict[str, float]:
         """Return the last-known per-currency cash balances for *account*
         (e.g. ``{"USD": 6300.0, "JPY": 5000.0}``), or an empty dict."""
