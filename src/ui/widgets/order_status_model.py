@@ -96,6 +96,11 @@ STATUS_CATEGORY: dict[str, str] = {
     "Cancelled":    FILTER_CANCELLED,
     "Canceled":     FILTER_CANCELLED,
     "Inactive":     FILTER_CANCELLED,
+    # Terminal failures — nothing left to cancel, so they must NOT fall
+    # into the FILTER_OPEN default (that's what paints the Cancel button
+    # and lists them under Active/Open).
+    "Rejected":        FILTER_CANCELLED,
+    "ValidationError": FILTER_CANCELLED,
 }
 
 # ── Custom item-data roles ────────────────────────────────────────────────────
