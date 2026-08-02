@@ -7,7 +7,7 @@ class Theme:
     # Panels and Backgrounds
     BG_PANEL = "#1e2230"
     BG_INPUT = "#272b3a"
-    BG_MAIN = "#161a25"
+    BG_MAIN = "#0E1117"
 
     # Text
     TEXT = "#C9D1D9"

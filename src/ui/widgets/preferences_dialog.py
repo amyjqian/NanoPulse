@@ -37,7 +37,7 @@ log = logging.getLogger(__name__)
 
 # ── Colour palette (matches main app dark theme) ─────────────────────────────
 _BG_DIALOG = "#1e2230"
-_BG_SIDEBAR = "#161a25"
+_BG_SIDEBAR = "#0E1117"   # keep in sync with Theme.BG_MAIN
 _BG_SIDEBAR_HOVER = "#1c2030"
 _BG_SIDEBAR_SEL = "#263050"
 _BG_PANEL = "#1e2230"

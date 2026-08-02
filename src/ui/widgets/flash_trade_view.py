@@ -25,7 +25,7 @@ from .positions_trades_tabs import PositionsTradesTabs
 log = logging.getLogger(__name__)
 
 # ── Colours ───────────────────────────────────────────────────────────────────
-BG_MAIN = "#161a25"
+BG_MAIN = "#0E1117"   # keep in sync with Theme.BG_MAIN
 BG_PANEL = "#1e2230"
 TEXT = "#C9D1D9"
 TEXT_DIM = "#8B949E"
