@@ -107,8 +107,8 @@ def test_action_labels_show_resolved_shares(panel):
     panel._refresh_action_labels()
     # The §5 safety readout — resolved count visible before any click,
     # per side: Buy from net liq, Sell from the held position.
-    assert panel._btn_buy_mkt._primary == "Buy 25% ≈1,946 @MKT"
-    assert panel._btn_sell_mkt._primary == "Sell 25% ≈150 @MKT"
+    assert panel._btn_buy_mkt._primary == "Buy 1,946 @MKT"
+    assert panel._btn_sell_mkt._primary == "Sell 150 @MKT"
     # Toggling back restores today's plain label.
     panel._btn_qty_unit.click()
     panel._refresh_action_labels()
@@ -146,6 +146,25 @@ def test_share_labels_show_total_across_accounts(panel):
     panel.order_requested.connect(payloads.append)
     panel._emit_order("BUY", "MKT")
     assert payloads[-1]["qty"] == 100
+
+
+def test_symbol_switch_keeps_percent_mode(panel):
+    panel._btn_qty_unit.click()                   # → %
+    chip = next(b for b in panel._qty_btn_group
+                if b.property("qty_value") == 50)
+    chip.click()
+    assert panel._active_pct == 50
+    # Stock → stock switch keeps % mode, pct back to default 25.
+    panel._active_symbol = "AAPL"
+    panel._rebuild_qty_buttons()
+    assert panel._qty_unit == UNIT_PCT
+    assert panel._active_pct == 25
+    assert panel._custom_qty._edit.validator().top() == 100
+    # Stock → futures forces shares.
+    panel._active_symbol = "MNQ"
+    panel._rebuild_qty_buttons()
+    assert panel._qty_unit == UNIT_SH
+    assert panel._btn_qty_unit is None
 
 
 def test_price_tick_recomputes_percent(panel):

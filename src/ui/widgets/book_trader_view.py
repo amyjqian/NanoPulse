@@ -369,6 +369,11 @@ class BookTraderView(QWidget):
             "QComboBox QAbstractItemView::item:hover,"
             "QComboBox QAbstractItemView::item:selected"
             "{background:#0071e3;color:white;border-radius:3px}")
+        # The list-view popup defaults to the combo's own (narrow)
+        # width, eliding the longest entries ("0.01" → "…") — widen it
+        # and never elide.
+        self._cmb_tick.view().setTextElideMode(Qt.TextElideMode.ElideNone)
+        self._cmb_tick.view().setMinimumWidth(90)
         self._cmb_tick.currentTextChanged.connect(self._on_tick_changed)
 
         # Lock button — when locked the ladder auto-scrolls so the

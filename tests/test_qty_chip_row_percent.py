@@ -306,13 +306,27 @@ def test_spinbox_arrow_keys_step_ladder(qtbot):
     assert row._custom.text() == "99"
 
 
-def test_set_presets_resets_to_shares(qtbot):
+def test_symbol_switch_keeps_percent_mode(qtbot):
     row = _make(qtbot)
     row._btn_unit.click()
+    _chip(row, 50).click()                        # pick 50%
+    assert row.current_percent() == 50
+    # Stock → stock switch: STAYS in % mode, pct resets to the default.
+    row.set_presets(*_STK, allow_percent=True)
     assert row.current_unit() == UNIT_PCT
-    row.set_presets(*_STK, allow_percent=True)    # symbol switch
+    assert row.current_percent() == 25
+    assert row._custom._edit.validator().top() == 100
+    assert [b.text() for b in row._buttons] == \
+        ["10", "25", "50", "75", "100"]
+    # Switching to a non-percent symbol (FUT) forces shares.
+    row.set_presets([1, 2, 3, 5], 1, list(range(1, 101)),
+                    allow_percent=False)
+    assert row.current_unit() == UNIT_SH
+    assert row._btn_unit.isHidden()
+    # And a fresh SH row still starts in shares after re-allowing %.
+    row.set_presets(*_STK, allow_percent=True)
     assert row.current_unit() == UNIT_SH
     assert row.current_qty() == 100
-    # Toggle survives the rebuild (it must not be deleteLater'd).
+    # Toggle survives the rebuilds (it must not be deleteLater'd).
     row._btn_unit.click()
     assert row.current_unit() == UNIT_PCT

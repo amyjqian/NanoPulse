@@ -4362,7 +4362,11 @@ class OrderEntryPanel(QWidget):
             popup_vals = _FUT_QTY_POPUP
             default    = _FUT_DEFAULT
 
-        self._qty_unit = UNIT_SH
+        # % mode SURVIVES a stock→stock symbol switch (the pct snaps
+        # back to the default); FUT/OPT force shares.  App launch
+        # starts in shares (initial _qty_unit).
+        stay_pct = sec == "STK" and self._qty_unit == UNIT_PCT
+        self._qty_unit = UNIT_PCT if stay_pct else UNIT_SH
         self._active_pct = PCT_DEFAULT
         self._qty_sel_by_unit = {UNIT_SH: default, UNIT_PCT: PCT_DEFAULT}
         self._qty_custom_by_unit = {UNIT_SH: "", UNIT_PCT: ""}
@@ -4378,17 +4382,26 @@ class OrderEntryPanel(QWidget):
         self._btn_qty_unit = None
         if sec == "STK":
             self._btn_qty_unit = make_unit_toggle()
+            apply_unit_toggle_style(self._btn_qty_unit, self._qty_unit)
             self._btn_qty_unit.clicked.connect(self._on_qty_unit_toggled)
             self._qty_layout.addWidget(self._btn_qty_unit)
 
         self._custom_qty = _QtyInput()
-        self._custom_qty.set_presets(popup_vals)
+        self._custom_qty.set_presets(
+            list(PCT_POPUP) if stay_pct else popup_vals)
+        if stay_pct:
+            self._custom_qty.set_max_value(100)
+            self._custom_qty.set_accent(Theme.CLR_PCT)
         self._custom_qty.textChanged.connect(self._on_custom_qty)
         self._custom_qty.returnPressed.connect(self._on_custom_qty_enter)
         self._custom_qty.focusChanged.connect(self._on_custom_qty_focus)
         self._qty_layout.addWidget(self._custom_qty)
         self._build_qty_chips()
 
+        if stay_pct:
+            self._active_qty = self._pct_ctx.preview_qty(self._active_pct)
+        if hasattr(self, "_btn_buy_mkt"):
+            self._refresh_action_labels()
         self._push_tier_qty(self._active_qty)
 
     def _build_qty_chips(self) -> None:
@@ -4598,10 +4611,10 @@ class OrderEntryPanel(QWidget):
         # is visible BEFORE the click.  Buy resolves from net liq, Sell
         # from the accounts' positions in the active symbol.
         if self._qty_unit == UNIT_PCT:
-            buy_total = self._pct_ctx.preview_total(self._active_pct)
-            sell_total = self._pct_ctx.sell_preview_total(self._active_pct)
-            qb = f"{self._active_pct}% ≈{buy_total:,}"
-            qs = f"{self._active_pct}% ≈{sell_total:,}"
+            # Just the resolved total share counts — the gold row
+            # already says the sizing unit is percent.
+            qb = f"{self._pct_ctx.preview_total(self._active_pct):,}"
+            qs = f"{self._pct_ctx.sell_preview_total(self._active_pct):,}"
         else:
             # Share mode shows the TOTAL a click transmits: qty × the
             # number of checked accounts (one order per account).

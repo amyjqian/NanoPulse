@@ -634,17 +634,23 @@ class QtyChipRow(QWidget):
         self._default = int(default)
         self._active_qty = self._default
         self._share_popup = list(popup_vals) if popup_vals is not None else []
+        # % mode SURVIVES a stock→stock symbol switch (the pct snaps
+        # back to the default); a non-percent symbol (FUT/OPT) forces
+        # shares.  App launch starts in shares (initial _unit).
+        stay_pct = bool(allow_percent) and self._unit == UNIT_PCT
         self._allow_percent = bool(allow_percent)
-        # Unit always resets to shares (spec §3.1 — never persisted).
-        self._unit = UNIT_SH
+        self._unit = UNIT_PCT if stay_pct else UNIT_SH
         self._active_pct = PCT_DEFAULT
         self._sel_by_unit = {UNIT_SH: self._default, UNIT_PCT: PCT_DEFAULT}
         self._custom_by_unit = {UNIT_SH: "", UNIT_PCT: ""}
 
-        if popup_vals is not None:
+        if stay_pct:
+            self._custom.set_presets(list(PCT_POPUP))
+        elif popup_vals is not None:
             self._custom.set_presets(list(popup_vals))
-        self._custom.set_max_value(self._qty_input_max)
-        self._custom.set_accent(None)
+        self._custom.set_max_value(
+            100 if stay_pct else self._qty_input_max)
+        self._custom.set_accent(Theme.CLR_PCT if stay_pct else None)
         self._custom.blockSignals(True)
         self._custom.clear()
         self._custom.blockSignals(False)
@@ -657,6 +663,10 @@ class QtyChipRow(QWidget):
             self._btn_unit.hide()
         self._layout.addWidget(self._custom)
         self._build_chip_buttons()
+        if stay_pct:
+            # Refresh readouts/chip enables against the new symbol's
+            # accounts + (not-yet-ticked) price immediately.
+            self._emit_state()
 
     def set_percent_context(self, accounts_provider) -> None:
         """*accounts_provider(symbol) -> [(account, nlv, bp, held)]*."""
