@@ -72,12 +72,12 @@ _S_RIGHT_ALIGN_COLS = {
 # Theme tokens (keep in sync with trades_model)
 CLR_BUY    = "#3FB950"
 CLR_SELL   = "#F85149"
-TEXT       = "#C9D1D9"
-TEXT_DIM   = "#8B949E"
-TEXT_BOLD  = "#E6EDF3"
+TEXT       = "#E6EBF2"
+TEXT_DIM   = "#A3AFC2"
+TEXT_BOLD  = "#E6EBF2"
 # Subtle tint for the footer/total row so it reads as a separate
 # band from the per-symbol rows above without shouting.
-BG_TOTAL   = "#242834"
+BG_TOTAL   = "#232A3B"
 
 
 class TradesSummaryModel(QAbstractTableModel):
@@ -133,10 +133,10 @@ class TradesSummaryModel(QAbstractTableModel):
         # ``_effective_agg`` so live fills keep updating the raw aggregate.
         self._matched_keys: set[tuple[str, str]] = set()
 
-        self._symbol_font = QFont("Helvetica Neue, Arial", 11)
+        self._symbol_font = QFont("Inter, Helvetica Neue, Arial", 11)
         self._symbol_font.setWeight(QFont.Weight.DemiBold)
         # Bold font used across every cell of the totals/footer row.
-        self._total_font = QFont("Helvetica Neue, Arial", 11)
+        self._total_font = QFont("Inter, Helvetica Neue, Arial", 11)
         self._total_font.setWeight(QFont.Weight.Bold)
 
     # ── Proxy helpers ───────────────────────────────────────────────────────

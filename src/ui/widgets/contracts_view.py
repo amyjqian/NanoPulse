@@ -34,30 +34,30 @@ from src.ui.theme import Theme
 log = logging.getLogger(__name__)
 
 # ── Theme tokens mapping ──────────────────────────────────────────────────────
-BG_PRIMARY = "#1A1D24"
-BG_SECONDARY = "#1E222A"
-BG_HEADER = "#14171D"
-BORDER = "#2A2E37"
-TEXT = "#C9D1D9"
-TEXT_DIM = "#8B949E"
+BG_PRIMARY = "#151922"
+BG_SECONDARY = "#1B2130"
+BG_HEADER = "#151922"
+BORDER = "#262E3F"
+TEXT = "#E6EBF2"
+TEXT_DIM = "#A3AFC2"
 
-BLUE = "#58A6FF"
+BLUE = "#539BF5"
 GREEN = Theme.ACCENT
-ORANGE = "#D29922"
+ORANGE = "#F2A13A"
 
 _TOOLBAR_BTN = f"""
     QPushButton {{
         background-color: transparent;
         color: {TEXT};
-        border: 1px solid #30363D;
+        border: 1px solid #262E3F;
         border-radius: 4px;
         padding: 6px 14px;
         font-weight: 500;
         font-size: 13px;
     }}
-    QPushButton:hover {{ background-color: #2A2E38; }}
+    QPushButton:hover {{ background-color: #232A3B; }}
     QPushButton:pressed {{ background-color: {BG_PRIMARY}; }}
-    QPushButton:disabled {{ background-color: {BG_PRIMARY}; color: #484F58; border-color: {BORDER}; }}
+    QPushButton:disabled {{ background-color: {BG_PRIMARY}; color: #6A7690; border-color: {BORDER}; }}
     QPushButton:checked {{ background-color: {BLUE}; color: #ffffff; border: none; font-weight: bold; }}
 """
 
@@ -86,9 +86,9 @@ _ACTION_BTN = f"""
         font-weight: bold;
         font-size: 13px;
     }}
-    QPushButton:hover {{ background-color: #4b97f0; }}
-    QPushButton:pressed {{ background-color: #2a72d1; }}
-    QPushButton:disabled {{ background-color: #1A2A3A; color: #484F58; }}
+    QPushButton:hover {{ background-color: #539BF5; }}
+    QPushButton:pressed {{ background-color: #6BA8F6; }}
+    QPushButton:disabled {{ background-color: #1A2A3A; color: #6A7690; }}
 """
 
 _INPUT_SS = f"""
@@ -105,7 +105,7 @@ _INPUT_SS = f"""
     }}
     QLineEdit:disabled {{
         background-color: {BG_HEADER};
-        color: #484F58;
+        color: #6A7690;
     }}
 """
 
@@ -137,7 +137,7 @@ _COMBO_SS = f"""
         background-color: {BG_SECONDARY};
         color: {TEXT};
         border: 1px solid {BORDER};
-        selection-background-color: #253545;
+        selection-background-color: #1C2740;
         selection-color: {TEXT};
         outline: none;
     }}
@@ -151,7 +151,7 @@ _TABLE_STYLE = f"""
         gridline-color: {BORDER};
         border: 1px solid {BORDER};
         font-size: 12px;
-        selection-background-color: #253545;
+        selection-background-color: #1C2740;
         selection-color: {TEXT};
     }}
     QHeaderView::section {{
@@ -168,9 +168,9 @@ _TABLE_STYLE = f"""
         padding: 4px 8px;
     }}
     QScrollBar:vertical {{ background: {BG_PRIMARY}; width: 8px; }}
-    QScrollBar::handle:vertical {{ background: #3A3E48; border-radius: 4px; min-height: 20px; }}
+    QScrollBar::handle:vertical {{ background: #232A3B; border-radius: 4px; min-height: 20px; }}
     QScrollBar:horizontal {{ background: {BG_PRIMARY}; height: 8px; }}
-    QScrollBar::handle:horizontal {{ background: #3A3E48; border-radius: 4px; min-width: 20px; }}
+    QScrollBar::handle:horizontal {{ background: #232A3B; border-radius: 4px; min-width: 20px; }}
     QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
 """
 
@@ -276,7 +276,7 @@ class ContractsView(QWidget):
         top_layout.setContentsMargins(0, 0, 0, 0)
 
         lbl_title = QLabel("Find Contracts")
-        lbl_title.setFont(QFont("Helvetica Neue, Arial",
+        lbl_title.setFont(QFont("Inter, Helvetica Neue, Arial",
                           18, QFont.Weight.DemiBold))
         lbl_title.setStyleSheet(
             f"QLabel {{ color: {TEXT}; background: transparent; }}")
@@ -295,7 +295,7 @@ class ContractsView(QWidget):
         bottom_layout.setSpacing(10)
 
         lbl_saved = QLabel("Saved Contracts (available for Order Entry)")
-        lbl_saved.setFont(QFont("Helvetica Neue, Arial",
+        lbl_saved.setFont(QFont("Inter, Helvetica Neue, Arial",
                           14, QFont.Weight.DemiBold))
         lbl_saved.setStyleSheet(
             f"QLabel {{ color: {TEXT}; background: transparent; }}")
@@ -1149,7 +1149,7 @@ _BROWSE_TABLE_STYLE = f"""
         gridline-color: {Theme.BORDER};
         border: 1px solid {Theme.BORDER};
         font-size: 12px;
-        selection-background-color: #253545;
+        selection-background-color: #1C2740;
         selection-color: {Theme.TEXT};
     }}
     QHeaderView::section {{
@@ -1170,7 +1170,7 @@ _BROWSE_TABLE_STYLE = f"""
         width: 8px;
     }}
     QScrollBar::handle:vertical {{
-        background: #3A3E48;
+        background: #232A3B;
         border-radius: 4px;
         min-height: 20px;
     }}
@@ -1179,7 +1179,7 @@ _BROWSE_TABLE_STYLE = f"""
         height: 8px;
     }}
     QScrollBar::handle:horizontal {{
-        background: #3A3E48;
+        background: #232A3B;
         border-radius: 4px;
         min-width: 20px;
     }}
@@ -1204,7 +1204,7 @@ _BROWSE_ADD_SS = f"""
 
 _BROWSE_CANCEL_SS = f"""
     QPushButton {{
-        background-color: #22262E;
+        background-color: #1B2130;
         color: {Theme.TEXT};
         border: 1px solid {Theme.BORDER};
         border-radius: 4px;
@@ -1212,8 +1212,8 @@ _BROWSE_CANCEL_SS = f"""
         font-weight: 500;
         font-size: 13px;
     }}
-    QPushButton:hover {{ background-color: #2A2E38; }}
-    QPushButton:pressed {{ background-color: #22262E; }}
+    QPushButton:hover {{ background-color: #232A3B; }}
+    QPushButton:pressed {{ background-color: #1B2130; }}
 """
 
 

@@ -75,14 +75,14 @@ _FILTER_PRESETS: dict[str, tuple[int, tuple[int, int] | None]] = {
 }
 
 # ── Theme tokens ──────────────────────────────────────────────────────────────
-BG_TABLE     = "#1A1D24"
-BG_TABLE_ALT = "#1E222A"
-BG_HEADER    = "#14171D"
-BORDER       = "#30363D"
-TEXT         = "#C9D1D9"
-TEXT_DIM     = "#8B949E"
+BG_TABLE     = "#151922"
+BG_TABLE_ALT = "#1B2130"
+BG_HEADER    = "#151922"
+BORDER       = "#262E3F"
+TEXT         = "#E6EBF2"
+TEXT_DIM     = "#A3AFC2"
 
-_TABLE_FONT = QFont("Menlo, Consolas, monospace", 11)
+_TABLE_FONT = QFont("JetBrains Mono, Menlo, Consolas, monospace", 11)
 
 _TABLE_STYLE = f"""
     QTableView {{
@@ -92,7 +92,7 @@ _TABLE_STYLE = f"""
         gridline-color: {BORDER};
         border: none;
         font-size: 11px;
-        selection-background-color: #253545;
+        selection-background-color: #1C2740;
         selection-color: {TEXT};
     }}
     QHeaderView::section {{
@@ -113,11 +113,11 @@ _TABLE_STYLE = f"""
         margin: 0;
     }}
     QScrollBar::handle:vertical {{
-        background: #4A4E58;
+        background: #334058;
         border-radius: 4px;
         min-height: 24px;
     }}
-    QScrollBar::handle:vertical:hover {{ background: #5E6370; }}
+    QScrollBar::handle:vertical:hover {{ background: #334058; }}
     QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
     QScrollBar:horizontal {{
         background: {BG_TABLE};
@@ -125,11 +125,11 @@ _TABLE_STYLE = f"""
         margin: 0;
     }}
     QScrollBar::handle:horizontal {{
-        background: #4A4E58;
+        background: #334058;
         border-radius: 4px;
         min-width: 40px;
     }}
-    QScrollBar::handle:horizontal:hover {{ background: #5E6370; }}
+    QScrollBar::handle:horizontal:hover {{ background: #334058; }}
     QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
 """
 

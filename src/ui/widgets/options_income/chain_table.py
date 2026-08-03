@@ -32,7 +32,7 @@ from src.core import config_manager
 
 log = logging.getLogger(__name__)
 
-ACCENT_BLUE = "#0071e3"
+ACCENT_BLUE = "#539BF5"
 
 # User-dragged column widths persist across opens under this layout key
 # (same per-user store as the ticket's window size).
@@ -51,7 +51,7 @@ HEADERS = ["STRIKE", "BID", "ASK", "LAST", "DELTA", "CREDIT", "YIELD",
            "ANN."]
 NUM_COLS = len(HEADERS)
 
-_MONO = QFont("Menlo, Consolas, monospace", 11)
+_MONO = QFont("JetBrains Mono, Menlo, Consolas, monospace", 11)
 _GREEN = QColor("#3FB950")
 
 # ATM separator row: {"sep": True, "label": "MU 831.92"} — painted by the

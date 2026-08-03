@@ -58,25 +58,25 @@ from .order_status_model import (
 log = logging.getLogger(__name__)
 
 # ── Theme tokens ──────────────────────────────────────────────────────────────
-BG_PANEL = "#1e2230"
-BG_TABLE = "#1A1D24"
-BG_TABLE_ALT = "#1E222A"
-BG_HEADER = "#14171D"
-BORDER = "#30363D"
-TEXT = "#C9D1D9"
-TEXT_DIM = "#8B949E"
+BG_PANEL = "#151922"
+BG_TABLE = "#151922"
+BG_TABLE_ALT = "#1B2130"
+BG_HEADER = "#151922"
+BORDER = "#262E3F"
+TEXT = "#E6EBF2"
+TEXT_DIM = "#A3AFC2"
 
-CLR_OPEN = "#58A6FF"
+CLR_OPEN = "#539BF5"
 CLR_CANCEL_BTN = "#3A1A1A"
 CLR_CANCEL_BTN_HOVER = "#4A2424"
 CLR_CANCEL_BTN_PRESSED = "#5A2A2A"
 CLR_CANCEL_BTN_BORDER = "#4A2A2A"
 
 # ── Fonts ─────────────────────────────────────────────────────────────────────
-_TITLE_FONT = QFont("Helvetica Neue, Arial", 11)
+_TITLE_FONT = QFont("Inter, Helvetica Neue, Arial", 11)
 _TITLE_FONT.setWeight(QFont.Weight.Bold)
 
-_TABLE_FONT = QFont("Menlo, Consolas, monospace", 11)
+_TABLE_FONT = QFont("JetBrains Mono, Menlo, Consolas, monospace", 11)
 
 # ── Table QSS (applied to QTableView) ────────────────────────────────────────
 _TABLE_STYLE = f"""
@@ -87,7 +87,7 @@ _TABLE_STYLE = f"""
         gridline-color: {BORDER};
         border: none;
         font-size: 11px;
-        selection-background-color: #253545;
+        selection-background-color: #1C2740;
         selection-color: {TEXT};
     }}
     QHeaderView::section {{
@@ -109,12 +109,12 @@ _TABLE_STYLE = f"""
         margin: 0;
     }}
     QScrollBar::handle:vertical {{
-        background: #4A4E58;
+        background: #334058;
         border-radius: 4px;
         min-height: 24px;
     }}
     QScrollBar::handle:vertical:hover {{
-        background: #5E6370;
+        background: #334058;
     }}
     QScrollBar::handle:vertical:pressed {{
         background: #6E7380;
@@ -125,12 +125,12 @@ _TABLE_STYLE = f"""
         margin: 0;
     }}
     QScrollBar::handle:horizontal {{
-        background: #4A4E58;
+        background: #334058;
         border-radius: 4px;
         min-width: 40px;
     }}
     QScrollBar::handle:horizontal:hover {{
-        background: #5E6370;
+        background: #334058;
     }}
     QScrollBar::handle:horizontal:pressed {{
         background: #6E7380;
@@ -192,7 +192,7 @@ class CancelButtonDelegate(QStyledItemDelegate):
         if bg:
             painter.fillRect(option.rect, bg)
         elif option.state & QStyle.StateFlag.State_Selected:
-            painter.fillRect(option.rect, QColor("#253545"))
+            painter.fillRect(option.rect, QColor("#1C2740"))
         elif option.features & QStyleOptionViewItem.ViewItemFeature.Alternate:
             painter.fillRect(option.rect, QColor(BG_TABLE_ALT))
 
@@ -219,7 +219,7 @@ class CancelButtonDelegate(QStyledItemDelegate):
         painter.drawRoundedRect(btn_rect, self._BTN_RADIUS, self._BTN_RADIUS)
 
         painter.setPen(QColor(CLR_SELL))
-        painter.setFont(QFont("Helvetica Neue, Arial", 10, QFont.Weight.Bold))
+        painter.setFont(QFont("Inter, Helvetica Neue, Arial", 10, QFont.Weight.Bold))
         painter.drawText(btn_rect, Qt.AlignmentFlag.AlignCenter, self._BTN_TEXT)
 
         painter.restore()
@@ -334,10 +334,10 @@ class OrderStatusPanel(QWidget):
             QPushButton:hover {{
                 color: #ffffff;
                 border-color: {CLR_OPEN};
-                background: #253545;
+                background: #1C2740;
             }}
             QPushButton:pressed {{
-                background: #1a2535;
+                background: #1C2740;
             }}
         """)
         refresh_btn.clicked.connect(self._on_refresh_clicked)
@@ -447,7 +447,7 @@ class OrderStatusPanel(QWidget):
             if label == active:
                 btn.setStyleSheet(f"""
                     QPushButton {{
-                        background: #253545;
+                        background: #1C2740;
                         color: #ffffff;
                         border: 1px solid {CLR_OPEN};
                         border-radius: 10px;

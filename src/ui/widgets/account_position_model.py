@@ -61,18 +61,18 @@ HEADERS = [
 NUM_COLS = len(HEADERS)
 
 # ── Theme tokens ──────────────────────────────────────────────────────────────
-TEXT     = "#C9D1D9"
-TEXT_DIM = "#8B949E"
-CLR_PNL_POS = "#4CAF50"
-CLR_PNL_NEG = "#FF5252"
-CLR_LONG    = "#4CAF50"
-CLR_SHORT   = "#FF5252"
-CLR_ACCT    = "#58A6FF"
-BG_HEADER_ROW = "#1D2535"
+TEXT     = "#E6EBF2"
+TEXT_DIM = "#A3AFC2"
+CLR_PNL_POS = "#2EA043"
+CLR_PNL_NEG = "#F85149"
+CLR_LONG    = "#2EA043"
+CLR_SHORT   = "#F85149"
+CLR_ACCT    = "#539BF5"
+BG_HEADER_ROW = "#1B2130"
 
-_MONO       = QFont("Menlo, Consolas, monospace", 11)
-_MONO_BOLD  = QFont("Menlo, Consolas, monospace", 11, QFont.Weight.Bold)
-_ACCT_FONT  = QFont("Menlo, Consolas, monospace", 11, QFont.Weight.Bold)
+_MONO       = QFont("JetBrains Mono, Menlo, Consolas, monospace", 11)
+_MONO_BOLD  = QFont("JetBrains Mono, Menlo, Consolas, monospace", 11, QFont.Weight.Bold)
+_ACCT_FONT  = QFont("JetBrains Mono, Menlo, Consolas, monospace", 11, QFont.Weight.Bold)
 
 _BG_HEADER_BRUSH = QBrush(QColor(BG_HEADER_ROW))
 

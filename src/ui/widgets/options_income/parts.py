@@ -34,7 +34,7 @@ from src.core.options_income import Expiry
 
 log = logging.getLogger(__name__)
 
-ACCENT_BLUE = "#0071e3"          # active-selection blue used app-wide
+ACCENT_BLUE = "#539BF5"          # active-selection blue used app-wide
 
 
 def _symbol_chip_style(active: bool) -> str:
@@ -42,14 +42,14 @@ def _symbol_chip_style(active: bool) -> str:
     order-entry symbol chips (order_panel_parts._apply_chip_style).
     Duplicated verbatim by convention to avoid a cross-panel import."""
     if active:
-        return ("QPushButton{background:#0071e3;color:white;border:none;"
+        return ("QPushButton{background:#539BF5;color:white;border:none;"
                 "border-radius:6px;padding:4px 12px;font-weight:bold;"
                 "font-size:12px}"
-                "QPushButton:hover{background:#0077ed}")
-    return ("QPushButton{background:#3a3a4a;color:#ccc;border:none;"
+                "QPushButton:hover{background:#6BA8F6}")
+    return ("QPushButton{background:#232A3B;color:#A3AFC2;border:none;"
             "border-radius:6px;padding:4px 12px;font-weight:600;"
             "font-size:12px}"
-            "QPushButton:hover{background:#4a4a5a}")
+            "QPushButton:hover{background:#334058}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -178,7 +178,7 @@ class SymbolChipBar(QWidget):
         self._search.setPlaceholderText("Search symbol")
         self._search.setFixedWidth(180)
         self._search.setStyleSheet(
-            f"QLineEdit{{ background:#262a36; color:{Theme.TEXT};"
+            f"QLineEdit{{ background:#1B2130; color:{Theme.TEXT};"
             f" border:1px solid {Theme.BORDER}; border-radius:6px;"
             " padding:2px 10px; font-size:11px; }"
             f"QLineEdit:focus{{ border-color:{ACCENT_BLUE}; }}")
@@ -197,7 +197,7 @@ class SymbolChipBar(QWidget):
         self._popup = QListWidget(self)
         self._popup.setWindowFlags(Qt.WindowType.ToolTip)
         self._popup.setStyleSheet(
-            f"QListWidget{{ background:#262a36; color:{Theme.TEXT};"
+            f"QListWidget{{ background:#1B2130; color:{Theme.TEXT};"
             f" border:1px solid {Theme.BORDER}; border-radius:6px;"
             " font-size:11px; }"
             "QListWidget::item{ padding:5px 10px; }"

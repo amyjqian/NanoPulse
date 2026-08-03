@@ -34,45 +34,45 @@ from src.core import config_manager
 log = logging.getLogger(__name__)
 
 # ── Colours (matching order_entry_panel) ──────────────────────────────────────
-BG_PANEL = "#1e2230"
+BG_PANEL = "#151922"
 BG_ITEM_ACTIVE = "#1a2040"
 BG_ITEM_INACTIVE = "#242424"
 BORDER_ACTIVE = "#2a3ab0"
 BORDER_INACTIVE = "#333333"
-BORDER = "#30363D"
-TEXT = "#C9D1D9"
-TEXT_DIM = "#8B949E"
+BORDER = "#262E3F"
+TEXT = "#E6EBF2"
+TEXT_DIM = "#A3AFC2"
 
-CLR_FLATTEN = "#cc6600"
-CLR_CLOSE = "#8E8E93"
-CLR_REVERSE = "#8E44AD"
-CLR_CANCEL = "#3A3A3C"
+CLR_FLATTEN = "#E08A3C"
+CLR_CLOSE = "#9DA3AB"
+CLR_REVERSE = "#A371F7"
+CLR_CANCEL = "#3A414C"
 
 # Orange accent matches the Flatten button + trades control bar.
-ACCENT = "#CC6600"
-ACCENT_DIM = "#8A4500"
+ACCENT = "#E08A3C"
+ACCENT_DIM = "#B8722F"
 
 # Filter-strip chip palette — same blue-selected / grey-unselected
 # pattern as the symbol chips in OrderEntryPanel so the two strips
 # read as the same affordance.
-_CHIP_SELECTED_BG    = "#0071e3"
-_CHIP_SELECTED_HOVER = "#0077ed"
-_CHIP_IDLE_BG        = "#3a3a4a"
-_CHIP_IDLE_HOVER     = "#4a4a5a"
+_CHIP_SELECTED_BG    = "#539BF5"
+_CHIP_SELECTED_HOVER = "#6BA8F6"
+_CHIP_IDLE_BG        = "#232A3B"
+_CHIP_IDLE_HOVER     = "#334058"
 
 # ── Account-card design tokens (ACCOUNT_CARD_SPEC.md, dark theme) ──────────────
-_CARD_SURFACE      = "#121724"   # --surface  (card background)
-_CARD_SURFACE3     = "#232c40"   # --surface-3 (close hover)
-_CARD_SEL_BG       = "#17243d"   # accent-soft (0.12) pre-blended over --surface
-_CARD_TEXT         = "#eef2fb"   # --text   (name, total amount)
-_CARD_TEXT2        = "#9aa3ba"   # --text-2 (balance values)
-_CARD_TEXT3        = "#5f6982"   # --text-3 (currency codes, caps, close)
-_CARD_BORDER2      = "#2c3850"   # --border-2 (idle frame, empty checkbox)
-_CARD_ACCENT       = "#3b82f6"   # --accent  (selected frame + checkbox fill)
+_CARD_SURFACE      = "#1B2130"   # --surface  (card background)
+_CARD_SURFACE3     = "#232A3B"   # --surface-3 (close hover)
+_CARD_SEL_BG       = "#1C2740"   # accent-soft (0.12) pre-blended over --surface
+_CARD_TEXT         = "#E6EBF2"   # --text   (name, total amount)
+_CARD_TEXT2        = "#A3AFC2"   # --text-2 (balance values)
+_CARD_TEXT3        = "#6A7690"   # --text-3 (currency codes, caps, close)
+_CARD_BORDER2      = "#334058"   # --border-2 (idle frame, empty checkbox)
+_CARD_ACCENT       = "#539BF5"   # --accent  (selected frame + checkbox fill)
 _CARD_LOSS         = "#fb6f84"   # --loss    (negative figures)
 # Offline (disconnected) dim variants.
-_CARD_OFF_PRIMARY  = "#5f6982"
-_CARD_OFF_SECOND   = "#3a4358"
+_CARD_OFF_PRIMARY  = "#6A7690"
+_CARD_OFF_SECOND   = "#334058"
 
 # Real minus sign (U+2212) for negative figures, per spec.
 _MINUS = "−"
@@ -91,11 +91,11 @@ def _apply_filter_chip_style(btn: QPushButton, selected: bool) -> None:
     else:
         btn.setStyleSheet(
             "QPushButton{background:" + _CHIP_IDLE_BG +
-            ";color:#ccc;border:none;border-radius:6px;"
+            ";color:#A3AFC2;border:none;border-radius:6px;"
             "padding:4px 12px;font-weight:600;font-size:12px}"
             "QPushButton:hover{background:" + _CHIP_IDLE_HOVER + "}")
 
-_TITLE_FONT = QFont("Helvetica Neue, Arial", 11)
+_TITLE_FONT = QFont("Inter, Helvetica Neue, Arial", 11)
 
 # Group-pill grid layout: 3 rows × 4 columns.  The first two slots
 # (row 0, cols 0 and 1) are reserved for the built-in All / None
@@ -118,11 +118,11 @@ _TITLE_FONT.setWeight(QFont.Weight.Bold)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _btn_qss(colour: str) -> str:
+def _btn_qss(colour: str, fg: str = "#ffffff") -> str:
     return f"""
         QPushButton {{
             background: {colour};
-            color: #ffffff;
+            color: {fg};
             border: none;
             border-radius: 4px;
             padding: 4px 2px;
@@ -134,7 +134,8 @@ def _btn_qss(colour: str) -> str:
     """
 
 
-def _make_btn(text: str, colour: str, min_h: int = 30) -> QPushButton:
+def _make_btn(text: str, colour: str, min_h: int = 30,
+              fg: str = "#ffffff") -> QPushButton:
     """Flat action button – similar to order_entry_panel but tuned
     tighter so the 2×3 action grid barely constrains the panel's
     minimum width.  Horizontal padding and font size are both pulled
@@ -145,7 +146,7 @@ def _make_btn(text: str, colour: str, min_h: int = 30) -> QPushButton:
     btn.setMinimumHeight(min_h)
     btn.setCursor(Qt.CursorShape.PointingHandCursor)
     btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-    btn.setStyleSheet(_btn_qss(colour))
+    btn.setStyleSheet(_btn_qss(colour, fg))
     return btn
 
 
@@ -401,14 +402,14 @@ class _AccountRow(QFrame):
     @staticmethod
     def _ui_font(pt: int) -> QFont:
         # Same family/point-sizing as the positions view title font.
-        f = QFont("Helvetica Neue, Arial", pt)
+        f = QFont("Inter, Helvetica Neue, Arial", pt)
         f.setWeight(QFont.Weight.Bold)
         return f
 
     @staticmethod
     def _mono_font(pt: int, demibold: bool = False) -> QFont:
         # Same family/point-sizing as the positions view table/value font.
-        f = QFont("Menlo, Consolas, monospace", pt)
+        f = QFont("JetBrains Mono, Menlo, Consolas, monospace", pt)
         f.setWeight(QFont.Weight.DemiBold if demibold else QFont.Weight.Bold)
         return f
 
@@ -756,7 +757,7 @@ class AccountListPanel(QWidget):
             QScrollArea {{ background: transparent; border: none; }}
             QScrollBar:vertical {{ background: transparent; width: 6px; }}
             QScrollBar::handle:vertical {{
-                background: #3A3E48; border-radius: 3px; min-height: 20px;
+                background: #232A3B; border-radius: 3px; min-height: 20px;
             }}
             QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
         """)
@@ -770,12 +771,12 @@ class AccountListPanel(QWidget):
         ag.setSpacing(4)
         ag.setContentsMargins(0, 4, 0, 0)
 
-        for col, (txt, clr, act) in enumerate([
-            ("25%",     CLR_CLOSE,   "close_25"),
-            ("50%",     CLR_CLOSE,   "close_50"),
-            ("Flatten", CLR_FLATTEN, "flatten"),
+        for col, (txt, clr, fg, act) in enumerate([
+            ("25%",     CLR_CLOSE,   "#0f1319", "close_25"),
+            ("50%",     CLR_CLOSE,   "#0f1319", "close_50"),
+            ("Flatten", CLR_FLATTEN, "#1c1206", "flatten"),
         ]):
-            b = _make_btn(txt, clr)
+            b = _make_btn(txt, clr, fg=fg)
             b.clicked.connect(lambda _, a=act: self._emit_action(a))
             if act == "flatten":
                 self._flatten_btn = b
@@ -791,12 +792,12 @@ class AccountListPanel(QWidget):
         self._flatten_confirm_timer.setInterval(3000)
         self._flatten_confirm_timer.timeout.connect(self._disarm_flatten)
 
-        for col, (txt, clr, act) in enumerate([
-            ("Reverse", CLR_REVERSE, "reverse"),
-            ("75%",     CLR_CLOSE,   "close_75"),
-            ("Cancel",  CLR_CANCEL,  "cancel_all"),
+        for col, (txt, clr, fg, act) in enumerate([
+            ("Reverse", CLR_REVERSE, "#ffffff", "reverse"),
+            ("75%",     CLR_CLOSE,   "#0f1319", "close_75"),
+            ("Cancel",  CLR_CANCEL,  "#E6EBF2", "cancel_all"),
         ]):
-            b = _make_btn(txt, clr)
+            b = _make_btn(txt, clr, fg=fg)
             b.clicked.connect(lambda _, a=act: self._emit_action(a))
             ag.addWidget(b, 1, col)
 
@@ -833,7 +834,7 @@ class AccountListPanel(QWidget):
             QComboBox QAbstractItemView {{
                 background: {BG_PANEL}; color: {TEXT};
                 border: 1px solid {BORDER};
-                selection-background-color: #253545;
+                selection-background-color: #1C2740;
                 selection-color: {TEXT}; padding: 4px;
             }}
         """)
@@ -1672,7 +1673,7 @@ class AccountListPanel(QWidget):
     def _arm_flatten(self) -> None:
         self._flatten_armed = True
         self._flatten_btn.setText("Confirm?")
-        self._flatten_btn.setStyleSheet(_btn_qss("#cc3333"))
+        self._flatten_btn.setStyleSheet(_btn_qss("#F85149"))
         self._flatten_confirm_timer.start()
 
     def _disarm_flatten(self) -> None:
@@ -1680,7 +1681,8 @@ class AccountListPanel(QWidget):
         if self._flatten_armed:
             self._flatten_armed = False
             self._flatten_btn.setText("Flatten")
-            self._flatten_btn.setStyleSheet(_btn_qss(CLR_FLATTEN))
+            self._flatten_btn.setStyleSheet(
+                _btn_qss(CLR_FLATTEN, fg="#1c1206"))
 
     def _confirm_reverse(self, accounts: list[str]) -> bool:
         """Show a styled confirmation dialog before reversing.
@@ -1710,11 +1712,11 @@ class AccountListPanel(QWidget):
 
         dlg.setStyleSheet("""
             QMessageBox {
-                background-color: #1e2230;
-                color: #C9D1D9;
+                background-color: #151922;
+                color: #E6EBF2;
             }
             QMessageBox QLabel {
-                color: #C9D1D9;
+                color: #E6EBF2;
                 font-size: 12px;
             }
             QPushButton {
@@ -1727,17 +1729,17 @@ class AccountListPanel(QWidget):
                 border: none;
             }
             QPushButton[text="Reverse"] {
-                background: #8E44AD;
+                background: #A371F7;
                 color: #ffffff;
             }
-            QPushButton[text="Reverse"]:hover  { background: #9B59B6; }
-            QPushButton[text="Reverse"]:pressed { background: #7D3C98; }
+            QPushButton[text="Reverse"]:hover  { background: #B58AF9; }
+            QPushButton[text="Reverse"]:pressed { background: #8F5FE8; }
             QPushButton[text="Cancel"] {
-                background: #3A3A3C;
-                color: #C9D1D9;
+                background: #3A414C;
+                color: #E6EBF2;
             }
-            QPushButton[text="Cancel"]:hover  { background: #4a4a4e; }
-            QPushButton[text="Cancel"]:pressed { background: #2a2a2c; }
+            QPushButton[text="Cancel"]:hover  { background: #232A3B; }
+            QPushButton[text="Cancel"]:pressed { background: #232A3B; }
         """)
 
         return dlg.exec() == QMessageBox.StandardButton.Yes

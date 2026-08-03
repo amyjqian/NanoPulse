@@ -5,9 +5,9 @@ from PySide6.QtWidgets import QWidget, QSizePolicy
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPainter, QColor, QFont, QPen
 
-CONTENT_BG = "#0D1117"
-BORDER = "#21262D"
-TEXT_DIM = "#484F58"
+CONTENT_BG = "#0E1117"
+BORDER = "#232A3B"
+TEXT_DIM = "#6A7690"
 
 
 class Canvas(QWidget):
@@ -37,7 +37,7 @@ class Canvas(QWidget):
 
         # Placeholder label – first line
         p.setPen(QColor(TEXT_DIM))
-        font_title = QFont("SF Pro Display, Helvetica Neue, Arial", 15)
+        font_title = QFont("Inter, Helvetica Neue, Arial", 15)
         font_title.setWeight(QFont.Weight.Medium)
         p.setFont(font_title)
 
@@ -51,7 +51,7 @@ class Canvas(QWidget):
         )
 
         # Second line (subtitle)
-        font_sub = QFont("SF Pro Display, Helvetica Neue, Arial", 13)
+        font_sub = QFont("Inter, Helvetica Neue, Arial", 13)
         p.setFont(font_sub)
         sub_color = QColor(TEXT_DIM)
         sub_color.setAlpha(160)

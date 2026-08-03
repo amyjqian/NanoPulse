@@ -32,7 +32,7 @@ from src.core import config_manager
 
 log = logging.getLogger(__name__)
 
-_C_WINDOW_BG = QColor("#30363D")
+_C_WINDOW_BG = QColor("#262E3F")
 
 # Tab label → stacked-widget index
 _PAGE_INDEX: dict[str, int] = {

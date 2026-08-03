@@ -55,15 +55,15 @@ HEADERS = ["TIME", "ACTION", "QTY", "SYMBOL", "STRIKE", "TYPE", "PRICE",
            "STATUS", "CANCEL"]
 NUM_COLS = len(HEADERS)
 
-_MONO = QFont("Menlo, Consolas, monospace", 11)
+_MONO = QFont("JetBrains Mono, Menlo, Consolas, monospace", 11)
 _TYPE_WORD = {"C": "CALL", "P": "PUT"}
 
 _STATUS_COLOR = {
-    FILTER_OPEN: "#58A6FF",
+    FILTER_OPEN: "#539BF5",
     FILTER_COMPLETED: Theme.ACCENT,
     FILTER_CANCELLED: Theme.TEXT_DIM,
 }
-_CLR_REJECTED = "#e06c75"
+_CLR_REJECTED = "#F85149"
 
 
 class _SessionModel(QAbstractTableModel):
@@ -141,7 +141,7 @@ class _SessionModel(QAbstractTableModel):
             if col == COL_CANCEL:
                 if not self.can_cancel(rd):
                     return QColor(Theme.TEXT_DIM)
-                return QColor("#FF4D4D" if rd.get("confirm")
+                return QColor("#F85149" if rd.get("confirm")
                               else _CLR_REJECTED)
             return QColor(Theme.TEXT)
 

@@ -36,20 +36,20 @@ from .preferences_columns_page import ColumnsPage
 log = logging.getLogger(__name__)
 
 # ── Colour palette (matches main app dark theme) ─────────────────────────────
-_BG_DIALOG = "#1e2230"
+_BG_DIALOG = "#151922"
 _BG_SIDEBAR = "#0E1117"   # keep in sync with Theme.BG_MAIN
 _BG_SIDEBAR_HOVER = "#1c2030"
-_BG_SIDEBAR_SEL = "#263050"
-_BG_PANEL = "#1e2230"
-_BG_INPUT = "#272b3a"
-_BORDER = "#30363D"
-_TEXT = "#C9D1D9"
-_TEXT_DIM = "#8B949E"
-_ACCENT_BLUE = "#0071e3"
+_BG_SIDEBAR_SEL = "#1C2740"
+_BG_PANEL = "#151922"
+_BG_INPUT = "#1B2130"
+_BORDER = "#262E3F"
+_TEXT = "#E6EBF2"
+_TEXT_DIM = "#A3AFC2"
+_ACCENT_BLUE = "#539BF5"
 
-_FONT_TITLE = QFont("Helvetica Neue, Arial", 14)
+_FONT_TITLE = QFont("Inter, Helvetica Neue, Arial", 14)
 _FONT_TITLE.setWeight(QFont.Weight.Bold)
-_FONT_SECTION = QFont("Helvetica Neue, Arial", 12)
+_FONT_SECTION = QFont("Inter, Helvetica Neue, Arial", 12)
 _FONT_SECTION.setWeight(QFont.Weight.DemiBold)
 
 
@@ -92,7 +92,7 @@ def _styled_sidebar() -> QListWidget:
     lw = QListWidget()
     lw.setFixedWidth(140)
     lw.setFrameShape(QFrame.Shape.NoFrame)
-    lw.setFont(QFont("Helvetica Neue, Arial", 12))
+    lw.setFont(QFont("Inter, Helvetica Neue, Arial", 12))
     lw.setStyleSheet(f"""
         QListWidget {{
             background: {_BG_SIDEBAR};
@@ -313,9 +313,9 @@ class _ThemeCard(QFrame):
         is_dark = self._label == "Dark"
 
         chart_bg = QColor("#1a1e2a") if is_dark else QColor("#f0f0f4")
-        chart_fg = QColor("#3FB950") if is_dark else QColor("#0071e3")
-        bar_red = QColor("#c62828") if is_dark else QColor("#d32f2f")
-        bar_green = QColor("#2e7d32") if is_dark else QColor("#388e3c")
+        chart_fg = QColor("#3FB950") if is_dark else QColor("#539BF5")
+        bar_red = QColor("#F85149") if is_dark else QColor("#d32f2f")
+        bar_green = QColor("#2EA043") if is_dark else QColor("#388e3c")
         text_clr = QColor(_TEXT) if is_dark else QColor("#333")
 
         # Chart background
@@ -341,7 +341,7 @@ class _ThemeCard(QFrame):
 
         # Label text
         p.setPen(text_clr)
-        p.setFont(QFont("Helvetica Neue, Arial", 11, QFont.Weight.Medium))
+        p.setFont(QFont("Inter, Helvetica Neue, Arial", 11, QFont.Weight.Medium))
         p.drawText(0, h - 18, w, 18,
                    Qt.AlignmentFlag.AlignHCenter, self._label)
         p.end()

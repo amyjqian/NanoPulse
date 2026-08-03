@@ -72,28 +72,28 @@ from .connections_view import _ToggleSwitch
 log = logging.getLogger(__name__)
 
 # ── Theme tokens ──────────────────────────────────────────────────────────────
-BG_PANEL     = "#1e2230"
-BG_TABLE     = "#1A1D24"
-BG_TABLE_ALT = "#1E222A"
-BG_HEADER    = "#14171D"
-BORDER       = "#30363D"
-TEXT         = "#C9D1D9"
-TEXT_DIM_PNL = "#8B949E"
-CLR_OPEN     = "#58A6FF"
+BG_PANEL     = "#151922"
+BG_TABLE     = "#151922"
+BG_TABLE_ALT = "#1B2130"
+BG_HEADER    = "#151922"
+BORDER       = "#262E3F"
+TEXT         = "#E6EBF2"
+TEXT_DIM_PNL = "#A3AFC2"
+CLR_OPEN     = "#539BF5"
 
 # Flatten button colours
 CLR_FLATTEN_BG      = "#1A2A1A"
 CLR_FLATTEN_HOVER   = "#1F3820"
 CLR_FLATTEN_PRESSED = "#254825"
 CLR_FLATTEN_BORDER  = "#2A4A2A"
-CLR_FLATTEN_TEXT    = "#FF9800"   # orange – caution action
+CLR_FLATTEN_TEXT    = "#F2A13A"   # orange – caution action
 
-_TITLE_FONT = QFont("Helvetica Neue, Arial", 11)
+_TITLE_FONT = QFont("Inter, Helvetica Neue, Arial", 11)
 _TITLE_FONT.setWeight(QFont.Weight.Bold)
 
-_TABLE_FONT = QFont("Menlo, Consolas, monospace", 11)
-_INFO_LABEL_FONT  = QFont("Menlo, Consolas, monospace", 10)
-_INFO_VALUE_FONT  = QFont("Menlo, Consolas, monospace", 10, QFont.Weight.Bold)
+_TABLE_FONT = QFont("JetBrains Mono, Menlo, Consolas, monospace", 11)
+_INFO_LABEL_FONT  = QFont("JetBrains Mono, Menlo, Consolas, monospace", 10)
+_INFO_VALUE_FONT  = QFont("JetBrains Mono, Menlo, Consolas, monospace", 10, QFont.Weight.Bold)
 
 # ── QSS ───────────────────────────────────────────────────────────────────────
 _TABLE_STYLE = f"""
@@ -104,7 +104,7 @@ _TABLE_STYLE = f"""
         gridline-color: {BORDER};
         border: none;
         font-size: 11px;
-        selection-background-color: #253545;
+        selection-background-color: #1C2740;
         selection-color: {TEXT};
     }}
     QHeaderView::section {{
@@ -126,12 +126,12 @@ _TABLE_STYLE = f"""
         margin: 0;
     }}
     QScrollBar::handle:vertical {{
-        background: #4A4E58;
+        background: #334058;
         border-radius: 4px;
         min-height: 24px;
     }}
     QScrollBar::handle:vertical:hover {{
-        background: #5E6370;
+        background: #334058;
     }}
     QScrollBar::handle:vertical:pressed {{
         background: #6E7380;
@@ -142,12 +142,12 @@ _TABLE_STYLE = f"""
         margin: 0;
     }}
     QScrollBar::handle:horizontal {{
-        background: #4A4E58;
+        background: #334058;
         border-radius: 4px;
         min-width: 40px;
     }}
     QScrollBar::handle:horizontal:hover {{
-        background: #5E6370;
+        background: #334058;
     }}
     QScrollBar::handle:horizontal:pressed {{
         background: #6E7380;
@@ -267,10 +267,10 @@ class AccountHeaderInfoDelegate(QStyledItemDelegate):
 # ── Position-row action buttons definition ────────────────────────────────────
 # (label, bg_normal, bg_hover, bg_pressed, pct)   pct=100 → full flatten
 _POS_BTNS = [
-    ("Flatten", "#cc6600", "#d97a00", "#b35800", 100),
-    ("25%",     "#8E8E93", "#9E9EA3", "#7E7E83",  25),
-    ("50%",     "#8E8E93", "#9E9EA3", "#7E7E83",  50),
-    ("75%",     "#8E8E93", "#9E9EA3", "#7E7E83",  75),
+    ("Flatten", "#E08A3C", "#CE7F37", "#BD742F", 100),
+    ("25%",     "#9DA3AB", "#C9CED5", "#8A9099",  25),
+    ("50%",     "#9DA3AB", "#C9CED5", "#8A9099",  50),
+    ("75%",     "#9DA3AB", "#C9CED5", "#8A9099",  75),
 ]
 # ── Position column definitions (configurable via Column Management) ───────────
 _POS_COL_KEYS = [
@@ -355,7 +355,7 @@ class FlattenButtonDelegate(QStyledItemDelegate):
         with the font the buttons are actually painted in — shared by
         the header button and the position-row Flatten button."""
         bfm = QFontMetrics(
-            QFont("Helvetica Neue, Arial", 10, QFont.Weight.Bold))
+            QFont("Inter, Helvetica Neue, Arial", 10, QFont.Weight.Bold))
         # Snug fit: just the label plus a few px of breathing room.
         return bfm.horizontalAdvance(self._HDR_ARMED_TEXT) + 2 * 3
 
@@ -399,7 +399,7 @@ class FlattenButtonDelegate(QStyledItemDelegate):
         if self._is_header(index):
             painter.fillRect(option.rect, QColor(BG_HEADER_ROW))
         elif option.state & QStyle.StateFlag.State_Selected:
-            painter.fillRect(option.rect, QColor("#253545"))
+            painter.fillRect(option.rect, QColor("#1C2740"))
         elif option.features & QStyleOptionViewItem.ViewItemFeature.Alternate:
             painter.fillRect(option.rect, QColor(BG_TABLE_ALT))
         else:
@@ -423,7 +423,7 @@ class FlattenButtonDelegate(QStyledItemDelegate):
             # armed state flips to red ("Sure?") until confirmed/expired.
             _lbl, bg_n, bg_h, bg_p, _pct = _POS_BTNS[0]
             if armed:
-                bg_n, bg_h, bg_p = "#cc3333", "#d94444", "#b32d2d"
+                bg_n, bg_h, bg_p = "#F85149", "#8B2A28", "#8B2A28"
             bg = (QColor(bg_p) if pressed
                   else QColor(bg_h) if hovered
                   else QColor(bg_n))
@@ -432,8 +432,10 @@ class FlattenButtonDelegate(QStyledItemDelegate):
             painter.setBrush(bg)
             painter.drawRoundedRect(btn_rect, self._HDR_RADIUS, self._HDR_RADIUS)
 
-            painter.setPen(QColor("#ffffff"))
-            painter.setFont(QFont("Helvetica Neue, Arial", 10, QFont.Weight.Bold))
+            # Amber flatten carries dark text (restyle); the armed red
+            # confirm state keeps white for contrast.
+            painter.setPen(QColor("#ffffff" if armed else "#1c1206"))
+            painter.setFont(QFont("Inter, Helvetica Neue, Arial", 10, QFont.Weight.Bold))
             painter.drawText(btn_rect, Qt.AlignmentFlag.AlignCenter,
                              self._HDR_ARMED_TEXT if armed
                              else self._HDR_TEXT)
@@ -450,7 +452,7 @@ class FlattenButtonDelegate(QStyledItemDelegate):
 
             rects   = self._pos_button_rects(option.rect, fm)
             hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
-            btn_font = QFont("Helvetica Neue, Arial", 10, QFont.Weight.Bold)
+            btn_font = QFont("Inter, Helvetica Neue, Arial", 10, QFont.Weight.Bold)
 
             for i, ((lbl, bg_n, bg_h, bg_p, _pct), rect) in enumerate(
                     zip(_POS_BTNS, rects)):
@@ -464,7 +466,9 @@ class FlattenButtonDelegate(QStyledItemDelegate):
                 painter.setBrush(bg)
                 painter.drawRoundedRect(rect, _POS_BTN_RADIUS, _POS_BTN_RADIUS)
 
-                painter.setPen(QColor("#ffffff"))
+                # Light-background buttons take dark text (restyle):
+                # amber Flatten #1c1206, grey 25/50/75% #0f1319.
+                painter.setPen(QColor("#1c1206" if i == 0 else "#0f1319"))
                 painter.setFont(btn_font)
                 painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, lbl)
 
@@ -915,8 +919,8 @@ class AccountPositionPanel(QWidget):
                 border: 1px solid {BORDER}; border-radius: 4px;
                 font-size: 14px; font-weight: bold;
             }}
-            QPushButton:hover {{ color: #ffffff; border-color: {CLR_OPEN}; background: #253545; }}
-            QPushButton:pressed {{ background: #1a2535; }}
+            QPushButton:hover {{ color: #ffffff; border-color: {CLR_OPEN}; background: #1C2740; }}
+            QPushButton:pressed {{ background: #1C2740; }}
         """)
         btn.clicked.connect(self._on_refresh_clicked)
         lay.addWidget(btn)
@@ -942,8 +946,8 @@ class AccountPositionPanel(QWidget):
                 border: 1px solid {BORDER}; border-radius: 4px;
                 font-size: 14px;
             }}
-            QPushButton:hover {{ color: #ffffff; border-color: {CLR_OPEN}; background: #253545; }}
-            QPushButton:pressed {{ background: #1a2535; }}
+            QPushButton:hover {{ color: #ffffff; border-color: {CLR_OPEN}; background: #1C2740; }}
+            QPushButton:pressed {{ background: #1C2740; }}
         """)
         gear.clicked.connect(self._on_gear_clicked)
         lay.addWidget(gear)

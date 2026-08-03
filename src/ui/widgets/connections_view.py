@@ -39,29 +39,29 @@ log = logging.getLogger(__name__)
 # ── Theme tokens ──────────────────────────────────────────────────────────────
 from src.ui.theme import Theme
 
-BG_PRIMARY = "#1A1D24"
-BG_SECONDARY = "#1E222A"
-BG_HEADER = "#14171D"
-BORDER = "#2A2E37"
-TEXT = "#C9D1D9"
-TEXT_DIM = "#8B949E"
+BG_PRIMARY = "#151922"
+BG_SECONDARY = "#1B2130"
+BG_HEADER = "#151922"
+BORDER = "#262E3F"
+TEXT = "#E6EBF2"
+TEXT_DIM = "#A3AFC2"
 GREEN = Theme.ACCENT
 RED = Theme.CLR_SELL
-BLUE = "#58A6FF"
+BLUE = "#539BF5"
 
 _TOOLBAR_BTN = f"""
     QPushButton {{
         background-color: transparent;
         color: {TEXT};
-        border: 1px solid #30363D;
+        border: 1px solid #262E3F;
         border-radius: 4px;
         padding: 4px 12px;
         font-weight: 500;
         font-size: 13px;
     }}
-    QPushButton:hover {{ background-color: #2A2E38; }}
+    QPushButton:hover {{ background-color: #232A3B; }}
     QPushButton:pressed {{ background-color: {BG_PRIMARY}; }}
-    QPushButton:disabled {{ background-color: transparent; color: #484F58; border-color: {BORDER}; }}
+    QPushButton:disabled {{ background-color: transparent; color: #6A7690; border-color: {BORDER}; }}
 """
 
 _CONNECT_SS = f"""
@@ -77,7 +77,7 @@ _CONNECT_SS = f"""
     }}
     QPushButton:hover {{ background-color: #4cd860; }}
     QPushButton:pressed {{ background-color: #35a145; }}
-    QPushButton:disabled {{ background-color: #1A3A2A; color: #484F58; }}
+    QPushButton:disabled {{ background-color: #1A3A2A; color: #6A7690; }}
 """
 
 _DISCONNECT_SS = f"""
@@ -97,7 +97,7 @@ _DISCONNECT_SS = f"""
 
 _ADD_SS = f"""
     QPushButton {{
-        background-color: #5C626E;
+        background-color: #6A7690;
         color: #ffffff;
         border: none;
         border-radius: 3px;
@@ -106,7 +106,7 @@ _ADD_SS = f"""
         font-weight: bold;
         font-size: 13px;
     }}
-    QPushButton:hover {{ background-color: #798190; }}
+    QPushButton:hover {{ background-color: #6A7690; }}
     QPushButton:pressed {{ background-color: #464B54; }}
 """
 
@@ -138,7 +138,7 @@ _TABLE_STYLE = f"""
         gridline-color: {BORDER};
         border: 1px solid {BORDER};
         font-size: 12px;
-        selection-background-color: #253545;
+        selection-background-color: #1C2740;
         selection-color: {TEXT};
     }}
     QHeaderView::section {{
@@ -157,21 +157,21 @@ _TABLE_STYLE = f"""
     QTableWidget QLineEdit, QTableView QLineEdit {{
         background-color: {BG_SECONDARY};
         color: {TEXT};
-        border: 1px solid #484F58;
+        border: 1px solid #6A7690;
         border-radius: 2px;
         padding: 4px 8px;
-        selection-background-color: #253545;
+        selection-background-color: #1C2740;
         selection-color: {TEXT};
         outline: none;
     }}
     QTableWidget QLineEdit:focus, QTableView QLineEdit:focus {{
-        border: 1px solid #484F58;
+        border: 1px solid #6A7690;
         outline: none;
     }}
     QScrollBar:vertical {{ background: {BG_PRIMARY}; width: 8px; }}
-    QScrollBar::handle:vertical {{ background: #3A3E48; border-radius: 4px; min-height: 20px; }}
+    QScrollBar::handle:vertical {{ background: #232A3B; border-radius: 4px; min-height: 20px; }}
     QScrollBar:horizontal {{ background: {BG_PRIMARY}; height: 8px; }}
-    QScrollBar::handle:horizontal {{ background: #3A3E48; border-radius: 4px; min-width: 20px; }}
+    QScrollBar::handle:horizontal {{ background: #232A3B; border-radius: 4px; min-width: 20px; }}
     QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
 """
 
@@ -224,7 +224,7 @@ class _ToggleSwitch(QWidget):
         label_text = "On" if self._checked else "Off"
         label_color = QColor(TEXT) if self._checked else QColor(TEXT_DIM)
         p.setPen(label_color)
-        f = QFont("SF Pro Display, Helvetica Neue, Arial", 11)
+        f = QFont("Inter, Helvetica Neue, Arial", 11)
         f.setWeight(QFont.Weight.Medium)
         p.setFont(f)
         fm = p.fontMetrics()
@@ -237,7 +237,7 @@ class _ToggleSwitch(QWidget):
         track_x = label_w + self._LABEL_GAP
         r = h // 2
 
-        track_color = QColor("#2F81F7") if self._checked else QColor("#3A3E48")
+        track_color = QColor("#539BF5") if self._checked else QColor("#232A3B")
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QBrush(track_color))
         p.drawRoundedRect(track_x, 0, tw, h, r, r)
@@ -586,7 +586,7 @@ class ConnectionsView(QWidget):
         # Section label
         lbl_conn = QLabel("Connections")
         lbl_conn.setFont(
-            QFont("SF Pro Display, Helvetica Neue, Arial", 13, QFont.Weight.DemiBold))
+            QFont("Inter, Helvetica Neue, Arial", 13, QFont.Weight.DemiBold))
         lbl_conn.setStyleSheet(
             f"QLabel {{ color: {TEXT}; background: transparent; padding: 0 0 2px 0; }}")
         top_layout.addWidget(lbl_conn)
@@ -613,7 +613,7 @@ class ConnectionsView(QWidget):
 
         lbl_acct = QLabel("Accounts")
         lbl_acct.setFont(
-            QFont("SF Pro Display, Helvetica Neue, Arial", 13, QFont.Weight.DemiBold))
+            QFont("Inter, Helvetica Neue, Arial", 13, QFont.Weight.DemiBold))
         lbl_acct.setStyleSheet(
             f"QLabel {{ color: {TEXT}; background: transparent; padding: 0 0 2px 0; }}")
         header_row.addWidget(lbl_acct)
@@ -834,7 +834,7 @@ class ConnectionsView(QWidget):
                 border: 1px solid {BORDER};
                 padding: 4px 0;
                 outline: 0;
-                selection-background-color: #1A3A5C;
+                selection-background-color: #1C2740;
                 selection-color: {TEXT};
             }}
             QAbstractItemView::item {{
@@ -843,7 +843,7 @@ class ConnectionsView(QWidget):
             }}
             QAbstractItemView::item:hover,
             QAbstractItemView::item:selected {{
-                background-color: #1A3A5C;
+                background-color: #1C2740;
                 color: {TEXT};
             }}
         """)
@@ -1216,7 +1216,7 @@ class ConnectionsView(QWidget):
             if status_item:
                 if connecting:
                     status_item.setText("Connecting…")
-                    status_item.setStyleSheet("color: #FFA657; background: transparent; padding-left: 4px;")  # amber
+                    status_item.setStyleSheet("color: #F2A13A; background: transparent; padding-left: 4px;")  # amber
                 elif connected:
                     status_item.setText("Connected")
                     status_item.setStyleSheet(f"color: {GREEN}; background: transparent; padding-left: 4px;")

@@ -4,6 +4,7 @@ Entry point.
 """
 import logging
 import sys
+from pathlib import Path
 
 from PySide6.QtCore import QObject, QTimer
 from PySide6.QtWidgets import QApplication
@@ -152,9 +153,21 @@ def main() -> None:
     app.setOrganizationName("nanoPulse")
     app.setStyle("Fusion")
 
+    # Register any bundled fonts (resources/fonts/*.ttf|*.otf) before the
+    # default font is set — the restyle targets Inter (UI) + JetBrains
+    # Mono (numbers); when the files are absent every family stack falls
+    # back gracefully to Helvetica Neue / Menlo.
+    from PySide6.QtGui import QFontDatabase
+    fonts_dir = Path(__file__).resolve().parent / "resources" / "fonts"
+    if fonts_dir.is_dir():
+        for f in sorted(fonts_dir.iterdir()):
+            if f.suffix.lower() in (".ttf", ".otf"):
+                if QFontDatabase.addApplicationFont(str(f)) == -1:
+                    log.warning("Could not load font %s", f.name)
+
     # Default application font
     font = QFont()
-    font.setFamilies(["SF Pro Display", "Helvetica Neue", "Arial"])
+    font.setFamilies(["Inter", "Helvetica Neue", "Arial"])
     font.setPointSize(11)
     app.setFont(font)
 

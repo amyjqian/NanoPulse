@@ -29,7 +29,7 @@ _BLUE = "#2f60d8"
 _TEAL = "#2ec4a6"
 _GREEN = "#5fce77"
 
-_MONO = "'SF Mono', ui-monospace, Menlo, monospace"
+_MONO = "'JetBrains Mono', Menlo, monospace"
 
 
 class UsersPage(QWidget):

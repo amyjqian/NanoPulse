@@ -60,9 +60,9 @@ _RIGHT_ALIGN_COLS = {
 # ── Theme tokens (match the rest of the FlashTrade panels) ───────────────────
 CLR_BUY    = "#3FB950"   # BOT – green
 CLR_SELL   = "#F85149"   # SLD – red
-TEXT       = "#C9D1D9"
-TEXT_DIM   = "#8B949E"
-TEXT_BOLD  = "#E6EDF3"
+TEXT       = "#E6EBF2"
+TEXT_DIM   = "#A3AFC2"
+TEXT_BOLD  = "#E6EBF2"
 
 
 class TradesModel(QAbstractTableModel):
@@ -74,10 +74,10 @@ class TradesModel(QAbstractTableModel):
         # execId → row index (for dedupe + surgical commission patches)
         self._index: dict[str, int] = {}
 
-        self._side_font = QFont("Helvetica Neue, Arial", 11)
+        self._side_font = QFont("Inter, Helvetica Neue, Arial", 11)
         self._side_font.setWeight(QFont.Weight.Bold)
 
-        self._symbol_font = QFont("Helvetica Neue, Arial", 11)
+        self._symbol_font = QFont("Inter, Helvetica Neue, Arial", 11)
         self._symbol_font.setWeight(QFont.Weight.DemiBold)
 
     # ── Proxy helpers ───────────────────────────────────────────────────────

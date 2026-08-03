@@ -61,16 +61,16 @@ log = logging.getLogger(__name__)
 _DB_PATH = Path(__file__).resolve().parents[3] / "data" / "strategy_tiers.db"
 
 # ── Palette ───────────────────────────────────────────────────────────────────
-BG_PRIMARY   = "#1A1D24"
-BG_SECONDARY = "#1E222A"
-BG_HEADER    = "#14171D"
-BORDER       = "#2A2E37"
-TEXT         = "#C9D1D9"
-TEXT_DIM     = "#8B949E"
+BG_PRIMARY   = "#151922"
+BG_SECONDARY = "#1B2130"
+BG_HEADER    = "#151922"
+BORDER       = "#262E3F"
+TEXT         = "#E6EBF2"
+TEXT_DIM     = "#A3AFC2"
 
-BLUE   = "#58A6FF"
+BLUE   = "#539BF5"
 GREEN  = Theme.ACCENT
-ORANGE = "#D29922"
+ORANGE = "#F2A13A"
 RED    = "#F85149"
 PURPLE = "#BC8CFF"
 COMPUTED = "#4ECDC4"   # teal – read-only computed Val cells
@@ -494,7 +494,7 @@ _TABLE_STYLE = f"""
         gridline-color: {BORDER};
         border: none;
         font-size: 12px;
-        selection-background-color: #253545;
+        selection-background-color: #1C2740;
         selection-color: {TEXT};
     }}
     QHeaderView::section {{
@@ -512,8 +512,8 @@ _TABLE_STYLE = f"""
     }}
     QScrollBar:vertical   {{ background: {BG_PRIMARY}; width: 8px; }}
     QScrollBar:horizontal {{ background: {BG_PRIMARY}; height: 8px; }}
-    QScrollBar::handle:vertical   {{ background: #3A3E48; border-radius: 4px; min-height: 20px; }}
-    QScrollBar::handle:horizontal {{ background: #3A3E48; border-radius: 4px; min-width:  20px; }}
+    QScrollBar::handle:vertical   {{ background: #232A3B; border-radius: 4px; min-height: 20px; }}
+    QScrollBar::handle:horizontal {{ background: #232A3B; border-radius: 4px; min-width:  20px; }}
     QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
 """
 
@@ -645,13 +645,13 @@ _BTN_BASE = f"""
     QPushButton {{
         background-color: transparent;
         color: {TEXT};
-        border: 1px solid #30363D;
+        border: 1px solid #262E3F;
         border-radius: 4px;
         padding: 6px 16px;
         font-weight: 500;
         font-size: 13px;
     }}
-    QPushButton:hover {{ background-color: #2A2E38; }}
+    QPushButton:hover {{ background-color: #232A3B; }}
     QPushButton:pressed {{ background-color: {BG_PRIMARY}; }}
 """
 _BTN_SAVE = f"""
@@ -711,7 +711,7 @@ class StrategyEditorView(QWidget):
 
         # Title
         title = QLabel("Strategy Tier Editor")
-        title.setFont(QFont("Helvetica Neue, Arial", 16, QFont.Weight.DemiBold))
+        title.setFont(QFont("Inter, Helvetica Neue, Arial", 16, QFont.Weight.DemiBold))
         title.setStyleSheet(
             f"QLabel {{ color: {TEXT}; background: transparent; }}")
         root.addWidget(title)
@@ -926,7 +926,7 @@ class StrategyEditorView(QWidget):
         menu = QMenu(self)
         menu.setStyleSheet(f"""
             QMenu {{
-                background-color: #1E222A;
+                background-color: #1B2130;
                 color: {TEXT};
                 border: 1px solid {BORDER};
                 border-radius: 4px;
@@ -937,7 +937,7 @@ class StrategyEditorView(QWidget):
                 border-radius: 3px;
             }}
             QMenu::item:selected {{
-                background-color: #253545;
+                background-color: #1C2740;
             }}
             QMenu::item:disabled {{
                 color: {TEXT_DIM};

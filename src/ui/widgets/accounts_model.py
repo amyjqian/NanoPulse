@@ -426,7 +426,7 @@ class AccountsTableModel(QAbstractTableModel):
 
         if role == Qt.ItemDataRole.BackgroundRole:
             # Slightly darker to visually separate the footer from data rows.
-            return QColor("#14171D")
+            return QColor("#151922")
 
         if role == Qt.ItemDataRole.ForegroundRole:
             if col == COL_DAILY_PNL:

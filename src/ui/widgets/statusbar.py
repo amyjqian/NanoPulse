@@ -7,11 +7,11 @@ from PySide6.QtGui import QPainter, QColor, QFont, QPen, QBrush
 
 BAR_HEIGHT = 24
 ACCENT = "#3FB950"
-TEXT_PRIMARY = "#C9D1D9"
-TEXT_SECONDARY = "#8B949E"
-TEXT_DIM = "#484F58"
-BAR_BG = "#161B22"
-BORDER = "#30363D"
+TEXT_PRIMARY = "#E6EBF2"
+TEXT_SECONDARY = "#A3AFC2"
+TEXT_DIM = "#6A7690"
+BAR_BG = "#151922"
+BORDER = "#262E3F"
 
 
 class StatusDot(QWidget):
@@ -113,7 +113,7 @@ class StatusBar(QWidget):
 
     @staticmethod
     def _mono_font(lbl: QLabel, bold: bool = False) -> None:
-        font = QFont("SF Mono, Consolas, Menlo, monospace", 8)
+        font = QFont("JetBrains Mono, Menlo, Consolas, monospace", 8)
         if bold:
             font.setWeight(QFont.Weight.Medium)
         lbl.setFont(font)
@@ -135,7 +135,7 @@ class StatusBar(QWidget):
             return
         self._status_lbl.setText(text)
         self._status_lbl.setStyleSheet(
-            f"color: #FFA657; letter-spacing: 0.8px;")  # amber accent
+            f"color: #F2A13A; letter-spacing: 0.8px;")  # amber accent
         self._transient_timer.stop()
         self._transient_timer.start(max(int(duration_ms), 500))
 

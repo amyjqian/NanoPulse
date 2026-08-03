@@ -15,13 +15,13 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QStackedWidget, QTabWidget, QWidget
 
 # ── Theme tokens ──────────────────────────────────────────────────────────────
-ACCENT    = "#CC6600"
-BG_PANEL  = "#1e2230"
+ACCENT    = "#E08A3C"
+BG_PANEL  = "#151922"
 # Matches BG_HEADER used by the Positions and Trades column-header rows
 # so the tab strip and the header row directly below it read as one band.
-BG_HEADER = "#14171D"
-TEXT      = "#C9D1D9"
-TEXT_DIM  = "#8B949E"
+BG_HEADER = "#151922"
+TEXT      = "#E6EBF2"
+TEXT_DIM  = "#A3AFC2"
 
 _TAB_QSS = f"""
     QTabWidget {{
@@ -47,7 +47,7 @@ _TAB_QSS = f"""
         margin: 0;
         border: none;
         border-bottom: 2px solid transparent;
-        font-family: "Helvetica Neue", Arial, sans-serif;
+        font-family: Inter, "Helvetica Neue", Arial, sans-serif;
         font-size: 11px;
         font-weight: 700;
         letter-spacing: 0.10em;

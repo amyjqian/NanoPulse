@@ -126,18 +126,18 @@ def test_custom_input_recolors_with_unit(qtbot):
     # palette and toggling back restores the grey share palette.
     row = _make(qtbot)
     box = row._custom
-    assert "#3a3a4a" in box.styleSheet()            # grey share box
+    assert "#232A3B" in box.styleSheet()            # grey share box
     assert "border-radius:6px" in box.styleSheet()
     assert "background:transparent" in box._edit.styleSheet()
     row._btn_unit.click()                          # → %
-    assert "#2b2a1e" in box.styleSheet()            # CLR_PCT_BG box
+    assert "rgba(45,180,164,.12)" in box.styleSheet()            # CLR_PCT_BG box
     assert "border-radius:6px" in box.styleSheet()
-    assert "#d9c07a" in box._edit.styleSheet()      # CLR_PCT_TEXT
+    assert "#2DB4A4" in box._edit.styleSheet()      # CLR_PCT_TEXT
     assert box._edit.placeholderText() == "%"
     row._btn_unit.click()                          # → SH
     assert box._edit.placeholderText() == "Qty"
-    assert "#3a3a4a" in box.styleSheet()
-    assert "#ccc" in box._edit.styleSheet()
+    assert "#232A3B" in box.styleSheet()
+    assert "#A3AFC2" in box._edit.styleSheet()
 
 
 def test_chips_disable_without_price_or_accounts(qtbot):
@@ -216,17 +216,17 @@ def test_custom_value_keeps_selected_look_unfocused(qtbot):
     # after focus moves elsewhere.
     box.setText("750")
     box.focusChanged.emit(False)
-    assert "#0071e3" in box.styleSheet()
+    assert "#539BF5" in box.styleSheet()
     # Percent mode, empty field → idle dark gold.
     row._btn_unit.click()
-    assert "#2b2a1e" in box.styleSheet()
+    assert "rgba(45,180,164,.12)" in box.styleSheet()
     # Typed percent → solid gold selected look, focused or not.
     box.setText("12")
     box.focusChanged.emit(False)
-    assert "#c9a227" in box.styleSheet()               # Theme.CLR_PCT
+    assert "#2DB4A4" in box.styleSheet()               # Theme.CLR_PCT
     # Clicking a preset clears the field → back to idle.
     _chip(row, 25).click()
-    assert "#2b2a1e" in box.styleSheet()
+    assert "rgba(45,180,164,.12)" in box.styleSheet()
 
 
 def test_typed_preset_value_adopts_the_chip(qtbot):
@@ -240,20 +240,20 @@ def test_typed_preset_value_adopts_the_chip(qtbot):
     box.focusChanged.emit(False)
     assert box.text() == ""
     assert _chip(row, 50).styleSheet() == ref_on.styleSheet()
-    assert "#0071e3" not in box.styleSheet()           # box unselected
+    assert "#539BF5" not in box.styleSheet()           # box unselected
     assert row.current_qty() == 50
     # A non-preset value stays in the box (selected look).
     box.setText("750")
     box.focusChanged.emit(False)
     assert box.text() == "750"
-    assert "#0071e3" in box.styleSheet()
+    assert "#539BF5" in box.styleSheet()
     # Same in percent mode: 25 is a percent preset.
     row._btn_unit.click()
     box.setText("25")
     box.focusChanged.emit(False)
     assert box.text() == ""
     assert row.current_percent() == 25
-    assert "#2b2a1e" in box.styleSheet()               # idle dark gold
+    assert "rgba(45,180,164,.12)" in box.styleSheet()               # idle dark gold
 
 
 def test_spinbox_arrow_keys_step_ladder(qtbot):

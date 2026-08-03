@@ -70,12 +70,12 @@ _KEY_FOR_COL: dict[int, str] = {
 # ── Theme tokens ──────────────────────────────────────────────────────────────
 CLR_BUY = "#3FB950"
 CLR_SELL = "#F85149"
-CLR_OPEN = "#58A6FF"
+CLR_OPEN = "#539BF5"
 CLR_FILLED = "#3FB950"
-CLR_CANCELLED = "#8B949E"
+CLR_CANCELLED = "#A3AFC2"
 CLR_EXTERNAL_BG = "#2A2420"
-TEXT = "#C9D1D9"
-TEXT_DIM = "#8B949E"
+TEXT = "#E6EBF2"
+TEXT_DIM = "#A3AFC2"
 
 # ── Filter categories ─────────────────────────────────────────────────────────
 FILTER_ALL = "All"
@@ -112,8 +112,8 @@ TimeSortRole = Qt.ItemDataRole.UserRole + 5
 RawStatusRole = Qt.ItemDataRole.UserRole + 6
 
 # ── Fonts (shared with the panel) ────────────────────────────────────────────
-ACTION_FONT = QFont("Helvetica Neue, Arial", 11, QFont.Weight.Bold)
-STATUS_FONT = QFont("Helvetica Neue, Arial", 11, QFont.Weight.Bold)
+ACTION_FONT = QFont("Inter, Helvetica Neue, Arial", 11, QFont.Weight.Bold)
+STATUS_FONT = QFont("Inter, Helvetica Neue, Arial", 11, QFont.Weight.Bold)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

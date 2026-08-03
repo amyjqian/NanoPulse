@@ -336,7 +336,7 @@ class BookTraderView(QWidget):
 
         _hdr_ss = (
             f"color: {Theme.TEXT_DIM}; border: none; "
-            f"font-size: 10px; font-family: 'Helvetica Neue', Arial; "
+            f"font-size: 10px; font-family: Inter, 'Helvetica Neue', Arial; "
             f"font-weight: bold;"
         )
         self._lbl_bid_hdr = QLabel("Bid Size")
@@ -354,21 +354,21 @@ class BookTraderView(QWidget):
         # combobox-popup:0 forces Qt's list-view popup instead of the
         # native macOS menu — the native one ignores the dark styling
         # and flashes a white panel.  The popup palette matches the
-        # qty-input dropdown ladder (#1E222A / #0071e3 highlight).
+        # qty-input dropdown ladder (#1B2130 / #539BF5 highlight).
         self._cmb_tick.setStyleSheet(
             f"QComboBox{{background:{Theme.BG_INPUT};color:{Theme.TEXT};"
             f"border:1px solid {Theme.BORDER};border-radius:3px;"
             f"padding:1px 6px;font-size:11px;combobox-popup:0}}"
             f"QComboBox:hover{{border-color:{Theme.ACCENT}}}"
             "QComboBox::drop-down{border:none;width:16px}"
-            "QComboBox QAbstractItemView{background:#1E222A;"
-            f"color:{Theme.TEXT};border:1px solid #3a3f50;"
+            "QComboBox QAbstractItemView{background:#1B2130;"
+            f"color:{Theme.TEXT};border:1px solid #334058;"
             "border-radius:4px;outline:none;padding:2px;font-size:12px}"
             "QComboBox QAbstractItemView::item{padding:3px 10px;"
             "border:none;min-height:20px}"
             "QComboBox QAbstractItemView::item:hover,"
             "QComboBox QAbstractItemView::item:selected"
-            "{background:#0071e3;color:white;border-radius:3px}")
+            "{background:#539BF5;color:white;border-radius:3px}")
         # The list-view popup defaults to the combo's own (narrow)
         # width, eliding the longest entries ("0.01" → "…") — widen it
         # and never elide.
@@ -411,7 +411,7 @@ class BookTraderView(QWidget):
             f"border:1px solid {Theme.BORDER};border-radius:3px;"
             f"padding:0}}"
             f"QPushButton:hover{{border-color:{Theme.ACCENT}}}"
-            f"QPushButton:checked{{background:#3a3f50;"
+            f"QPushButton:checked{{background:#334058;"
             f"border-color:{Theme.ACCENT}}}")
         self._btn_lock.toggled.connect(self._on_lock_toggled)
 
@@ -431,7 +431,7 @@ class BookTraderView(QWidget):
         # equal-stretch thirds).
         _pct_ss = (
             "color: {clr}; border: none; font-size: 11px; "
-            "font-family: 'Helvetica Neue', Arial; font-weight: bold;")
+            "font-family: Inter, 'Helvetica Neue', Arial; font-weight: bold;")
         self._lbl_pct_buy = QLabel("")
         self._lbl_pct_buy.setStyleSheet(_pct_ss.format(clr=Theme.ACCENT))
         self._lbl_pct_buy.hide()
@@ -488,7 +488,8 @@ class BookTraderView(QWidget):
         pm_row.setContentsMargins(0, 0, 0, 0)
         pm_row.setSpacing(4)
         self._btn_reverse = _make_btn("Reverse", Theme.CLR_REVERSE, 30)
-        self._btn_flatten = _make_btn("Flatten", Theme.CLR_FLATTEN, 30)
+        self._btn_flatten = _make_btn("Flatten", Theme.CLR_FLATTEN, 30,
+                                      fg="#1c1206")
         self._btn_cancel = _make_btn("Cancel", Theme.CLR_CANCEL, 30)
         pm_row.addWidget(self._btn_reverse)
         pm_row.addWidget(self._btn_flatten)

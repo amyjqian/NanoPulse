@@ -140,7 +140,7 @@ class LoginPage(QWidget):
         bl.addSpacing(14)
         version = QLabel("v3.2.1 · SECURE SESSION · TLS 1.3")
         version.setStyleSheet(
-            f"color: #45454d; font-size: 11px; font-family: 'SF Mono', monospace;"
+            f"color: #45454d; font-size: 11px; font-family: 'JetBrains Mono', Menlo, monospace;"
             " background: transparent;")
         bl.addWidget(version)
         outer.addWidget(brand)

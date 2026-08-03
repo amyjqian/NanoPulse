@@ -90,20 +90,23 @@ _STK_QTY_POPUP: list[int] = (
 )
 
 # ── Fonts ─────────────────────────────────────────────────────────────────────
-_TITLE_FONT = QFont("Helvetica Neue, Arial", 11)
+_TITLE_FONT = QFont("Inter, Helvetica Neue, Arial", 11)
 _TITLE_FONT.setWeight(QFont.Weight.Bold)
 
-_SYMBOL_FONT = QFont("Helvetica Neue, Arial", 14)
+_SYMBOL_FONT = QFont("Inter, Helvetica Neue, Arial", 14)
 _SYMBOL_FONT.setWeight(QFont.Weight.Bold)
 
-_PRICE_FONT = QFont("Menlo, Consolas, monospace", 14)
+_PRICE_FONT = QFont("JetBrains Mono, Menlo, Consolas, monospace", 14)
 _PRICE_FONT.setWeight(QFont.Weight.Bold)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _make_btn(text: str, colour: str, min_h: int = 32) -> QPushButton:
-    """Flat styled action button."""
+def _make_btn(text: str, colour: str, min_h: int = 32,
+              fg: str = "#ffffff") -> QPushButton:
+    """Flat styled action button.  *fg* overrides the label colour —
+    the restyle gives light-background buttons (Flatten, 25/50/75%)
+    dark text."""
     btn = QPushButton(text)
     btn.setMinimumHeight(min_h)
     btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -111,7 +114,7 @@ def _make_btn(text: str, colour: str, min_h: int = 32) -> QPushButton:
     btn.setStyleSheet(f"""
         QPushButton {{
             background: {colour};
-            color: #ffffff;
+            color: {fg};
             border: none;
             border-radius: 4px;
             padding: 4px 8px;
@@ -234,14 +237,14 @@ def _apply_chip_style(btn: QPushButton, selected: bool) -> None:
     """Apply blue-selected or grey-unselected style to a symbol chip button."""
     if selected:
         btn.setStyleSheet(
-            "QPushButton{background:#0071e3;color:white;border:none;"
+            "QPushButton{background:#539BF5;color:white;border:none;"
             "border-radius:6px;padding:4px 12px;font-weight:bold;font-size:12px}"
-            "QPushButton:hover{background:#0077ed}")
+            "QPushButton:hover{background:#6BA8F6}")
     else:
         btn.setStyleSheet(
-            "QPushButton{background:#3a3a4a;color:#ccc;border:none;"
+            "QPushButton{background:#232A3B;color:#A3AFC2;border:none;"
             "border-radius:6px;padding:4px 12px;font-weight:600;font-size:12px}"
-            "QPushButton:hover{background:#4a4a5a}")
+            "QPushButton:hover{background:#334058}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -293,35 +296,35 @@ class TickPriceInput(QWidget):
     # background a selected tier chip uses.  Triggered by the host
     # ``_TierSection`` via :meth:`set_armed`.
     _EDIT_SS_NORMAL = (
-        "QLineEdit{background:#3a3a4a;color:#ccc;border:none;"
+        "QLineEdit{background:#232A3B;color:#A3AFC2;border:none;"
         "border-radius:6px 0 0 6px;padding:2px 6px;font-size:11px}"
-        "QLineEdit:focus{background:#4a4a5a;color:white}"
-        "QLineEdit:disabled{background:#252535;color:#444;border:none}"
+        "QLineEdit:focus{background:#334058;color:white}"
+        "QLineEdit:disabled{background:#1B2130;color:#444;border:none}"
     )
     _EDIT_SS_ARMED = (
-        "QLineEdit{background:#0071e3;color:white;border:none;"
+        "QLineEdit{background:#539BF5;color:white;border:none;"
         "border-radius:6px 0 0 6px;padding:2px 6px;font-size:11px;"
         "font-weight:bold}"
-        "QLineEdit:focus{background:#0077ed;color:white}"
-        "QLineEdit:disabled{background:#252535;color:#444;border:none}"
+        "QLineEdit:focus{background:#6BA8F6;color:white}"
+        "QLineEdit:disabled{background:#1B2130;color:#444;border:none}"
     )
     _ARROW_SS_NORMAL = (
-        "QToolButton{background:#3a3a4a;color:#aaa;border:none;"
+        "QToolButton{background:#232A3B;color:#6A7690;border:none;"
         "font-size:7px;padding:0;margin:0}"
-        "QToolButton:hover{background:#4a4a5a;color:white}"
-        "QToolButton:pressed{background:#0071e3;color:white}"
+        "QToolButton:hover{background:#334058;color:white}"
+        "QToolButton:pressed{background:#539BF5;color:white}"
     )
     _ARROW_SS_ARMED = (
-        "QToolButton{background:#0071e3;color:white;border:none;"
+        "QToolButton{background:#539BF5;color:white;border:none;"
         "font-size:7px;padding:0;margin:0}"
-        "QToolButton:hover{background:#0077ed;color:white}"
-        "QToolButton:pressed{background:#0077ed;color:white}"
+        "QToolButton:hover{background:#6BA8F6;color:white}"
+        "QToolButton:pressed{background:#6BA8F6;color:white}"
     )
     _ARROW_W_SS_NORMAL = (
-        "QWidget{background:#3a3a4a;border:none;border-radius:0 6px 6px 0}"
+        "QWidget{background:#232A3B;border:none;border-radius:0 6px 6px 0}"
     )
     _ARROW_W_SS_ARMED = (
-        "QWidget{background:#0071e3;border:none;border-radius:0 6px 6px 0}"
+        "QWidget{background:#539BF5;border:none;border-radius:0 6px 6px 0}"
     )
 
     def __init__(self, parent=None) -> None:
@@ -581,16 +584,16 @@ class TickPriceInput(QWidget):
         popup.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         popup.setStyleSheet("""
             QListWidget {
-                background: #1E222A;
-                color: #C9D1D9;
-                border: 1px solid #3a3f50;
+                background: #1B2130;
+                color: #E6EBF2;
+                border: 1px solid #334058;
                 border-radius: 4px;
                 font-size: 12px;
                 outline: none;
             }
             QListWidget::item            { padding: 3px 14px; border: none; }
             QListWidget::item:selected,
-            QListWidget::item:hover      { background: #0071e3; color: white; }
+            QListWidget::item:hover      { background: #539BF5; color: white; }
         """)
 
         # ── Populate tick-based offset rows (1*tick, 2*tick, ..., N*tick) ──
@@ -617,7 +620,7 @@ class TickPriceInput(QWidget):
                 popup.addItem(item)
         else:
             ph = QListWidgetItem("  Tick size unknown")
-            ph.setForeground(QColor("#6B7280"))
+            ph.setForeground(QColor("#6A7690"))
             ph.setFlags(ph.flags()
                         & ~Qt.ItemFlag.ItemIsSelectable
                         & ~Qt.ItemFlag.ItemIsEnabled)
@@ -934,22 +937,22 @@ class _QtyInput(QWidget):
         if self._accent is None:                      # share mode
             if active:                                # selected-chip blue
                 return {
-                    "box_bg": "#0071e3",
-                    "border": "#0077ed",
+                    "box_bg": "#539BF5",
+                    "border": "#6BA8F6",
                     "text": "white",
                     "bold": True,
                     "arrow": "white",
                     "arrow_hover": "white",
-                    "sep": "#0077ed",
+                    "sep": "#6BA8F6",
                 }
             return {                                  # idle grey
-                "box_bg": "#3a3a4a",
-                "border": "#4a4a5a",
-                "text": "#ccc",
+                "box_bg": "#232A3B",
+                "border": "#334058",
+                "text": "#A3AFC2",
                 "bold": False,
-                "arrow": "#aaa",
+                "arrow": "#6A7690",
                 "arrow_hover": "white",
-                "sep": "#4a4a5a",
+                "sep": "#334058",
             }
         if active:                                    # % : solid gold
             return {
@@ -963,12 +966,12 @@ class _QtyInput(QWidget):
             }
         return {                                      # % idle: dark gold
             "box_bg": Theme.CLR_PCT_BG,
-            "border": "#4a4126",
+            "border": "rgba(45,180,164,.35)",
             "text": Theme.CLR_PCT_TEXT,
             "bold": False,
             "arrow": Theme.CLR_PCT_TEXT,
             "arrow_hover": Theme.CLR_PCT_BORDER,
-            "sep": "#4a4126",
+            "sep": "rgba(45,180,164,.35)",
         }
 
     def _apply_styles(self) -> None:
@@ -1196,14 +1199,14 @@ class _QtyInput(QWidget):
         # corners paint on the solid window fill instead.
         popup.setStyleSheet("""
             QListWidget {
-                background: #1E222A; color: #C9D1D9;
-                border: 1px solid #3a3f50; border-radius: 6px;
+                background: #1B2130; color: #E6EBF2;
+                border: 1px solid #334058; border-radius: 6px;
                 font-size: 12px; outline: none;
             }
             QListWidget::item            { padding: 3px 12px; border: none;
                                            border-radius: 4px; }
             QListWidget::item:selected,
-            QListWidget::item:hover      { background: #0071e3; color: white; }
+            QListWidget::item:hover      { background: #539BF5; color: white; }
         """)
 
         # Large values at top, small values at bottom; initial view shows the bottom
@@ -1291,20 +1294,20 @@ class _TierSection(QWidget):
 
     _CHIP_H = 28
     _SS_SEL = (
-        "QPushButton{background:#0071e3;color:white;border:none;"
+        "QPushButton{background:#539BF5;color:white;border:none;"
         "border-radius:6px;padding:4px 12px;font-weight:bold;font-size:12px}"
-        "QPushButton:hover{background:#0077ed}"
+        "QPushButton:hover{background:#6BA8F6}"
     )
     _SS_NORM = (
-        "QPushButton{background:#3a3a4a;color:#ccc;border:none;"
+        "QPushButton{background:#232A3B;color:#A3AFC2;border:none;"
         "border-radius:6px;padding:4px 12px;font-weight:600;font-size:12px}"
-        "QPushButton:hover{background:#4a4a5a}"
+        "QPushButton:hover{background:#334058}"
     )
     _SS_INPUT = (
-        "QLineEdit{background:#3a3a4a;color:#ccc;border:none;"
+        "QLineEdit{background:#232A3B;color:#A3AFC2;border:none;"
         "border-radius:4px;padding:2px 6px;font-size:11px}"
-        "QLineEdit:focus{background:#4a4a5a;color:white}"
-        "QLineEdit:disabled{background:#252535;color:#444;border:none}"
+        "QLineEdit:focus{background:#334058;color:white}"
+        "QLineEdit:disabled{background:#1B2130;color:#444;border:none}"
     )
 
     # Cap the number of preset chips displayed.  Three chips + the
@@ -1656,7 +1659,7 @@ _COMBO_SS = f"""
     QComboBox QAbstractItemView {{
         background: {Theme.BG_INPUT}; color: {Theme.TEXT};
         border: 1px solid {Theme.BORDER}; border-radius: 4px;
-        selection-background-color: #3a3f50;
+        selection-background-color: #334058;
         selection-color: {Theme.TEXT};
         padding: 2px; outline: none;
     }}
@@ -1708,15 +1711,15 @@ class _HotButtonPlaceholder(QPushButton):
         self.setStyleSheet(
             "QPushButton{"
             " background:transparent;"
-            " color:#5a6478;"
-            " border:1px dashed #3a4051;"
+            " color:#6A7690;"
+            " border:1px dashed #334058;"
             " border-radius:6px;"
             " font-size:16px;"
             " font-weight:bold;"
             " padding:0;"
             "}"
             "QPushButton:hover{"
-            " color:#8a94a8;"
+            " color:#A3AFC2;"
             " border-color:#4a5168;"
             "}"
         )
@@ -1887,10 +1890,10 @@ class _Segmented(QWidget):
 
     selectionChanged = Signal(str)
 
-    _ACTIVE_BG_DEFAULT = "#0071e3"
-    _INACTIVE_BG = "#262a36"
+    _ACTIVE_BG_DEFAULT = "#539BF5"
+    _INACTIVE_BG = "#1B2130"
     _ACTIVE_FG = "#ffffff"
-    _INACTIVE_FG = "#aab1c0"
+    _INACTIVE_FG = "#A3AFC2"
 
     def __init__(
         self,
@@ -2516,20 +2519,20 @@ class _HotButtonModal(QDialog):
 
     _INPUT_QSS = (
         "QLineEdit, QComboBox{"
-        " background:#262a36; color:#e6e9ef;"
-        " border:1px solid #2c313a; border-radius:5px;"
+        " background:#1B2130; color:#E6EBF2;"
+        " border:1px solid #232A3B; border-radius:5px;"
         " padding:4px 8px; font-size:11px;"
         "}"
-        "QLineEdit:focus, QComboBox:focus{ border-color:#0071e3; }"
-        "QLineEdit:disabled, QComboBox:disabled{ color:#5a6478; }"
+        "QLineEdit:focus, QComboBox:focus{ border-color:#539BF5; }"
+        "QLineEdit:disabled, QComboBox:disabled{ color:#6A7690; }"
         "QComboBox::drop-down{ border:none; width:20px; }"
         # Style the popup list — without this Qt falls back to the
         # platform default which renders light-on-light on dark themes.
         "QComboBox QAbstractItemView{"
-        " background:#262a36; color:#e6e9ef;"
-        " selection-background-color:#0071e3;"
+        " background:#1B2130; color:#E6EBF2;"
+        " selection-background-color:#539BF5;"
         " selection-color:#ffffff;"
-        " border:1px solid #2c313a;"
+        " border:1px solid #232A3B;"
         " outline:none; padding:2px;"
         "}"
         "QComboBox QAbstractItemView::item{"
@@ -2538,24 +2541,24 @@ class _HotButtonModal(QDialog):
     )
     _BTN_NEUTRAL_QSS = (
         "QPushButton{"
-        " background:transparent; color:#aab1c0;"
-        " border:1px solid #3a4051; border-radius:5px;"
+        " background:transparent; color:#A3AFC2;"
+        " border:1px solid #334058; border-radius:5px;"
         " padding:6px 14px; font-weight:bold; font-size:11px;"
         "}"
-        "QPushButton:hover{ color:#e6e9ef; border-color:#4a5168; }"
+        "QPushButton:hover{ color:#E6EBF2; border-color:#4a5168; }"
     )
     _BTN_PRIMARY_QSS = (
         "QPushButton{"
-        " background:#0071e3; color:#ffffff;"
+        " background:#539BF5; color:#ffffff;"
         " border:none; border-radius:5px;"
         " padding:6px 14px; font-weight:bold; font-size:11px;"
         "}"
-        "QPushButton:hover{ background:#0077ed; }"
+        "QPushButton:hover{ background:#6BA8F6; }"
     )
     _SWITCH_QSS = (
         "QCheckBox::indicator{"
         " width:34px; height:18px; border-radius:9px;"
-        " background:#3a4051; border:none;"
+        " background:#334058; border:none;"
         "}"
         "QCheckBox::indicator:checked{ background:#3FB950; }"
     )
@@ -2816,10 +2819,10 @@ class _HotButtonModal(QDialog):
         popup = completer.popup()
         popup.setStyleSheet(
             "QListView{"
-            " background:#262a36; color:#e6e9ef;"
-            " selection-background-color:#0071e3;"
+            " background:#1B2130; color:#E6EBF2;"
+            " selection-background-color:#539BF5;"
             " selection-color:#ffffff;"
-            " border:1px solid #2c313a; outline:none;"
+            " border:1px solid #232A3B; outline:none;"
             "}"
             "QListView::item{ padding:4px 10px; min-height:22px; }"
         )
@@ -2963,10 +2966,10 @@ class _HotButtonModal(QDialog):
                 f"color:{Theme.TEXT_DIM}; font-size:11px; padding:0 6px;")
         else:
             w["name"].setStyleSheet(
-                "color:#5a6478; font-size:11px; font-weight:bold;")
-            w["sub"].setStyleSheet("color:#3a4051; font-size:9px;")
+                "color:#6A7690; font-size:11px; font-weight:bold;")
+            w["sub"].setStyleSheet("color:#334058; font-size:9px;")
             w["unit_lbl"].setStyleSheet(
-                "color:#3a4051; font-size:11px; padding:0 6px;")
+                "color:#334058; font-size:11px; padding:0 6px;")
 
     def _update_limit_row_state(self) -> None:
         is_lmt = self._draft.get("ord_type") == "LMT"
@@ -3204,11 +3207,11 @@ class OrderEntryPanel(QWidget):
         _ticker_dim = f"color: {Theme.TEXT_DIM}; border: none;"
         # Slightly smaller than _SYMBOL_FONT / _PRICE_FONT so the whole
         # strip can fit the narrow Order Entry column without wrapping.
-        _sym_font = QFont("Helvetica Neue, Arial", 12)
+        _sym_font = QFont("Inter, Helvetica Neue, Arial", 12)
         _sym_font.setWeight(QFont.Weight.Bold)
-        _price_font = QFont("Menlo, Consolas, monospace", 12)
+        _price_font = QFont("JetBrains Mono, Menlo, Consolas, monospace", 12)
         _price_font.setWeight(QFont.Weight.Bold)
-        _ticker_font = QFont("Menlo, Consolas, monospace", 11)
+        _ticker_font = QFont("JetBrains Mono, Menlo, Consolas, monospace", 11)
         _ticker_font.setWeight(QFont.Weight.Bold)
 
         self._lbl_symbol = QLabel("")
@@ -3392,9 +3395,9 @@ class OrderEntryPanel(QWidget):
         pm_grid.setContentsMargins(0, 0, 0, 0)
 
 
-        self._btn_close25 = _make_btn("25%", Theme.CLR_CLOSE, 30)
-        self._btn_close50 = _make_btn("50%", Theme.CLR_CLOSE, 30)
-        self._btn_close75 = _make_btn("75%", Theme.CLR_CLOSE, 30)
+        self._btn_close25 = _make_btn("25%", Theme.CLR_CLOSE, 30, fg="#0f1319")
+        self._btn_close50 = _make_btn("50%", Theme.CLR_CLOSE, 30, fg="#0f1319")
+        self._btn_close75 = _make_btn("75%", Theme.CLR_CLOSE, 30, fg="#0f1319")
         pm_grid.addWidget(self._btn_close25, 1, 0)
         pm_grid.addWidget(self._btn_close50, 1, 1)
         pm_grid.addWidget(self._btn_close75, 2, 1)
@@ -3402,7 +3405,8 @@ class OrderEntryPanel(QWidget):
         self._btn_close50.clicked.connect(lambda: self._on_close_pct(50))
         self._btn_close75.clicked.connect(lambda: self._on_close_pct(75))
 
-        self._btn_flatten = _make_btn("Flatten", Theme.CLR_FLATTEN, 30)
+        self._btn_flatten = _make_btn("Flatten", Theme.CLR_FLATTEN, 30,
+                                      fg="#1c1206")
         pm_grid.addWidget(self._btn_flatten, 0, 0)
         self._btn_flatten.clicked.connect(self._on_flatten)
 
@@ -3535,7 +3539,7 @@ class OrderEntryPanel(QWidget):
         # be able to Edit / Delete the cell from the context menu.  The
         # left-click submission is short-circuited in
         # ``_on_hot_button_clicked`` when ``disabled`` is True.
-        colour = "#484F58" if is_disabled else _HOT_BUTTON_COLOURS.get(
+        colour = "#6A7690" if is_disabled else _HOT_BUTTON_COLOURS.get(
             side, Theme.CLR_BUY)
         cell = _HotButtonCell(label, colour, parent=self)
         if is_disabled:

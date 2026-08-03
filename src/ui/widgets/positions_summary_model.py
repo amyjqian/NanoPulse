@@ -71,10 +71,10 @@ _S_RIGHT_ALIGN_COLS = {
 }
 
 # Theme tokens (keep in sync with account_position_model / trades_summary_model).
-TEXT_BOLD = "#E6EDF3"
+TEXT_BOLD = "#E6EBF2"
 # Same subtle tint used by the Trades summary footer so both summary
 # views read the same way visually.
-BG_TOTAL  = "#242834"
+BG_TOTAL  = "#232A3B"
 
 # Net-zero threshold for the Zero-Pos toggle — fractional-share
 # positions are possible so an exact `== 0` test is too strict.
@@ -118,9 +118,9 @@ class PositionsSummaryModel(QAbstractTableModel):
         # (matches the flat model's semantics so they stay in sync).
         self._selected_accounts: set[str] | None = None
 
-        self._symbol_font = QFont("Helvetica Neue, Arial", 11)
+        self._symbol_font = QFont("Inter, Helvetica Neue, Arial", 11)
         self._symbol_font.setWeight(QFont.Weight.DemiBold)
-        self._total_font = QFont("Helvetica Neue, Arial", 11)
+        self._total_font = QFont("Inter, Helvetica Neue, Arial", 11)
         self._total_font.setWeight(QFont.Weight.Bold)
 
     # ── Proxy / menu helpers ────────────────────────────────────────────────

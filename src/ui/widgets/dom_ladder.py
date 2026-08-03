@@ -433,12 +433,20 @@ class DOMLadderDelegate(QStyledItemDelegate):
     # Row height bumped along with the font sizes (was 16) so the
     # taller text has comfortable vertical breathing room.
     _ROW_H = 18
-    _NUMERIC_FONT = QFont("Menlo, Consolas, monospace", 10)
-    _PRICE_FONT = QFont("Menlo, Consolas, monospace", 11)
-    _PRICE_FONT.setWeight(QFont.Weight.Bold)
-    _LAST_ARROW_FONT = QFont("Helvetica Neue, Arial", 10)
+    _NUMERIC_FONT = QFont("JetBrains Mono, Menlo, Consolas, monospace", 10)
+    # Price column: JetBrains Mono 10 DemiBold with tabular numerals so
+    # every price digit column aligns down the ladder.
+    _PRICE_FONT = QFont("JetBrains Mono, Menlo, Consolas, monospace", 10)
+    _PRICE_FONT.setWeight(QFont.Weight.DemiBold)
+    try:
+        # OpenType 'tnum' feature — Qt 6.7+ (older Qt: mono fallback
+        # fonts are tabular anyway).
+        _PRICE_FONT.setFeature(QFont.Tag("tnum"), 1)
+    except (AttributeError, TypeError):
+        pass
+    _LAST_ARROW_FONT = QFont("Inter, Helvetica Neue, Arial", 10)
     _LAST_ARROW_FONT.setWeight(QFont.Weight.Bold)
-    _TRADE_STRIPE_FONT = QFont("Helvetica Neue, Arial", 10)
+    _TRADE_STRIPE_FONT = QFont("Inter, Helvetica Neue, Arial", 10)
     _TRADE_STRIPE_FONT.setWeight(QFont.Weight.Bold)
 
     def paint(self, painter: QPainter, option, index) -> None:
@@ -737,7 +745,7 @@ class DOMLadderView(QTableView):
         self._hover_badge = QLabel(self.viewport())
         self._hover_badge.setObjectName("ladderHoverBadge")
         self._hover_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._hover_badge.setFont(QFont("Helvetica Neue, Arial", 10, QFont.Weight.Bold))
+        self._hover_badge.setFont(QFont("Inter, Helvetica Neue, Arial", 10, QFont.Weight.Bold))
         self._hover_badge.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self._hover_badge.hide()

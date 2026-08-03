@@ -5,36 +5,36 @@ Centralized styling variables for NanoPulse UI.
 
 class Theme:
     # Panels and Backgrounds
-    BG_PANEL = "#1e2230"
-    BG_INPUT = "#272b3a"
+    BG_PANEL = "#151922"
+    BG_INPUT = "#1B2130"
     BG_MAIN = "#0E1117"
 
     # Text
-    TEXT = "#C9D1D9"
-    TEXT_DIM = "#8B949E"
+    TEXT = "#E6EBF2"
+    TEXT_DIM = "#A3AFC2"
 
     # Borders and Accents
-    BORDER = "#30363D"
+    BORDER = "#262E3F"
     ACCENT = "#3FB950"
 
     # Action Colors
-    CLR_BUY = "#2e7d32"
-    CLR_SELL = "#c62828"
-    CLR_BUY_LMT = "#1b5e20"
-    CLR_SELL_LMT = "#8b0000"
+    CLR_BUY = "#2EA043"
+    CLR_SELL = "#F85149"
+    CLR_BUY_LMT = "#1F6F37"
+    CLR_SELL_LMT = "#8B2A28"
 
     # Position Colors
-    CLR_FLATTEN = "#cc6600"
-    CLR_REVERSE = "#8E44AD"
-    CLR_CLOSE = "#8E8E93"
-    CLR_CANCEL = "#3A3A3C"
+    CLR_FLATTEN = "#E08A3C"
+    CLR_REVERSE = "#A371F7"
+    CLR_CLOSE = "#9DA3AB"
+    CLR_CANCEL = "#3A414C"
 
     # Percent-sizing accent (gold) — the SH/% unit toggle and the
     # percent-mode size chips.  Deliberately distinct from CLR_FLATTEN's
     # orange: the gold row is the visual guard against misreading "25%"
     # as 25 shares.
-    CLR_PCT = "#c9a227"          # solid gold (selected chip / active toggle)
-    CLR_PCT_BORDER = "#e0b93a"   # gold border
-    CLR_PCT_BG = "#2b2a1e"       # dark-gold unselected chip background
-    CLR_PCT_TEXT = "#d9c07a"     # gold text on dark chip
-    CLR_PCT_ON = "#1a1608"       # near-black text on solid gold
+    CLR_PCT = "#2DB4A4"          # solid gold (selected chip / active toggle)
+    CLR_PCT_BORDER = "#43C6B7"   # gold border
+    CLR_PCT_BG = "rgba(45,180,164,.12)"       # dark-gold unselected chip background
+    CLR_PCT_TEXT = "#2DB4A4"     # gold text on dark chip
+    CLR_PCT_ON = "#0d1a17"       # near-black text on solid gold

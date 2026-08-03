@@ -159,10 +159,10 @@ class OptionsIncomeTicket(QDialog):
         self._h_account = QLabel(self._display_account, self)
         self._h_account.setStyleSheet(
             f"color:{Theme.TEXT_DIM}; font-size:11px;"
-            " font-family:Menlo, Consolas, monospace;")
+            " font-family:'JetBrains Mono', Menlo, Consolas, monospace;")
         self._h_margin = QLabel("MARGIN", self)
         self._h_margin.setStyleSheet(
-            "color:#58A6FF; background:rgba(88,166,255,0.12); border:none;"
+            "color:#539BF5; background:rgba(88,166,255,0.12); border:none;"
             " border-radius:4px; padding:2px 8px; font-size:9px;"
             " font-weight:bold; letter-spacing:1px;")
         self._h_margin.setVisible(self._is_margin)
@@ -851,7 +851,7 @@ class OptionsIncomeTicket(QDialog):
             self._rail.set_sell_enabled(True)
 
     def _set_status(self, text: str, *, error: bool = False) -> None:
-        color = "#e06c75" if error else Theme.TEXT_DIM
+        color = "#F85149" if error else Theme.TEXT_DIM
         self._status.setStyleSheet(f"color:{color}; font-size:10px;")
         self._status.setText(text)
 

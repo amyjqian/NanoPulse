@@ -26,24 +26,24 @@ from PySide6.QtWidgets import (
 from src.ui.theme import Theme
 from src.core.options_income import snap_to_tick, to_dec
 
-ACCENT_BLUE = "#0071e3"
+ACCENT_BLUE = "#539BF5"
 
 _STEP_BTN_QSS = (
-    "QPushButton{ background:#262a36; color:#e6e9ef; border:none;"
+    "QPushButton{ background:#1B2130; color:#E6EBF2; border:none;"
     " border-radius:5px; padding:4px 10px; font-size:12px;"
     " font-weight:bold; }"
     "QPushButton:hover{ background:#2f3442; }"
-    "QPushButton:disabled{ color:#5a6478; }")
+    "QPushButton:disabled{ color:#6A7690; }")
 
 _CHIP_ON = (
-    "QPushButton{ background:rgba(0,113,227,0.16); color:#e6e9ef;"
+    "QPushButton{ background:rgba(0,113,227,0.16); color:#E6EBF2;"
     f" border:1px solid {ACCENT_BLUE}; border-radius:5px;"
     " padding:4px 8px; font-size:10px; font-weight:bold; }")
 _CHIP_OFF = (
-    "QPushButton{ background:#262a36; color:#8B949E;"
+    "QPushButton{ background:#1B2130; color:#A3AFC2;"
     f" border:1px solid {Theme.BORDER}; border-radius:5px;"
     " padding:4px 8px; font-size:10px; }"
-    "QPushButton:hover{ border-color:#4A4E58; }")
+    "QPushButton:hover{ border-color:#334058; }")
 
 def _caption(parent: QWidget, text: str) -> QLabel:
     lbl = QLabel(text, parent)
@@ -162,7 +162,7 @@ class OrderRail(QWidget):
         validator.setNotation(QDoubleValidator.Notation.StandardNotation)
         self._px_edit.setValidator(validator)
         self._px_edit.setStyleSheet(
-            f"QLineEdit{{ background:#262a36; color:{Theme.TEXT};"
+            f"QLineEdit{{ background:#1B2130; color:{Theme.TEXT};"
             f" border:1px solid {Theme.BORDER}; border-radius:5px;"
             " padding:4px 6px; font-size:13px; font-weight:bold; }"
             f"QLineEdit:focus{{ border-color:{ACCENT_BLUE}; }}")
@@ -209,7 +209,7 @@ class OrderRail(QWidget):
             f"QPushButton{{ background:{Theme.CLR_SELL}; color:#ffffff;"
             " border:none; border-radius:6px; padding:9px 16px;"
             " font-size:12px; font-weight:bold; }"
-            "QPushButton:disabled{ background:#3a3f4d; color:#5a6478; }")
+            "QPushButton:disabled{ background:#3a3f4d; color:#6A7690; }")
         self._sell_btn.clicked.connect(self.submit_clicked.emit)
         # Equal-width pair — both take an identical share of the row.
         brow.addWidget(self._cancel_btn, stretch=1)
@@ -386,7 +386,7 @@ class OrderRail(QWidget):
             f"QPushButton{{ background:{color}; color:#ffffff;"
             " border:none; border-radius:6px; padding:9px 16px;"
             " font-size:12px; font-weight:bold; }"
-            "QPushButton:disabled{ background:#3a3f4d; color:#5a6478; }")
+            "QPushButton:disabled{ background:#3a3f4d; color:#6A7690; }")
         if self._sell_btn.isEnabled():
             self._sell_btn.setText(self._submit_label())
 

@@ -15,13 +15,13 @@ from PySide6.QtCore import Qt, Signal, QSize
 from PySide6.QtGui import QPainter, QColor, QFont, QPen
 
 BAR_HEIGHT = 36
-BAR_BG = "#161B22"
-HOVER_BG = "#1C2128"
-ACTIVE_BG = "#1F2937"
+BAR_BG = "#151922"
+HOVER_BG = "#1B2130"
+ACTIVE_BG = "#1B2130"
 ACCENT = "#3FB950"
-TEXT_PRIMARY = "#C9D1D9"
-TEXT_SECONDARY = "#8B949E"
-BORDER = "#30363D"
+TEXT_PRIMARY = "#E6EBF2"
+TEXT_SECONDARY = "#A3AFC2"
+BORDER = "#262E3F"
 
 # Pre-cached QColor instances (avoid allocating on every paint call)
 _C_BAR_BG = QColor(BAR_BG)
@@ -33,9 +33,9 @@ _C_TEXT_SEC = QColor(TEXT_SECONDARY)
 _C_BORDER = QColor(BORDER)
 
 # Pre-cached fonts
-_FONT_ACTIVE = QFont("Helvetica Neue, Arial", 11)
+_FONT_ACTIVE = QFont("Inter, Helvetica Neue, Arial", 11)
 _FONT_ACTIVE.setWeight(QFont.Weight.Medium)
-_FONT_NORMAL = QFont("Helvetica Neue, Arial", 11)
+_FONT_NORMAL = QFont("Inter, Helvetica Neue, Arial", 11)
 _FONT_NORMAL.setWeight(QFont.Weight.Normal)
 
 # Unicode icons (lightweight, no image files needed)
@@ -172,12 +172,12 @@ class TopTabBar(QWidget):
         self._group_label.setFixedHeight(_CHIP_HEIGHT)
         self._group_label.setStyleSheet(
             "QPushButton {"
-            " background: #0071e3; color: white;"
+            " background: #539BF5; color: white;"
             " border: none; border-radius: 6px;"
             " padding: 4px 12px; margin-right: 8px;"
             " font-weight: bold; font-size: 12px;"
             "}"
-            "QPushButton:disabled { background: #0071e3; color: white; }")
+            "QPushButton:disabled { background: #539BF5; color: white; }")
         self._group_label.hide()
         layout.addWidget(self._group_label)
 
@@ -190,12 +190,12 @@ class TopTabBar(QWidget):
         self._accounts_pill.setFixedHeight(_CHIP_HEIGHT)
         self._accounts_pill.setStyleSheet(
             "QPushButton {"
-            " background: #0071e3; color: white;"
+            " background: #539BF5; color: white;"
             " border: none; border-radius: 6px;"
             " padding: 4px 12px; margin-right: 12px;"
             " font-weight: bold; font-size: 12px;"
             "}"
-            "QPushButton:hover { background: #0077ed; }")
+            "QPushButton:hover { background: #6BA8F6; }")
         self._accounts_pill.clicked.connect(
             self.accountsToggleRequested.emit)
         layout.addWidget(self._accounts_pill)

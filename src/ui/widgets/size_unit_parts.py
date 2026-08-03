@@ -41,13 +41,13 @@ _TOOLTIP_PCT = ("Sizing by percent of account NET LIQUIDATION value — "
 # order_entry_panel/order_panel_parts) — do not edit; share mode must
 # render byte-identically to the original row.
 _SH_CHIP_ON = (
-    "QPushButton{background:#0071e3;color:white;border:none;"
+    "QPushButton{background:#539BF5;color:white;border:none;"
     "border-radius:6px;padding:4px 12px;font-weight:bold;font-size:12px}"
-    "QPushButton:hover{background:#0077ed}")
+    "QPushButton:hover{background:#6BA8F6}")
 _SH_CHIP_OFF = (
-    "QPushButton{background:#3a3a4a;color:#ccc;border:none;"
+    "QPushButton{background:#232A3B;color:#A3AFC2;border:none;"
     "border-radius:6px;padding:4px 12px;font-weight:600;font-size:12px}"
-    "QPushButton:hover{background:#4a4a5a}")
+    "QPushButton:hover{background:#334058}")
 
 _PCT_CHIP_ON = (
     f"QPushButton{{background:{Theme.CLR_PCT};color:{Theme.CLR_PCT_ON};"
@@ -56,16 +56,16 @@ _PCT_CHIP_ON = (
     f"QPushButton:hover{{background:{Theme.CLR_PCT_BORDER}}}")
 _PCT_CHIP_OFF = (
     f"QPushButton{{background:{Theme.CLR_PCT_BG};color:{Theme.CLR_PCT_TEXT};"
-    "border:1px solid #4a4126;border-radius:6px;padding:4px 12px;"
+    "border:1px solid rgba(45,180,164,.35);border-radius:6px;padding:4px 12px;"
     "font-weight:600;font-size:12px}"
     f"QPushButton:hover{{border-color:{Theme.CLR_PCT_BORDER}}}")
 _CHIP_DISABLED = (
-    "QPushButton{background:#2a2a33;color:#666a76;border:none;"
+    "QPushButton{background:#2a2a33;color:#6A7690;border:none;"
     "border-radius:6px;padding:4px 12px;font-weight:600;font-size:12px}")
 
 _TOGGLE_SH = (
-    "QPushButton{background:#3a4250;color:#e8ecf2;"
-    "border:1px solid #4a5464;border-radius:6px;padding:4px 0;"
+    "QPushButton{background:#3a4250;color:#E6EBF2;"
+    "border:1px solid #334058;border-radius:6px;padding:4px 0;"
     "font-weight:bold;font-size:12px}"
     "QPushButton:hover{border-color:#5a6474}")
 _TOGGLE_PCT = (

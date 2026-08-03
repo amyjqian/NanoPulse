@@ -36,7 +36,7 @@ _BLUE_HOVER = "#3d70e6"
 _GREEN = "#5fce77"
 _RED = "#f08080"
 _AMBER = "#e0a63a"
-_MONO = "'SF Mono', ui-monospace, Menlo, monospace"
+_MONO = "'JetBrains Mono', Menlo, monospace"
 
 _FILTER = "NanoPulse backup (*.npbak)"
 

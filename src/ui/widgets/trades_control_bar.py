@@ -23,13 +23,13 @@ from PySide6.QtWidgets import (
 )
 
 # ── Theme tokens ──────────────────────────────────────────────────────────────
-ACCENT     = "#CC6600"
-ACCENT_DIM = "#8A4500"
-BG_PANEL   = "#1e2230"
-BG_INPUT   = "#1A1D24"
-BORDER     = "#30363D"
-TEXT       = "#C9D1D9"
-TEXT_DIM   = "#8B949E"
+ACCENT     = "#E08A3C"
+ACCENT_DIM = "#B8722F"
+BG_PANEL   = "#151922"
+BG_INPUT   = "#151922"
+BORDER     = "#262E3F"
+TEXT       = "#E6EBF2"
+TEXT_DIM   = "#A3AFC2"
 
 _BAR_HEIGHT = 32
 
@@ -40,14 +40,14 @@ _BAR_QSS = f"""
     }}
     QLabel#tbSummaryLabel {{
         color: {TEXT};
-        font-family: "Helvetica Neue", Arial, sans-serif;
+        font-family: Inter, "Helvetica Neue", Arial, sans-serif;
         font-size: 11px;
         font-weight: 600;
         letter-spacing: 0.04em;
     }}
     QLabel#tbTradeCount {{
         color: {TEXT_DIM};
-        font-family: "Helvetica Neue", Arial, sans-serif;
+        font-family: Inter, "Helvetica Neue", Arial, sans-serif;
         font-size: 11px;
         font-weight: 500;
     }}
@@ -61,11 +61,11 @@ _BAR_QSS = f"""
         width: 34px;
         height: 18px;
         border-radius: 9px;
-        background: #30363D;
+        background: #262E3F;
         border: 1px solid {BORDER};
     }}
     QCheckBox#tbSummaryToggle::indicator:hover {{
-        border-color: #4A4E58;
+        border-color: #334058;
     }}
     QCheckBox#tbSummaryToggle::indicator:checked {{
         background: {ACCENT};
@@ -77,7 +77,7 @@ _BAR_QSS = f"""
         border: 1px solid {BORDER};
         border-radius: 4px;
         padding: 2px 6px;
-        font-family: "Helvetica Neue", Arial, sans-serif;
+        font-family: Inter, "Helvetica Neue", Arial, sans-serif;
         font-size: 11px;
     }}
     QComboBox#tbDateCombo:focus {{
@@ -97,7 +97,7 @@ _BAR_QSS = f"""
         border: 1px solid {BORDER};
         border-radius: 4px;
         padding: 3px 8px;
-        font-family: "Helvetica Neue", Arial, sans-serif;
+        font-family: Inter, "Helvetica Neue", Arial, sans-serif;
         font-size: 11px;
         min-width: 60px;
         max-width: 60px;

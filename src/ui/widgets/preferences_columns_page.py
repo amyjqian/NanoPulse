@@ -39,16 +39,16 @@ from PySide6.QtWidgets import (
 log = logging.getLogger(__name__)
 
 # ── Theme tokens ──────────────────────────────────────────────────────────────
-ACCENT     = "#CC6600"
-ACCENT_DIM = "#8A4500"
-BG_DIALOG  = "#181B22"
-BG_PANEL   = "#1E222A"
-BG_INPUT   = "#1A1D24"
-BORDER     = "#30363D"
-TEXT       = "#C9D1D9"
-TEXT_BOLD  = "#E6EDF3"
-TEXT_DIM   = "#8B949E"
-LINK       = "#4C9AFF"
+ACCENT     = "#E08A3C"
+ACCENT_DIM = "#B8722F"
+BG_DIALOG  = "#151922"
+BG_PANEL   = "#1B2130"
+BG_INPUT   = "#151922"
+BORDER     = "#262E3F"
+TEXT       = "#E6EBF2"
+TEXT_BOLD  = "#E6EBF2"
+TEXT_DIM   = "#A3AFC2"
+LINK       = "#539BF5"
 
 SUBVIEW_OVERVIEW          = "overview"
 SUBVIEW_POSITIONS         = "positions"
@@ -139,7 +139,7 @@ _OVERVIEW_QSS = f"""
         border-bottom: none;
     }}
     QFrame#overviewRow:hover {{
-        background: #232836;
+        background: #1B2130;
     }}
     QLabel#overviewRowTitle {{
         color: {TEXT_BOLD};
@@ -327,7 +327,7 @@ _EDITOR_QSS = f"""
         border-color: {ACCENT};
     }}
     QPushButton#rowAction {{
-        background: #2a2f3a;
+        background: #232A3B;
         color: {TEXT};
         border: 1px solid {BORDER};
         border-radius: 10px;

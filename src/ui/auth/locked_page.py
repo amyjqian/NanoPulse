@@ -70,7 +70,7 @@ class LockedPage(QWidget):
         self._clock.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._clock.setStyleSheet(
             f"color: {S.DANGER}; font-size: 34px; font-weight: 600;"
-            " font-family: 'SF Mono', monospace; background: transparent;")
+            " font-family: 'JetBrains Mono', Menlo, monospace; background: transparent;")
         holder = QWidget()
         holder.setObjectName("lockHolder")
         holder.setStyleSheet(

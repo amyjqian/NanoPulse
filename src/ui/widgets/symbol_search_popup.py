@@ -442,8 +442,8 @@ class SymbolSearchPopup(QDialog):
             f"QListWidget{{background:transparent;color:{Theme.TEXT};"
             f"border:none;outline:none}}"
             f"QListWidget::item{{border-radius:6px;padding:0px}}"
-            f"QListWidget::item:selected{{background:#3a3f50}}"
-            f"QListWidget::item:hover{{background:#2e3342}}")
+            f"QListWidget::item:selected{{background:#334058}}"
+            f"QListWidget::item:hover{{background:#232A3B}}")
         self._lst.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         lay.addWidget(self._lst)
 

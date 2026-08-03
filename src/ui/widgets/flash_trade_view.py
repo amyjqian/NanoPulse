@@ -26,14 +26,14 @@ log = logging.getLogger(__name__)
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 BG_MAIN = "#0E1117"   # keep in sync with Theme.BG_MAIN
-BG_PANEL = "#1e2230"
-TEXT = "#C9D1D9"
-TEXT_DIM = "#8B949E"
-BORDER = "#30363D"
+BG_PANEL = "#151922"
+TEXT = "#E6EBF2"
+TEXT_DIM = "#A3AFC2"
+BORDER = "#262E3F"
 
 _C_MAIN = QColor(BG_MAIN)
 
-_TITLE_FONT = QFont("Helvetica Neue, Arial", 11)
+_TITLE_FONT = QFont("Inter, Helvetica Neue, Arial", 11)
 _TITLE_FONT.setWeight(QFont.Weight.Bold)
 
 _SPLITTER_SS = f"QSplitter::handle {{ background: {BORDER}; }}"
