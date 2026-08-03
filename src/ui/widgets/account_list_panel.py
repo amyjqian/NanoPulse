@@ -70,6 +70,7 @@ _CARD_TEXT3        = "#6A7690"   # --text-3 (currency codes, caps, close)
 _CARD_BORDER2      = "#334058"   # --border-2 (idle frame, empty checkbox)
 _CARD_ACCENT       = "#539BF5"   # --accent  (selected frame + checkbox fill)
 _CARD_LOSS         = "#fb6f84"   # --loss    (negative figures)
+_CARD_GAIN         = "#2EA043"   # --gain    (positive USD balance, matches CLR_PNL_POS)
 # Offline (disconnected) dim variants.
 _CARD_OFF_PRIMARY  = "#6A7690"
 _CARD_OFF_SECOND   = "#334058"
@@ -466,6 +467,8 @@ class _AccountRow(QFrame):
             val_c = _CARD_OFF_SECOND
         elif self._usd < 0:
             val_c = _CARD_LOSS
+        elif self._usd > 0:
+            val_c = _CARD_GAIN
         else:
             val_c = _CARD_TEXT2
         self._sub_code.setStyleSheet(
@@ -714,7 +717,7 @@ class AccountListPanel(QWidget):
         header = QHBoxLayout()
         header.setSpacing(4)
 
-        title = QLabel("Account management")
+        title = QLabel("Accounts")
         title.setFont(_TITLE_FONT)
         title.setStyleSheet("color: #ffffff; border: none;")
         header.addWidget(title)

@@ -91,8 +91,8 @@ class TickerStrip(QWidget):
         top_row.setSpacing(6)
         top_row.setContentsMargins(0, 0, 0, 0)
 
-        _sym_font = QFont("Inter, Helvetica Neue, Arial", 12)
-        _sym_font.setWeight(QFont.Weight.Bold)
+        _sym_font = QFont("JetBrains Mono, Menlo, Consolas, monospace", 12)
+        _sym_font.setWeight(QFont.Weight.Medium)
         _price_font = QFont("JetBrains Mono, Menlo, Consolas, monospace", 12)
         _price_font.setWeight(QFont.Weight.Bold)
         _ticker_font = QFont("JetBrains Mono, Menlo, Consolas, monospace", 11)
@@ -292,12 +292,12 @@ def _apply_chip_style(btn: QPushButton, selected: bool) -> None:
     if selected:
         btn.setStyleSheet(
             "QPushButton{background:#539BF5;color:white;border:none;"
-            "border-radius:6px;padding:4px 12px;font-weight:bold;font-size:12px}"
+            "border-radius:6px;padding:4px 12px;font-weight:600;font-size:12px}"
             "QPushButton:hover{background:#6BA8F6}")
     else:
         btn.setStyleSheet(
             "QPushButton{background:#232A3B;color:#A3AFC2;border:none;"
-            "border-radius:6px;padding:4px 12px;font-weight:600;font-size:12px}"
+            "border-radius:6px;padding:4px 12px;font-weight:500;font-size:12px}"
             "QPushButton:hover{background:#334058}")
 
 

@@ -37,31 +37,34 @@ _TOOLTIP_SH = "Sizing in shares — click for percent of account value"
 _TOOLTIP_PCT = ("Sizing by percent of account NET LIQUIDATION value — "
                 "click for shares")
 
-# Verbatim copies of the pre-toggle chip styles (_apply_chip_style in
-# order_entry_panel/order_panel_parts) — do not edit; share mode must
-# render byte-identically to the original row.
+# Derived from the symbol-chip styles (_apply_chip_style in
+# order_entry_panel/order_panel_parts) but numeric chips render in
+# JetBrains Mono — numbers you scan use the mono family, words use Inter.
 _SH_CHIP_ON = (
     "QPushButton{background:#539BF5;color:white;border:none;"
-    "border-radius:6px;padding:4px 12px;font-weight:bold;font-size:12px}"
+    "border-radius:6px;padding:4px 12px;font-weight:bold;font-size:12px;"
+    "font-family:'JetBrains Mono'}"
     "QPushButton:hover{background:#6BA8F6}")
 _SH_CHIP_OFF = (
     "QPushButton{background:#232A3B;color:#A3AFC2;border:none;"
-    "border-radius:6px;padding:4px 12px;font-weight:600;font-size:12px}"
+    "border-radius:6px;padding:4px 12px;font-weight:600;font-size:12px;"
+    "font-family:'JetBrains Mono'}"
     "QPushButton:hover{background:#334058}")
 
 _PCT_CHIP_ON = (
     f"QPushButton{{background:{Theme.CLR_PCT};color:{Theme.CLR_PCT_ON};"
     "border:none;border-radius:6px;padding:4px 12px;font-weight:bold;"
-    "font-size:12px}"
+    "font-size:12px;font-family:'JetBrains Mono'}"
     f"QPushButton:hover{{background:{Theme.CLR_PCT_BORDER}}}")
 _PCT_CHIP_OFF = (
     f"QPushButton{{background:{Theme.CLR_PCT_BG};color:{Theme.CLR_PCT_TEXT};"
     "border:1px solid rgba(45,180,164,.35);border-radius:6px;padding:4px 12px;"
-    "font-weight:600;font-size:12px}"
+    "font-weight:600;font-size:12px;font-family:'JetBrains Mono'}"
     f"QPushButton:hover{{border-color:{Theme.CLR_PCT_BORDER}}}")
 _CHIP_DISABLED = (
     "QPushButton{background:#2a2a33;color:#6A7690;border:none;"
-    "border-radius:6px;padding:4px 12px;font-weight:600;font-size:12px}")
+    "border-radius:6px;padding:4px 12px;font-weight:600;font-size:12px;"
+    "font-family:'JetBrains Mono'}")
 
 _TOGGLE_SH = (
     "QPushButton{background:#3a4250;color:#E6EBF2;"

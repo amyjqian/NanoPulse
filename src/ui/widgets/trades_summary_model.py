@@ -167,13 +167,17 @@ class TradesSummaryModel(QAbstractTableModel):
         if parent.isValid():
             return 0
         n = len(self._order)
-        # One extra row at the bottom is the totals/footer.  Hidden
+        # Two extra rows at the bottom: the totals/footer plus the
+        # "Realized P&L" (paired round-trips only) band.  Hidden
         # entirely when the model has no aggregates so an empty view
-        # doesn't display a stray "TOTAL 0" band.
-        return n + 1 if n else 0
+        # doesn't display stray footer bands.
+        return n + 2 if n else 0
 
     def _is_total_row(self, row: int) -> bool:
         return bool(self._order) and row == len(self._order)
+
+    def _is_realized_row(self, row: int) -> bool:
+        return bool(self._order) and row == len(self._order) + 1
 
     def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
         return 0 if parent.isValid() else _S_NUM_COLS
@@ -195,6 +199,8 @@ class TradesSummaryModel(QAbstractTableModel):
 
         if self._is_total_row(row):
             return self._total_row_data(col, role)
+        if self._is_realized_row(row):
+            return self._realized_row_data(col, role)
 
         if row < 0 or row >= len(self._order):
             return None
@@ -269,9 +275,98 @@ class TradesSummaryModel(QAbstractTableModel):
             eff["sells_qty"] = matched
         return eff
 
+    # ── Realized-P&L row rendering (paired round-trips only) ────────────────
+
+    @staticmethod
+    def _paired_agg(agg: dict) -> dict | None:
+        """The paired (closed round-trip) portion of *agg*: the larger of
+        the buy/sell legs is scaled down to the smaller, preserving each
+        leg's average price.  Commission is prorated onto the paired legs
+        by share count.  Returns ``None`` when nothing is paired (one-
+        sided position)."""
+        b_q = agg.get("buys_qty", 0.0)
+        s_q = agg.get("sells_qty", 0.0)
+        matched = min(b_q, s_q)
+        if matched <= 0:
+            return None
+        eff = dict(agg)
+        if b_q > matched:
+            eff["buys_notional"] = agg.get("buys_notional", 0.0) * (matched / b_q)
+            eff["buys_qty"] = matched
+        if s_q > matched:
+            eff["sells_notional"] = agg.get("sells_notional", 0.0) * (matched / s_q)
+            eff["sells_qty"] = matched
+        total_sh = b_q + s_q
+        eff["commission"] = (
+            agg.get("commission", 0.0) * (2 * matched / total_sh)
+            if total_sh else 0.0)
+        return eff
+
+    def _paired_aggs(self) -> list[dict]:
+        pairs = (self._paired_agg(a) for a in self._visible_aggs())
+        return [p for p in pairs if p is not None]
+
+    def _realized_row_data(self, col: int, role: int) -> Any:
+        """Render a cell on the synthetic "Realized P&L" footer row —
+        same shape as the TOTAL row but computed over only the paired
+        (buy-and-sell-matched) portion of every visible aggregate."""
+        if role == Qt.ItemDataRole.DisplayRole:
+            return self._realized_cell_text(col)
+        if role == Qt.ItemDataRole.ForegroundRole:
+            return self._realized_cell_color(col)
+        if role == Qt.ItemDataRole.BackgroundRole:
+            return QColor(BG_TOTAL)
+        if role == Qt.ItemDataRole.FontRole:
+            return self._total_font
+        if role == Qt.ItemDataRole.TextAlignmentRole:
+            if col in _S_RIGHT_ALIGN_COLS:
+                return int(Qt.AlignmentFlag.AlignRight
+                           | Qt.AlignmentFlag.AlignVCenter)
+            return int(Qt.AlignmentFlag.AlignLeft
+                       | Qt.AlignmentFlag.AlignVCenter)
+        return None
+
+    def _realized_cell_text(self, col: int) -> str:
+        if col == S_COL_SYMBOL:
+            return "Realized P&L"
+        paired = self._paired_aggs()
+        if col == S_COL_TRANS_TOTAL:
+            return self._fmt_compact(
+                sum(self._trans_total(a) for a in paired))
+        if col == S_COL_NET_TOTAL:
+            return self._fmt_signed(
+                sum(self._net_total(a) for a in paired))
+        if col == S_COL_COMMISSION:
+            s = sum(a.get("commission", 0.0) for a in paired)
+            return f"{s:,.2f}" if s else ""
+        if col == S_COL_NET_INCL_COMM:
+            s = sum(self._net_total(a) - a.get("commission", 0.0)
+                    for a in paired)
+            return self._fmt_signed(s)
+        return ""
+
+    def _realized_cell_color(self, col: int) -> QColor | None:
+        if col == S_COL_SYMBOL:
+            return QColor(TEXT_BOLD)
+        paired = self._paired_aggs()
+        if col == S_COL_NET_TOTAL:
+            v = sum(self._net_total(a) for a in paired)
+        elif col == S_COL_NET_INCL_COMM:
+            v = sum(self._net_total(a) - a.get("commission", 0.0)
+                    for a in paired)
+        elif col == S_COL_TRANS_TOTAL:
+            return QColor(TEXT_BOLD)
+        else:
+            return QColor(TEXT)
+        if v > 0:
+            return QColor(CLR_BUY)
+        if v < 0:
+            return QColor(CLR_SELL)
+        return QColor(TEXT_DIM)
+
     def _total_cell_text(self, col: int) -> str:
         if col == S_COL_SYMBOL:
-            return "TOTAL"
+            return "P&L"
         visible = self._visible_aggs()
         if col == S_COL_TRANS_TOTAL:
             return self._fmt_compact(
@@ -513,10 +608,10 @@ class TradesSummaryModel(QAbstractTableModel):
         if key not in self._agg:
             n = len(self._order)
             if n == 0:
-                # First aggregate materialises the totals row too, so we
-                # insert rows [0, 1] in a single transaction to keep Qt's
-                # row-count bookkeeping consistent.
-                self.beginInsertRows(QModelIndex(), 0, 1)
+                # First aggregate materialises both footer rows (TOTAL +
+                # Realized P&L) too, so we insert rows [0, 2] in a single
+                # transaction to keep Qt's row-count bookkeeping consistent.
+                self.beginInsertRows(QModelIndex(), 0, 2)
             else:
                 self.beginInsertRows(QModelIndex(), n, n)
             self._agg[key] = self._empty_agg(fill)
@@ -538,7 +633,7 @@ class TradesSummaryModel(QAbstractTableModel):
             total_row = len(self._order)
             self.dataChanged.emit(
                 self.index(total_row, 0),
-                self.index(total_row, _S_NUM_COLS - 1))
+                self.index(total_row + 1, _S_NUM_COLS - 1))
 
     def set_days_back(self, days: int) -> None:
         """Change the date window (1 = today, 2 = last 2 days, …).
@@ -609,12 +704,12 @@ class TradesSummaryModel(QAbstractTableModel):
         self._order.pop(row)
         self._hidden_symbols.add(key)
         self.endRemoveRows()
-        # Totals footer shifted up by one and its values changed.
+        # Both footer rows shifted up by one and their values changed.
         if self._order:
             total_row = len(self._order)
             self.dataChanged.emit(
                 self.index(total_row, 0),
-                self.index(total_row, _S_NUM_COLS - 1))
+                self.index(total_row + 1, _S_NUM_COLS - 1))
 
     def restore_hidden(self) -> None:
         """Un-hide every user-hidden row.  Order after restore is not
@@ -674,7 +769,7 @@ class TradesSummaryModel(QAbstractTableModel):
         self._emit_row_and_total(key)
 
     def _emit_row_and_total(self, key: tuple[str, str]) -> None:
-        """Repaint *key*'s visible row and the totals footer."""
+        """Repaint *key*'s visible row and both footer rows."""
         if key not in self._order:
             return
         row = self._order.index(key)
@@ -682,7 +777,8 @@ class TradesSummaryModel(QAbstractTableModel):
             self.index(row, 0), self.index(row, _S_NUM_COLS - 1))
         total_row = len(self._order)
         self.dataChanged.emit(
-            self.index(total_row, 0), self.index(total_row, _S_NUM_COLS - 1))
+            self.index(total_row, 0),
+            self.index(total_row + 1, _S_NUM_COLS - 1))
 
     # ── Date-filter helpers ─────────────────────────────────────────────────
 
@@ -876,10 +972,10 @@ class TradesSummaryModel(QAbstractTableModel):
             return
         row = self._order.index(key)
         if len(self._order) == 1:
-            # Dropping the last aggregate also hides the totals footer
-            # so the view goes back to empty — remove both rows in one
-            # transaction.
-            self.beginRemoveRows(QModelIndex(), 0, 1)
+            # Dropping the last aggregate also hides both footer rows
+            # (TOTAL + Realized P&L) so the view goes back to empty —
+            # remove all three rows in one transaction.
+            self.beginRemoveRows(QModelIndex(), 0, 2)
         else:
             self.beginRemoveRows(QModelIndex(), row, row)
         self._order.pop(row)

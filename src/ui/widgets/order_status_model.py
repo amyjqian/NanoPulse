@@ -114,6 +114,8 @@ RawStatusRole = Qt.ItemDataRole.UserRole + 6
 # ── Fonts (shared with the panel) ────────────────────────────────────────────
 ACTION_FONT = QFont("Inter, Helvetica Neue, Arial", 11, QFont.Weight.Bold)
 STATUS_FONT = QFont("Inter, Helvetica Neue, Arial", 11, QFont.Weight.Bold)
+SYMBOL_FONT = QFont("Inter, Helvetica Neue, Arial", 11)
+SYMBOL_FONT.setWeight(QFont.Weight.DemiBold)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -214,6 +216,8 @@ class OrderStatusModel(QAbstractTableModel):
                 return ACTION_FONT
             if col == COL_STATUS:
                 return STATUS_FONT
+            if col == COL_SYMBOL:
+                return SYMBOL_FONT
             return None
 
         # ── BackgroundRole ───────────────────────────────────────────────

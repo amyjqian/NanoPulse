@@ -394,6 +394,16 @@ class IBWorkerThread(QThread):
         # NOT cleared on reconnect.
         self._rejected_order_cache: dict[str, dict] = {}
 
+        # Latest emitted status dict per order_id.  Lets late subscribers
+        # (e.g. BookTraderView, which wires order_status_updated only when
+        # the Flash tab first refreshes) replay orders whose snapshot
+        # burst fired before they connected — a quietly-working open
+        # order never emits another status event on its own.  Updated on
+        # the main thread via the queued self-connection below, so
+        # readers on the GUI thread never race the worker loop.
+        self._order_status_cache: dict[str, dict] = {}
+        self.order_status_updated.connect(self._cache_order_status)
+
         # First valid timestamp observed per orderRef (nano_...), ISO format.
         # Cancelled orders have no completedTime and no fills, so their
         # timestamp is lost after a reconnect.  This cache lets _build_trade_dict
@@ -2977,6 +2987,25 @@ class IBWorkerThread(QThread):
         if supersedes:
             d["supersedes"] = supersedes
         self.order_status_updated.emit(d)
+
+    def _cache_order_status(self, d: dict) -> None:
+        """Queued slot on the main thread — mirror every emitted status
+        dict into ``_order_status_cache`` for late subscribers."""
+        if not isinstance(d, dict):
+            return
+        order_id = d.get("order_id", "")
+        if not order_id:
+            return
+        superseded = d.get("supersedes")
+        if superseded:
+            self._order_status_cache.pop(superseded, None)
+        self._order_status_cache[order_id] = dict(d)
+
+    def order_status_snapshot(self) -> list[dict]:
+        """Copies of the latest status dict per order, for consumers that
+        wire ``order_status_updated`` after the post-connect snapshot
+        burst already fired.  Call from the GUI thread only."""
+        return [dict(d) for d in self._order_status_cache.values()]
 
     # ── ib_async callbacks ────────────────────────────────────────────────────
 

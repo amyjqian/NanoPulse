@@ -93,8 +93,8 @@ _STK_QTY_POPUP: list[int] = (
 _TITLE_FONT = QFont("Inter, Helvetica Neue, Arial", 11)
 _TITLE_FONT.setWeight(QFont.Weight.Bold)
 
-_SYMBOL_FONT = QFont("Inter, Helvetica Neue, Arial", 14)
-_SYMBOL_FONT.setWeight(QFont.Weight.Bold)
+_SYMBOL_FONT = QFont("JetBrains Mono, Menlo, Consolas, monospace", 14)
+_SYMBOL_FONT.setWeight(QFont.Weight.Medium)
 
 _PRICE_FONT = QFont("JetBrains Mono, Menlo, Consolas, monospace", 14)
 _PRICE_FONT.setWeight(QFont.Weight.Bold)
@@ -238,12 +238,12 @@ def _apply_chip_style(btn: QPushButton, selected: bool) -> None:
     if selected:
         btn.setStyleSheet(
             "QPushButton{background:#539BF5;color:white;border:none;"
-            "border-radius:6px;padding:4px 12px;font-weight:bold;font-size:12px}"
+            "border-radius:6px;padding:4px 12px;font-weight:600;font-size:12px}"
             "QPushButton:hover{background:#6BA8F6}")
     else:
         btn.setStyleSheet(
             "QPushButton{background:#232A3B;color:#A3AFC2;border:none;"
-            "border-radius:6px;padding:4px 12px;font-weight:600;font-size:12px}"
+            "border-radius:6px;padding:4px 12px;font-weight:500;font-size:12px}"
             "QPushButton:hover{background:#334058}")
 
 
@@ -297,14 +297,15 @@ class TickPriceInput(QWidget):
     # ``_TierSection`` via :meth:`set_armed`.
     _EDIT_SS_NORMAL = (
         "QLineEdit{background:#232A3B;color:#A3AFC2;border:none;"
-        "border-radius:6px 0 0 6px;padding:2px 6px;font-size:11px}"
+        "border-radius:6px 0 0 6px;padding:2px 6px;font-size:11px;"
+        "font-family:'JetBrains Mono'}"
         "QLineEdit:focus{background:#334058;color:white}"
         "QLineEdit:disabled{background:#1B2130;color:#444;border:none}"
     )
     _EDIT_SS_ARMED = (
         "QLineEdit{background:#539BF5;color:white;border:none;"
         "border-radius:6px 0 0 6px;padding:2px 6px;font-size:11px;"
-        "font-weight:bold}"
+        "font-weight:bold;font-family:'JetBrains Mono'}"
         "QLineEdit:focus{background:#6BA8F6;color:white}"
         "QLineEdit:disabled{background:#1B2130;color:#444;border:none}"
     )
@@ -985,7 +986,8 @@ class _QtyInput(QWidget):
             f"border:1px solid {p['border']};border-radius:6px}}")
         self._edit.setStyleSheet(
             f"QLineEdit{{background:transparent;color:{p['text']};"
-            f"border:none;padding:2px 6px;font-size:11px;{weight}}}")
+            f"border:none;padding:2px 6px;font-size:11px;"
+            f"font-family:'JetBrains Mono';{weight}}}")
         arrow = (
             f"QToolButton{{background:transparent;color:{p['arrow']};"
             "border:none;font-size:7px;padding:0;margin:0}"
@@ -1295,17 +1297,20 @@ class _TierSection(QWidget):
     _CHIP_H = 28
     _SS_SEL = (
         "QPushButton{background:#539BF5;color:white;border:none;"
-        "border-radius:6px;padding:4px 12px;font-weight:bold;font-size:12px}"
+        "border-radius:6px;padding:4px 12px;font-weight:bold;font-size:12px;"
+        "font-family:'JetBrains Mono'}"
         "QPushButton:hover{background:#6BA8F6}"
     )
     _SS_NORM = (
         "QPushButton{background:#232A3B;color:#A3AFC2;border:none;"
-        "border-radius:6px;padding:4px 12px;font-weight:600;font-size:12px}"
+        "border-radius:6px;padding:4px 12px;font-weight:600;font-size:12px;"
+        "font-family:'JetBrains Mono'}"
         "QPushButton:hover{background:#334058}"
     )
     _SS_INPUT = (
         "QLineEdit{background:#232A3B;color:#A3AFC2;border:none;"
-        "border-radius:4px;padding:2px 6px;font-size:11px}"
+        "border-radius:4px;padding:2px 6px;font-size:11px;"
+        "font-family:'JetBrains Mono'}"
         "QLineEdit:focus{background:#334058;color:white}"
         "QLineEdit:disabled{background:#1B2130;color:#444;border:none}"
     )
@@ -3207,8 +3212,8 @@ class OrderEntryPanel(QWidget):
         _ticker_dim = f"color: {Theme.TEXT_DIM}; border: none;"
         # Slightly smaller than _SYMBOL_FONT / _PRICE_FONT so the whole
         # strip can fit the narrow Order Entry column without wrapping.
-        _sym_font = QFont("Inter, Helvetica Neue, Arial", 12)
-        _sym_font.setWeight(QFont.Weight.Bold)
+        _sym_font = QFont("JetBrains Mono, Menlo, Consolas, monospace", 12)
+        _sym_font.setWeight(QFont.Weight.Medium)
         _price_font = QFont("JetBrains Mono, Menlo, Consolas, monospace", 12)
         _price_font.setWeight(QFont.Weight.Bold)
         _ticker_font = QFont("JetBrains Mono, Menlo, Consolas, monospace", 11)

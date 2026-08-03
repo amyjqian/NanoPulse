@@ -1,15 +1,14 @@
 """QtyChipRow SH/% unit-toggle behaviour (pytest-qt).
 
-Locks in: share mode renders byte-identically to the pre-toggle row,
+Locks in: share mode renders the numeric-chip (JetBrains Mono) styles,
 toggle cycling, per-unit preset + custom-spinner memory, the 0–100
 percent validator, disabled-chip states and resolved-share signalling.
 """
 from __future__ import annotations
 
 import pytest
-from PySide6.QtWidgets import QPushButton
 
-from src.ui.widgets.order_panel_parts import QtyChipRow, _apply_chip_style
+from src.ui.widgets.order_panel_parts import QtyChipRow
 from src.ui.widgets.size_unit_parts import UNIT_PCT, UNIT_SH
 
 _STK = ([10, 25, 50, 100, 500], 100, list(range(1, 101)))
@@ -43,14 +42,14 @@ def test_no_toggle_without_allow_percent(qtbot):
 
 
 def test_share_mode_stylesheets_byte_identical(qtbot):
-    # SH chips must carry the exact stylesheet the pre-toggle
-    # _apply_chip_style produced — pixel-identical share mode (spec §1).
+    # SH chips must carry the exact numeric-chip stylesheet from
+    # size_unit_parts (JetBrains Mono — numbers you scan), which
+    # deliberately diverges from the Inter symbol-chip style.
+    from src.ui.widgets.size_unit_parts import _SH_CHIP_ON, _SH_CHIP_OFF
     row = _make(qtbot)
-    ref_on, ref_off = QPushButton(), QPushButton()
-    _apply_chip_style(ref_on, True)
-    _apply_chip_style(ref_off, False)
-    assert _chip(row, 100).styleSheet() == ref_on.styleSheet()
-    assert _chip(row, 25).styleSheet() == ref_off.styleSheet()
+    assert _chip(row, 100).styleSheet() == _SH_CHIP_ON
+    assert _chip(row, 25).styleSheet() == _SH_CHIP_OFF
+    assert "JetBrains Mono" in _chip(row, 100).styleSheet()
 
 
 def test_toggle_cycles_and_relabels(qtbot):
@@ -191,21 +190,19 @@ def test_sell_enabled_without_price(qtbot):
 
 
 def test_custom_focus_drops_chip_highlight(qtbot):
+    from src.ui.widgets.size_unit_parts import _SH_CHIP_ON, _SH_CHIP_OFF
     row = _make(qtbot)
-    ref_on, ref_off = QPushButton(), QPushButton()
-    _apply_chip_style(ref_on, True)
-    _apply_chip_style(ref_off, False)
-    assert _chip(row, 100).styleSheet() == ref_on.styleSheet()
+    assert _chip(row, 100).styleSheet() == _SH_CHIP_ON
     # Cursor enters the custom field → no chip reads selected.
     row._custom.focusChanged.emit(True)
-    assert _chip(row, 100).styleSheet() == ref_off.styleSheet()
+    assert _chip(row, 100).styleSheet() == _SH_CHIP_OFF
     # Leaves it empty → the active chip highlight comes back.
     row._custom.focusChanged.emit(False)
-    assert _chip(row, 100).styleSheet() == ref_on.styleSheet()
+    assert _chip(row, 100).styleSheet() == _SH_CHIP_ON
     # Leaves it with a typed value → chips stay unselected.
     row._custom.setText("750")
     row._custom.focusChanged.emit(False)
-    assert _chip(row, 100).styleSheet() == ref_off.styleSheet()
+    assert _chip(row, 100).styleSheet() == _SH_CHIP_OFF
     assert row.current_qty() == 750
 
 
@@ -230,16 +227,15 @@ def test_custom_value_keeps_selected_look_unfocused(qtbot):
 
 
 def test_typed_preset_value_adopts_the_chip(qtbot):
+    from src.ui.widgets.size_unit_parts import _SH_CHIP_ON
     row = _make(qtbot)
-    ref_on = QPushButton()
-    _apply_chip_style(ref_on, True)
     box = row._custom
     # Typing an existing preset value → on focus-out the chip takes
     # over: chip selected, field cleared and back to idle.
     box.setText("50")
     box.focusChanged.emit(False)
     assert box.text() == ""
-    assert _chip(row, 50).styleSheet() == ref_on.styleSheet()
+    assert _chip(row, 50).styleSheet() == _SH_CHIP_ON
     assert "#539BF5" not in box.styleSheet()           # box unselected
     assert row.current_qty() == 50
     # A non-preset value stays in the box (selected look).

@@ -358,7 +358,8 @@ class BookTraderView(QWidget):
         self._cmb_tick.setStyleSheet(
             f"QComboBox{{background:{Theme.BG_INPUT};color:{Theme.TEXT};"
             f"border:1px solid {Theme.BORDER};border-radius:3px;"
-            f"padding:1px 6px;font-size:11px;combobox-popup:0}}"
+            f"padding:1px 6px;font-size:11px;font-family:'JetBrains Mono';"
+            f"combobox-popup:0}}"
             f"QComboBox:hover{{border-color:{Theme.ACCENT}}}"
             "QComboBox::drop-down{border:none;width:16px}"
             "QComboBox QAbstractItemView{background:#1B2130;"
@@ -431,7 +432,7 @@ class BookTraderView(QWidget):
         # equal-stretch thirds).
         _pct_ss = (
             "color: {clr}; border: none; font-size: 11px; "
-            "font-family: Inter, 'Helvetica Neue', Arial; font-weight: bold;")
+            "font-family: 'JetBrains Mono'; font-weight: bold;")
         self._lbl_pct_buy = QLabel("")
         self._lbl_pct_buy.setStyleSheet(_pct_ss.format(clr=Theme.ACCENT))
         self._lbl_pct_buy.hide()
@@ -686,6 +687,11 @@ class BookTraderView(QWidget):
         order_id = data.get("order_id", "")
         if not order_id:
             return
+        # orderId → permId migration: drop the stale entry the new one
+        # replaces so the old badge doesn't linger on the ladder.
+        superseded = data.get("supersedes")
+        if superseded:
+            self._live_orders.pop(superseded, None)
         status = data.get("status", "")
         terminal = status in (
             "Filled", "Completed", "Cancelled", "ApiCancelled", "Inactive")
@@ -1285,6 +1291,15 @@ class BookTraderView(QWidget):
                     worker.order_status_updated.connect(
                         self._on_order_status)
                     self._order_status_wired.add(worker)
+                    # Replay statuses emitted before we wired — the
+                    # post-connect snapshot fires ~1-2 s after connect
+                    # and a working open order never re-emits on its
+                    # own, so without this the ladder shows no badge
+                    # for orders restored across an app restart.
+                    snapshot = getattr(worker, "order_status_snapshot", None)
+                    if callable(snapshot):
+                        for d in snapshot():
+                            self._on_order_status(d)
             except Exception:
                 continue
 
