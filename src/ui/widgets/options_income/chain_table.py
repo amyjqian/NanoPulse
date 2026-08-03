@@ -3,7 +3,7 @@ Options Income ticket — strike ladder (§4.4).
 
 ``ChainModel`` holds an ATM-centred window of strike rows — OTM and ITM
 blocks divided by a separator row at the spot price — with live-updating
-delta / credit / yield / annualized figures; ``ChainView`` renders them
+delta / credit / yield figures; ``ChainView`` renders them
 with the app's dark table styling and paints a left accent bar on the
 selected row.
 """
@@ -45,16 +45,14 @@ COL_LAST = 3
 COL_DELTA = 4
 COL_CREDIT = 5
 COL_YIELD = 6
-COL_ANN = 7
 
-HEADERS = ["STRIKE", "BID", "ASK", "LAST", "DELTA", "CREDIT", "YIELD",
-           "ANN."]
+HEADERS = ["STRIKE", "BID", "ASK", "LAST", "DELTA", "CREDIT", "YIELD"]
 NUM_COLS = len(HEADERS)
 
 _MONO = QFont("JetBrains Mono, Menlo, Consolas, monospace", 11)
 _GREEN = QColor("#3FB950")
 
-# ATM separator row: {"sep": True, "label": "MU 831.92"} — painted by the
+# ATM separator row: {"sep": True, "label": "831.92"} — painted by the
 # delegate as a horizontal rule between the ITM and OTM sections.
 SEP_ROLE = int(Qt.ItemDataRole.UserRole)
 SEP_LABEL_ROLE = SEP_ROLE + 1
@@ -62,7 +60,7 @@ SEP_ROW_HEIGHT = 22
 
 
 class ChainModel(QAbstractTableModel):
-    """Row dicts: strike, conid, delta, credit, yield_pct, ann_pct —
+    """Row dicts: strike, conid, delta, credit, yield_pct —
     display-ready values computed by the ticket.  Rows arrive sorted
     descending by strike (highest on top).  A ``{"sep": True, "label"}``
     row marks the ITM/OTM boundary and is not selectable."""
@@ -124,9 +122,6 @@ class ChainModel(QAbstractTableModel):
             if col == COL_YIELD:
                 y = rd.get("yield_pct")
                 return f"{y:.2f}%" if y else "—"
-            if col == COL_ANN:
-                a = rd.get("ann_pct")
-                return f"{a:.1f}%" if a else "—"
 
         if role == Qt.ItemDataRole.TextAlignmentRole:
             if col == COL_STRIKE:
@@ -136,7 +131,7 @@ class ChainModel(QAbstractTableModel):
                        | Qt.AlignmentFlag.AlignVCenter)
 
         if role == Qt.ItemDataRole.ForegroundRole:
-            if col in (COL_YIELD, COL_ANN) and rd.get("yield_pct"):
+            if col == COL_YIELD and rd.get("yield_pct"):
                 return _GREEN
             if col == COL_DELTA:
                 return QColor(Theme.TEXT_DIM)
@@ -250,10 +245,12 @@ class ChainView(QTableView):
         self.verticalHeader().setVisible(False)
         self.verticalHeader().setDefaultSectionSize(34)
         hh = self.horizontalHeader()
-        # Interactive = user-draggable column edges; the last column
-        # absorbs the leftover so the ladder always fills its width.
+        # Interactive = user-draggable column edges — every column,
+        # including the last (a stretch section can't be dragged, which
+        # made YIELD un-resizable once it became the last column).  The
+        # first-open equal split in resizeEvent still fills the width.
         hh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        hh.setStretchLastSection(True)
+        hh.setStretchLastSection(False)
         hh.setMinimumSectionSize(48)
         hh.setHighlightSections(False)
         self.setStyleSheet(
@@ -306,7 +303,7 @@ class ChainView(QTableView):
     def _apply_widths(self, widths: list[int]) -> None:
         self._applying_widths = True
         try:
-            for col in range(NUM_COLS - 1):     # last column stretches
+            for col in range(NUM_COLS):
                 self.setColumnWidth(col, widths[col])
         finally:
             self._applying_widths = False

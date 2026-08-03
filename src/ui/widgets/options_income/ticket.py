@@ -528,7 +528,7 @@ class OptionsIncomeTicket(QDialog):
                 "contract": r,
                 "delta": 0.0, "bid": None, "ask": None, "last": None,
                 "mid": 0.0,
-                "credit": None, "yield_pct": None, "ann_pct": None,
+                "credit": None, "yield_pct": None,
             })
         # ATM separator between the ≥spot block and the <spot block
         # (ITM/OTM boundary — reversed sides for calls vs puts).
@@ -594,7 +594,7 @@ class OptionsIncomeTicket(QDialog):
         self._scroll_debounce.start()
 
     def _sep_label(self) -> str:
-        return f"{self._symbol} {self._spot:,.2f}" if self._spot > 0 else ""
+        return f"{self._spot:,.2f}" if self._spot > 0 else ""
 
     @staticmethod
     def _default_row(rows: list[dict], spot: float, right: str) -> int:
@@ -730,15 +730,14 @@ class OptionsIncomeTicket(QDialog):
         self._recompute()
 
     def _income_figures(self, mid: float, strike: float, dte: int) -> dict:
-        """Per-row YIELD/ANN display fields for the current strategy —
+        """Per-row YIELD display field for the current strategy —
         premium yield is an income (selling) metric, blank on longs."""
         strategy = self._strategy()
         if _ACTION[strategy] != "SELL":
-            return {"yield_pct": None, "ann_pct": None}
+            return {"yield_pct": None}
         ref = self._spot if strategy == "CC" else strike
         y = oi.yield_pct(mid, ref)
-        return {"yield_pct": float(y),
-                "ann_pct": float(oi.annualized_pct(y, dte))}
+        return {"yield_pct": float(y)}
 
     def _refresh_row_figures(self) -> None:
         """Re-derive yield/ann from cached row mids (side toggled)."""

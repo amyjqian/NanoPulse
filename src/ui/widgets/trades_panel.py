@@ -794,6 +794,11 @@ class TradesPanel(QWidget):
         self._flat_model.add_fill(fill)
         self._summary_model.add_fill(fill)
 
+    def update_last_price(self, symbol: str, price: float) -> None:
+        """Live last-trade price feed — the summary's P&L footer row
+        marks unclosed positions to it."""
+        self._summary_model.set_last_price(symbol, price)
+
     def clear_fills(self) -> None:
         self._flat_model.clear()
         self._summary_model.clear()

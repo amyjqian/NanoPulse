@@ -190,7 +190,7 @@ def test_chain_flow_populates_defaults(qtbot):
     seps = [i for i in range(model.rowCount())
             if model.row_data(i).get("sep")]
     assert seps == [8]                     # 182.5 above, 180 below
-    assert model.row_data(8)["label"] == "NVDA 182.40"
+    assert model.row_data(8)["label"] == "182.40"
     # Descending — highest strike on top.
     strikes = [model.row_data(i)["strike"] for i in range(model.rowCount())
                if not model.row_data(i).get("sep")]
@@ -233,7 +233,7 @@ def test_sep_row_not_selectable_and_tracks_spot(qtbot):
     w.option_quote_updated.emit(token, UNDERLYING_CONID,
                                 {"bid": 183.0, "ask": 183.2, "last": 183.1,
                                  "close": 181.0, "delta": 0.0})
-    assert model.row_data(8)["label"] == "NVDA 183.10"
+    assert model.row_data(8)["label"] == "183.10"
 
 
 def test_large_chain_shows_50_per_side_but_windows_quotes(qtbot):

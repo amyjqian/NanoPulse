@@ -859,6 +859,14 @@ class FlashTradeView(QWidget):
                 prev.fill_updated.disconnect(self._on_fill_updated)
             except RuntimeError:
                 pass
+            try:
+                prev.price_updated.disconnect(self._on_price_for_trades)
+            except RuntimeError:
+                pass
+            try:
+                prev.bg_price_updated.disconnect(self._on_bg_price_for_trades)
+            except RuntimeError:
+                pass
             log.debug("FlashTrade: unwired stale signals for worker %s", label)
 
         worker.order_status_updated.connect(self._on_order_status_updated)
@@ -868,6 +876,10 @@ class FlashTradeView(QWidget):
         worker.pnl_single_updated.connect(self._on_pnl_single_updated)
         worker.account_pnl_updated.connect(self._on_account_pnl_updated)
         worker.fill_updated.connect(self._on_fill_updated)
+        # Last-price feeds → trades summary, so the P&L footer row can
+        # mark unclosed positions to the last traded price.
+        worker.price_updated.connect(self._on_price_for_trades)
+        worker.bg_price_updated.connect(self._on_bg_price_for_trades)
         self._connected_order_workers[label] = worker
         self._connected_portfolio_workers[label] = worker
         log.debug(
@@ -1037,6 +1049,18 @@ class FlashTradeView(QWidget):
                 fill = dict(fill)
                 fill["account"] = alias
         self._trades_panel.add_fill(fill)
+
+    def _on_price_for_trades(self, symbol: str, price: float) -> None:
+        """Active-symbol L1 tick → trades summary last-price cache."""
+        if price and price > 0:
+            self._trades_panel.update_last_price(symbol, price)
+
+    def _on_bg_price_for_trades(self, symbol: str, last: float,
+                                _bid: float, _ask: float,
+                                _close: float) -> None:
+        """Background L1 tick → trades summary last-price cache."""
+        if last and last > 0:
+            self._trades_panel.update_last_price(symbol, last)
 
     def _refresh_portfolio(self) -> None:
         """Ask every connected worker to re-push portfolio positions."""
