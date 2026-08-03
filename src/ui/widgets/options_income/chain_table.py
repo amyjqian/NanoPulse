@@ -258,11 +258,31 @@ class ChainView(QTableView):
             f" border:1px solid {Theme.BORDER}; border-radius:6px;"
             " selection-background-color:rgba(0,113,227,0.14);"
             f" selection-color:{Theme.TEXT}; }}"
+            # The bare QHeaderView (the area past the last section — no
+            # stretch column anymore) must carry the dark background too,
+            # else it renders default-white.
+            f"QHeaderView{{ background:{Theme.BG_MAIN}; border:none;"
+            f" border-bottom:1px solid {Theme.BORDER}; }}"
             f"QHeaderView::section{{ background:{Theme.BG_MAIN};"
             f" color:{Theme.TEXT_DIM}; border:none;"
             f" border-bottom:1px solid {Theme.BORDER};"
             " padding:6px 8px; font-size:10px; font-weight:bold;"
-            " letter-spacing:1px; }")
+            " letter-spacing:1px; }"
+            # Scrollbars — same slim dark style as the Orders view.
+            f"QScrollBar:vertical{{ background:{Theme.BG_MAIN};"
+            " width:8px; margin:0; }"
+            "QScrollBar::handle:vertical{ background:#334058;"
+            " border-radius:4px; min-height:24px; }"
+            "QScrollBar::handle:vertical:pressed{ background:#6E7380; }"
+            f"QScrollBar:horizontal{{ background:{Theme.BG_MAIN};"
+            " height:10px; margin:0; }"
+            "QScrollBar::handle:horizontal{ background:#334058;"
+            " border-radius:4px; min-width:40px; }"
+            "QScrollBar::handle:horizontal:pressed{ background:#6E7380; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical"
+            "{ height:0; }"
+            "QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal"
+            "{ width:0; }")
         sel_model = self.selectionModel()
         sel_model.currentRowChanged.connect(
             lambda cur, _prev: self.row_selected.emit(cur.row()))

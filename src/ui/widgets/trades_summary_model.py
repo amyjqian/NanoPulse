@@ -32,23 +32,25 @@ S_COL_NET           = 4
 S_COL_AVG_BUY       = 5
 S_COL_AVG_SELL      = 6
 S_COL_TRANS_TOTAL   = 7
-S_COL_NET_TOTAL     = 8
-S_COL_COMMISSION    = 9
-S_COL_NET_INCL_COMM = 10
-S_COL_REALIZED      = 11
-S_COL_EXCHANGES     = 12
+S_COL_PAIRED_PNL    = 8    # R.P&L — FIFO-paired (realized) portion
+S_COL_UNPAIRED_PNL  = 9    # U.P&L — open remainder, marked to last
+S_COL_NET_TOTAL     = 10   # P&L — R.P&L + U.P&L
+S_COL_COMMISSION    = 11
+S_COL_NET_INCL_COMM = 12
+S_COL_REALIZED      = 13
+S_COL_EXCHANGES     = 14
 
 S_HEADERS: list[str] = [
     "Symbol", "Type", "Buys", "Sells", "Net",
     "Avg buy price", "Avg sell price", "Trans total",
-    "P&L", "Comm", "Net P&L", "Rlz P&L", "Exchanges",
+    "R.P&L", "U.P&L", "P&L", "Comm", "Net P&L", "Rlz P&L", "Exchanges",
 ]
 
 # Column key used by the preferences dialog / column visibility state
 S_COL_KEYS: list[str] = [
     "symbol", "sec_type", "buys", "sells", "net", "avg_buy", "avg_sell",
-    "trans_total", "net_total", "commission", "net_incl_comm",
-    "realized_pnl", "exchanges",
+    "trans_total", "paired_pnl", "unpaired_pnl", "net_total",
+    "commission", "net_incl_comm", "realized_pnl", "exchanges",
 ]
 
 # Fill-level fields the search box matches against before aggregation.
@@ -65,6 +67,7 @@ _S_NUM_COLS = len(S_HEADERS)
 _S_RIGHT_ALIGN_COLS = {
     S_COL_BUYS, S_COL_SELLS, S_COL_NET,
     S_COL_AVG_BUY, S_COL_AVG_SELL, S_COL_TRANS_TOTAL,
+    S_COL_PAIRED_PNL, S_COL_UNPAIRED_PNL,
     S_COL_NET_TOTAL, S_COL_COMMISSION, S_COL_NET_INCL_COMM,
     S_COL_REALIZED,
 }
@@ -172,21 +175,14 @@ class TradesSummaryModel(QAbstractTableModel):
         if parent.isValid():
             return 0
         n = len(self._order)
-        # Three extra rows at the bottom: the "P&L" totals/footer, the
-        # "Realized P&L" (paired round-trips only) band, and the
-        # "Unrealized P&L" (open remainder, marked to last) band.
+        # One extra row at the bottom is the "P&L" totals footer (its
+        # R.P&L / U.P&L columns carry the realized/unrealized split).
         # Hidden entirely when the model has no aggregates so an empty
-        # view doesn't display stray footer bands.
-        return n + 3 if n else 0
+        # view doesn't display a stray footer band.
+        return n + 1 if n else 0
 
     def _is_total_row(self, row: int) -> bool:
         return bool(self._order) and row == len(self._order)
-
-    def _is_realized_row(self, row: int) -> bool:
-        return bool(self._order) and row == len(self._order) + 1
-
-    def _is_unrealized_row(self, row: int) -> bool:
-        return bool(self._order) and row == len(self._order) + 2
 
     def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
         return 0 if parent.isValid() else _S_NUM_COLS
@@ -208,21 +204,18 @@ class TradesSummaryModel(QAbstractTableModel):
 
         if self._is_total_row(row):
             return self._total_row_data(col, role)
-        if self._is_realized_row(row):
-            return self._realized_row_data(col, role)
-        if self._is_unrealized_row(row):
-            return self._unrealized_row_data(col, role)
 
         if row < 0 or row >= len(self._order):
             return None
-        agg = self._effective_agg(self._order[row])
+        key = self._order[row]
+        agg = self._effective_agg(key)
         if agg is None:
             return None
 
         if role == Qt.ItemDataRole.DisplayRole:
-            return self._cell_text(agg, col)
+            return self._cell_text(agg, col, key)
         if role == Qt.ItemDataRole.ForegroundRole:
-            return self._cell_color(agg, col)
+            return self._cell_color(agg, col, key)
         if role == Qt.ItemDataRole.TextAlignmentRole:
             if col in _S_RIGHT_ALIGN_COLS:
                 return int(Qt.AlignmentFlag.AlignRight
@@ -354,70 +347,12 @@ class TradesSummaryModel(QAbstractTableModel):
                  if k in self._agg)
         return [p for p in pairs if p is not None]
 
-    def _realized_row_data(self, col: int, role: int) -> Any:
-        """Render a cell on the synthetic "Realized P&L" footer row —
-        same shape as the TOTAL row but computed over only the paired
-        (buy-and-sell-matched) portion of every visible aggregate."""
-        if role == Qt.ItemDataRole.DisplayRole:
-            return self._realized_cell_text(col)
-        if role == Qt.ItemDataRole.ForegroundRole:
-            return self._realized_cell_color(col)
-        if role == Qt.ItemDataRole.BackgroundRole:
-            return QColor(BG_TOTAL)
-        if role == Qt.ItemDataRole.FontRole:
-            return self._total_font
-        if role == Qt.ItemDataRole.TextAlignmentRole:
-            if col in _S_RIGHT_ALIGN_COLS:
-                return int(Qt.AlignmentFlag.AlignRight
-                           | Qt.AlignmentFlag.AlignVCenter)
-            return int(Qt.AlignmentFlag.AlignLeft
-                       | Qt.AlignmentFlag.AlignVCenter)
-        return None
-
-    def _realized_cell_text(self, col: int) -> str:
-        if col == S_COL_SYMBOL:
-            return "Realized P&L"
-        paired = self._paired_aggs()
-        if col == S_COL_TRANS_TOTAL:
-            return self._fmt_compact(
-                sum(self._trans_total(a) for a in paired))
-        if col == S_COL_NET_TOTAL:
-            return self._fmt_signed(
-                sum(self._net_total(a) for a in paired))
-        if col == S_COL_COMMISSION:
-            s = sum(a.get("commission", 0.0) for a in paired)
-            return f"{s:,.2f}" if s else ""
-        if col == S_COL_NET_INCL_COMM:
-            s = sum(self._net_total(a) - a.get("commission", 0.0)
-                    for a in paired)
-            return self._fmt_signed(s)
-        return ""
-
-    def _realized_cell_color(self, col: int) -> QColor | None:
-        if col == S_COL_SYMBOL:
-            return QColor(TEXT_BOLD)
-        paired = self._paired_aggs()
-        if col == S_COL_NET_TOTAL:
-            v = sum(self._net_total(a) for a in paired)
-        elif col == S_COL_NET_INCL_COMM:
-            v = sum(self._net_total(a) - a.get("commission", 0.0)
-                    for a in paired)
-        elif col == S_COL_TRANS_TOTAL:
-            return QColor(TEXT_BOLD)
-        else:
-            return QColor(TEXT)
-        if v > 0:
-            return QColor(CLR_BUY)
-        if v < 0:
-            return QColor(CLR_SELL)
-        return QColor(TEXT_DIM)
-
-    # ── Unrealized-P&L row rendering (open remainder, marked) ───────────────
+    # ── Unrealized (open remainder) helpers — feed the U.P&L column ─────────
 
     def _unrealized_parts(self) -> list[tuple[dict, dict | None]]:
         """(effective aggregate, FIFO-paired portion) per visible symbol.
-        The unrealized row is each column's total minus its realized
-        part, so P&L = Realized + Unrealized always reconciles."""
+        Unrealized is each column's total minus its realized part, so
+        P&L = R.P&L + U.P&L always reconciles."""
         parts = []
         for key in self._order:
             agg = self._effective_agg(key)
@@ -444,54 +379,6 @@ class TradesSummaryModel(QAbstractTableModel):
                      - paired.get("commission", 0.0)) if paired else 0.0)
         return total
 
-    def _unrealized_row_data(self, col: int, role: int) -> Any:
-        """Render a cell on the synthetic "Unrealized P&L" footer row —
-        the open (unpaired) remainder of every visible aggregate, with
-        its P&L marked to the last traded price."""
-        if role == Qt.ItemDataRole.DisplayRole:
-            return self._unrealized_cell_text(col)
-        if role == Qt.ItemDataRole.ForegroundRole:
-            return self._unrealized_cell_color(col)
-        if role == Qt.ItemDataRole.BackgroundRole:
-            return QColor(BG_TOTAL)
-        if role == Qt.ItemDataRole.FontRole:
-            return self._total_font
-        if role == Qt.ItemDataRole.TextAlignmentRole:
-            if col in _S_RIGHT_ALIGN_COLS:
-                return int(Qt.AlignmentFlag.AlignRight
-                           | Qt.AlignmentFlag.AlignVCenter)
-            return int(Qt.AlignmentFlag.AlignLeft
-                       | Qt.AlignmentFlag.AlignVCenter)
-        return None
-
-    def _unrealized_cell_text(self, col: int) -> str:
-        if col == S_COL_SYMBOL:
-            return "Unrealized P&L"
-        if col == S_COL_TRANS_TOTAL:
-            return self._fmt_compact(self._unrealized_value(col))
-        if col == S_COL_NET_TOTAL:
-            return self._fmt_signed(self._unrealized_value(col))
-        if col == S_COL_COMMISSION:
-            s = self._unrealized_value(col)
-            return f"{s:,.2f}" if s else ""
-        if col == S_COL_NET_INCL_COMM:
-            return self._fmt_signed(self._unrealized_value(col))
-        return ""
-
-    def _unrealized_cell_color(self, col: int) -> QColor | None:
-        if col == S_COL_SYMBOL:
-            return QColor(TEXT_BOLD)
-        if col == S_COL_TRANS_TOTAL:
-            return QColor(TEXT_BOLD)
-        if col in (S_COL_NET_TOTAL, S_COL_NET_INCL_COMM):
-            v = self._unrealized_value(col)
-            if v > 0:
-                return QColor(CLR_BUY)
-            if v < 0:
-                return QColor(CLR_SELL)
-            return QColor(TEXT_DIM)
-        return QColor(TEXT)
-
     def _total_cell_text(self, col: int) -> str:
         if col == S_COL_SYMBOL:
             return "P&L"
@@ -499,6 +386,11 @@ class TradesSummaryModel(QAbstractTableModel):
         if col == S_COL_TRANS_TOTAL:
             return self._fmt_compact(
                 sum(self._trans_total(a) for a in visible))
+        if col == S_COL_PAIRED_PNL:
+            return self._fmt_signed(
+                sum(self._net_total(p) for p in self._paired_aggs()))
+        if col == S_COL_UNPAIRED_PNL:
+            return self._fmt_signed(self._unrealized_value(S_COL_NET_TOTAL))
         if col == S_COL_NET_TOTAL:
             return self._fmt_signed(
                 sum(self._marked_net_total(a) for a in visible))
@@ -515,6 +407,15 @@ class TradesSummaryModel(QAbstractTableModel):
         if col == S_COL_SYMBOL:
             return QColor(TEXT_BOLD)
         visible = self._visible_aggs()
+        if col in (S_COL_PAIRED_PNL, S_COL_UNPAIRED_PNL):
+            v = (sum(self._net_total(p) for p in self._paired_aggs())
+                 if col == S_COL_PAIRED_PNL
+                 else self._unrealized_value(S_COL_NET_TOTAL))
+            if v > 0:
+                return QColor(CLR_BUY)
+            if v < 0:
+                return QColor(CLR_SELL)
+            return QColor(TEXT_DIM)
         if col == S_COL_NET_TOTAL:
             v = sum(self._marked_net_total(a) for a in visible)
             if v > 0:
@@ -568,7 +469,14 @@ class TradesSummaryModel(QAbstractTableModel):
             return f"{sign}{a / 1_000:.2f}k"
         return f"{sign}{a / 1_000_000:.2f}m"
 
-    def _cell_text(self, agg: dict, col: int) -> str:
+    def _paired_pnl(self, key: tuple[str, str] | None) -> float:
+        """R.P&L for one row — the FIFO-paired round-trip's net."""
+        if key is None:
+            return 0.0
+        paired = self._fifo_paired(key)
+        return self._net_total(paired) if paired else 0.0
+
+    def _cell_text(self, agg: dict, col: int, key=None) -> str:
         if col == S_COL_SYMBOL:
             return agg.get("symbol", "")
         if col == S_COL_TYPE:
@@ -590,13 +498,21 @@ class TradesSummaryModel(QAbstractTableModel):
             return f"{(agg.get('sells_notional', 0.0) / s_q):,.2f}" if s_q else ""
         if col == S_COL_TRANS_TOTAL:
             return self._fmt_compact(self._trans_total(agg))
+        if col == S_COL_PAIRED_PNL:
+            return self._fmt_signed(self._paired_pnl(key))
+        if col == S_COL_UNPAIRED_PNL:
+            return self._fmt_signed(
+                self._marked_net_total(agg) - self._paired_pnl(key))
         if col == S_COL_NET_TOTAL:
-            return self._fmt_signed(self._net_total(agg))
+            # P&L = R.P&L + U.P&L — the marked (paired + open-remainder)
+            # net, not the raw cash flow.
+            return self._fmt_signed(self._marked_net_total(agg))
         if col == S_COL_COMMISSION:
             c = agg.get("commission", 0.0)
             return f"{c:,.2f}" if c else ""
         if col == S_COL_NET_INCL_COMM:
-            return self._fmt_signed(self._net_total(agg) - agg.get("commission", 0.0))
+            return self._fmt_signed(
+                self._marked_net_total(agg) - agg.get("commission", 0.0))
         if col == S_COL_REALIZED:
             pnl = agg.get("realized_pnl", 0.0)
             if pnl == 0:
@@ -618,6 +534,13 @@ class TradesSummaryModel(QAbstractTableModel):
         return diff * agg.get("multiplier", 1.0)
 
     def _last_price_for(self, agg: dict) -> float | None:
+        if (agg.get("sec_type") or "").upper() in ("OPT", "FOP"):
+            # Only an exact local-symbol quote may mark an option — the
+            # root-symbol feed carries the UNDERLYING's price, which
+            # would mark a $0.86 contract at e.g. 192.00 × 100.  No
+            # option quote in the cache → fall back to cash-based.
+            p = self._last_prices.get((agg.get("symbol", "") or "").upper())
+            return p if p else None
         for key in (agg.get("root_symbol", ""),
                     (agg.get("symbol", "") or "").upper()):
             if key:
@@ -649,7 +572,7 @@ class TradesSummaryModel(QAbstractTableModel):
         total = agg.get("buys_notional", 0.0) + agg.get("sells_notional", 0.0)
         return total * agg.get("multiplier", 1.0)
 
-    def _cell_color(self, agg: dict, col: int) -> QColor | None:
+    def _cell_color(self, agg: dict, col: int, key=None) -> QColor | None:
         if col == S_COL_SYMBOL:
             return QColor(TEXT_BOLD)
         if col == S_COL_NET:
@@ -659,9 +582,16 @@ class TradesSummaryModel(QAbstractTableModel):
             if net < 0:
                 return QColor(CLR_SELL)
             return QColor(TEXT_DIM)
-        if col in (S_COL_NET_TOTAL, S_COL_NET_INCL_COMM):
-            v = (self._net_total(agg) if col == S_COL_NET_TOTAL
-                 else self._net_total(agg) - agg.get("commission", 0.0))
+        if col in (S_COL_PAIRED_PNL, S_COL_UNPAIRED_PNL,
+                   S_COL_NET_TOTAL, S_COL_NET_INCL_COMM):
+            if col == S_COL_PAIRED_PNL:
+                v = self._paired_pnl(key)
+            elif col == S_COL_UNPAIRED_PNL:
+                v = self._marked_net_total(agg) - self._paired_pnl(key)
+            elif col == S_COL_NET_TOTAL:
+                v = self._marked_net_total(agg)
+            else:
+                v = self._marked_net_total(agg) - agg.get("commission", 0.0)
             if v > 0:
                 return QColor(CLR_BUY)
             if v < 0:
@@ -760,11 +690,10 @@ class TradesSummaryModel(QAbstractTableModel):
         if key not in self._agg:
             n = len(self._order)
             if n == 0:
-                # First aggregate materialises all three footer rows
-                # (P&L + Realized + Unrealized) too, so we insert rows
-                # [0, 3] in a single transaction to keep Qt's row-count
-                # bookkeeping consistent.
-                self.beginInsertRows(QModelIndex(), 0, 3)
+                # First aggregate materialises the totals row too, so we
+                # insert rows [0, 1] in a single transaction to keep
+                # Qt's row-count bookkeeping consistent.
+                self.beginInsertRows(QModelIndex(), 0, 1)
             else:
                 self.beginInsertRows(QModelIndex(), n, n)
             self._agg[key] = self._empty_agg(fill)
@@ -786,7 +715,7 @@ class TradesSummaryModel(QAbstractTableModel):
             total_row = len(self._order)
             self.dataChanged.emit(
                 self.index(total_row, 0),
-                self.index(total_row + 2, _S_NUM_COLS - 1))
+                self.index(total_row, _S_NUM_COLS - 1))
 
     def set_days_back(self, days: int) -> None:
         """Change the date window (1 = today, 2 = last 2 days, …).
@@ -839,19 +768,26 @@ class TradesSummaryModel(QAbstractTableModel):
         self._last_prices[sym] = price
         if not self._order:
             return
-        # Repaint the footer only when a visible aggregate is actually
-        # open on this symbol — closed round-trips don't re-price.
-        for a in self._visible_aggs():
-            if a.get("buys_qty", 0.0) == a.get("sells_qty", 0.0):
+        # Repaint rows whose symbol has an open leg (their U.P&L / P&L
+        # columns mark to last price) plus the footer bands.  Closed
+        # round-trips don't re-price.
+        hit = False
+        for row, k in enumerate(self._order):
+            a = self._effective_agg(k)
+            if a is None \
+                    or a.get("buys_qty", 0.0) == a.get("sells_qty", 0.0):
                 continue
             if sym in (a.get("root_symbol", ""),
                        (a.get("symbol", "") or "").upper()):
-                # P&L and Unrealized P&L both mark to last price.
-                total_row = len(self._order)
+                hit = True
                 self.dataChanged.emit(
-                    self.index(total_row, 0),
-                    self.index(total_row + 2, _S_NUM_COLS - 1))
-                return
+                    self.index(row, 0),
+                    self.index(row, _S_NUM_COLS - 1))
+        if hit:
+            total_row = len(self._order)
+            self.dataChanged.emit(
+                self.index(total_row, 0),
+                self.index(total_row, _S_NUM_COLS - 1))
 
     def clear(self) -> None:
         if not self._order and not self._fills:
@@ -883,12 +819,12 @@ class TradesSummaryModel(QAbstractTableModel):
         self._order.pop(row)
         self._hidden_symbols.add(key)
         self.endRemoveRows()
-        # The footer rows shifted up by one and their values changed.
+        # The totals footer shifted up by one and its values changed.
         if self._order:
             total_row = len(self._order)
             self.dataChanged.emit(
                 self.index(total_row, 0),
-                self.index(total_row + 2, _S_NUM_COLS - 1))
+                self.index(total_row, _S_NUM_COLS - 1))
 
     def restore_hidden(self) -> None:
         """Un-hide every user-hidden row.  Order after restore is not
@@ -957,7 +893,7 @@ class TradesSummaryModel(QAbstractTableModel):
         total_row = len(self._order)
         self.dataChanged.emit(
             self.index(total_row, 0),
-            self.index(total_row + 2, _S_NUM_COLS - 1))
+            self.index(total_row, _S_NUM_COLS - 1))
 
     # ── Date-filter helpers ─────────────────────────────────────────────────
 
@@ -1104,6 +1040,14 @@ class TradesSummaryModel(QAbstractTableModel):
                     agg["multiplier"] = mult_f
             except (TypeError, ValueError):
                 pass
+        # Option fills occasionally arrive without contract.multiplier —
+        # a standard equity option delivers 100 shares, so without this
+        # a 0.86 premium would fold into P&L as $0.86 instead of $86.
+        # Non-standard multipliers (minis, adjusted) always arrive
+        # explicitly and take the branch above instead.
+        if agg.get("multiplier", 1.0) == 1.0 \
+                and (fill.get("sec_type") or "").upper() in ("OPT", "FOP"):
+            agg["multiplier"] = 100.0
         if side == "BOT":
             agg["buys_qty"] += shares
             agg["buys_notional"] += shares * price
@@ -1154,10 +1098,10 @@ class TradesSummaryModel(QAbstractTableModel):
             return
         row = self._order.index(key)
         if len(self._order) == 1:
-            # Dropping the last aggregate also hides the three footer
-            # rows (P&L + Realized + Unrealized) so the view goes back
-            # to empty — remove all four rows in one transaction.
-            self.beginRemoveRows(QModelIndex(), 0, 3)
+            # Dropping the last aggregate also hides the totals footer
+            # so the view goes back to empty — remove both rows in one
+            # transaction.
+            self.beginRemoveRows(QModelIndex(), 0, 1)
         else:
             self.beginRemoveRows(QModelIndex(), row, row)
         self._order.pop(row)

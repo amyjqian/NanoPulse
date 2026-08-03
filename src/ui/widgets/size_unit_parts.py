@@ -34,7 +34,8 @@ PCT_POPUP: list[int] = list(range(1, 101))         # spinner ladder, 1–100
 TOGGLE_W = 38                                      # spec §2
 
 _TOOLTIP_SH = "Sizing in shares — click for percent of account value"
-_TOOLTIP_PCT = ("Sizing by percent of account NET LIQUIDATION value — "
+_TOOLTIP_PCT = ("Sizing by percent of deployable account value (the "
+                "lesser of net liquidation and buying power) — "
                 "click for shares")
 
 # Derived from the symbol-chip styles (_apply_chip_style in

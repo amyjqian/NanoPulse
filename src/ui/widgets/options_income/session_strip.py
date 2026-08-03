@@ -238,7 +238,22 @@ class SessionOrdersStrip(QTableView):
             f"QTableView{{ background:{Theme.BG_MAIN}; color:{Theme.TEXT};"
             f" border:1px solid {Theme.BORDER}; border-radius:6px;"
             " selection-background-color:rgba(0,113,227,0.14);"
-            f" selection-color:{Theme.TEXT}; }}")
+            f" selection-color:{Theme.TEXT}; }}"
+            # Scrollbars — same slim dark style as the Orders view.
+            f"QScrollBar:vertical{{ background:{Theme.BG_MAIN};"
+            " width:8px; margin:0; }"
+            "QScrollBar::handle:vertical{ background:#334058;"
+            " border-radius:4px; min-height:24px; }"
+            "QScrollBar::handle:vertical:pressed{ background:#6E7380; }"
+            f"QScrollBar:horizontal{{ background:{Theme.BG_MAIN};"
+            " height:10px; margin:0; }"
+            "QScrollBar::handle:horizontal{ background:#334058;"
+            " border-radius:4px; min-width:40px; }"
+            "QScrollBar::handle:horizontal:pressed{ background:#6E7380; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical"
+            "{ height:0; }"
+            "QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal"
+            "{ width:0; }")
         self.clicked.connect(self._on_clicked)
 
         # Misclick guard: the first click on a Cancel cell only ARMS it

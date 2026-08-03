@@ -488,7 +488,9 @@ class PositionsSummaryModel(QAbstractTableModel):
         agg["position"] += position
         if math.isfinite(market_value):
             agg["market_value"] += market_value
-        if math.isfinite(unrealized):
+        # A flat per-account row has no unrealized P&L by definition —
+        # guard against a stale pre-close figure lingering in its dict.
+        if math.isfinite(unrealized) and abs(position) > _ZERO_EPS:
             agg["unrealized_pnl"] += unrealized
         if math.isfinite(realized):
             agg["realized_pnl"] += realized

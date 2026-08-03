@@ -569,7 +569,7 @@ class QtyChipRow(QWidget):
     """
 
     qty_changed = Signal(int)        # resolved shares, both units
-    # Per-side % readouts ("B:1,946", "S:150"); empty strings in share
+    # Per-side % readouts ("B 1,946", "S 150"); empty strings in share
     # mode or when a side doesn't resolve.
     preview_changed = Signal(str, str)
 
@@ -783,8 +783,8 @@ class QtyChipRow(QWidget):
             buy = self._pct_ctx.preview_total(self._active_pct)
             sell = self._pct_ctx.sell_preview_total(self._active_pct)
             self.preview_changed.emit(
-                f"B:{buy:,}" if buy > 0 else "",
-                f"S:{sell:,}" if sell > 0 else "")
+                f"B {buy:,}" if buy > 0 else "",
+                f"S {sell:,}" if sell > 0 else "")
         else:
             self.preview_changed.emit("", "")
 

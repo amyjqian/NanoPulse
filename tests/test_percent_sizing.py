@@ -95,7 +95,26 @@ def test_sell_percent_truncates_fractional_position():
 
 
 def test_resolve_full_pipeline():
-    # 50% of $200k @ $50 = 2,000 shares, BP $40k caps at 800.
-    assert resolve_percent_qty(50, 200_000, 50, buying_power=40_000) == 800
+    # Deployable base = min(NLV, BP): 50% of min($200k, $40k) @ $50 = 400.
+    assert resolve_percent_qty(50, 200_000, 50, buying_power=40_000) == 400
+    # BP unknown → NLV alone: 50% of $200k @ $50 = 2,000.
     assert resolve_percent_qty(50, 200_000, 50) == 2000
     assert resolve_percent_qty(50, 200_000, 0) == 0
+
+
+def test_resolve_scales_when_bp_below_nlv():
+    # Capital mostly tied up (NLV $249k, BP $22.3k): each percentage
+    # must resolve to a DIFFERENT count — under the old NLV base every
+    # chip smashed into the BP clamp and read identically.
+    kw = dict(net_liq=249_359, price=Decimal("825.82"), buying_power=22_299)
+    assert resolve_percent_qty(10, **kw) == 2
+    assert resolve_percent_qty(25, **kw) == 6
+    assert resolve_percent_qty(50, **kw) == 13
+    assert resolve_percent_qty(100, **kw) == 27
+
+
+def test_resolve_margin_account_keeps_nlv_base():
+    # BP above NLV (margin): base stays NLV so 100% is 1× leverage,
+    # never a levered position behind a single click.
+    assert resolve_percent_qty(100, 100_000, 100,
+                               buying_power=400_000) == 1000

@@ -5,9 +5,13 @@ Pure Decimal math — no Qt.  Used by the SH/% unit toggle on the order-size
 rows (Book Trader ladder + Order Entry panel) and by FlashTradeView's
 per-account fan-out.
 
-The percent base is **NetLiquidation**, never buying power: 100% of BP on
-a 4× margin account would be a 4× leveraged position behind a single
-click.  Buying power is only a *clamp* applied after resolution.
+The percent base is the account's **deployable value** — the lesser of
+NetLiquidation and buying power (falling back to NLV alone while the BP
+tag hasn't arrived).  Never BP alone: 100% of BP on a 4× margin account
+would be a 4× leveraged position behind a single click.  And never NLV
+alone: when capital is already tied up in positions (BP < NLV), every
+percentage would smash into the BP clamp and resolve to the same share
+count — the chips must scale what can actually still be deployed.
 """
 from __future__ import annotations
 
@@ -76,7 +80,9 @@ def sell_shares_from_position(pct, position) -> int:
 
 
 def resolve_percent_qty(pct, net_liq, price, buying_power=0.0) -> int:
-    """Full resolution: pct of NLV at price, floored, BP-clamped, >= 0.
+    """Full resolution: pct of the deployable value — ``min(NLV, BP)``
+    when buying power is known, NLV alone otherwise — floored at price,
+    BP-clamped, >= 0.
 
     *pct* is clamped into (0, 100] first — the UI validator already
     enforces this, but the payload path must not trust the caller.
@@ -86,5 +92,7 @@ def resolve_percent_qty(pct, net_liq, price, buying_power=0.0) -> int:
         return 0
     if p > 100:
         p = Decimal(100)
-    shares = shares_from_percent(p, net_liq, price)
+    nlv, bp = _dec(net_liq), _dec(buying_power)
+    base = min(nlv, bp) if bp > 0 else nlv
+    shares = shares_from_percent(p, base, price)
     return max(0, clamp_to_buying_power(shares, price, buying_power))

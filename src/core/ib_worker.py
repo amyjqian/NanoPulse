@@ -1390,8 +1390,19 @@ class IBWorkerThread(QThread):
                 self.option_chain_failed.emit(
                     token, f"No option chain for {symbol}.")
                 return
-            oc = next((c for c in chains if c.exchange == "SMART"),
-                      chains[0])
+            # reqSecDefOptParams returns one row per (exchange, trading
+            # class) — ETFs like QQQ have several SMART rows (standard
+            # class plus quarterlies/flex classes with only a handful of
+            # expirations).  Taking the first SMART row blindly can land
+            # on a sparse class → one expiry chip and near-empty ladder.
+            # Prefer SMART, then the underlying's own trading class,
+            # then whichever class lists the most expirations.
+            pool = [c for c in chains if c.exchange == "SMART"] \
+                or list(chains)
+            oc = max(pool, key=lambda c: (
+                (c.tradingClass or "") == symbol,
+                len(c.expirations or ()),
+            ))
             result = {
                 "symbol": symbol,
                 "underlying_conid": con_id,
@@ -3049,6 +3060,11 @@ class IBWorkerThread(QThread):
             cached["position"] = new_pos
             if new_pos == 0:
                 cached["market_value"] = 0.0
+                # A flat position has no unrealized P&L — everything is
+                # realized on close.  TWS omits flat positions from later
+                # events, so a stale pre-close unrealized figure would
+                # otherwise stick on the zero row forever.
+                cached["unrealized_pnl"] = 0.0
             self._portfolio_cache[key] = cached
 
             # Emit immediately so the UI updates without waiting for positionEvent
@@ -3707,19 +3723,24 @@ class IBWorkerThread(QThread):
                 # to reappear with the old (pre-sell) qty.
                 # Position qty is owned exclusively by _on_position_update.
                 if pos_qty == 0:
-                    # Market value / price for a flat position are definitively
-                    # zero — zero them out without the != 0.0 guard so the UI
-                    # model shows market_value=0 even when positionEvent is late.
+                    # Market value / price / unrealized P&L for a flat
+                    # position are definitively zero — zero them without
+                    # the != 0.0 guards so the UI model shows them as 0
+                    # even when positionEvent is late.  (The unrealized
+                    # guard below would otherwise SKIP IB's legitimate
+                    # "unrealized = 0" report and leave the stale
+                    # pre-close figure on the zero row forever.)
                     cached["market_value"] = 0.0
                     cached["market_price"] = 0.0
+                    cached["unrealized_pnl"] = 0.0
                 else:
                     # Position is still open — update live market data.
                     if mkt_value != 0.0:
                         cached["market_value"] = mkt_value
                     if mkt_price != 0.0:
                         cached["market_price"] = mkt_price
-                if unrealized != 0.0:
-                    cached["unrealized_pnl"] = unrealized
+                    if unrealized != 0.0:
+                        cached["unrealized_pnl"] = unrealized
                 if realized != 0.0:
                     cached["realized_pnl"] = realized
                 # Re-buffer so the throttler emits an updated portfolio row
@@ -3767,11 +3788,15 @@ class IBWorkerThread(QThread):
                 # portfolio cache there.  Preserve any cached values so we
                 # don't zero out live data from pnlSingle.
                 "avg_cost": float(getattr(item, "avgCost", 0)),
-                "market_price":   self._portfolio_cache.get(
+                # A flat position has zero market value and zero
+                # unrealized P&L by definition — preserving the cached
+                # pre-close values would pin stale figures on the zero
+                # row (TWS won't send further events to correct them).
+                "market_price":   0.0 if pos == 0 else self._portfolio_cache.get(
                     (acct, con_id), {}).get("market_price", 0.0),
-                "market_value":   self._portfolio_cache.get(
+                "market_value":   0.0 if pos == 0 else self._portfolio_cache.get(
                     (acct, con_id), {}).get("market_value", 0.0),
-                "unrealized_pnl": self._portfolio_cache.get(
+                "unrealized_pnl": 0.0 if pos == 0 else self._portfolio_cache.get(
                     (acct, con_id), {}).get("unrealized_pnl", 0.0),
                 "realized_pnl":   self._portfolio_cache.get(
                     (acct, con_id), {}).get("realized_pnl", 0.0),

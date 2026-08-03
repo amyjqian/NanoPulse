@@ -143,8 +143,8 @@ _DEFAULT_FLAT_VISIBLE = [
 ]
 _DEFAULT_SUMMARY_VISIBLE = [
     "symbol", "sec_type", "buys", "sells", "net", "avg_buy", "avg_sell",
-    "trans_total", "net_total", "commission", "net_incl_comm",
-    "realized_pnl", "exchanges",
+    "trans_total", "paired_pnl", "unpaired_pnl", "net_total",
+    "commission", "net_incl_comm", "realized_pnl", "exchanges",
 ]
 
 
@@ -183,6 +183,8 @@ class TradesPanel(QWidget):
         for new_key, after_key in (
                 ("trans_total", "avg_sell"),
                 ("sec_type", "symbol"),
+                ("paired_pnl", "trans_total"),
+                ("unpaired_pnl", "paired_pnl"),
         ):
             if new_key not in self._visible_summary:
                 try:

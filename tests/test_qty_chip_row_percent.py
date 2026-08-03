@@ -80,7 +80,7 @@ def test_percent_resolves_shares(qtbot):
     assert fired[-1] == 1946
     assert row.current_qty() == 1946
     assert row.current_percent() == 25
-    assert previews[-1] == ("B:1,946", "")
+    assert previews[-1] == ("B 1,946", "")
 
 
 def test_per_unit_selection_and_custom_memory(qtbot):
@@ -159,7 +159,7 @@ def test_multi_account_preview_shows_total(qtbot):
     _chip(row, 25).click()
     # A → 1,946; B → 250,000 / 182.40 = 1,370.6 → 1,370.  The readout
     # shows the TOTAL going out across accounts.
-    assert previews[-1] == ("B:3,316", "")
+    assert previews[-1] == ("B 3,316", "")
     # Conservative internal preview: the smallest account's count.
     assert row.current_qty() == 1370
 
@@ -174,7 +174,7 @@ def test_sell_side_resolves_from_position(qtbot):
     _chip(row, 25).click()
     assert row.percent_side_qty("BUY") == 1946
     assert row.percent_side_qty("SELL") == 150
-    assert previews[-1] == ("B:1,946", "S:150")
+    assert previews[-1] == ("B 1,946", "S 150")
 
 
 def test_sell_enabled_without_price(qtbot):

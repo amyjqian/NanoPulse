@@ -102,10 +102,10 @@ def _seed_positions(v):
 def test_percent_resolves_per_account(view):
     v, workers = view
     v._on_order_requested(_payload(qty_pct=25))
-    # A1: 25% × $1.42M / 182.40 → 1,946 (BP unknown → unclamped).
+    # A1: 25% × $1.42M / 182.40 → 1,946 (BP unknown → NLV base).
     assert workers["A1"].orders[0]["qty"] == 1946
-    # A2: 25% × $1.0M / 182.40 → 1,370, BP $100k caps at 548.
-    assert workers["A2"].orders[0]["qty"] == 548
+    # A2: deployable base min($1.0M, $100k BP) → 25% × $100k / 182.40 → 137.
+    assert workers["A2"].orders[0]["qty"] == 137
     # A3 has no NLV → skipped entirely, never a guessed size.
     assert workers["A3"].orders == []
 

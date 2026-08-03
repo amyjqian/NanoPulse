@@ -101,6 +101,11 @@ class OptionsIncomeTicket(QDialog):
         self._chain: dict | None = None
         self._selected_leg: dict | None = None
         self._price_pending = True   # reset price to mid on next leg quote
+        # Contract results of the current (expiry, right) + the spot the
+        # ladder was built with — lets the ladder re-centre when the
+        # underlying's first quote arrives after a spot-less build.
+        self._contracts_cache: list = []
+        self._rows_spot = 0.0
         self._session_refs: set[str] = set()   # orderRefs placed here
 
         self.setWindowTitle("Options income")
@@ -409,6 +414,10 @@ class OptionsIncomeTicket(QDialog):
         self._chain = None
         self._selected_leg = None
         self._price_pending = True
+        # Stale contracts must never seed a spot-arrival rebuild for the
+        # new symbol.
+        self._contracts_cache = []
+        self._rows_spot = 0.0
         # New symbol → expiry snaps back to the nearest weekly.
         self._expiry.reset_selection()
         self._chain_view.chain_model.set_rows([])
@@ -518,6 +527,8 @@ class OptionsIncomeTicket(QDialog):
             return
 
         spot = self._spot or 0.0
+        self._contracts_cache = list(results)
+        self._rows_spot = spot
         strikes = oi.pick_strikes(list(by_strike), spot, right)
         rows = []
         for s in strikes:                      # descending — highest first
@@ -634,6 +645,12 @@ class OptionsIncomeTicket(QDialog):
             self._refresh_header()
             if self._spot > 0:
                 self._chain_view.chain_model.set_sep_label(self._sep_label())
+                # A ladder built before the spot arrived fell back to
+                # the chain's LOWEST strikes (deep ITM, delta ≈ 1) —
+                # rebuild it centred on the money now that we know it.
+                if self._rows_spot <= 0 and self._contracts_cache:
+                    self._on_contracts_results(
+                        self._token, self._contracts_cache)
             return
 
         model = self._chain_view.chain_model
