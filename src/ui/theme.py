@@ -1,6 +1,18 @@
 """
 Centralized styling variables for NanoPulse UI.
 """
+from PySide6.QtGui import QColor
+
+
+def hover_shades(colour: str) -> tuple[str, str]:
+    """(hover, pressed) background shades for flat action buttons.
+
+    The surface lightens ~30% under the cursor and darkens ~15% while
+    pressed — no border, no layout shift (the old style drew a 1 px
+    white frame on hover, which both looked dated and nudged the label).
+    """
+    c = QColor(colour)
+    return c.lighter(130).name(), c.darker(115).name()
 
 
 class Theme:

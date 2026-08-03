@@ -412,6 +412,13 @@ class IBWorkerThread(QThread):
         # NOT cleared on reconnect.
         self._order_times: dict[str, str] = {}
 
+        # Display symbol per orderRef (nano_...).  Option orders are placed
+        # on a lean conId-only contract (TWS error 478 workaround), so the
+        # Trade kept by ib_async carries no symbol/localSymbol —
+        # _build_trade_dict (reject / snapshot / global-status paths) would
+        # otherwise emit an empty symbol and blank out the blotter row.
+        self._order_symbols: dict[str, str] = {}
+
         # Fills cache: execId → flattened fill dict.
         # Populated by _on_exec_details and _snapshot_fills.  Lets the UI
         # replay today's fills when the Trades view wires its signals
@@ -2971,6 +2978,9 @@ class IBWorkerThread(QThread):
         order_ref = getattr(trade.order, "orderRef", "") or ""
         if order_ref and order_ref.startswith("nano_"):
             self._order_times.setdefault(order_ref, et_dt.isoformat())
+            sym = params.get("local_symbol") or params.get("symbol", "")
+            if sym:
+                self._order_symbols.setdefault(order_ref, sym)
 
         d = {
             "order_id": order_id,
@@ -3531,7 +3541,8 @@ class IBWorkerThread(QThread):
 
         Called by the throttler loop every ~75 s.  Removes:
         * Order-ref caches (_order_times, _order_error_messages,
-          _rejected_order_cache) for orders placed on a previous calendar day.
+          _order_symbols, _rejected_order_cache) for orders placed on a
+          previous calendar day.
         * Terminal-status _trades entries that are NOT from today.
         * _portfolio_cache entries for zero-position instruments whose
           reqPnLSingle subscription has already been cancelled (they will
@@ -3546,6 +3557,7 @@ class IBWorkerThread(QThread):
         for r in stale_refs:
             self._order_times.pop(r, None)
             self._order_error_messages.pop(r, None)
+            self._order_symbols.pop(r, None)
 
         stale_rejected = [oid for oid in list(self._rejected_order_cache)
                           if today_prefix not in oid]
@@ -4011,7 +4023,13 @@ class IBWorkerThread(QThread):
             symbol = (getattr(contract, "localSymbol", "")
                       or getattr(contract, "symbol", ""))
 
-            # Fallback: if symbol is still empty (contract built with conId
+            # Fallback 1: symbol cached at placement time.  Option orders
+            # are placed on a conId-only contract, so this is the only
+            # source for their display symbol on reject/snapshot emits.
+            if not symbol:
+                symbol = self._order_symbols.get(order_ref, "")
+
+            # Fallback 2: if symbol is still empty (contract built with conId
             # only and ib_async didn't update it), resolve from saved config.
             if not symbol:
                 con_id = getattr(contract, "conId", 0)

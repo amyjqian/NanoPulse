@@ -27,6 +27,8 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import QBrush, QColor, QFont
 
+from src.utils.helpers import format_option_symbol
+
 # ── Custom roles ──────────────────────────────────────────────────────────────
 IsFirstInGroupRole      = Qt.ItemDataRole.UserRole + 100  # kept for compat (unused now)
 RowTypeRole             = Qt.ItemDataRole.UserRole + 101  # str: ROW_TYPE_*
@@ -288,7 +290,8 @@ class AccountPositionModel(QAbstractTableModel):
                 v = pnl_s.get("daily_pnl", rd.get("daily_pnl", float("nan")))
                 return _fmt_pnl(v) if math.isfinite(v) else "–"
             if col == COL_SYMBOL:
-                return rd.get("local_symbol") or rd.get("symbol", "")
+                return format_option_symbol(
+                    rd.get("local_symbol") or rd.get("symbol", ""))
             if col == COL_POSITION:
                 return _fmt_qty(rd.get("position", 0))
             if col == COL_AVG_PRICE:

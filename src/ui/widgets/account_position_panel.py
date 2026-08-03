@@ -37,7 +37,6 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
     QHeaderView,
-    QLabel,
     QMenu,
     QPushButton,
     QStackedWidget,
@@ -67,7 +66,6 @@ from .positions_summary_model import (
     S_COL_KEYS as PS_COL_KEYS,
     S_HEADERS as PS_COL_HEADERS,
 )
-from .connections_view import _ToggleSwitch
 
 log = logging.getLogger(__name__)
 
@@ -590,17 +588,11 @@ class AccountPositionPanel(QWidget):
             get_alias=self._get_alias, parent=self)
         self._summary_model = PositionsSummaryModel(self)
         self._setup_ui()
-        # Sync both models with persisted Zero-Pos toggle state (model
-        # default is True; summary mirrors).
+        # Both pills start unchecked every launch (no persistence):
+        # flat account-grouped view, zero positions hidden.
         zero_pos = self._zero_pos_toggle.isChecked()
         self._model.set_show_zero(zero_pos)
         self._summary_model.set_show_zero(zero_pos)
-        # Restore persisted Summary-mode toggle.  Applied after the
-        # stack is built so the correct index is showing on launch.
-        saved_summary = QSettings("NanoPulse", "Dashboard").value(
-            "AccountPositionPanel/summaryMode", False, type=bool)
-        if saved_summary:
-            self._summary_toggle.setChecked(True)
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -897,17 +889,47 @@ class AccountPositionPanel(QWidget):
         # tab-bar corner (the stack can be much wider than our content).
         lay.addStretch(1)
 
-        # Summary toggle + label — sits leftmost in the controls
-        # cluster.  Flipping it swaps the stack between the flat
-        # account-grouped view and the per-contract aggregate view.
-        summary_lbl = QLabel("Summary")
-        summary_lbl.setStyleSheet(
-            f"color: {TEXT_DIM_PNL}; font-size: 10px; border: none;")
-        self._summary_toggle = _ToggleSwitch(checked=False)
+        # Summary pill button — sits leftmost in the controls cluster.
+        # Checked = per-contract aggregate view; unchecked = flat
+        # account-grouped view.
+        self._summary_toggle = QPushButton("Summary")
+        self._summary_toggle.setCheckable(True)
+        self._summary_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._summary_toggle.setFixedHeight(24)
+        self._summary_toggle.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; color: {TEXT_DIM_PNL};
+                border: 1px solid {BORDER}; border-radius: 8px;
+                padding: 0; font-size: 11px; font-weight: 600;
+            }}
+            QPushButton:hover {{ color: #ffffff; border-color: #5D8EF0; }}
+            QPushButton:checked {{
+                background: #5D8EF0; color: #ffffff; border: none;
+            }}
+            QPushButton:checked:hover {{ background: #6E9AF2; }}
+        """)
         self._summary_toggle.toggled.connect(self._on_summary_toggled)
         lay.addWidget(self._summary_toggle)
-        lay.addWidget(summary_lbl)
         lay.addSpacing(6)
+
+        self._zero_pos_toggle = QPushButton("Zero Pos")
+        self._zero_pos_toggle.setCheckable(True)
+        self._zero_pos_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._zero_pos_toggle.setFixedHeight(24)
+        self._zero_pos_toggle.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; color: {TEXT_DIM_PNL};
+                border: 1px solid {BORDER}; border-radius: 8px;
+                padding: 0; font-size: 11px; font-weight: 600;
+            }}
+            QPushButton:hover {{ color: #ffffff; border-color: #5D8EF0; }}
+            QPushButton:checked {{
+                background: #5D8EF0; color: #ffffff; border: none;
+            }}
+            QPushButton:checked:hover {{ background: #6E9AF2; }}
+        """)
+        self._zero_pos_toggle.toggled.connect(self._on_zero_pos_toggled)
+        lay.addWidget(self._zero_pos_toggle)
 
         btn = QPushButton("⟳")
         btn.setToolTip("Refresh positions")
@@ -925,16 +947,18 @@ class AccountPositionPanel(QWidget):
         btn.clicked.connect(self._on_refresh_clicked)
         lay.addWidget(btn)
 
-        zero_lbl = QLabel("Zero Pos")
-        zero_lbl.setStyleSheet(
-            f"color: {TEXT_DIM_PNL}; font-size: 10px; border: none;")
-        lay.addWidget(zero_lbl)
-
-        _saved_zero = QSettings("NanoPulse", "Dashboard").value(
-            "AccountPositionPanel/showZeroPos", True, type=bool)
-        self._zero_pos_toggle = _ToggleSwitch(checked=_saved_zero)
-        self._zero_pos_toggle.toggled.connect(self._on_zero_pos_toggled)
-        lay.addWidget(self._zero_pos_toggle)
+        # Both pills share one width — the wider label plus breathing
+        # room — so Summary and Zero Pos render as equal-sized buttons.
+        # Measured with a font matching the QSS (11px, weight 600).
+        pill_font = QFont(self._summary_toggle.font())
+        pill_font.setPixelSize(11)
+        pill_font.setWeight(QFont.Weight.DemiBold)
+        fm = QFontMetrics(pill_font)
+        pill_w = max(fm.horizontalAdvance(b.text())
+                     for b in (self._summary_toggle,
+                               self._zero_pos_toggle)) + 22
+        self._summary_toggle.setFixedWidth(pill_w)
+        self._zero_pos_toggle.setFixedWidth(pill_w)
 
         gear = QPushButton("\u2699")   # ⚙
         gear.setToolTip("Column preferences")
@@ -969,13 +993,9 @@ class AccountPositionPanel(QWidget):
     def _on_zero_pos_toggled(self, checked: bool) -> None:
         self._model.set_show_zero(checked)
         self._summary_model.set_show_zero(checked)
-        QSettings("NanoPulse", "Dashboard").setValue(
-            "AccountPositionPanel/showZeroPos", checked)
 
     def _on_summary_toggled(self, on: bool) -> None:
         self._stack.setCurrentIndex(1 if on else 0)
-        QSettings("NanoPulse", "Dashboard").setValue(
-            "AccountPositionPanel/summaryMode", bool(on))
 
     def _on_gear_clicked(self) -> None:
         if self._open_preferences_callback:
@@ -1027,13 +1047,35 @@ class AccountPositionPanel(QWidget):
             "visible", list(PS_COL_KEYS))
 
     def _apply_column_visibility(self, visible_keys: list[str]) -> None:
+        visible = set(visible_keys)
         for key, col in _POS_KEY_TO_COL.items():
-            self._table.setColumnHidden(col, key not in visible_keys)
+            self._table.setColumnHidden(col, key not in visible)
+        hdr = self._table.horizontalHeader()
+        for target_visual, key in enumerate(visible_keys):
+            logical = _POS_KEY_TO_COL.get(key)
+            if logical is None:
+                continue
+            current_visual = hdr.visualIndex(logical)
+            if current_visual != target_visual:
+                hdr.moveSection(current_visual, target_visual)
+        # Keep the Flatten-buttons column visually last regardless of order.
+        flatten_visual = hdr.visualIndex(COL_FLATTEN)
+        if flatten_visual != hdr.count() - 1:
+            hdr.moveSection(flatten_visual, hdr.count() - 1)
 
     def _apply_summary_column_visibility(self, visible_keys: list[str]) -> None:
         visible = set(visible_keys)
         for col, key in enumerate(PS_COL_KEYS):
             self._summary_table.setColumnHidden(col, key not in visible)
+        hdr = self._summary_table.horizontalHeader()
+        key_to_col = {k: i for i, k in enumerate(PS_COL_KEYS)}
+        for target_visual, key in enumerate(visible_keys):
+            logical = key_to_col.get(key)
+            if logical is None:
+                continue
+            current_visual = hdr.visualIndex(logical)
+            if current_visual != target_visual:
+                hdr.moveSection(current_visual, target_visual)
 
     @staticmethod
     def _migrate_positions_columns(prefs: dict) -> None:

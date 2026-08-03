@@ -937,6 +937,20 @@ class FlashTradeView(QWidget):
         log.debug("FlashTrade: portfolio batch received (%d positions)", len(batch))
         self._account_position.update_positions(batch)
 
+        # Feed each position's IB market price into the trades-summary
+        # price cache.  Portfolio updates cover every HELD symbol without
+        # a market-data subscription, so summary rows for symbols outside
+        # the active/background feeds (e.g. SGOV) still mark to a real
+        # price instead of falling back to their last fill.  Keyed by
+        # local symbol so option rows match exactly (their market_price
+        # is the option's own premium, not the underlying).
+        for pos in batch:
+            mkt = float(pos.get("market_price", 0.0) or 0.0)
+            if mkt > 0:
+                sym = pos.get("local_symbol", "") or pos.get("symbol", "")
+                if sym:
+                    self._trades_panel.update_last_price(sym, mkt)
+
         # Feed account balance info from accounts_model if available.
         # RC #2: use O(1) reverse-index lookup (_acct_to_label + _row_map)
         # instead of the previous O(n×m) linear scan over every account row

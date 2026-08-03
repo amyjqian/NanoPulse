@@ -19,6 +19,8 @@ from zoneinfo import ZoneInfo
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
 from PySide6.QtGui import QColor, QFont
 
+from src.utils.helpers import format_option_symbol
+
 log = logging.getLogger(__name__)
 
 _ET = ZoneInfo("America/New_York")
@@ -478,7 +480,9 @@ class TradesSummaryModel(QAbstractTableModel):
 
     def _cell_text(self, agg: dict, col: int, key=None) -> str:
         if col == S_COL_SYMBOL:
-            return agg.get("symbol", "")
+            # agg["symbol"] stays the raw local symbol (price-cache key);
+            # prettify OCC option symbols only at render time.
+            return format_option_symbol(agg.get("symbol", ""))
         if col == S_COL_TYPE:
             return agg.get("sec_type", "") or ""
         if col == S_COL_BUYS:
@@ -552,15 +556,18 @@ class TradesSummaryModel(QAbstractTableModel):
     def _marked_net_total(self, agg: dict) -> float:
         """Cash-flow net with the open (unpaired) leg marked to the last
         traded price: a net-long leg is valued as if sold at the last
-        price, a net-short leg as if bought back.  Falls back to the
-        plain cash net when no live price has been seen for the symbol
-        yet."""
+        price, a net-short leg as if bought back.  When no live quote has
+        been seen for the symbol, falls back to the newest fill price —
+        without a mark, an all-buys position would report its entire
+        cost as unrealized loss."""
         cash = self._net_total(agg)
         net_qty = agg.get("buys_qty", 0.0) - agg.get("sells_qty", 0.0)
         if net_qty == 0:
             return cash
         last = self._last_price_for(agg)
         if last is None:
+            last = agg.get("last_fill_price", 0.0)
+        if not last:
             return cash
         return cash + net_qty * last * agg.get("multiplier", 1.0)
 
@@ -631,9 +638,10 @@ class TradesSummaryModel(QAbstractTableModel):
         else the root symbol (``NQ``).  Matches the orders blotter and
         positions view so the same contract reads identically across
         every panel."""
-        return (fill.get("local_symbol", "")
-                or fill.get("symbol", "")
-                or "—")
+        return format_option_symbol(
+            fill.get("local_symbol", "")
+            or fill.get("symbol", "")
+            or "—")
 
     def add_fill(self, fill: dict) -> None:
         """Fold a flattened fill into its symbol aggregate, or refresh in
@@ -1015,6 +1023,11 @@ class TradesSummaryModel(QAbstractTableModel):
             "has_any_realized": False,
             "exchanges": set(),
             "fill_count": 0,
+            # Most recent fill price (by time_sort) — the mark-to-market
+            # fallback for symbols with no live quote subscription, so an
+            # open position never shows its full cost as unrealized loss.
+            "last_fill_price": 0.0,
+            "last_fill_sort": "",
         }
 
     def _add_to_agg(self, key: tuple[str, str], fill: dict) -> None:
@@ -1063,6 +1076,14 @@ class TradesSummaryModel(QAbstractTableModel):
         if exch:
             agg["exchanges"].add(exch)
         agg["fill_count"] += 1
+        # Track the newest fill's price as the no-quote mark fallback.
+        # Fills can replay out of order (snapshot + live), so compare by
+        # time_sort rather than arrival order.
+        if price > 0:
+            ts = fill.get("time_sort", "") or ""
+            if ts >= (agg.get("last_fill_sort", "") or ""):
+                agg["last_fill_price"] = price
+                agg["last_fill_sort"] = ts
 
     def _subtract_from_agg(self, key: tuple[str, str], fill: dict) -> None:
         agg = self._agg.get(key)

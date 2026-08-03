@@ -31,6 +31,8 @@ from typing import Any
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
 from PySide6.QtGui import QColor, QFont
 
+from src.utils.helpers import format_option_symbol
+
 from .account_position_model import (
     AccountPositionModel,
     TEXT, TEXT_DIM, CLR_PNL_POS, CLR_PNL_NEG,
@@ -248,7 +250,8 @@ class PositionsSummaryModel(QAbstractTableModel):
 
     def _cell_text(self, agg: dict, col: int) -> str:
         if col == S_COL_SYMBOL:
-            return agg.get("local_symbol") or agg.get("symbol") or ""
+            return format_option_symbol(
+                agg.get("local_symbol") or agg.get("symbol") or "")
         if col == S_COL_SEC_TYPE:
             return agg.get("sec_type", "")
         if col == S_COL_POSITION:

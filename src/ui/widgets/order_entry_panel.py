@@ -1,6 +1,6 @@
 from __future__ import annotations
 from src.core.enums import OrderAction, OrderType
-from src.ui.theme import Theme
+from src.ui.theme import Theme, hover_shades
 
 import logging
 import math
@@ -111,6 +111,7 @@ def _make_btn(text: str, colour: str, min_h: int = 32,
     btn.setMinimumHeight(min_h)
     btn.setCursor(Qt.CursorShape.PointingHandCursor)
     btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+    hover, pressed = hover_shades(colour)
     btn.setStyleSheet(f"""
         QPushButton {{
             background: {colour};
@@ -121,8 +122,8 @@ def _make_btn(text: str, colour: str, min_h: int = 32,
             font-weight: bold;
             font-size: 11px;
         }}
-        QPushButton:hover {{ background: {colour}; border: 1px solid #ffffff30; }}
-        QPushButton:pressed {{ background: {colour}; border: 1px solid #ffffff60; }}
+        QPushButton:hover {{ background: {hover}; }}
+        QPushButton:pressed {{ background: {pressed}; }}
     """)
     return btn
 
@@ -147,6 +148,7 @@ class _ActionButton(QPushButton):
         self.setMinimumHeight(40)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        hover, pressed = hover_shades(colour)
         self.setStyleSheet(f"""
             QPushButton {{
                 background: {colour};
@@ -155,8 +157,8 @@ class _ActionButton(QPushButton):
                 border-radius: 4px;
                 padding: 4px 8px;
             }}
-            QPushButton:hover {{ background: {colour}; border: 1px solid #ffffff30; }}
-            QPushButton:pressed {{ background: {colour}; border: 1px solid #ffffff60; }}
+            QPushButton:hover {{ background: {hover}; }}
+            QPushButton:pressed {{ background: {pressed}; }}
         """)
 
     def setPrimary(self, text: str) -> None:  # noqa: N802
@@ -1413,7 +1415,6 @@ class _TierSection(QWidget):
         self._dollar_lbl.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._dollar_lbl.clicked.connect(self._on_header_submit)
-        self._dollar_lbl.setEnabled(False)
         lay.addWidget(self._dollar_lbl, self._BUTTON_STRETCH)
 
         self._update_chip_styles()
@@ -1435,7 +1436,6 @@ class _TierSection(QWidget):
         has_chip = self._selected_idx is not None
         has_input = bool(input_text)
         active = has_chip or has_input
-        self._dollar_lbl.setEnabled(active)
 
         if not active:
             self._dollar_lbl.setText(self._title_str)
@@ -1479,8 +1479,9 @@ class _TierSection(QWidget):
     def _on_header_submit(self) -> None:
         """Title button click → fire ``submit_requested`` so the host
         (OrderEntryPanel) routes it as a close-the-position order.  No-op
-        when nothing is armed; the button is also disabled in that
-        state via ``_update_dollar_display`` so this is defensive."""
+        when nothing is armed — the button stays enabled in that state
+        (so it gets :hover feedback like the Buy/Sell buttons), making
+        this guard the real gate."""
         if self.get_value() is None:
             return
         self.submit_requested.emit()
@@ -1786,6 +1787,7 @@ class _HotButtonCell(QPushButton):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        hover, pressed = hover_shades(colour)
         self.setStyleSheet(
             f"""
             QPushButton {{
@@ -1798,12 +1800,10 @@ class _HotButtonCell(QPushButton):
                 font-size: 11px;
             }}
             QPushButton:hover {{
-                background: {colour};
-                border: 1px solid #ffffff30;
+                background: {hover};
             }}
             QPushButton:pressed {{
-                background: {colour};
-                border: 1px solid #ffffff60;
+                background: {pressed};
             }}
             """
         )

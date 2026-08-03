@@ -4,9 +4,39 @@ Math utilities and helpers for tick sizes, PnL calculations, and position sizing
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 log = logging.getLogger(__name__)
+
+_MONTH_ABBR = ("", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+# OCC option localSymbol: root (padded with spaces by IB), YYMMDD expiry,
+# C/P right, strike × 1000 as 8 digits — e.g. "QQQ   260807P00670000".
+_OCC_OPTION_RE = re.compile(
+    r"^([A-Z][A-Z0-9.]*)\s*(\d{2})(\d{2})(\d{2})([CP])(\d{8})$")
+
+
+def format_option_symbol(symbol: str) -> str:
+    """Pretty-print an OCC option localSymbol for display.
+
+    ``"QQQ 260807P00670000"`` → ``"QQQ Aug7 670 P"``.  Strings that
+    don't match the OCC pattern (stocks, futures, already-formatted
+    text) are returned unchanged, so this is safe to call on every
+    symbol at display time.  Display-only — flatten/close flows match
+    positions on the raw localSymbol, so never feed the result back
+    into order routing.
+    """
+    m = _OCC_OPTION_RE.match((symbol or "").strip())
+    if not m:
+        return symbol
+    root, _yy, mm, dd, right, strike_raw = m.groups()
+    month = int(mm)
+    if not 1 <= month <= 12:
+        return symbol
+    strike = int(strike_raw) / 1000.0
+    return f"{root} {_MONTH_ABBR[month]}{int(dd)} {strike:g} {right}"
 
 
 def round_to_tick(price: float, tick_size: float = 0.01) -> float:

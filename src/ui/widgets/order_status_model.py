@@ -29,6 +29,8 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import QColor, QFont
 
+from src.utils.helpers import format_option_symbol
+
 log = logging.getLogger(__name__)
 
 # ── Column indices ────────────────────────────────────────────────────────────
@@ -189,6 +191,8 @@ class OrderStatusModel(QAbstractTableModel):
                 return None  # delegate handles this column
             if col == COL_STATUS and error_msg:
                 return f"{status} ⚠"
+            if col == COL_SYMBOL:
+                return format_option_symbol(order.get("symbol", "–"))
             key = _KEY_FOR_COL.get(col)
             return order.get(key, "–") if key else None
 

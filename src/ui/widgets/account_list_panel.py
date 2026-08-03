@@ -30,6 +30,7 @@ from .accounts_model import (
     COL_TYPE,
 )
 from src.core import config_manager
+from src.ui.theme import hover_shades
 
 log = logging.getLogger(__name__)
 
@@ -120,6 +121,7 @@ _TITLE_FONT.setWeight(QFont.Weight.Bold)
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _btn_qss(colour: str, fg: str = "#ffffff") -> str:
+    hover, pressed = hover_shades(colour)
     return f"""
         QPushButton {{
             background: {colour};
@@ -130,8 +132,8 @@ def _btn_qss(colour: str, fg: str = "#ffffff") -> str:
             font-weight: bold;
             font-size: 11px;
         }}
-        QPushButton:hover {{ background: {colour}; border: 1px solid #ffffff30; }}
-        QPushButton:pressed {{ background: {colour}; border: 1px solid #ffffff60; }}
+        QPushButton:hover {{ background: {hover}; }}
+        QPushButton:pressed {{ background: {pressed}; }}
     """
 
 
