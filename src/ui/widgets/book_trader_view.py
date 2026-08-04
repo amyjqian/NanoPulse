@@ -83,12 +83,16 @@ _TICK_PRESETS: dict[str, list[float]] = {
 }
 
 
-# Qty presets (same rule as OrderEntryPanel: different sets for FUT vs. STK).
+# Qty presets (same rule as OrderEntryPanel: different sets for FUT vs. STK;
+# option contracts trade in small lots like futures).
 _FUT_QTYS = [1, 2, 3, 5]
 _STK_QTYS = [10, 25, 50, 100, 500]
+_OPT_QTYS = [1, 2, 3, 5]
 _FUT_DEFAULT = 1
 _STK_DEFAULT = 100
+_OPT_DEFAULT = 1
 _FUT_QTY_POPUP: list[int] = list(range(1, 101))
+_OPT_QTY_POPUP: list[int] = list(range(1, 101))
 _STK_QTY_POPUP: list[int] = (
     list(range(1, 11))
     + list(range(20, 110, 10))
@@ -102,7 +106,69 @@ def _presets_for_sec(sec: str) -> tuple[list[int], int, list[int]]:
     """(presets, default, popup_ladder) for an asset-class string."""
     if sec == "FUT":
         return _FUT_QTYS, _FUT_DEFAULT, _FUT_QTY_POPUP
+    if sec == "OPT":
+        return _OPT_QTYS, _OPT_DEFAULT, _OPT_QTY_POPUP
     return _STK_QTYS, _STK_DEFAULT, _STK_QTY_POPUP
+
+
+def _chip_key_for_position(pos: dict) -> tuple[str, str]:
+    """Chip key + sec_type for a portfolio position dict.
+
+    STK and FUT chips are keyed by the root symbol (FUT chips are roots
+    like "MNQ", never local symbols like "MNQM6").  OPT chips are keyed
+    by the raw OCC local symbol — an option must map to its own chip,
+    never to the root's STK chip.  Returns ("", sec) when the position
+    carries no usable symbol.
+    """
+    sec = (pos.get("sec_type") or "").upper()
+    if sec == "OPT":
+        key = (pos.get("local_symbol") or "").strip().upper()
+    else:
+        key = (pos.get("symbol") or "").strip().upper()
+    return key, sec
+
+
+def _ensure_position_contract_saved(pos: dict) -> None:
+    """Save an OPT position's contract into the contracts universe.
+
+    Option contracts generally are not in ``contracts.db`` (the options
+    flows fetch chains live), but Book Trader resolves a chip's sec_type,
+    conid and multiplier through ``ReferenceData.contracts_by_symbol`` —
+    keyed by the row's ``symbol`` field.  Storing the row with
+    ``symbol`` = the raw OCC local symbol makes ``_sec_type_for`` and
+    ``_build_l1_params_for`` work for the OCC chip key with no
+    ReferenceData changes.  Root-symbol lookups are unaffected.
+    Idempotent: no-op when the key already resolves or the conid is
+    already saved.  Mirrors ``symbol_search_popup.ensure_contract_saved``.
+    """
+    key, sec = _chip_key_for_position(pos)
+    if sec != "OPT" or not key:
+        return
+    if _sec_type_for(key) != "?":
+        return  # already resolvable — a saved row exists for this key
+    con_id = str(pos.get("con_id") or "")
+    existing = config_manager.load_contracts()
+    if con_id and any(str(c.get("conid", "")) == con_id for c in existing):
+        return
+    existing.append({
+        "conid": con_id,
+        "symbol": key,                     # raw OCC upper — the chip key
+        "sec_type": "OPT",
+        "exchange": pos.get("exchange") or "SMART",
+        "currency": pos.get("currency") or "USD",
+        "expiry": "",
+        "strike": "",
+        "right": "",
+        "local_symbol": pos.get("local_symbol") or "",
+        "multiplier": str(pos.get("multiplier") or "100"),
+        "primary_exchange": "",
+        "name": "",
+    })
+    config_manager.save_contracts(existing)
+    from src.core.reference_data import get_instance as _rd
+    _rd().reload_contracts()
+    log.info("BookTrader: saved OPT contract %s (conid %s) from position",
+             key, con_id)
 
 
 # Known-futures per-symbol tick sizes — used as a fallback when a saved
@@ -210,6 +276,14 @@ class BookTraderView(QWidget):
         # starts each symbol unarmed.
         self._tier_state_by_symbol: dict[str, dict] = {}
         self._last_price: float = 0.0
+        # Last-known (last, bid, ask, close) per symbol, updated on every
+        # bg tick BEFORE the active-symbol gate in ``feed_price``.  On a
+        # symbol switch the cached tick is replayed so the ladder warm-
+        # starts instantly — the worker skips already-subscribed symbols
+        # (no fresh snapshot on re-select), and a thinly-traded contract
+        # (e.g. an option) may not print for minutes, which used to
+        # leave the ladder blank until the next natural tick.
+        self._bg_price_cache: dict[str, tuple[float, float, float, float]] = {}
         # L1 fallback state — set False when TWS rejects the depth
         # subscription (no L2 entitlement, code 10090/10167).  While
         # False, we render a single-level "book" synthesised from
@@ -560,6 +634,17 @@ class BookTraderView(QWidget):
         recentres the ladder on it (warm-start the view with data
         instead of a blank grid).
         """
+        # Cache every symbol's tick (merging per-field so a bid-only
+        # tick doesn't erase a known last) BEFORE the active-symbol
+        # gate — the cache warm-starts the ladder on symbol switches.
+        u = symbol.upper()
+        prev = self._bg_price_cache.get(u, (0.0, 0.0, 0.0, 0.0))
+        self._bg_price_cache[u] = (
+            float(last) if last and last > 0 else prev[0],
+            float(bid) if bid and bid > 0 else prev[1],
+            float(ask) if ask and ask > 0 else prev[2],
+            float(close) if close and close > 0 else prev[3],
+        )
         if not self._active_symbol or symbol.upper() != self._active_symbol.upper():
             return
         if self._last_price <= 0:
@@ -823,6 +908,14 @@ class BookTraderView(QWidget):
         # Different symbol → different subset of live orders is
         # relevant.  Re-project the ladder markers.
         self._refresh_ladder_orders()
+
+        # Warm-start from the last-known tick.  The worker skips
+        # already-subscribed symbols (no fresh snapshot on re-select),
+        # so a thinly-traded contract would otherwise leave the ladder
+        # blank until its next natural tick.
+        cached = self._bg_price_cache.get(sym.upper())
+        if cached and any(v > 0 for v in cached[:3]):
+            self.feed_price(sym, *cached)
 
         self.active_symbol_changed.emit(sym)
 
@@ -1395,6 +1488,38 @@ class BookTraderView(QWidget):
             "for %s", label, self._active_symbol)
         self._bg_worker.subscribe_depth(self._active_symbol)
 
+    # ── Jump-to-position (positions panel row click) ─────────────────────────
+
+    def focus_position(self, pos: dict) -> None:
+        """Select (or add) the symbol chip for a portfolio position and
+        prefill Qty with the position size.
+
+        Called by FlashTradeView when the user clicks a position row.
+        The qty fill must run AFTER the symbol selection because
+        ``_on_symbol_selected`` resets the qty row to the sec-type
+        presets.  In percent mode the fill is deliberately skipped —
+        silently flipping the user out of % sizing would be worse than
+        leaving the percentage untouched.
+        """
+        key, sec = _chip_key_for_position(pos)
+        if not key:
+            return
+        if sec == "OPT":
+            # Before selection: sec_type + L1 params must resolve.
+            _ensure_position_contract_saved(pos)
+        if key in {s.upper() for s in self._symbols}:
+            self._on_symbol_selected(key, _sec_type_for(key))
+        else:
+            self._add_symbol(key)
+        from src.ui.widgets.size_unit_parts import UNIT_PCT
+        try:
+            qty = abs(int(float(pos.get("position") or 0)))
+        except (TypeError, ValueError):
+            qty = 0
+        if qty > 0 and self._qty_row.current_unit() != UNIT_PCT:
+            self._qty_row.set_qty(qty)   # visual only — emits no signal
+            self._on_qty_changed(qty)    # sync _active_qty + tier sections
+
     # ── Add-symbol popup (searchable) ────────────────────────────────────────
 
     def open_symbol_search(self) -> None:
@@ -1442,8 +1567,17 @@ class BookTraderView(QWidget):
             return
         self._symbols.append(sym)
         config_manager.save_book_trader_symbols(self._symbols)
-        self._chip_bar.set_symbols(
-            [(s, _sec_type_for(s)) for s in self._symbols])
+        entries = [(s, _sec_type_for(s)) for s in self._symbols]
+        self._chip_bar.set_symbols(entries)
+        # SymbolChipBar renders at most columns × max_rows chips per group
+        # (FUT vs everything-else); an overflowing symbol is persisted and
+        # activated but its chip is not visible.
+        new_sec = _sec_type_for(sym)
+        group = [s for s, sec in entries
+                 if (sec == "FUT") == (new_sec == "FUT")]
+        if len(group) > 10:
+            log.warning("BookTrader: chip group full — %s added and "
+                        "activated but its chip is not rendered", sym)
         # Auto-activate the newly added symbol.
         self._on_symbol_selected(sym, _sec_type_for(sym))
 

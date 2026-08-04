@@ -579,6 +579,10 @@ class AccountPositionPanel(QWidget):
     refresh_requested         = Signal()
     flatten_requested         = Signal(str)          # account id (header row Flatten)
     position_close_requested  = Signal(str, int, int)  # account, con_id, pct (100=flatten)
+    # Row click on either table — full position dict (summary rows carry
+    # account="" since they aggregate across accounts).  FlashTradeView
+    # routes this to BookTraderView.focus_position.
+    position_row_clicked      = Signal(dict)
 
     def __init__(self, accounts_model=None, parent=None, *, open_preferences=None):
         super().__init__(parent)
@@ -655,6 +659,7 @@ class AccountPositionPanel(QWidget):
         self._restore_col_widths()
         self._apply_column_visibility(self._load_visible_pos_keys())
         h.sectionResized.connect(self._on_section_resized)
+        self._table.clicked.connect(self._on_table_row_clicked)
 
         # Apply column spans whenever model is rebuilt
         self._model.modelReset.connect(self._apply_spans)
@@ -685,6 +690,7 @@ class AccountPositionPanel(QWidget):
         self._apply_summary_column_visibility(
             self._load_visible_summary_keys())
         sh.sectionResized.connect(self._on_summary_section_resized)
+        self._summary_table.clicked.connect(self._on_summary_row_clicked)
 
         # Context menu + Delete shortcut for hide/restore (summary only).
         self._summary_table.setContextMenuPolicy(
@@ -1012,6 +1018,41 @@ class AccountPositionPanel(QWidget):
         log.info("Portfolio: close %d%% requested – %s conId=%d",
                  pct, account, con_id)
         self.position_close_requested.emit(account, con_id, pct)
+
+    def _on_table_row_clicked(self, idx) -> None:
+        """Flat-table row click → ``position_row_clicked``.  Header rows
+        and the Flatten column are excluded — a near-miss of the
+        Flatten/25/50/75 buttons must not retarget the Book Trader
+        ladder."""
+        if not idx.isValid() or idx.column() == COL_FLATTEN:
+            return
+        if idx.data(RowTypeRole) != ROW_TYPE_POSITION:
+            return
+        key = idx.data(PositionKeyRole)
+        if not key:
+            return
+        account, con_id = key
+        row = self._model.position_data(account, con_id)
+        if not row:
+            return
+        payload = dict(row)
+        payload["account"] = account
+        self.position_row_clicked.emit(payload)
+
+    def _on_summary_row_clicked(self, idx) -> None:
+        """Summary-table row click → ``position_row_clicked``.  The
+        TOTAL footer returns None from row_data and is ignored.  The
+        aggregate's ``position`` is the net across accounts — the right
+        qty to prefill."""
+        if not idx.isValid():
+            return
+        agg = self._summary_model.row_data(idx.row())
+        if agg is None:
+            return
+        payload = dict(agg)
+        payload.pop("accounts", None)   # set() — keep the payload uniform
+        payload["account"] = ""
+        self.position_row_clicked.emit(payload)
 
     # ── Column management (ColumnsProvider protocol) ──────────────────────────
 

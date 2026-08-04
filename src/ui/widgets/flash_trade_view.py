@@ -267,6 +267,9 @@ class FlashTradeView(QWidget):
             self._on_account_action_requested)
         self._account_position.position_action_requested.connect(
             self._on_position_action_requested)
+        # Row click → jump the Book Trader ladder to that instrument
+        self._account_position.position_row_clicked.connect(
+            self._on_position_row_clicked)
 
         # ── Wire account-list action buttons ─────────────────────────────────
         # 25% · 50% · 75% · Flatten · Reverse · Cancel
@@ -716,6 +719,10 @@ class FlashTradeView(QWidget):
         if account:
             self._open_options_ticket(account,
                                       symbol=data.get("symbol") or None)
+
+    def _on_position_row_clicked(self, pos: dict) -> None:
+        """Position row click → jump Book Trader to that instrument."""
+        self._book_trading.focus_position(pos)
 
     def _open_options_ticket(self, account: str,
                              symbol: str | None = None) -> None:

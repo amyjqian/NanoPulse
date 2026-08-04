@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.ui.theme import Theme
+from src.utils.helpers import format_option_symbol
 from src.ui.widgets.size_unit_parts import (
     PCT_DEFAULT,
     PCT_POPUP,
@@ -288,16 +289,24 @@ def _apply_chip_style(btn: QPushButton, selected: bool) -> None:
 
     Duplicated verbatim from order_entry_panel._apply_chip_style so both
     panels render chips identically.  Kept here to avoid a reverse import.
+
+    Chips whose ``chip_small`` property is set (option chips showing a
+    compact "QQQ Aug7 670 P" label) get a smaller font and tighter
+    padding so the label fits the standard chip size.
     """
+    if bool(btn.property("chip_small")):
+        font, pad = "9px", "4px 4px"
+    else:
+        font, pad = "12px", "4px 12px"
     if selected:
         btn.setStyleSheet(
             "QPushButton{background:#539BF5;color:white;border:none;"
-            "border-radius:6px;padding:4px 12px;font-weight:600;font-size:12px}"
+            f"border-radius:6px;padding:{pad};font-weight:600;font-size:{font}}}"
             "QPushButton:hover{background:#6BA8F6}")
     else:
         btn.setStyleSheet(
             "QPushButton{background:#232A3B;color:#A3AFC2;border:none;"
-            "border-radius:6px;padding:4px 12px;font-weight:500;font-size:12px}"
+            f"border-radius:6px;padding:{pad};font-weight:500;font-size:{font}}}"
             "QPushButton:hover{background:#334058}")
 
 
@@ -321,8 +330,12 @@ class DraggableChip(QPushButton):
         sec_type: str,
         on_drop,
         parent=None,
+        *,
+        label: str | None = None,
     ) -> None:
-        super().__init__(sym, parent)
+        # *label* is display-only (e.g. a compact option label); the chip's
+        # identity for drag payloads / dedupe / callbacks stays *sym*.
+        super().__init__(label if label is not None else sym, parent)
         self._sym = sym
         self._sec_type = sec_type
         self._on_drop = on_drop
@@ -505,7 +518,13 @@ class SymbolChipBar(QWidget):
         self.set_active(self._active)
 
     def _make_chip(self, sym: str, sec_type: str) -> QPushButton:
-        btn = DraggableChip(sym, sec_type, self._on_drop)
+        # OCC option symbols render a compact display label in a smaller
+        # font; format_option_symbol passes every other symbol through
+        # unchanged, so STK/FUT chips are unaffected.
+        disp = format_option_symbol(sym)
+        btn = DraggableChip(sym, sec_type, self._on_drop,
+                            label=disp if disp != sym else None)
+        btn.setProperty("chip_small", disp != sym)
         btn.setFixedHeight(self._CHIP_HEIGHT)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         _apply_chip_style(btn, sym == self._active)
@@ -721,8 +740,10 @@ class QtyChipRow(QWidget):
 
     def set_qty(self, qty: int) -> None:
         """Programmatically set the active qty (no signal emitted).  Used
-        by the host to sync from an external source (e.g. keyboard shortcut)
-        without triggering re-entrant order logic.  Share mode only —
+        by the host to sync from an external source (e.g. keyboard shortcut
+        or a position-row click) without triggering re-entrant order logic.
+        A preset value lights its chip; any other value lands in the
+        custom Qty input so the number is visible.  Share mode only —
         percent mode owns its own state."""
         if self._unit == UNIT_PCT:
             return
@@ -730,7 +751,21 @@ class QtyChipRow(QWidget):
         if qty <= 0:
             return
         self._active_qty = qty
-        self._restyle(qty)
+        if qty in self._presets:
+            # Mirror _on_preset minus the signal: chip lights, custom clears.
+            self._custom.blockSignals(True)
+            self._custom.clear()
+            self._custom.blockSignals(False)
+            self._custom_by_unit[self._unit] = ""
+            self._sel_by_unit[self._unit] = qty
+            self._restyle(qty)
+        else:
+            # Non-preset qty → show it in the custom Qty input.
+            self._custom.blockSignals(True)
+            self._custom.setText(str(qty))
+            self._custom.blockSignals(False)
+            self._custom_by_unit[self._unit] = str(qty)
+            self._restyle(None)  # no chip is "current" while custom is active
 
     def current_qty(self) -> int:
         """Resolved shares.  Percent mode resolves live via the context

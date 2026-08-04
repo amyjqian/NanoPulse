@@ -2402,6 +2402,8 @@ class IBWorkerThread(QThread):
                            self._label, order_id, trade.order.orderId,
                            getattr(trade.contract, "symbol", "?"),
                            getattr(trade.order, "orderRef", ""))
+            asyncio.create_task(
+                self._force_cancel_if_stuck(order_id, trade, _status))
         except Exception as exc:
             log.exception("Worker %s: cancel_order failed: %s",
                           self._label, exc)
@@ -2409,6 +2411,68 @@ class IBWorkerThread(QThread):
                           self._label, order_id, exc)
             order_log.error("[%s] ORDER-CANCEL  ERROR for %s: %s",
                             self._label, order_id, exc)
+
+    # Order statuses meaning "held at IB, not working at an exchange".
+    # Outside RTH a new order sits PreSubmitted at IB (TWS warning 399:
+    # "will not be placed at the exchange until <open>").
+    _HELD_STATUSES = ("PreSubmitted", "PendingSubmit")
+
+    async def _force_cancel_if_stuck(self, order_id: str, trade,
+                                     pre_status: str,
+                                     delay: float = 3.0) -> None:
+        """Re-issue cancelOrder when a held order's cancel stalls.
+
+        For an order held at IB (outside RTH), TWS answers the first
+        cancelOrder with PendingCancel only and defers the actual
+        cancellation to the exchange open; a SECOND cancelOrder while
+        PendingCancel makes TWS cancel the order locally right away —
+        the API equivalent of the user clicking Cancel twice.  Only
+        orders that were held (no exchange exposure) are retried:
+        force-cancelling an exchange-working order locally could mask a
+        late fill, which is exactly why TWS prompts for confirmation in
+        that case.
+        """
+        if pre_status not in self._HELD_STATUSES:
+            return
+        await asyncio.sleep(delay)
+        if self._ib is None or not self._ib.isConnected():
+            return
+        status = (getattr(trade.orderStatus, "status", "")
+                  if getattr(trade, "orderStatus", None) else "")
+        if status != "PendingCancel":
+            return  # cancel completed (or order filled) — nothing to do
+        open_ids = {getattr(t.order, "orderId", None)
+                    for t in self._ib.openTrades()}
+        if getattr(trade.order, "orderId", None) not in open_ids:
+            return
+        try:
+            self._ib.cancelOrder(trade.order)
+            log.info("Worker %s: forcing local cancel for held order %s "
+                     "(stuck PendingCancel)", self._label, order_id)
+            order_log.info("[%s] ORDER-CANCEL  re-issued for %s — held "
+                           "order stuck PendingCancel (local cancel)",
+                           self._label, order_id)
+        except Exception as exc:
+            log.warning("Worker %s: forced cancel failed for %s: %s",
+                        self._label, order_id, exc)
+
+    def _trade_matches_symbol(self, trade, symbol_upper: str) -> bool:
+        """True when *trade* is for *symbol_upper* (root or localSymbol).
+
+        Option orders are placed on a lean conId-only contract (TWS
+        error 478 workaround), so the ib_async Trade carries no
+        symbol/localSymbol and ``_symbol_matches`` can never hit — fall
+        back to the display symbol cached at placement time, keyed by
+        orderRef (same cache the blotter uses).
+        """
+        contract = getattr(trade, "contract", None)
+        if contract is None:
+            return False
+        if _symbol_matches(contract, symbol_upper):
+            return True
+        ref = getattr(trade.order, "orderRef", "") or ""
+        cached = (self._order_symbols.get(ref, "") or "").upper()
+        return bool(cached) and cached == symbol_upper
 
     async def _do_cancel_all_for_symbol(self, symbol: str,
                                         accounts: set[str]) -> None:
@@ -2426,10 +2490,7 @@ class IBWorkerThread(QThread):
                          for t in self._ib.openTrades()}
 
         for oid, trade in list(self._trades.items()):
-            contract = getattr(trade, "contract", None)
-            if contract is None:
-                continue
-            if not _symbol_matches(contract, symbol_upper):
+            if not self._trade_matches_symbol(trade, symbol_upper):
                 continue
             # ── Account filter ────────────────────────────────────────────
             trade_acct = getattr(trade.order, "account", "") or ""
@@ -2452,6 +2513,8 @@ class IBWorkerThread(QThread):
                              self._label, trade.order.orderId, symbol)
                 order_log.info("[%s] ORDER-CANCEL  %s (cancel-all for %s) | orderId=%s",
                                self._label, oid, symbol, trade.order.orderId)
+                asyncio.create_task(
+                    self._force_cancel_if_stuck(oid, trade, status))
             except Exception as exc:
                 log.warning("Worker %s: cancel_all_for_symbol failed for %s: %s",
                             self._label, oid, exc)
