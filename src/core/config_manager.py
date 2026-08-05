@@ -66,6 +66,15 @@ def set_active_config(username: str | None) -> None:
     # Re-read next_client_id from whichever file is now active.
     _next_client_id = 100
     load_connections()
+    # New active file → drop the instrument-resolver cache, then enrich
+    # any bare chip / hot-button entries from the legacy contracts.db
+    # (one-time, idempotent, read-only on the DB).
+    try:
+        from src.core import instruments
+        instruments.invalidate_cache()
+        instruments.migrate_active_config_from_db()
+    except Exception:
+        log.exception("Instrument migration failed for %s", _default_path())
     log.info("Active config → %s", _default_path())
 
 
@@ -281,6 +290,145 @@ def save_layout(
     log.debug("Saved layout to %s", p)
 
 
+# ── Chip / hot-button instrument entries ─────────────────────────────────────
+#
+# ``order_entry_symbols`` / ``book_trader_symbols`` entries are bare
+# strings (legacy) OR dicts carrying inline contract metadata (see
+# ``instruments.META_KEYS``).  The *_entries helpers expose the dict
+# form; the legacy *_symbols helpers below keep their string-list
+# signatures but MERGE into the entry store so metadata survives the
+# panels' reorder / remove / append writes.
+
+
+def _load_symbol_entries(key: str, p: Path) -> list[dict[str, Any]]:
+    from src.core.instruments import normalise_symbol_entry
+    data = _read_json(p)
+    out: list[dict[str, Any]] = []
+    for raw in data.get(key, []) or []:
+        e = normalise_symbol_entry(raw)
+        if e is not None:
+            out.append(e)
+    return out
+
+
+def _save_symbol_entries(
+    key: str, entries: list[dict[str, Any]], p: Path,
+) -> None:
+    from src.core.instruments import normalise_symbol_entry
+    cleaned = [e for e in (normalise_symbol_entry(x) for x in entries)
+               if e is not None]
+    data = _read_json(p)
+    data[key] = cleaned
+    _write_json(p, data)
+    log.debug("Saved %d %s entr(ies) to %s", len(cleaned), key, p)
+
+
+def _merge_symbols_into_entries(
+    key: str,
+    symbols: list[str],
+    p: Path,
+    source_entries: list[dict[str, Any]] | None = None,
+) -> None:
+    """Reorder/drop/append the *key* entry list to match *symbols*
+    (a plain string list from the panels), preserving each surviving
+    symbol's stored metadata.  Unknown symbols append as bare entries.
+    *source_entries* overrides where the metadata comes from (the Book
+    Trader first-save case, where the key doesn't exist yet and the
+    metadata lives in the Order Entry seed)."""
+    source = (source_entries if source_entries is not None
+              else _load_symbol_entries(key, p))
+    existing = {e["symbol"].upper(): e for e in source}
+    merged: list[dict[str, Any]] = []
+    for s in symbols:
+        sym = str(s or "").strip()
+        if not sym:
+            continue
+        merged.append(existing.get(sym.upper(), {"symbol": sym}))
+    _save_symbol_entries(key, merged, p)
+
+
+def load_order_entry_entries(
+    path: Path | str | None = None,
+) -> list[dict[str, Any]]:
+    """Order Entry chip entries (dict form, legacy strings normalised)."""
+    p = Path(path) if path else _default_path()
+    entries = _load_symbol_entries("order_entry_symbols", p)
+    return entries if entries else [{"symbol": "MNQ"}]
+
+
+def save_order_entry_entries(
+    entries: list[dict[str, Any]],
+    path: Path | str | None = None,
+) -> None:
+    p = Path(path) if path else _default_path()
+    _save_symbol_entries("order_entry_symbols", entries, p)
+
+
+def load_book_trader_entries(
+    path: Path | str | None = None,
+) -> list[dict[str, Any]]:
+    """Book Trader chip entries.  On first launch (no key yet) seeds
+    from the Order Entry entries — metadata included."""
+    p = Path(path) if path else _default_path()
+    data = _read_json(p)
+    if "book_trader_symbols" in data:
+        return _load_symbol_entries("book_trader_symbols", p)
+    seeded = _load_symbol_entries("order_entry_symbols", p)
+    return seeded if seeded else [{"symbol": "MNQ"}]
+
+
+def save_book_trader_entries(
+    entries: list[dict[str, Any]],
+    path: Path | str | None = None,
+) -> None:
+    p = Path(path) if path else _default_path()
+    _save_symbol_entries("book_trader_symbols", entries, p)
+
+
+def upsert_instrument(
+    key: str,
+    meta: dict[str, Any],
+    path: Path | str | None = None,
+) -> bool:
+    """Merge contract *meta* into EVERY entry matching *key* — both chip
+    lists and every hot button whose symbol equals *key*.  The single
+    write point that keeps duplicated metadata from drifting (futures
+    rollover, re-qualification, healing).  Returns True when anything
+    changed."""
+    from src.core.instruments import normalise_contract_meta
+    clean = normalise_contract_meta(meta)
+    sym = str(key or "").strip()
+    if not sym or clean is None:
+        return False
+    p = Path(path) if path else _default_path()
+    changed = False
+    for list_key in ("order_entry_symbols", "book_trader_symbols"):
+        entries = _load_symbol_entries(list_key, p)
+        hit = False
+        for e in entries:
+            if e["symbol"].upper() == sym.upper():
+                merged = {**e, **clean}
+                if merged != e:
+                    e.clear()
+                    e.update(merged)
+                    hit = True
+        if hit:
+            _save_symbol_entries(list_key, entries, p)
+            changed = True
+    buttons = load_hot_buttons(p)
+    hit = False
+    for b in buttons:
+        if str(b.get("symbol", "") or "").strip().upper() == sym.upper():
+            merged = {**(b.get("contract") or {}), **clean}
+            if merged != b.get("contract"):
+                b["contract"] = merged
+                hit = True
+    if hit:
+        save_hot_buttons(buttons, p)
+        changed = True
+    return changed
+
+
 # ── Order-entry symbol list persistence ───────────────────────────────────────
 
 
@@ -290,21 +438,17 @@ def load_order_entry_symbols(path: Path | str | None = None) -> list[str]:
     Falls back to ``["MNQ"]`` on first launch so the panel has a sensible
     default without requiring the user to add a symbol manually.
     """
-    p = Path(path) if path else _default_path()
-    data = _read_json(p)
-    saved = list(data.get("order_entry_symbols", []))
-    return saved if saved else ["MNQ"]
+    return [e["symbol"] for e in load_order_entry_entries(path)]
 
 
 def save_order_entry_symbols(
     symbols: list[str],
     path: Path | str | None = None,
 ) -> None:
-    """Persist Order Entry symbol list. Merges with existing config."""
+    """Persist Order Entry symbol list (merge-aware: preserves each
+    surviving symbol's stored contract metadata)."""
     p = Path(path) if path else _default_path()
-    data = _read_json(p)
-    data["order_entry_symbols"] = symbols
-    _write_json(p, data)
+    _merge_symbols_into_entries("order_entry_symbols", symbols, p)
     log.debug("Saved %d order-entry symbol(s) to %s", len(symbols), p)
 
 
@@ -338,23 +482,19 @@ def load_book_trader_symbols(path: Path | str | None = None) -> list[str]:
     key in config), seed from the existing Order Entry list so upgrading
     users don't lose their chips; if that's also empty, default to ``["MNQ"]``.
     """
-    p = Path(path) if path else _default_path()
-    data = _read_json(p)
-    if "book_trader_symbols" in data:
-        return list(data.get("book_trader_symbols", []))
-    seeded = list(data.get("order_entry_symbols", []))
-    return seeded if seeded else ["MNQ"]
+    return [e["symbol"] for e in load_book_trader_entries(path)]
 
 
 def save_book_trader_symbols(
     symbols: list[str],
     path: Path | str | None = None,
 ) -> None:
-    """Persist Book Trader symbol list. Merges with existing config."""
+    """Persist Book Trader symbol list (merge-aware: preserves each
+    surviving symbol's stored contract metadata, including the metadata
+    seeded from Order Entry on the very first save)."""
     p = Path(path) if path else _default_path()
-    data = _read_json(p)
-    data["book_trader_symbols"] = symbols
-    _write_json(p, data)
+    _merge_symbols_into_entries("book_trader_symbols", symbols, p,
+                                source_entries=load_book_trader_entries(p))
     log.debug("Saved %d book-trader symbol(s) to %s", len(symbols), p)
 
 
@@ -579,7 +719,7 @@ def _normalise_hot_button(entry: Any) -> dict[str, Any] | None:
         offset = int(entry.get("offset", 0) or 0)
     except (TypeError, ValueError):
         offset = 0
-    return {
+    out = {
         "side": side,
         "group": str(entry.get("group", "__current__") or "__current__"),
         "symbol": str(entry.get("symbol", "") or ""),
@@ -596,6 +736,13 @@ def _normalise_hot_button(entry: Any) -> dict[str, Any] | None:
         # contract is added.
         "disabled": bool(entry.get("disabled", False)),
     }
+    # Optional inline contract identity (see instruments.META_KEYS) —
+    # must survive renormalisation or every save would strip it.
+    from src.core.instruments import normalise_contract_meta
+    meta = normalise_contract_meta(entry.get("contract"))
+    if meta is not None:
+        out["contract"] = meta
+    return out
 
 
 def load_hot_buttons(path: Path | str | None = None) -> list[dict[str, Any]]:
@@ -701,3 +848,12 @@ def _write_json(p: Path, data: dict[str, Any]) -> None:
             raise
     except Exception:
         log.exception("Failed to write config to %s", p)
+        return
+    # Any config write may have touched instrument entries — drop the
+    # resolver's snapshot (its mtime keying makes this belt-and-braces,
+    # but it also covers same-instant rewrites).
+    try:
+        from src.core.instruments import invalidate_cache
+        invalidate_cache()
+    except Exception:
+        pass

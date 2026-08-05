@@ -78,6 +78,15 @@ class MainWindow(QWidget):
         _rd().reload_contracts()
         _rd().reload_strategy_tiers()
 
+        # Enrich bare chip / hot-button entries with contract metadata
+        # from the legacy contracts.db (idempotent; also runs on sign-in
+        # via set_active_config — this covers legacy/test construction).
+        try:
+            from src.core import instruments
+            instruments.migrate_active_config_from_db()
+        except Exception:
+            log.exception("Instrument migration failed")
+
         self._setup_ui()
         self._setup_shortcuts()
         self._apply_role_gating()
