@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from PySide6.QtCore import QEvent, Qt, QTimer, Signal
-from PySide6.QtGui import QPainter, QColor
+from PySide6.QtGui import QKeySequence, QPainter, QColor, QShortcut
 
 from .widgets.top_tab_bar import TopTabBar
 from .widgets.statusbar import StatusBar
@@ -61,6 +61,12 @@ class MainWindow(QWidget):
         # Authenticated session (may be None for legacy / test construction).
         self._current_user = current_user
         self._auth_service = auth_service
+
+        # Session lock (⌘L / padlock button).  The overlay is created
+        # lazily on first lock; while locked, global shortcuts are
+        # suppressed and the workers keep running underneath.
+        self._locked = False
+        self._lock_overlay = None
 
         # Shared data structures
         self._accounts_model = AccountsTableModel(self)
@@ -205,6 +211,11 @@ class MainWindow(QWidget):
         # the user is on a non-Nano tab, the click also switches to
         # the Nano tab so the toggle is visible.
         self._tab_bar.accountsToggleRequested.connect(self._toggle_accounts)
+        self._tab_bar.lockRequested.connect(self.lock_session)
+        # The padlock needs a user to re-authenticate — hide it for
+        # legacy / test construction with no auth session.
+        self._tab_bar.set_lock_visible(
+            self._current_user is not None and self._auth_service is not None)
 
         self._pages.addWidget(self._connections_view)
         self._pages.addWidget(self._contracts_view)
@@ -240,11 +251,19 @@ class MainWindow(QWidget):
         Both keys are suppressed while a text-entry widget has focus so
         typing a literal "/" or "?" in an input never hijacks the
         keystroke.
+
+        ``Ctrl+L`` (⌘L on macOS) locks the session — same action as the
+        tab bar's padlock button.
         """
         QApplication.instance().installEventFilter(self)
+        self._lock_shortcut = QShortcut(QKeySequence("Ctrl+L"), self)
+        self._lock_shortcut.setContext(
+            Qt.ShortcutContext.ApplicationShortcut)
+        self._lock_shortcut.activated.connect(self.lock_session)
 
     def eventFilter(self, obj, event):  # noqa: N802 – Qt override
         if (event.type() == QEvent.Type.KeyPress
+                and not self._locked
                 and isinstance(obj, QWidget)
                 and not event.isAutoRepeat()
                 and event.key() in (Qt.Key.Key_Slash, Qt.Key.Key_Question)
@@ -313,6 +332,53 @@ class MainWindow(QWidget):
 
     def _request_sign_out(self) -> None:
         self.sign_out_requested.emit()
+
+    # ── Session lock ──────────────────────────────────────────────────────────
+
+    def lock_session(self) -> None:
+        """Cover the window with an opaque lock overlay (⌘L / padlock /
+        Preferences → Lock).  Workers, subscriptions and working orders
+        keep running underneath — this hides the UI, it doesn't stop the
+        session.  No-op without an authenticated user (nothing to
+        re-authenticate) or when already locked."""
+        if (self._locked or self._current_user is None
+                or self._auth_service is None):
+            return
+        # Floating windows would leak data around the overlay — close
+        # them first.  Preferences is modeless; symbol-search popups are
+        # frameless Tool windows anchored to buttons.
+        for dlg in self.findChildren(PreferencesDialog):
+            dlg.close()
+        from src.ui.widgets.symbol_search_popup import SymbolSearchPopup
+        for popup in self.findChildren(SymbolSearchPopup):
+            popup.close()
+        if self._lock_overlay is None:
+            from src.ui.auth.lock_overlay import LockOverlay
+
+            def _feed_live() -> bool:
+                return any(
+                    t.isRunning() and t.is_ib_connected
+                    for t in self.active_threads.values())
+
+            self._lock_overlay = LockOverlay(
+                self._current_user, self._auth_service, self,
+                feed_live_provider=_feed_live)
+            self._lock_overlay.unlocked.connect(self._on_unlocked)
+            self._lock_overlay.sign_out_requested.connect(
+                self._request_sign_out)
+        self._locked = True
+        self._lock_overlay.activate()
+        log.info("Session locked by %r", self._current_user.username)
+
+    def _on_unlocked(self) -> None:
+        self._locked = False
+        if self._lock_overlay is not None:
+            self._lock_overlay.hide()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        if self._lock_overlay is not None and self._locked:
+            self._lock_overlay.setGeometry(self.rect())
 
     # ── Navigation ────────────────────────────────────────────────────────────
 
@@ -387,6 +453,7 @@ class MainWindow(QWidget):
                 "user": self._current_user,
                 "service": self._auth_service,
                 "on_sign_out": self._request_sign_out,
+                "on_lock": self.lock_session,
             }
         dlg = PreferencesDialog(self, columns_provider=provider,
                                 auth_context=auth_context)
