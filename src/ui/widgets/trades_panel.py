@@ -796,6 +796,29 @@ class TradesPanel(QWidget):
         self._flat_model.add_fill(fill)
         self._summary_model.add_fill(fill)
 
+    def set_selected_accounts(self, accounts) -> None:
+        """Follow the Account List panel's checked accounts (raw IB ids;
+        empty = show all).  Flat rows filter in the proxy; the summary
+        re-aggregates from only the matching fills."""
+        self._flat_proxy.setSelectedAccounts(accounts)
+        self._summary_model.set_selected_accounts(accounts)
+
+    def pnl_totals(self, accounts=None) -> tuple[float, float, float, float]:
+        """(R.P&L, U.P&L, P&L, commission) across *accounts* (raw IB ids; empty/None
+        = all) over the control bar's current time frame — the status
+        bar's aggregate.  Follows the date combo (Today / Morning / Noon
+        / Evening / Last N Days) but ignores the view's search text,
+        account filter, and hidden rows."""
+        return self._summary_model.pnl_totals(
+            accounts,
+            days_back=self._flat_proxy.daysBack(),
+            threshold=self._flat_proxy.presetThreshold())
+
+    def pnl_timeframe_label(self) -> str:
+        """Display label of the active time frame ("Today", "Morning",
+        "Last 3 Days", …) for the status bar caption."""
+        return self._control_bar.filterLabel()
+
     def update_last_price(self, symbol: str, price: float) -> None:
         """Live last-trade price feed — the summary's P&L footer row
         marks unclosed positions to it."""

@@ -51,7 +51,8 @@ class TestChipLabels:
     def test_occ_chip_gets_compact_small_label(self, qtbot):
         bar = self._bar(qtbot)
         chip = bar._buttons[_OCC.upper()]
-        assert chip.text() == "QQQ Aug7 670 P"
+        # Two-line label: root on top, expiry/strike/right underneath.
+        assert chip.text() == "QQQ\nAug7 670 P"
         assert chip.property("chip_small") is True
         assert "font-size:9px" in chip.styleSheet()
 
@@ -109,6 +110,58 @@ class TestChipKey:
         assert key == ""
 
 
+# ── Add-symbol insert position ────────────────────────────────────────────────
+
+class TestAddSymbolInsertPosition:
+    """OPT chips always occupy the last position of the chip bar: options
+    append to the tail, and later stock adds slot in BEFORE the options."""
+
+    def _host(self, monkeypatch, symbols: list[str]) -> SimpleNamespace:
+        sec_types = {"AAPL": "STK", "MSFT": "STK", "MNQ": "FUT",
+                     "MES": "FUT", _OCC.upper(): "OPT"}
+        monkeypatch.setattr(
+            btv, "_sec_type_for", lambda s: sec_types.get(s, "STK"))
+        monkeypatch.setattr(
+            btv.config_manager, "save_book_trader_symbols",
+            lambda syms, path=None: None)
+        host = SimpleNamespace(
+            _symbols=list(symbols),
+            _chip_bar=SimpleNamespace(set_symbols=lambda entries: None),
+            _on_symbol_selected=lambda sym, sec: None,
+        )
+        return host
+
+    def test_opt_appends_last(self, monkeypatch):
+        host = self._host(monkeypatch, ["AAPL", "MSFT", "MNQ"])
+        btv.BookTraderView._add_symbol(host, _OCC)
+        assert host._symbols == ["AAPL", "MSFT", "MNQ", _OCC.upper()]
+
+    def test_unsaved_occ_shape_still_appends_last(self, monkeypatch):
+        # Contract save failed (no conid) → _sec_type_for returns "?";
+        # the OCC shape alone must still route the chip to the tail.
+        host = self._host(monkeypatch, ["AAPL", "MNQ"])
+        monkeypatch.setattr(btv, "_sec_type_for", lambda s: "?")
+        btv.BookTraderView._add_symbol(host, _OCC)
+        assert host._symbols[-1] == _OCC.upper()
+
+    def test_stk_inserts_before_existing_opt(self, monkeypatch):
+        host = self._host(monkeypatch, ["AAPL", _OCC.upper(), "MNQ"])
+        btv.BookTraderView._add_symbol(host, "TSLA")
+        assert host._symbols == ["AAPL", "TSLA", _OCC.upper(), "MNQ"]
+
+    def test_stk_appends_when_no_opt_present(self, monkeypatch):
+        host = self._host(monkeypatch, ["AAPL", "MNQ"])
+        btv.BookTraderView._add_symbol(host, "TSLA")
+        assert host._symbols == ["AAPL", "MNQ", "TSLA"]
+
+    def test_fut_always_appends(self, monkeypatch):
+        # FUT renders in its own group, so its list position relative to
+        # the option chips is irrelevant — plain append.
+        host = self._host(monkeypatch, ["AAPL", _OCC.upper()])
+        btv.BookTraderView._add_symbol(host, "MES")
+        assert host._symbols == ["AAPL", _OCC.upper(), "MES"]
+
+
 # ── OPT contract save helper ──────────────────────────────────────────────────
 
 @pytest.fixture
@@ -163,6 +216,26 @@ class TestEnsurePositionContractSaved:
     def test_ignores_non_opt(self, contracts_env):
         btv._ensure_position_contract_saved(_pos(sec_type="STK"))
         assert contracts_env["saved"] is None
+
+    def test_missing_conid_does_not_save(self, contracts_env):
+        """A conid-less row could never subscribe market data, and saving
+        it would permanently block the retry that has the conid."""
+        btv._ensure_position_contract_saved(_pos(con_id=None))
+        assert contracts_env["saved"] is None
+        # A later call WITH the conid must still be able to save.
+        btv._ensure_position_contract_saved(_pos())
+        assert contracts_env["saved"][0]["conid"] == "111"
+
+    def test_heals_row_saved_without_conid(self, contracts_env):
+        """Rows saved by older builds with conid='' get their conid
+        filled in instead of blocking on 'already resolvable'."""
+        contracts_env["contracts"] = [
+            {"conid": "", "symbol": _OCC.upper(), "sec_type": "OPT",
+             "local_symbol": _OCC, "multiplier": "100"}]
+        btv._ensure_position_contract_saved(_pos())
+        assert len(contracts_env["saved"]) == 1
+        assert contracts_env["saved"][0]["conid"] == "111"
+        assert contracts_env["reloaded"] == 1
 
 
 # ── Panel signal filtering ────────────────────────────────────────────────────

@@ -84,6 +84,18 @@ class StatusBar(QWidget):
         self._mono_font(self._status_lbl, bold=True)
         layout.addWidget(self._status_lbl)
 
+        # Today's transaction P&L, right of the status text.  Fed once a
+        # second by MainWindow._update_status; rich text so each number
+        # carries its own gain/loss colour.
+        layout.addSpacing(10)
+        self._pnl_sep = self._make_label("")
+        layout.addWidget(self._pnl_sep)
+        layout.addSpacing(10)
+        self._pnl_lbl = QLabel("", self)
+        self._mono_font(self._pnl_lbl)
+        self._pnl_lbl.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(self._pnl_lbl)
+
         layout.addStretch(1)
 
         # RIGHT group
@@ -124,6 +136,80 @@ class StatusBar(QWidget):
         self._time_lbl.setText(
             QDateTime.currentDateTime().toString("hh:mm:ss"))
 
+    # ── Today's P&L summary ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _fmt_pnl(v: float) -> str:
+        # Flat (0) counts as "not losing" — green, per trader preference.
+        colour = "#F85149" if v < 0 else "#3FB950"
+        # Whole dollars — the status bar is a glance number, the Trades
+        # view carries the cents.
+        text = "0" if v == 0 else f"{v:+,.0f}"
+        return (f"<span style='color:{colour};font-size:12px;"
+                f"font-weight:600'>{text}</span>")
+
+    @staticmethod
+    def _fmt_caption(text: str) -> str:
+        # Same look as the NORMAL OPERATIONS label: the label's own 8pt
+        # mono base font (no size override), primary text colour,
+        # medium weight, matching letter-spacing.
+        return (f"<span style='color:{TEXT_PRIMARY};font-weight:500;"
+                f"letter-spacing:1.2px'>{text}</span>")
+
+    @staticmethod
+    def _fmt_comm(v: float) -> str:
+        # Commission is a cost, not a P&L direction — neutral colour,
+        # unsigned, with cents (commissions are small; whole dollars
+        # would usually round to 0).
+        return (f"<span style='color:{TEXT_SECONDARY};font-size:12px;"
+                f"font-weight:600'>{v:,.2f}</span>")
+
+    def _fmt_triple(self, label: str, triple) -> str:
+        from html import escape
+        r, u, total, *rest = triple
+        body = (f"{self._fmt_caption(escape(label))}&nbsp;"
+                f"{self._fmt_caption('R')}&nbsp;{self._fmt_pnl(r)}&nbsp; "
+                f"{self._fmt_caption('U')}&nbsp;{self._fmt_pnl(u)}")
+        # 4th element = reported commissions over the same fill set.
+        # NET (total − commissions) replaces the gross P&L segment —
+        # one total on the bar, the net one.  Without a commission
+        # element the gross total is the only total, so keep it.
+        if rest:
+            comm = rest[0]
+            body += (f"&nbsp; {self._fmt_caption('C')}&nbsp;"
+                     f"{self._fmt_comm(comm)}&nbsp; "
+                     f"{self._fmt_caption('NET')}&nbsp;"
+                     f"{self._fmt_pnl(total - comm)}")
+        else:
+            body += (f"&nbsp; {self._fmt_caption('P&amp;L')}&nbsp;"
+                     f"{self._fmt_pnl(total)}")
+        return body
+
+    def set_pnl_summary(self, triple, label: str | None = None,
+                        frame_label: str | None = None) -> None:
+        """Show transaction P&L for the checked accounts over the active
+        time frame.  *triple* = (R, U, total) or (R, U, total,
+        commission) — with the 4th element the bar shows "C" (reported
+        commissions) and "NET" (total − commissions) instead of the
+        gross P&L segment; *label* names the
+        selection (the active account group, "ALL" when everything is
+        checked, "SEL" for a hand-picked subset).  *frame_label* names
+        the time frame ("Today", "Morning", "Last 3 Days" — mirrors the
+        Trades view's date combo) so the numbers are self-describing.
+        Pass ``triple=None`` to hide the section entirely (admin role,
+        no trades panel, or nothing checked)."""
+        if triple is None:
+            self._pnl_sep.setText("")
+            self._pnl_lbl.setText("")
+            return
+        from html import escape
+        self._pnl_sep.setText("|")
+        body = self._fmt_triple((label or "SEL").upper(), triple)
+        if frame_label:
+            body = (self._fmt_caption(escape(frame_label.upper()))
+                    + "&nbsp;&nbsp;" + body)
+        self._pnl_lbl.setText(body)
+
     # ── Transient messages ───────────────────────────────────────────────────
 
     def show_message(self, text: str, duration_ms: int = 6000) -> None:
@@ -152,7 +238,7 @@ class StatusBar(QWidget):
         )
         for lbl in (self._build_lbl, self._market_lbl, self._time_lbl):
             lbl.setStyleSheet(f"color: {TEXT_SECONDARY};")
-        for sep in (self._sep1, self._sep2):
+        for sep in (self._sep1, self._sep2, self._pnl_sep):
             sep.setStyleSheet(f"color: {TEXT_DIM};")
 
     # ── Background ────────────────────────────────────────────────────────────

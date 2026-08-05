@@ -340,10 +340,16 @@ class OrderStatusModel(QAbstractTableModel):
                 order[key] = new_val
                 changed_cols.append(col)
 
-        # Also update non-column meta fields
+        # Also update non-column meta fields.  con_id/sec_type may be
+        # absent or zero on the first (pre-check) emit and arrive with a
+        # later status — only overwrite with truthy values.
         for meta_key in ("order_ref", "error_message", "time_sort", "order_id"):
             new_val = data.get(meta_key)
             if new_val is not None:
+                order[meta_key] = new_val
+        for meta_key in ("con_id", "sec_type"):
+            new_val = data.get(meta_key)
+            if new_val:
                 order[meta_key] = new_val
 
         # Status change may affect the cancel column appearance

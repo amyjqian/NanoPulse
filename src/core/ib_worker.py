@@ -1748,6 +1748,11 @@ class IBWorkerThread(QThread):
             "order_ref": order_ref,
             "symbol": (params.get("local_symbol")
                        or params.get("symbol", "")),
+            # Contract identity — lets the UI jump the Book Trader ladder
+            # to this order's instrument even when it isn't in contracts.db
+            # (options are placed from live chains, never saved).
+            "con_id": int(params.get("conid", 0) or 0),
+            "sec_type": params.get("sec_type", "") or "",
             "account": params.get("account", ""),
             "action": params.get("action", ""),
             "order_type": params.get("order_type", "LMT"),
@@ -3054,6 +3059,10 @@ class IBWorkerThread(QThread):
             # Falls back to bare symbol for instruments that have no localSymbol
             # (most stocks), then to "" if params are empty.
             "symbol": (params.get("local_symbol") or params.get("symbol", "")),
+            # Contract identity for jump-to-Book-Trader (see
+            # _emit_opt_precheck_status).
+            "con_id": int(params.get("conid", 0) or 0),
+            "sec_type": params.get("sec_type", "") or "",
             "account": params.get("account", ""),
             "action": params.get("action", ""),
             "order_type": params.get("order_type", "MKT"),
@@ -4178,6 +4187,11 @@ class IBWorkerThread(QThread):
                 "order_id": order_id,
                 "order_ref": getattr(order, "orderRef", "") or "",
                 "symbol": symbol,
+                # Contract identity for jump-to-Book-Trader (see the
+                # pre-check emit).  secType may be "" for orders placed
+                # on a lean conId-only contract.
+                "con_id": getattr(contract, "conId", 0) or 0,
+                "sec_type": getattr(contract, "secType", "") or "",
                 "account": getattr(order, "account", ""),
                 "action": getattr(order, "action", ""),
                 "order_type": getattr(order, "orderType", "MKT"),

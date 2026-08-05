@@ -12,13 +12,14 @@ bucket and emits the right ``beginInsertRows`` / ``dataChanged`` pairs.
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
 from PySide6.QtGui import QColor, QFont
 
+from src.ui.widgets.trades_filter_proxy import today_et, trading_days_cutoff
 from src.utils.helpers import format_option_symbol
 
 log = logging.getLogger(__name__)
@@ -60,8 +61,8 @@ S_COL_KEYS: list[str] = [
 # ``NASDAQ`` (an exchange) works the same way in both views — the
 # summary just folds the matching subset into symbol aggregates.
 _FILL_SEARCH_KEYS: tuple[str, ...] = (
-    "symbol", "local_symbol", "side", "account", "sec_type",
-    "exchange", "order_ref",
+    "symbol", "local_symbol", "side", "account", "account_id",
+    "sec_type", "exchange", "order_ref",
 )
 
 _S_NUM_COLS = len(S_HEADERS)
@@ -102,14 +103,13 @@ class TradesSummaryModel(QAbstractTableModel):
         # a re-snapshot that re-emits the same fill doesn't double-count it
         self._fills: dict[str, dict] = {}
         # Date-range filter.  0 means "show every fill regardless of time".
-        # ``_latest_fill_date`` is tracked incrementally from the stored
-        # fills; ``_anchor_date`` is derived from it + today_ET (mirrors
-        # the rule in TradesFilterProxy so the two views stay in sync).
-        # Default 1 = "Today" to match TradesFilterProxy's default so a
-        # fresh app shows the same window in both flat and summary views.
+        # ``_anchor_date`` is strictly today_ET and the lookback counts
+        # trading days (mirrors the rule in TradesFilterProxy so the two
+        # views stay in sync).  Default 1 = "Today" to match
+        # TradesFilterProxy's default so a fresh app shows the same
+        # window in both flat and summary views.
         self._days_back: int = 1
-        self._latest_fill_date: date | None = None
-        self._anchor_date: date | None = None
+        self._anchor_date: date = today_et()
         # Time-threshold filter (driven by the search box parsing a
         # datetime).  When set, it *overrides* the date window — the
         # user is being explicit about which moment forward to include.
@@ -131,6 +131,12 @@ class TradesSummaryModel(QAbstractTableModel):
         # symbol aggregate.  Unlike ``_hidden_symbols`` this is owned by
         # the flat proxy, so it survives this model's filter rebuilds.
         self._hidden_fills: set[str] = set()
+        # Checked accounts from the Account List panel (raw IB ids,
+        # matched against each fill's ``account_id``).  Aggregates span
+        # accounts so this must gate fills BEFORE aggregation — a proxy
+        # over the aggregate rows couldn't split a mixed-account bucket.
+        # Empty set = show all, mirroring the positions view.
+        self._selected_accounts: set[str] = set()
         # Keys the user asked to "match buy & sell": the larger of the
         # buy/sell legs is trimmed (qty + notional, avg price kept) down
         # to the smaller so Net reads flat and the P&L columns show only
@@ -299,9 +305,17 @@ class TradesSummaryModel(QAbstractTableModel):
         open remainder is always the *latest* fills on the larger leg.
         Commission is the paired fills' own commission (partial fills
         prorated).  Returns ``None`` when nothing is paired."""
+        return self._fifo_paired_fills(self._fills_for_key(key),
+                                       self._agg.get(key) or {})
+
+    @staticmethod
+    def _fifo_paired_fills(fills: list[dict], meta: dict) -> dict | None:
+        """``_fifo_paired`` over an explicit time-ordered fill list.
+        *meta* supplies symbol/multiplier (an aggregate dict, or a
+        minimal stand-in for the status-bar aggregate)."""
         buys: list[tuple[float, float, float]] = []   # (qty, price, comm)
         sells: list[tuple[float, float, float]] = []
-        for f in self._fills_for_key(key):
+        for f in fills:
             qty = float(f.get("shares", 0.0) or 0.0)
             if qty <= 0:
                 continue
@@ -332,109 +346,292 @@ class TradesSummaryModel(QAbstractTableModel):
 
         b_notional, b_comm = take(buys, matched)
         s_notional, s_comm = take(sells, matched)
-        agg = self._agg.get(key) or {}
         return {
-            "symbol": agg.get("symbol", ""),
-            "root_symbol": agg.get("root_symbol", ""),
+            "symbol": meta.get("symbol", ""),
+            "root_symbol": meta.get("root_symbol", ""),
             "buys_qty": matched,
             "sells_qty": matched,
             "buys_notional": b_notional,
             "sells_notional": s_notional,
             "commission": b_comm + s_comm,
-            "multiplier": agg.get("multiplier", 1.0),
+            "multiplier": meta.get("multiplier", 1.0),
         }
 
-    def _paired_aggs(self) -> list[dict]:
-        pairs = (self._fifo_paired(k) for k in self._order
-                 if k in self._agg)
-        return [p for p in pairs if p is not None]
+    # ── FIFO remainder split — closing (IB realized) vs opening (marked) ────
 
-    # ── Unrealized (open remainder) helpers — feed the U.P&L column ─────────
+    def _fifo_split(self, key: tuple[str, str]) -> dict:
+        """Split *key*'s in-window fills three ways:
 
-    def _unrealized_parts(self) -> list[tuple[dict, dict | None]]:
-        """(effective aggregate, FIFO-paired portion) per visible symbol.
-        Unrealized is each column's total minus its realized part, so
-        P&L = R.P&L + U.P&L always reconciles."""
-        parts = []
+        * the FIFO-**paired** round trip (as ``_fifo_paired``),
+        * the unpaired **closing** remainder — fills that closed a
+          position opened *outside* the window.  IB's commissionReport
+          stamps ``realized_pnl`` (computed against the account's average
+          cost) on every closing execution, so their P&L is taken from
+          IB directly instead of being synthesised from a basis we can't
+          see.  Prorated when a fill is only partially unpaired,
+        * the unpaired **opening** remainder (no ``realized_pnl`` on the
+          fill) — a genuinely new position, marked to the last price by
+          ``_unrealized_total``.
+
+        A closing fill whose commissionReport hasn't arrived yet counts
+        as opening (marked) until the report lands and the re-emitted
+        fill re-folds — self-healing, never double-counted.
+        """
+        return self._fifo_split_fills(self._fills_for_key(key))
+
+    @staticmethod
+    def _fifo_split_fills(fills: list[dict]) -> dict:
+        """``_fifo_split`` over an explicit time-ordered fill list."""
+        buys: list[tuple[float, float, float | None]] = []  # (qty, price, rpnl)
+        sells: list[tuple[float, float, float | None]] = []
+        for f in fills:
+            qty = float(f.get("shares", 0.0) or 0.0)
+            if qty <= 0:
+                continue
+            price = float(f.get("price", 0.0) or 0.0)
+            rpnl = f.get("realized_pnl", None)
+            side = f.get("side", "")
+            if side == "BOT":
+                buys.append((qty, price, rpnl))
+            elif side == "SLD":
+                sells.append((qty, price, rpnl))
+        matched = min(sum(q for q, _p, _r in buys),
+                      sum(q for q, _p, _r in sells))
+
+        out = {
+            "closing_realized": 0.0,
+            "open_buys_qty": 0.0, "open_buys_notional": 0.0,
+            "open_sells_qty": 0.0, "open_sells_notional": 0.0,
+        }
+
+        def walk(legs, side: str) -> None:
+            left = matched  # FIFO consumes the earliest fills first
+            for qty, price, rpnl in legs:
+                consumed = min(qty, left)
+                left -= consumed
+                rest = qty - consumed
+                if rest <= 0:
+                    continue
+                if rpnl:
+                    # Closing remainder — IB's number, prorated.  Only a
+                    # NONZERO realized P&L marks a closing fill: live
+                    # commissionReports stamp realizedPNL = 0.0 on
+                    # opening executions too, so `is not None` would
+                    # classify every opening leg as a $0 close and pin
+                    # U.P&L at zero.  (A genuine scratch close at
+                    # exactly $0.00 falls through to marking — same as
+                    # an opening leg, and harmlessly close to truth.)
+                    out["closing_realized"] += rpnl * (rest / qty)
+                elif side == "BOT":
+                    out["open_buys_qty"] += rest
+                    out["open_buys_notional"] += rest * price
+                else:
+                    out["open_sells_qty"] += rest
+                    out["open_sells_notional"] += rest * price
+
+        walk(buys, "BOT")
+        walk(sells, "SLD")
+        return out
+
+    def _realized_total(self, key: tuple[str, str]) -> float:
+        """R.P&L for one row: the in-window FIFO round trip plus IB's
+        realized P&L on unpaired closing fills.  A matched row shows the
+        trimmed round trip only — that's the point of matching."""
+        paired = self._fifo_paired(key)
+        realized = self._net_total(paired) if paired else 0.0
+        if self.is_matched(key):
+            return realized
+        return realized + self._fifo_split(key)["closing_realized"]
+
+    def _unrealized_total(self, key: tuple[str, str], agg: dict) -> float:
+        """U.P&L for one row: only the *opening* remainder marked to the
+        last price (a net-long remainder valued as if sold, a net-short
+        as if bought back).  Falls back to the newest fill price when no
+        live quote has been seen — without a mark, an all-buys position
+        would report its entire cost as unrealized loss."""
+        if self.is_matched(key):
+            return 0.0
+        s = self._fifo_split(key)
+        mult = agg.get("multiplier", 1.0)
+        cash = (s["open_sells_notional"] - s["open_buys_notional"]) * mult
+        open_net = s["open_buys_qty"] - s["open_sells_qty"]
+        if open_net == 0:
+            return cash
+        last = self._last_price_for(agg)
+        if last is None:
+            last = agg.get("last_fill_price", 0.0)
+        if not last:
+            return cash
+        return cash + open_net * last * mult
+
+    def _row_pnl_total(self, key: tuple[str, str], agg: dict) -> float:
+        """P&L column: R.P&L + U.P&L, so the three always reconcile."""
+        return self._realized_total(key) + self._unrealized_total(key, agg)
+
+    def _visible_key_aggs(self) -> list[tuple[tuple[str, str], dict]]:
+        out = []
         for key in self._order:
             agg = self._effective_agg(key)
             if agg is not None:
-                parts.append((agg, self._fifo_paired(key)))
-        return parts
+                out.append((key, agg))
+        return out
 
-    def _unrealized_value(self, col: int) -> float:
-        total = 0.0
-        for agg, paired in self._unrealized_parts():
-            if col == S_COL_TRANS_TOTAL:
-                total += self._trans_total(agg) - (
-                    self._trans_total(paired) if paired else 0.0)
-            elif col == S_COL_NET_TOTAL:
-                total += self._marked_net_total(agg) - (
-                    self._net_total(paired) if paired else 0.0)
-            elif col == S_COL_COMMISSION:
-                total += agg.get("commission", 0.0) - (
-                    paired.get("commission", 0.0) if paired else 0.0)
-            elif col == S_COL_NET_INCL_COMM:
-                total += (self._marked_net_total(agg)
-                          - agg.get("commission", 0.0)) - (
-                    (self._net_total(paired)
-                     - paired.get("commission", 0.0)) if paired else 0.0)
-        return total
+    # ── Status-bar aggregate (today's session, by account set) ──────────────
+
+    @staticmethod
+    def _group_multiplier(fills: list[dict]) -> float:
+        """Contract multiplier for a fill group — first fill carrying
+        one, with the OPT/FOP = 100 default (same rules as
+        ``_add_to_agg``)."""
+        mult = 1.0
+        for f in fills:
+            m = f.get("multiplier")
+            if m is None:
+                continue
+            try:
+                mf = float(m)
+            except (TypeError, ValueError):
+                continue
+            if mf > 0:
+                mult = mf
+                break
+        if mult == 1.0 and any((f.get("sec_type") or "").upper()
+                               in ("OPT", "FOP") for f in fills):
+            mult = 100.0
+        return mult
+
+    def pnl_totals_today(self, accounts=None
+                         ) -> tuple[float, float, float, float]:
+        """``pnl_totals`` over today's ET session only."""
+        return self.pnl_totals(accounts, days_back=1)
+
+    def pnl_totals(self, accounts=None, days_back: int = 1,
+                   threshold: datetime | None = None,
+                   ) -> tuple[float, float, float, float]:
+        """(R.P&L, U.P&L, P&L, commission) for *accounts* (raw IB ids via
+        ``account_id``; empty/None = every account) over a time frame:
+        *threshold* keeps fills at or after that ET moment (the control
+        bar's Morning/Noon/Evening presets) and overrides the day
+        window; otherwise *days_back* counts trading days back from
+        today ET (1 = today, 2 = today + the previous trading day,
+        0/negative = everything).
+
+        Deliberately independent of the view's search text, account
+        filter, and hidden rows/fills — this feeds the always-on
+        status-bar aggregate.  Same math as the summary rows: in-window
+        FIFO pairs, plus IB realized on unpaired closing fills, plus the
+        opening remainder marked to the last cached price (newest fill
+        price when no quote is cached).  The commission element sums the
+        in-frame fills' reported commissions (TWS only sends a
+        commissionReport for a subset of fills, so this is "commissions
+        reported so far" — same caveat as the summary Comm column); the
+        R/U/P&L elements stay gross so they keep matching the summary
+        rows, and net-of-commission = P&L − commission.
+        """
+        sel = {a for a in (accounts or ()) if a}
+        anchor = self._compute_anchor()
+
+        def in_frame(f: dict) -> bool:
+            if threshold is not None:
+                ts = f.get("time_sort", "")
+                if not ts:
+                    return True
+                try:
+                    parsed = datetime.fromisoformat(ts)
+                except ValueError:
+                    return True
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=_ET)
+                return parsed >= threshold
+            if days_back <= 0:
+                return True
+            local = self._fill_local_date(f)
+            if local is None:
+                return True
+            return local >= trading_days_cutoff(anchor, days_back)
+
+        groups: dict[tuple[str, str], list[dict]] = {}
+        comm_total = 0.0
+        for f in self._fills.values():
+            if sel:
+                aid = f.get("account_id", "")
+                if aid and aid not in sel:
+                    continue
+            if not in_frame(f):
+                continue
+            groups.setdefault(self._agg_key(f), []).append(f)
+            try:
+                comm_total += float(f.get("commission") or 0.0)
+            except (TypeError, ValueError):
+                pass
+
+        r_total = u_total = 0.0
+        for fills in groups.values():
+            fills.sort(key=lambda f: f.get("time_sort", "") or "")
+            newest = fills[-1]
+            meta = {
+                "symbol": self._fill_display_symbol(newest),
+                "root_symbol": (newest.get("symbol", "") or "").upper(),
+                "sec_type": newest.get("sec_type", "") or "",
+                "multiplier": self._group_multiplier(fills),
+            }
+            mult = meta["multiplier"]
+            paired = self._fifo_paired_fills(fills, meta)
+            split = self._fifo_split_fills(fills)
+            r_total += ((self._net_total(paired) if paired else 0.0)
+                        + split["closing_realized"])
+            cash = (split["open_sells_notional"]
+                    - split["open_buys_notional"]) * mult
+            open_net = split["open_buys_qty"] - split["open_sells_qty"]
+            if open_net == 0:
+                u_total += cash
+                continue
+            last = self._last_price_for(meta)
+            if not last:
+                last = float(newest.get("price", 0.0) or 0.0)
+            u_total += (cash + open_net * last * mult) if last else cash
+        return r_total, u_total, r_total + u_total, comm_total
+
+    def _total_value(self, col: int) -> float | None:
+        """Footer number for the P&L-family columns, ``None`` for columns
+        the footer leaves blank.  Summed per visible row from the same
+        helpers the row cells use, so footer ≡ Σ rows by construction."""
+        pairs = self._visible_key_aggs()
+        if col == S_COL_PAIRED_PNL:
+            return sum(self._realized_total(k) for k, _a in pairs)
+        if col == S_COL_UNPAIRED_PNL:
+            return sum(self._unrealized_total(k, a) for k, a in pairs)
+        if col == S_COL_NET_TOTAL:
+            return sum(self._row_pnl_total(k, a) for k, a in pairs)
+        if col == S_COL_NET_INCL_COMM:
+            return sum(self._row_pnl_total(k, a) - a.get("commission", 0.0)
+                       for k, a in pairs)
+        return None
 
     def _total_cell_text(self, col: int) -> str:
         if col == S_COL_SYMBOL:
             return "P&L"
-        visible = self._visible_aggs()
         if col == S_COL_TRANS_TOTAL:
             return self._fmt_compact(
-                sum(self._trans_total(a) for a in visible))
-        if col == S_COL_PAIRED_PNL:
-            return self._fmt_signed(
-                sum(self._net_total(p) for p in self._paired_aggs()))
-        if col == S_COL_UNPAIRED_PNL:
-            return self._fmt_signed(self._unrealized_value(S_COL_NET_TOTAL))
-        if col == S_COL_NET_TOTAL:
-            return self._fmt_signed(
-                sum(self._marked_net_total(a) for a in visible))
+                sum(self._trans_total(a) for a in self._visible_aggs()))
         if col == S_COL_COMMISSION:
-            s = sum(a.get("commission", 0.0) for a in visible)
+            s = sum(a.get("commission", 0.0) for a in self._visible_aggs())
             return f"{s:,.2f}" if s else ""
-        if col == S_COL_NET_INCL_COMM:
-            s = sum(self._marked_net_total(a) - a.get("commission", 0.0)
-                    for a in visible)
-            return self._fmt_signed(s)
-        return ""
+        v = self._total_value(col)
+        return self._fmt_signed(v) if v is not None else ""
 
     def _total_cell_color(self, col: int) -> QColor | None:
         if col == S_COL_SYMBOL:
             return QColor(TEXT_BOLD)
-        visible = self._visible_aggs()
-        if col in (S_COL_PAIRED_PNL, S_COL_UNPAIRED_PNL):
-            v = (sum(self._net_total(p) for p in self._paired_aggs())
-                 if col == S_COL_PAIRED_PNL
-                 else self._unrealized_value(S_COL_NET_TOTAL))
-            if v > 0:
-                return QColor(CLR_BUY)
-            if v < 0:
-                return QColor(CLR_SELL)
-            return QColor(TEXT_DIM)
-        if col == S_COL_NET_TOTAL:
-            v = sum(self._marked_net_total(a) for a in visible)
-            if v > 0:
-                return QColor(CLR_BUY)
-            if v < 0:
-                return QColor(CLR_SELL)
-            return QColor(TEXT_DIM)
-        if col == S_COL_NET_INCL_COMM:
-            v = sum(self._marked_net_total(a) - a.get("commission", 0.0)
-                    for a in visible)
-            if v > 0:
-                return QColor(CLR_BUY)
-            if v < 0:
-                return QColor(CLR_SELL)
-            return QColor(TEXT_DIM)
         if col == S_COL_TRANS_TOTAL:
             return QColor(TEXT_BOLD)
+        v = self._total_value(col)
+        if v is not None:
+            if v > 0:
+                return QColor(CLR_BUY)
+            if v < 0:
+                return QColor(CLR_SELL)
+            return QColor(TEXT_DIM)
         return QColor(TEXT)
 
     # ── Cell rendering ──────────────────────────────────────────────────────
@@ -472,11 +669,11 @@ class TradesSummaryModel(QAbstractTableModel):
         return f"{sign}{a / 1_000_000:.2f}m"
 
     def _paired_pnl(self, key: tuple[str, str] | None) -> float:
-        """R.P&L for one row — the FIFO-paired round-trip's net."""
+        """R.P&L for one row — the in-window FIFO round trip plus IB's
+        realized P&L on unpaired closing fills (see ``_fifo_split``)."""
         if key is None:
             return 0.0
-        paired = self._fifo_paired(key)
-        return self._net_total(paired) if paired else 0.0
+        return self._realized_total(key)
 
     def _cell_text(self, agg: dict, col: int, key=None) -> str:
         if col == S_COL_SYMBOL:
@@ -506,17 +703,19 @@ class TradesSummaryModel(QAbstractTableModel):
             return self._fmt_signed(self._paired_pnl(key))
         if col == S_COL_UNPAIRED_PNL:
             return self._fmt_signed(
-                self._marked_net_total(agg) - self._paired_pnl(key))
+                self._unrealized_total(key, agg) if key else 0.0)
         if col == S_COL_NET_TOTAL:
-            # P&L = R.P&L + U.P&L — the marked (paired + open-remainder)
-            # net, not the raw cash flow.
-            return self._fmt_signed(self._marked_net_total(agg))
+            # P&L = R.P&L + U.P&L — paired + IB-realized closes + the
+            # marked opening remainder, not the raw cash flow.
+            return self._fmt_signed(
+                self._row_pnl_total(key, agg) if key else 0.0)
         if col == S_COL_COMMISSION:
             c = agg.get("commission", 0.0)
             return f"{c:,.2f}" if c else ""
         if col == S_COL_NET_INCL_COMM:
             return self._fmt_signed(
-                self._marked_net_total(agg) - agg.get("commission", 0.0))
+                (self._row_pnl_total(key, agg) if key else 0.0)
+                - agg.get("commission", 0.0))
         if col == S_COL_REALIZED:
             pnl = agg.get("realized_pnl", 0.0)
             if pnl == 0:
@@ -553,24 +752,6 @@ class TradesSummaryModel(QAbstractTableModel):
                     return p
         return None
 
-    def _marked_net_total(self, agg: dict) -> float:
-        """Cash-flow net with the open (unpaired) leg marked to the last
-        traded price: a net-long leg is valued as if sold at the last
-        price, a net-short leg as if bought back.  When no live quote has
-        been seen for the symbol, falls back to the newest fill price —
-        without a mark, an all-buys position would report its entire
-        cost as unrealized loss."""
-        cash = self._net_total(agg)
-        net_qty = agg.get("buys_qty", 0.0) - agg.get("sells_qty", 0.0)
-        if net_qty == 0:
-            return cash
-        last = self._last_price_for(agg)
-        if last is None:
-            last = agg.get("last_fill_price", 0.0)
-        if not last:
-            return cash
-        return cash + net_qty * last * agg.get("multiplier", 1.0)
-
     @staticmethod
     def _trans_total(agg: dict) -> float:
         """Gross transaction volume — total buy notional + total sell
@@ -594,11 +775,12 @@ class TradesSummaryModel(QAbstractTableModel):
             if col == S_COL_PAIRED_PNL:
                 v = self._paired_pnl(key)
             elif col == S_COL_UNPAIRED_PNL:
-                v = self._marked_net_total(agg) - self._paired_pnl(key)
+                v = self._unrealized_total(key, agg) if key else 0.0
             elif col == S_COL_NET_TOTAL:
-                v = self._marked_net_total(agg)
+                v = self._row_pnl_total(key, agg) if key else 0.0
             else:
-                v = self._marked_net_total(agg) - agg.get("commission", 0.0)
+                v = ((self._row_pnl_total(key, agg) if key else 0.0)
+                     - agg.get("commission", 0.0))
             if v > 0:
                 return QColor(CLR_BUY)
             if v < 0:
@@ -655,16 +837,12 @@ class TradesSummaryModel(QAbstractTableModel):
         exec_id = fill.get("exec_id", "")
         key = self._agg_key(fill)
 
-        # Detect an anchor advance (e.g. a fresh session's first fill
-        # arrives and pushes "today" forward).  A full rebuild is the
-        # simplest correct response — yesterday's aggregates may need
-        # to drop out of a 1-day window and rebuilding is O(n_fills).
+        # Detect an anchor advance (the midnight ET rollover — a fresh
+        # session's first fill arrives and "today" has moved forward).
+        # A full rebuild is the simplest correct response — yesterday's
+        # aggregates may need to drop out of a 1-day window and
+        # rebuilding is O(n_fills).
         prev_anchor = self._anchor_date
-        local_date = self._fill_local_date(fill)
-        if local_date is not None and (
-                self._latest_fill_date is None
-                or local_date > self._latest_fill_date):
-            self._latest_fill_date = local_date
         self._anchor_date = self._compute_anchor()
         anchor_changed = (
             self._days_back > 0 and prev_anchor != self._anchor_date)
@@ -726,8 +904,8 @@ class TradesSummaryModel(QAbstractTableModel):
                 self.index(total_row, _S_NUM_COLS - 1))
 
     def set_days_back(self, days: int) -> None:
-        """Change the date window (1 = today, 2 = last 2 days, …).
-        0 or negative means "show every fill regardless of time"."""
+        """Change the date window (1 = today, 2 = last 2 trading days,
+        …).  0 or negative means "show every fill regardless of time"."""
         days = max(0, int(days or 0))
         if days == self._days_back:
             return
@@ -751,6 +929,15 @@ class TradesSummaryModel(QAbstractTableModel):
         if new_search == self._search_text:
             return
         self._search_text = new_search
+        self._rebuild_from_fills()
+
+    def set_selected_accounts(self, accounts) -> None:
+        """Re-aggregate using only fills whose ``account_id`` is in
+        *accounts* (raw IB ids).  Empty/None shows every account."""
+        new = {a for a in (accounts or ()) if a}
+        if new == self._selected_accounts:
+            return
+        self._selected_accounts = new
         self._rebuild_from_fills()
 
     def set_hidden_fills(self, exec_ids) -> None:
@@ -807,8 +994,7 @@ class TradesSummaryModel(QAbstractTableModel):
         self._hidden_symbols.clear()
         self._hidden_fills.clear()
         self._matched_keys.clear()
-        self._latest_fill_date = None
-        self._anchor_date = None
+        self._anchor_date = self._compute_anchor()
         self.endResetModel()
 
     # ── Hide / restore (user-driven, temporary) ────────────────────────────
@@ -919,20 +1105,21 @@ class TradesSummaryModel(QAbstractTableModel):
             parsed = parsed.replace(tzinfo=_ET)
         return parsed.astimezone(_ET).date()
 
-    def _compute_anchor(self) -> date | None:
-        """Rule mirrors ``TradesFilterProxy``: anchor = ``today_ET`` during
-        live trading, but if the latest fill is in the past (weekend /
-        pre-open) fall back to that fill's date so the window isn't empty.
-        Returns ``None`` when no fills have been seen yet."""
-        if self._latest_fill_date is None:
-            return None
-        today = datetime.now(_ET).date()
-        return self._latest_fill_date if self._latest_fill_date < today else today
+    def _compute_anchor(self) -> date:
+        """Rule mirrors ``TradesFilterProxy``: strict "Today" — the
+        window is always anchored to the current ET date."""
+        return today_et()
 
     def _passes_filter(self, fill: dict) -> bool:
         if self._hidden_fills:
             ek = fill.get("exec_id", "")
             if ek and ek in self._hidden_fills:
+                return False
+        if self._selected_accounts:
+            acct = fill.get("account_id", "")
+            # Fills without an account_id stay visible rather than being
+            # silently dropped (mirrors TradesFilterProxy).
+            if acct and acct not in self._selected_accounts:
                 return False
         if not self._passes_time_filter(fill):
             return False
@@ -957,13 +1144,13 @@ class TradesSummaryModel(QAbstractTableModel):
                 parsed = parsed.replace(tzinfo=_ET)
             return parsed >= self._time_threshold
 
-        if self._days_back <= 0 or self._anchor_date is None:
+        if self._days_back <= 0:
             return True
         local_date = self._fill_local_date(fill)
         if local_date is None:
             return True
-        cutoff = self._anchor_date - timedelta(days=self._days_back - 1)
-        return local_date >= cutoff
+        return local_date >= trading_days_cutoff(
+            self._anchor_date, self._days_back)
 
     def _passes_search_filter(self, fill: dict) -> bool:
         if not self._search_text:

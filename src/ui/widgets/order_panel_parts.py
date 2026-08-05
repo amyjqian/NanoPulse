@@ -291,11 +291,11 @@ def _apply_chip_style(btn: QPushButton, selected: bool) -> None:
     panels render chips identically.  Kept here to avoid a reverse import.
 
     Chips whose ``chip_small`` property is set (option chips showing a
-    compact "QQQ Aug7 670 P" label) get a smaller font and tighter
-    padding so the label fits the standard chip size.
+    compact two-line "QQQ ⏎ Aug7 670 P" label) get a smaller font and
+    tighter padding so both lines fit the standard chip height.
     """
     if bool(btn.property("chip_small")):
-        font, pad = "9px", "4px 4px"
+        font, pad = "9px", "1px 4px"
     else:
         font, pad = "12px", "4px 12px"
     if selected:
@@ -434,10 +434,15 @@ class SymbolChipBar(QWidget):
         *,
         columns: int = 5,
         max_rows_per_group: int = 2,
+        max_stk_rows: int = 3,
     ) -> None:
         super().__init__(parent)
         self._columns = max(1, columns)
         self._max_rows_per_group = max(1, max_rows_per_group)
+        # The STK group gets an extra row (3 × columns chips) — stock
+        # lists grow faster than futures roots.  FUT keeps
+        # ``max_rows_per_group``.
+        self._max_stk_rows = max(1, max_stk_rows)
         self._entries: list[tuple[str, str]] = []  # (sym, sec_type)
         self._buttons: dict[str, QPushButton] = {}
         self._active: str | None = None
@@ -497,9 +502,8 @@ class SymbolChipBar(QWidget):
         for sym, sec in self._entries:
             (fut if sec == "FUT" else stk).append((sym, sec))
 
-        cap = self._columns * self._max_rows_per_group
-        stk = stk[:cap]
-        fut = fut[:cap]
+        stk = stk[:self._columns * self._max_stk_rows]
+        fut = fut[:self._columns * self._max_rows_per_group]
 
         row = 0
         for i, (sym, sec) in enumerate(stk):
@@ -520,11 +524,16 @@ class SymbolChipBar(QWidget):
     def _make_chip(self, sym: str, sec_type: str) -> QPushButton:
         # OCC option symbols render a compact display label in a smaller
         # font; format_option_symbol passes every other symbol through
-        # unchanged, so STK/FUT chips are unaffected.
+        # unchanged, so STK/FUT chips are unaffected.  The label breaks
+        # after the root ("QQQ" / "Aug7 670 P") so the chip stays as
+        # narrow as a plain symbol chip.
         disp = format_option_symbol(sym)
+        is_opt = disp != sym
+        if is_opt:
+            disp = disp.replace(" ", "\n", 1)
         btn = DraggableChip(sym, sec_type, self._on_drop,
-                            label=disp if disp != sym else None)
-        btn.setProperty("chip_small", disp != sym)
+                            label=disp if is_opt else None)
+        btn.setProperty("chip_small", is_opt)
         btn.setFixedHeight(self._CHIP_HEIGHT)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         _apply_chip_style(btn, sym == self._active)
@@ -573,8 +582,8 @@ class QtyChipRow(QWidget):
     different preset sets); ``qty_changed`` fires whenever the active qty
     changes (either a preset click or a valid custom value).  The
     integer-input widget comes from ``order_entry_panel._QtyInput`` —
-    reused directly so the popup-ladder behaviour is identical across
-    panels.
+    reused directly so the wheel/keyboard ladder-stepping behaviour is
+    identical across panels.
 
     With ``allow_percent=True`` (stocks only) the row grows an SH/%
     unit toggle (spec: NanoPulse-Ladder-Percent-Sizing.md).  Percent
@@ -634,9 +643,9 @@ class QtyChipRow(QWidget):
         allow_percent: bool = False,
     ) -> None:
         """Rebuild the preset chips with *presets*; *default* is the qty
-        selected initially.  *popup_vals* seeds the _QtyInput's arrow-
-        dropdown ladder.  *allow_percent* shows the SH/% toggle (host
-        passes True only for stock symbols)."""
+        selected initially.  *popup_vals* seeds the _QtyInput's
+        wheel/keyboard stepping ladder.  *allow_percent* shows the SH/%
+        toggle (host passes True only for stock symbols)."""
         # Clear current widgets from the layout.  The custom input AND
         # the unit toggle are long-lived — deleting the toggle here
         # would leave a dangling C++ object after the first symbol

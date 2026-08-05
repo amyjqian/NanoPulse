@@ -810,16 +810,18 @@ class TickPriceInput(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  _QtyInput  –  integer quantity field with ▲/▼ spinners + preset popup
+#  _QtyInput  –  integer quantity field stepped by mouse wheel / ↑↓ keys
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class _QtyInput(QWidget):
-    """Styled integer input (matches TickPriceInput look) with a preset popup."""
+    """Styled integer input (matches TickPriceInput look).
+
+    Deliberately minimal in both units: no ▲/▼ arrow column and no
+    preset dropdown — the mouse wheel and ↑/↓ keys step through the
+    preset ladder (``set_presets``) instead.
+    """
 
     _CHIP_H       = 28
-    _BTN_W        = 18
-    _VISIBLE_ROWS = 10
-    _ROW_H        = 22
     _MAX_DEFAULT  = 999_999_999
 
     textChanged   = Signal(str)
@@ -837,11 +839,8 @@ class _QtyInput(QWidget):
         self._accent:               str | None         = None
         self._max:                  int                = self._MAX_DEFAULT
         self._presets:              list[int]          = []
-        self._popup:                QListWidget | None = None
-        self._arrow_w:              QWidget     | None = None
         self._app_filter_installed: bool               = False
-        self._win_filter_installed: bool               = False
-        self._tracked_win:          QWidget     | None = None
+        self._wheel_accum:          int                = 0
         self._build_ui()
 
     # ── UI construction ───────────────────────────────────────────────────────
@@ -863,44 +862,10 @@ class _QtyInput(QWidget):
         self._edit.textChanged.connect(self._relay_text)
         # Text presence drives the selected-look — restyle on every edit.
         self._edit.textChanged.connect(lambda _t: self._apply_styles())
-        self._edit.returnPressed.connect(self._close_popup)
         self._edit.returnPressed.connect(self.returnPressed.emit)
         self._edit.installEventFilter(self)
 
-        self._btn_up = QToolButton()
-        self._btn_up.setText("▲")
-        self._btn_up.setFixedSize(self._BTN_W, self._CHIP_H // 2)
-        # Steppers must not steal focus from the edit — a FocusOut here
-        # would trigger the host row's leave-the-field handling mid-step.
-        self._btn_up.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._btn_up.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._btn_up.setAutoRepeat(True)
-        self._btn_up.setAutoRepeatDelay(400)
-        self._btn_up.setAutoRepeatInterval(80)
-        self._btn_up.clicked.connect(self._on_up)
-
-        self._btn_dn = QToolButton()
-        self._btn_dn.setText("▼")
-        self._btn_dn.setFixedSize(self._BTN_W, self._CHIP_H // 2)
-        self._btn_dn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._btn_dn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._btn_dn.setAutoRepeat(True)
-        self._btn_dn.setAutoRepeatDelay(400)
-        self._btn_dn.setAutoRepeatInterval(80)
-        self._btn_dn.clicked.connect(self._on_dn)
-
-        arrow_col = QVBoxLayout()
-        arrow_col.setSpacing(0)
-        arrow_col.setContentsMargins(0, 0, 0, 0)
-        arrow_col.addWidget(self._btn_up)
-        arrow_col.addWidget(self._btn_dn)
-
-        self._arrow_w = QWidget()
-        self._arrow_w.setFixedSize(self._BTN_W, self._CHIP_H - 2)
-        self._arrow_w.setLayout(arrow_col)
-
         lay.addWidget(self._edit, 1)
-        lay.addWidget(self._arrow_w)
 
         self.setFixedHeight(self._CHIP_H)
         self.setSizePolicy(
@@ -944,18 +909,12 @@ class _QtyInput(QWidget):
                     "border": "#6BA8F6",
                     "text": "white",
                     "bold": True,
-                    "arrow": "white",
-                    "arrow_hover": "white",
-                    "sep": "#6BA8F6",
                 }
             return {                                  # idle grey
                 "box_bg": "#232A3B",
                 "border": "#334058",
                 "text": "#A3AFC2",
                 "bold": False,
-                "arrow": "#6A7690",
-                "arrow_hover": "white",
-                "sep": "#334058",
             }
         if active:                                    # % : solid gold
             return {
@@ -963,24 +922,17 @@ class _QtyInput(QWidget):
                 "border": Theme.CLR_PCT_BORDER,
                 "text": Theme.CLR_PCT_ON,
                 "bold": True,
-                "arrow": Theme.CLR_PCT_ON,
-                "arrow_hover": Theme.CLR_PCT_ON,
-                "sep": Theme.CLR_PCT_BORDER,
             }
         return {                                      # % idle: dark gold
             "box_bg": Theme.CLR_PCT_BG,
             "border": "rgba(45,180,164,.35)",
             "text": Theme.CLR_PCT_TEXT,
             "bold": False,
-            "arrow": Theme.CLR_PCT_TEXT,
-            "arrow_hover": Theme.CLR_PCT_BORDER,
-            "sep": "rgba(45,180,164,.35)",
         }
 
     def _apply_styles(self) -> None:
         """One rounded box: background/border/radius live on the
-        container; edit + arrows are transparent inside it, with a thin
-        separator line between number and arrows."""
+        container; the edit sits transparent inside it."""
         p = self._palette()
         weight = "font-weight:bold;" if p["bold"] else ""
         self.setStyleSheet(
@@ -990,16 +942,6 @@ class _QtyInput(QWidget):
             f"QLineEdit{{background:transparent;color:{p['text']};"
             f"border:none;padding:2px 6px;font-size:11px;"
             f"font-family:'JetBrains Mono';{weight}}}")
-        arrow = (
-            f"QToolButton{{background:transparent;color:{p['arrow']};"
-            "border:none;font-size:7px;padding:0;margin:0}"
-            f"QToolButton:hover{{color:{p['arrow_hover']}}}"
-            f"QToolButton:pressed{{color:{p['arrow_hover']}}}")
-        self._btn_up.setStyleSheet(arrow)
-        self._btn_dn.setStyleSheet(arrow)
-        self._arrow_w.setStyleSheet(
-            f"QWidget{{background:transparent;border:none;"
-            f"border-left:1px solid {p['sep']}}}")
 
     def text(self) -> str:
         return self._edit.text()
@@ -1033,10 +975,10 @@ class _QtyInput(QWidget):
             return None
 
     def _on_up(self) -> None:
-        """Step UP through the dropdown ladder (1…10, 20, 30 … 100,
-        200 … — same values the popup shows).  A value between rungs
-        snaps to the next larger rung.  Falls back to ±1 when no ladder
-        is set.  In percent mode the ladder is 1–100, so this is ±1."""
+        """Step UP through the preset ladder (1…10, 20, 30 … 100,
+        200 …).  A value between rungs snaps to the next larger rung.
+        Falls back to ±1 when no ladder is set.  In percent mode the
+        ladder is 1–100, so this is ±1."""
         v = self._current_value()
         ladder = sorted(p for p in self._presets if p <= self._max)
         if ladder:
@@ -1047,7 +989,7 @@ class _QtyInput(QWidget):
         self._edit.setText("1" if v is None else str(min(v + 1, self._max)))
 
     def _on_dn(self) -> None:
-        """Step DOWN through the dropdown ladder (see :meth:`_on_up`)."""
+        """Step DOWN through the preset ladder (see :meth:`_on_up`)."""
         v = self._current_value()
         ladder = sorted(p for p in self._presets if p <= self._max)
         if ladder:
@@ -1060,19 +1002,11 @@ class _QtyInput(QWidget):
         if v is not None and v > 1:
             self._edit.setText(str(v - 1))
 
-    # ── Popup ─────────────────────────────────────────────────────────────────
+    # ── Events (focus tracking + stepping) ────────────────────────────────────
 
     def eventFilter(self, obj, event) -> bool:          # noqa: N802
         t = event.type()
-        # Focus recolors the whole box (the edit itself is transparent)
-        # and notifies the host row so it can drop the chip highlight
-        # while the user is in the field.  A FocusOut caused by the
-        # component's own popup stealing activation is NOT "leaving the
-        # field" — without this guard, picking a preset-valued entry
-        # from the dropdown momentarily adopts its chip (visible flash)
-        # before the next pick overwrites the text again.
-        # Keyboard stepping: ↑/↓ in the edit behave like the ▲/▼ buttons
-        # (±1, clamped to the unit's max).
+        # Keyboard stepping: ↑/↓ in the edit walk the preset ladder.
         if obj is self._edit and t == QEvent.Type.KeyPress:
             if event.key() == Qt.Key.Key_Up:
                 self._on_up()
@@ -1080,6 +1014,9 @@ class _QtyInput(QWidget):
             if event.key() == Qt.Key.Key_Down:
                 self._on_dn()
                 return True
+        # Focus recolors the whole box (the edit itself is transparent)
+        # and notifies the host row so it can drop the chip highlight
+        # while the user is in the field.
         if obj is self._edit and t == QEvent.Type.FocusIn:
             # Watch app-wide clicks while engaged — on macOS most
             # widgets don't take focus on click, so "user clicked
@@ -1089,36 +1026,36 @@ class _QtyInput(QWidget):
             self.focusChanged.emit(True)
         if obj is self._edit and t == QEvent.Type.FocusOut:
             self._apply_styles()
-            if not (self._popup is not None and self._popup.isVisible()):
-                self._remove_app_filter()
-                self.focusChanged.emit(False)
-        # Close when the main window is dragged/moved
-        if obj is self._tracked_win and t == QEvent.Type.Move:
-            self._close_popup()
-            return False
-        # Click outside popup + component → dismiss the popup AND treat
-        # it as leaving the field (forces the FocusOut that drives the
-        # host row's chip adoption, which never arrives on its own when
-        # the clicked widget doesn't accept click-focus).
+            self._remove_app_filter()
+            self.focusChanged.emit(False)
+        # Click outside the component → treat it as leaving the field
+        # (forces the FocusOut that drives the host row's chip adoption,
+        # which never arrives on its own when the clicked widget doesn't
+        # accept click-focus).
         if t == QEvent.Type.MouseButtonPress and self._app_filter_installed:
             try:
                 gpos = event.globalPosition().toPoint()  # type: ignore[attr-defined]
             except AttributeError:
                 gpos = event.globalPos()                  # type: ignore[attr-defined]
             from PySide6.QtCore import QPoint as _QP, QRect as _QR
-            in_popup = (self._popup is not None and self._popup.isVisible()
-                        and self._popup.geometry().contains(gpos))
             in_self = _QR(self.mapToGlobal(_QP(0, 0)),
                           self.size()).contains(gpos)
-            if not in_popup:
-                if self._popup is not None and self._popup.isVisible():
-                    self._close_popup()
-                if not in_self and self._edit.hasFocus():
-                    self._edit.clearFocus()
-        if obj is self._edit and t == QEvent.Type.MouseButtonPress:
-            if self._popup is None or not self._popup.isVisible():
-                QTimer.singleShot(50, self._show_popup)
+            if not in_self and self._edit.hasFocus():
+                self._edit.clearFocus()
         return False
+
+    def wheelEvent(self, event) -> None:                # noqa: N802
+        """Scroll steps the value through the preset ladder (same rungs
+        as the ↑/↓ keys).  Deltas accumulate so trackpads (many small
+        deltas) step at the same rate as a wheel (±120 per notch)."""
+        self._wheel_accum += event.angleDelta().y()
+        while self._wheel_accum >= 120:
+            self._wheel_accum -= 120
+            self._on_up()
+        while self._wheel_accum <= -120:
+            self._wheel_accum += 120
+            self._on_dn()
+        event.accept()
 
     def _install_app_filter(self) -> None:
         if self._app_filter_installed:
@@ -1139,143 +1076,6 @@ class _QtyInput(QWidget):
                 except RuntimeError:
                     pass
             self._app_filter_installed = False
-
-    def _release_app_filter_if_left(self) -> None:
-        """Drop the app filter only once the edit is no longer focused —
-        the filter's click-outside watch must survive popup teardown
-        while the user is still typing in the field."""
-        try:
-            engaged = self._edit.hasFocus()
-        except RuntimeError:
-            engaged = False
-        if not engaged:
-            self._remove_app_filter()
-
-    def _remove_win_filter(self) -> None:
-        if self._win_filter_installed and self._tracked_win is not None:
-            try:
-                self._tracked_win.removeEventFilter(self)
-            except RuntimeError:
-                pass
-            self._win_filter_installed = False
-            self._tracked_win = None
-
-    def _close_popup(self) -> None:
-        self._release_app_filter_if_left()
-        self._remove_win_filter()
-        if self._popup is not None:
-            try:
-                self._popup.destroyed.disconnect(self._on_popup_destroyed)
-            except RuntimeError:
-                pass
-            self._popup.close()
-            self._popup.deleteLater()
-            self._popup = None
-
-    def _on_popup_destroyed(self) -> None:
-        self._popup = None
-        self._release_app_filter_if_left()
-        self._remove_win_filter()
-
-    def _show_popup(self) -> None:
-        if self._popup is not None and self._popup.isVisible():
-            return
-        self._close_popup()
-
-        from PySide6.QtCore import QPoint
-        from PySide6.QtWidgets import QApplication as _QApp
-
-        popup = QListWidget()
-        popup.setUniformItemSizes(True)
-        popup.setWindowFlags(
-            Qt.WindowType.Tool
-            | Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
-        )
-        popup.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        popup.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        popup.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        popup.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        popup.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-        # NOTE: do NOT set WA_TranslucentBackground here — on macOS it
-        # stops the QListWidget painting its stylesheet background
-        # entirely (items float transparent over the app).  The radius
-        # corners paint on the solid window fill instead.
-        popup.setStyleSheet("""
-            QListWidget {
-                background: #1B2130; color: #E6EBF2;
-                border: 1px solid #334058; border-radius: 6px;
-                font-size: 12px; outline: none;
-            }
-            QListWidget::item            { padding: 3px 12px; border: none;
-                                           border-radius: 4px; }
-            QListWidget::item:selected,
-            QListWidget::item:hover      { background: #539BF5; color: white; }
-        """)
-
-        # Large values at top, small values at bottom; initial view shows the bottom
-        current     = self._current_value()
-        centre_item: QListWidgetItem | None = None
-        for v in reversed(self._presets):
-            item = QListWidgetItem(str(v))
-            if v == current:
-                f = item.font()
-                f.setBold(True)
-                item.setFont(f)
-                item.setForeground(QColor("#3FB950"))
-                centre_item = item
-            popup.addItem(item)
-
-        popup_w = 90
-        popup_h = min(len(self._presets), self._VISIBLE_ROWS) * self._ROW_H + 8
-        popup.setFixedSize(popup_w, popup_h)
-        popup.itemClicked.connect(self._on_popup_item)
-        popup.destroyed.connect(self._on_popup_destroyed)
-
-        # Position popup next to the arrow widget, centred on the input row
-        if self._arrow_w is not None:
-            arrow_gx = self._arrow_w.mapToGlobal(QPoint(0, 0)).x()
-        else:
-            arrow_gx = self.mapToGlobal(QPoint(self.width() - self._BTN_W, 0)).x()
-        widget_gcy    = self.mapToGlobal(QPoint(0, self.height() // 2)).y()
-        global_origin = QPoint(arrow_gx, widget_gcy - popup_h // 2)
-
-        wc = self.mapToGlobal(QPoint(self.width() // 2, self.height() // 2))
-        screen = _QApp.screenAt(wc) or _QApp.primaryScreen()
-        if screen:
-            sg = screen.availableGeometry()
-            gx = max(sg.left(), min(global_origin.x(), sg.right()  - popup_w))
-            gy = max(sg.top(),  min(global_origin.y(), sg.bottom() - popup_h))
-            global_origin = QPoint(gx, gy)
-
-        popup.move(global_origin)
-        popup.show()
-        self._popup = popup
-
-        # If a value is already selected scroll to it, otherwise show the bottom
-        # (smallest values) so the user scrolls up to reach larger ones.
-        if centre_item is not None:
-            popup.scrollToItem(centre_item, QAbstractItemView.ScrollHint.PositionAtBottom)
-        else:
-            popup.scrollToBottom()
-
-        # Track app-level clicks for outside-dismiss
-        self._install_app_filter()
-
-        # Track top-level window moves to dismiss popup
-        top_win = self.window()
-        if top_win and top_win is not self:
-            top_win.installEventFilter(self)
-            self._tracked_win          = top_win
-            self._win_filter_installed = True
-
-    def _on_popup_item(self, item: QListWidgetItem) -> None:
-        self._edit.setText(item.text())
-        self._close_popup()
-        # The popup click may have taken activation — hand focus back to
-        # the edit so the component stays "engaged" (the chip-adoption
-        # logic runs only when the user genuinely leaves the field).
-        self._edit.setFocus()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4132,6 +3932,23 @@ class OrderEntryPanel(QWidget):
         sym = sym.upper()
         log.info("OrderEntry: adding symbol '%s'", sym)
         if sym not in self._symbols:
+            if _sec_type_for(sym) != "FUT":
+                # The STK group renders at most 5 × 3 chips.  When it's
+                # full, the new symbol replaces the LAST chip (row 3,
+                # column 5) instead of becoming an invisible overflow
+                # entry.  Mirrors _remove_symbol's cleanup.
+                stk_group = [s for s in self._symbols
+                             if _sec_type_for(s) != "FUT"]
+                if len(stk_group) >= self._CHIP_COLS * self._MAX_STK_ROWS:
+                    replaced = stk_group[-1]
+                    self._symbols.remove(replaced)
+                    config_manager.remove_stock_contract_if_unused(replaced)
+                    if self._bg_worker is not None:
+                        self._bg_worker.unsubscribe_background_symbol(
+                            replaced)
+                    self._price_cache.pop(replaced.upper(), None)
+                    log.info("OrderEntry: STK chip group full — %s "
+                             "replaces %s", sym, replaced)
             self._symbols.append(sym)
             config_manager.save_order_entry_symbols(self._symbols)
             # Subscribe new symbol to background stream
@@ -4155,9 +3972,12 @@ class OrderEntryPanel(QWidget):
 
     _CHIP_COLS = 5        # max buttons per row
     _CHIP_HEIGHT = 28
+    _MAX_STK_ROWS = 3     # STK rows (stocks accumulate faster)
+    _MAX_FUT_ROWS = 2
 
     def _rebuild_symbol_buttons(self) -> None:
-        """Recreate symbol chip grid: STK rows first, then FUT rows (max 2 each)."""
+        """Recreate symbol chip grid: STK rows first (max 3), then FUT
+        rows (max 2)."""
         # Clear grid
         while self._sym_grid.count():
             item = self._sym_grid.takeAt(0)
@@ -4175,10 +3995,9 @@ class OrderEntryPanel(QWidget):
             else:
                 stk_syms.append(sym)  # STK, OPT, unknown all go here
 
-        # Cap at 2 rows each (12 symbols)
-        max_per_group = self._CHIP_COLS * 2
-        stk_syms = stk_syms[:max_per_group]
-        fut_syms = fut_syms[:max_per_group]
+        # Cap: STK at 3 rows (15 symbols), FUT at 2 rows (10)
+        stk_syms = stk_syms[:self._CHIP_COLS * self._MAX_STK_ROWS]
+        fut_syms = fut_syms[:self._CHIP_COLS * self._MAX_FUT_ROWS]
 
         row = 0
         # ── STK rows ──

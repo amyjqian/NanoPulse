@@ -248,6 +248,10 @@ class TradesControlBar(QWidget):
     def filterKey(self) -> str:
         return str(self._date_combo.currentData() or "today")
 
+    def filterLabel(self) -> str:
+        """Display text of the active date filter ("Today", "Noon", …)."""
+        return self._date_combo.currentText()
+
     def setFilterKey(self, key: str) -> None:
         idx = self._date_combo.findData(key)
         if idx >= 0:

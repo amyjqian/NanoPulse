@@ -1450,6 +1450,17 @@ class AccountListPanel(QWidget):
         """Return the set of currently checked account IDs."""
         return {a for a, r in self._account_rows.items() if r.is_checked}
 
+    def get_all_accounts(self) -> set[str]:
+        """Every account known to the accounts model — regardless of the
+        active group, the hidden list, or check state.  The status bar
+        compares the checked set against THIS to decide whether the
+        selection is a real subset: while a group is active the visible
+        rows are only that group's members, so comparing against
+        ``_account_rows`` would make any fully-checked group look like
+        "everything selected"."""
+        return {row[COL_ACCOUNT] for row in self._model._table_data
+                if row[COL_ACCOUNT]}
+
     def _emit_selection_changed(self) -> None:
         """Broadcast the current selected-account set."""
         self.selection_changed.emit(self.get_selected_accounts())

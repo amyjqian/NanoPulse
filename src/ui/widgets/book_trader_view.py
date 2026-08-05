@@ -51,6 +51,7 @@ from PySide6.QtWidgets import (
 
 from src.core import config_manager
 from src.ui.theme import Theme
+from src.utils.helpers import format_option_symbol
 from src.ui.widgets.dom_ladder import DOMLadderModel, DOMLadderView
 from src.ui.widgets.order_entry_panel import (
     _make_btn,
@@ -128,6 +129,72 @@ def _chip_key_for_position(pos: dict) -> tuple[str, str]:
     return key, sec
 
 
+def _position_like_from_order(order: dict) -> dict | None:
+    """Translate an order-blotter dict into a ``focus_position`` payload.
+
+    The blotter's ``symbol`` is a display symbol — a bare root ("AAPL"),
+    a futures localSymbol ("MNQU6"), or a raw OCC option symbol — so it
+    is first matched against the saved-contracts cache (localSymbol
+    match wins over root match, mirroring ``pick_active_contract``).
+    Unsaved symbols fall back to the order dict itself: OCC-shaped ones
+    become OPT payloads (``con_id``/``sec_type`` travel on the order
+    dict, so ``_ensure_position_contract_saved`` can still register
+    them), anything else is treated as a bare root symbol.  Returns
+    ``None`` when the order carries no symbol.
+    """
+    raw = (order.get("symbol") or "").strip().upper()
+    if not raw:
+        return None
+    try:
+        qty = abs(int(float(order.get("quantity") or 0)))
+    except (TypeError, ValueError):
+        qty = 0
+
+    from src.core.reference_data import get_instance as _rd
+    root_match: dict | None = None
+    local_match: dict | None = None
+    for rows in _rd().contracts_by_symbol.values():
+        for c in rows:
+            if (c.get("local_symbol") or "").strip().upper() == raw:
+                local_match = c
+                break
+            if root_match is None and (
+                    (c.get("symbol") or "").strip().upper() == raw):
+                root_match = c
+        if local_match:
+            break
+    row = local_match or root_match
+    if row:
+        return {
+            "symbol":       row.get("symbol") or raw,
+            "local_symbol": row.get("local_symbol") or "",
+            "sec_type":     (row.get("sec_type") or "").upper(),
+            # The order's own con_id backfills a saved row missing its
+            # conid (older builds saved OPT rows without one) so
+            # _ensure_position_contract_saved can heal it.
+            "con_id":       row.get("conid") or order.get("con_id") or "",
+            "exchange":     row.get("exchange") or "",
+            "currency":     row.get("currency") or "USD",
+            "multiplier":   row.get("multiplier") or "",
+            "position":     qty,
+        }
+
+    # Not in the contracts universe.  OCC-shaped symbols are options
+    # (format_option_symbol only rewrites OCC strings); anything else is
+    # treated as a bare root symbol and resolved best-effort at chip time.
+    is_opt = format_option_symbol(raw) != raw
+    return {
+        "symbol":       raw,
+        "local_symbol": raw if is_opt else "",
+        "sec_type":     "OPT" if is_opt else (order.get("sec_type") or "").upper(),
+        "con_id":       order.get("con_id") or "",
+        "exchange":     order.get("exchange") or "",
+        "currency":     order.get("currency") or "USD",
+        "multiplier":   order.get("multiplier") or "",
+        "position":     qty,
+    }
+
+
 def _ensure_position_contract_saved(pos: dict) -> None:
     """Save an OPT position's contract into the contracts universe.
 
@@ -144,26 +211,41 @@ def _ensure_position_contract_saved(pos: dict) -> None:
     key, sec = _chip_key_for_position(pos)
     if sec != "OPT" or not key:
         return
-    if _sec_type_for(key) != "?":
-        return  # already resolvable — a saved row exists for this key
     con_id = str(pos.get("con_id") or "")
     existing = config_manager.load_contracts()
-    if con_id and any(str(c.get("conid", "")) == con_id for c in existing):
+    row = next((c for c in existing
+                if (c.get("symbol") or "").strip().upper() == key), None)
+    if row is not None and str(row.get("conid") or ""):
+        return  # saved with a real conid — market data can resolve
+    if not con_id:
+        # Without a conid the row could never subscribe market data —
+        # and saving it would make the key "resolvable", permanently
+        # blocking a later save that DOES have the conid.  Skip; the
+        # chip still selects, and the next click that carries a conid
+        # completes the save.
+        log.warning("BookTrader: no conid for OPT %s — contract not "
+                    "saved, ladder will not stream", key)
         return
-    existing.append({
-        "conid": con_id,
-        "symbol": key,                     # raw OCC upper — the chip key
-        "sec_type": "OPT",
-        "exchange": pos.get("exchange") or "SMART",
-        "currency": pos.get("currency") or "USD",
-        "expiry": "",
-        "strike": "",
-        "right": "",
-        "local_symbol": pos.get("local_symbol") or "",
-        "multiplier": str(pos.get("multiplier") or "100"),
-        "primary_exchange": "",
-        "name": "",
-    })
+    if row is not None:
+        # Heal a row saved by an older build with an empty conid.
+        row["conid"] = con_id
+    elif any(str(c.get("conid", "")) == con_id for c in existing):
+        return
+    else:
+        existing.append({
+            "conid": con_id,
+            "symbol": key,                 # raw OCC upper — the chip key
+            "sec_type": "OPT",
+            "exchange": pos.get("exchange") or "SMART",
+            "currency": pos.get("currency") or "USD",
+            "expiry": "",
+            "strike": "",
+            "right": "",
+            "local_symbol": pos.get("local_symbol") or "",
+            "multiplier": str(pos.get("multiplier") or "100"),
+            "primary_exchange": "",
+            "name": "",
+        })
     config_manager.save_contracts(existing)
     from src.core.reference_data import get_instance as _rd
     _rd().reload_contracts()
@@ -1520,6 +1602,21 @@ class BookTraderView(QWidget):
             self._qty_row.set_qty(qty)   # visual only — emits no signal
             self._on_qty_changed(qty)    # sync _active_qty + tier sections
 
+    def focus_order(self, order: dict) -> None:
+        """Jump the ladder to an order-blotter row's instrument.
+
+        Called by FlashTradeView when the user clicks the Symbol cell in
+        the Orders view.  Translates the blotter dict (display symbol +
+        order qty) into a position-shaped payload and reuses the
+        ``focus_position`` flow: chip select/add, qty prefill (preset
+        chip lights when the qty matches, custom field otherwise), and
+        the price subscription that starts the ladder streaming.
+        """
+        pos = _position_like_from_order(order)
+        if pos is None:
+            return
+        self.focus_position(pos)
+
     # ── Add-symbol popup (searchable) ────────────────────────────────────────
 
     def open_symbol_search(self) -> None:
@@ -1565,19 +1662,47 @@ class BookTraderView(QWidget):
         sym = (sym or "").strip().upper()
         if not sym or sym in {s.upper() for s in self._symbols}:
             return
-        self._symbols.append(sym)
+        new_sec = _sec_type_for(sym)
+        if new_sec != "FUT":
+            # The STK group renders at most 5 × 3 chips.  When it's
+            # full, the new symbol replaces the LAST chip (row 3,
+            # column 5) instead of becoming an invisible overflow
+            # entry.  Mirrors _on_symbol_remove's contract cleanup.
+            stk_group = [s for s in self._symbols
+                         if _sec_type_for(s) != "FUT"]
+            if len(stk_group) >= 15:
+                replaced = stk_group[-1]
+                self._symbols.remove(replaced)
+                config_manager.remove_stock_contract_if_unused(replaced)
+                log.info("BookTrader: STK chip group full — %s replaces "
+                         "%s", sym, replaced)
+        # Option chips always occupy the LAST position of the chip bar:
+        # an option appends to the tail, and a new stock slots in BEFORE
+        # the first option chip so options stay pinned at the end as the
+        # list grows.  The OCC-shape check covers options whose contract
+        # couldn't be saved (no conid → _sec_type_for is "?").
+        def _is_opt(s: str) -> bool:
+            return _sec_type_for(s) == "OPT" or format_option_symbol(s) != s
+        if new_sec == "FUT" or _is_opt(sym):
+            self._symbols.append(sym)
+        else:
+            opt_idx = next(
+                (i for i, s in enumerate(self._symbols) if _is_opt(s)), None)
+            if opt_idx is None:
+                self._symbols.append(sym)
+            else:
+                self._symbols.insert(opt_idx, sym)
         config_manager.save_book_trader_symbols(self._symbols)
         entries = [(s, _sec_type_for(s)) for s in self._symbols]
         self._chip_bar.set_symbols(entries)
-        # SymbolChipBar renders at most columns × max_rows chips per group
-        # (FUT vs everything-else); an overflowing symbol is persisted and
-        # activated but its chip is not visible.
-        new_sec = _sec_type_for(sym)
-        group = [s for s, sec in entries
-                 if (sec == "FUT") == (new_sec == "FUT")]
-        if len(group) > 10:
-            log.warning("BookTrader: chip group full — %s added and "
-                        "activated but its chip is not rendered", sym)
+        # The FUT group still renders at most 5 × 2 chips; an
+        # overflowing future is persisted and activated but its chip is
+        # not visible.
+        if new_sec == "FUT":
+            group = [s for s, sec in entries if sec == "FUT"]
+            if len(group) > 10:
+                log.warning("BookTrader: chip group full — %s added and "
+                            "activated but its chip is not rendered", sym)
         # Auto-activate the newly added symbol.
         self._on_symbol_selected(sym, _sec_type_for(sym))
 
