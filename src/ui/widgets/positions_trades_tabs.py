@@ -15,17 +15,15 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QStackedWidget, QTabWidget, QWidget
 
 # ── Theme tokens ──────────────────────────────────────────────────────────────
-ACCENT    = "#E08A3C"
 BG_PANEL  = "#151922"
-# Matches BG_HEADER used by the Positions and Trades column-header rows
-# so the tab strip and the header row directly below it read as one band.
-BG_HEADER = "#151922"
+# Raised chip behind the selected tab label
+BG_CHIP   = "#2A3242"
 TEXT      = "#E6EBF2"
 TEXT_DIM  = "#A3AFC2"
 
 _TAB_QSS = f"""
     QTabWidget {{
-        background: {BG_HEADER};
+        background: transparent;
     }}
     QTabWidget::pane {{
         border: none;
@@ -38,26 +36,26 @@ _TAB_QSS = f"""
     }}
     QTabBar {{
         qproperty-drawBase: 0;
-        background: {BG_HEADER};
+        background: transparent;
     }}
     QTabBar::tab {{
         background: transparent;
         color: {TEXT_DIM};
-        padding: 7px 18px;
-        margin: 0;
+        padding: 4px 12px;
+        margin: 4px 3px;
         border: none;
-        border-bottom: 2px solid transparent;
+        border-radius: 8px;
         font-family: Inter, "Helvetica Neue", Arial, sans-serif;
         font-size: 11px;
         font-weight: 700;
-        letter-spacing: 0.10em;
+        letter-spacing: 0.02em;
     }}
     QTabBar::tab:hover {{
         color: {TEXT};
     }}
     QTabBar::tab:selected {{
-        color: {ACCENT};
-        border-bottom: 2px solid {ACCENT};
+        background: {BG_CHIP};
+        color: #FFFFFF;
     }}
 """
 
@@ -86,8 +84,8 @@ class PositionsTradesTabs(QTabWidget):
         # scroll buttons (which themselves also eat horizontal space).
         self.tabBar().setUsesScrollButtons(False)
         self.setElideMode(Qt.TextElideMode.ElideRight)
-        self.addTab(positions_widget, "Pos")
-        self.addTab(trades_widget, "Trds")
+        self.addTab(positions_widget, "Positions")
+        self.addTab(trades_widget, "Trades")
 
         self._corner_stack = QStackedWidget(self)
         # Index 0 → Positions bar; Index 1 → Trades bar.  An empty widget

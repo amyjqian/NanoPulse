@@ -326,3 +326,58 @@ def test_symbol_switch_keeps_percent_mode(qtbot):
     # Toggle survives the rebuilds (it must not be deleteLater'd).
     row._btn_unit.click()
     assert row.current_unit() == UNIT_PCT
+
+
+# ── Spin field: no arrows, no dropdown, wheel steps (both units) ──────────────
+
+class _FakeWheel:
+    """Minimal stand-in for QWheelEvent (only what wheelEvent reads)."""
+
+    def __init__(self, dy: int) -> None:
+        self._dy = dy
+
+    def angleDelta(self):
+        from PySide6.QtCore import QPoint
+        return QPoint(0, self._dy)
+
+    def accept(self) -> None:
+        pass
+
+
+def test_spin_field_has_no_arrows_or_dropdown(qtbot):
+    # The arrow column and preset popup were removed outright — the
+    # wheel and ↑/↓ keys are the only steppers, in BOTH units.
+    row = _make(qtbot)
+    box = row._custom
+    for gone in ("_arrow_w", "_btn_up", "_btn_dn", "_popup", "_show_popup"):
+        assert not hasattr(box, gone)
+    row._btn_unit.click()                         # % mode: same
+    for gone in ("_arrow_w", "_popup", "_show_popup"):
+        assert not hasattr(box, gone)
+
+
+def test_wheel_steps_ladder_both_units(qtbot):
+    row = _make(qtbot)
+    box = row._custom
+    box.wheelEvent(_FakeWheel(120))               # empty → first rung
+    assert box.text() == "1"
+    box.wheelEvent(_FakeWheel(120))
+    assert box.text() == "2"
+    box.wheelEvent(_FakeWheel(-120))
+    assert box.text() == "1"
+    box.wheelEvent(_FakeWheel(-120))              # floor at first rung
+    assert box.text() == "1"
+    # Trackpad-style small deltas accumulate into a single step.
+    box.wheelEvent(_FakeWheel(60))
+    assert box.text() == "1"
+    box.wheelEvent(_FakeWheel(60))
+    assert box.text() == "2"
+    # Percent mode: ladder is 1–100, so stepping is ±1, clamped at 100.
+    row._btn_unit.click()
+    box.setText("99")
+    box.wheelEvent(_FakeWheel(120))
+    assert box.text() == "100"
+    box.wheelEvent(_FakeWheel(120))               # ceiling at 100
+    assert box.text() == "100"
+    box.wheelEvent(_FakeWheel(-120))
+    assert box.text() == "99"

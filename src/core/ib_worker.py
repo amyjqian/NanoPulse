@@ -412,6 +412,13 @@ class IBWorkerThread(QThread):
         # NOT cleared on reconnect.
         self._order_times: dict[str, str] = {}
 
+        # Display symbol per orderRef (nano_...).  Option orders are placed
+        # on a lean conId-only contract (TWS error 478 workaround), so the
+        # Trade kept by ib_async carries no symbol/localSymbol —
+        # _build_trade_dict (reject / snapshot / global-status paths) would
+        # otherwise emit an empty symbol and blank out the blotter row.
+        self._order_symbols: dict[str, str] = {}
+
         # Fills cache: execId → flattened fill dict.
         # Populated by _on_exec_details and _snapshot_fills.  Lets the UI
         # replay today's fills when the Trades view wires its signals
@@ -1741,6 +1748,11 @@ class IBWorkerThread(QThread):
             "order_ref": order_ref,
             "symbol": (params.get("local_symbol")
                        or params.get("symbol", "")),
+            # Contract identity — lets the UI jump the Book Trader ladder
+            # to this order's instrument even when it isn't in contracts.db
+            # (options are placed from live chains, never saved).
+            "con_id": int(params.get("conid", 0) or 0),
+            "sec_type": params.get("sec_type", "") or "",
             "account": params.get("account", ""),
             "action": params.get("action", ""),
             "order_type": params.get("order_type", "LMT"),
@@ -2395,6 +2407,8 @@ class IBWorkerThread(QThread):
                            self._label, order_id, trade.order.orderId,
                            getattr(trade.contract, "symbol", "?"),
                            getattr(trade.order, "orderRef", ""))
+            asyncio.create_task(
+                self._force_cancel_if_stuck(order_id, trade, _status))
         except Exception as exc:
             log.exception("Worker %s: cancel_order failed: %s",
                           self._label, exc)
@@ -2402,6 +2416,68 @@ class IBWorkerThread(QThread):
                           self._label, order_id, exc)
             order_log.error("[%s] ORDER-CANCEL  ERROR for %s: %s",
                             self._label, order_id, exc)
+
+    # Order statuses meaning "held at IB, not working at an exchange".
+    # Outside RTH a new order sits PreSubmitted at IB (TWS warning 399:
+    # "will not be placed at the exchange until <open>").
+    _HELD_STATUSES = ("PreSubmitted", "PendingSubmit")
+
+    async def _force_cancel_if_stuck(self, order_id: str, trade,
+                                     pre_status: str,
+                                     delay: float = 3.0) -> None:
+        """Re-issue cancelOrder when a held order's cancel stalls.
+
+        For an order held at IB (outside RTH), TWS answers the first
+        cancelOrder with PendingCancel only and defers the actual
+        cancellation to the exchange open; a SECOND cancelOrder while
+        PendingCancel makes TWS cancel the order locally right away —
+        the API equivalent of the user clicking Cancel twice.  Only
+        orders that were held (no exchange exposure) are retried:
+        force-cancelling an exchange-working order locally could mask a
+        late fill, which is exactly why TWS prompts for confirmation in
+        that case.
+        """
+        if pre_status not in self._HELD_STATUSES:
+            return
+        await asyncio.sleep(delay)
+        if self._ib is None or not self._ib.isConnected():
+            return
+        status = (getattr(trade.orderStatus, "status", "")
+                  if getattr(trade, "orderStatus", None) else "")
+        if status != "PendingCancel":
+            return  # cancel completed (or order filled) — nothing to do
+        open_ids = {getattr(t.order, "orderId", None)
+                    for t in self._ib.openTrades()}
+        if getattr(trade.order, "orderId", None) not in open_ids:
+            return
+        try:
+            self._ib.cancelOrder(trade.order)
+            log.info("Worker %s: forcing local cancel for held order %s "
+                     "(stuck PendingCancel)", self._label, order_id)
+            order_log.info("[%s] ORDER-CANCEL  re-issued for %s — held "
+                           "order stuck PendingCancel (local cancel)",
+                           self._label, order_id)
+        except Exception as exc:
+            log.warning("Worker %s: forced cancel failed for %s: %s",
+                        self._label, order_id, exc)
+
+    def _trade_matches_symbol(self, trade, symbol_upper: str) -> bool:
+        """True when *trade* is for *symbol_upper* (root or localSymbol).
+
+        Option orders are placed on a lean conId-only contract (TWS
+        error 478 workaround), so the ib_async Trade carries no
+        symbol/localSymbol and ``_symbol_matches`` can never hit — fall
+        back to the display symbol cached at placement time, keyed by
+        orderRef (same cache the blotter uses).
+        """
+        contract = getattr(trade, "contract", None)
+        if contract is None:
+            return False
+        if _symbol_matches(contract, symbol_upper):
+            return True
+        ref = getattr(trade.order, "orderRef", "") or ""
+        cached = (self._order_symbols.get(ref, "") or "").upper()
+        return bool(cached) and cached == symbol_upper
 
     async def _do_cancel_all_for_symbol(self, symbol: str,
                                         accounts: set[str]) -> None:
@@ -2419,10 +2495,7 @@ class IBWorkerThread(QThread):
                          for t in self._ib.openTrades()}
 
         for oid, trade in list(self._trades.items()):
-            contract = getattr(trade, "contract", None)
-            if contract is None:
-                continue
-            if not _symbol_matches(contract, symbol_upper):
+            if not self._trade_matches_symbol(trade, symbol_upper):
                 continue
             # ── Account filter ────────────────────────────────────────────
             trade_acct = getattr(trade.order, "account", "") or ""
@@ -2445,6 +2518,8 @@ class IBWorkerThread(QThread):
                              self._label, trade.order.orderId, symbol)
                 order_log.info("[%s] ORDER-CANCEL  %s (cancel-all for %s) | orderId=%s",
                                self._label, oid, symbol, trade.order.orderId)
+                asyncio.create_task(
+                    self._force_cancel_if_stuck(oid, trade, status))
             except Exception as exc:
                 log.warning("Worker %s: cancel_all_for_symbol failed for %s: %s",
                             self._label, oid, exc)
@@ -2971,6 +3046,9 @@ class IBWorkerThread(QThread):
         order_ref = getattr(trade.order, "orderRef", "") or ""
         if order_ref and order_ref.startswith("nano_"):
             self._order_times.setdefault(order_ref, et_dt.isoformat())
+            sym = params.get("local_symbol") or params.get("symbol", "")
+            if sym:
+                self._order_symbols.setdefault(order_ref, sym)
 
         d = {
             "order_id": order_id,
@@ -2981,6 +3059,10 @@ class IBWorkerThread(QThread):
             # Falls back to bare symbol for instruments that have no localSymbol
             # (most stocks), then to "" if params are empty.
             "symbol": (params.get("local_symbol") or params.get("symbol", "")),
+            # Contract identity for jump-to-Book-Trader (see
+            # _emit_opt_precheck_status).
+            "con_id": int(params.get("conid", 0) or 0),
+            "sec_type": params.get("sec_type", "") or "",
             "account": params.get("account", ""),
             "action": params.get("action", ""),
             "order_type": params.get("order_type", "MKT"),
@@ -3531,7 +3613,8 @@ class IBWorkerThread(QThread):
 
         Called by the throttler loop every ~75 s.  Removes:
         * Order-ref caches (_order_times, _order_error_messages,
-          _rejected_order_cache) for orders placed on a previous calendar day.
+          _order_symbols, _rejected_order_cache) for orders placed on a
+          previous calendar day.
         * Terminal-status _trades entries that are NOT from today.
         * _portfolio_cache entries for zero-position instruments whose
           reqPnLSingle subscription has already been cancelled (they will
@@ -3546,6 +3629,7 @@ class IBWorkerThread(QThread):
         for r in stale_refs:
             self._order_times.pop(r, None)
             self._order_error_messages.pop(r, None)
+            self._order_symbols.pop(r, None)
 
         stale_rejected = [oid for oid in list(self._rejected_order_cache)
                           if today_prefix not in oid]
@@ -4011,7 +4095,13 @@ class IBWorkerThread(QThread):
             symbol = (getattr(contract, "localSymbol", "")
                       or getattr(contract, "symbol", ""))
 
-            # Fallback: if symbol is still empty (contract built with conId
+            # Fallback 1: symbol cached at placement time.  Option orders
+            # are placed on a conId-only contract, so this is the only
+            # source for their display symbol on reject/snapshot emits.
+            if not symbol:
+                symbol = self._order_symbols.get(order_ref, "")
+
+            # Fallback 2: if symbol is still empty (contract built with conId
             # only and ib_async didn't update it), resolve from saved config.
             if not symbol:
                 con_id = getattr(contract, "conId", 0)
@@ -4097,6 +4187,11 @@ class IBWorkerThread(QThread):
                 "order_id": order_id,
                 "order_ref": getattr(order, "orderRef", "") or "",
                 "symbol": symbol,
+                # Contract identity for jump-to-Book-Trader (see the
+                # pre-check emit).  secType may be "" for orders placed
+                # on a lean conId-only contract.
+                "con_id": getattr(contract, "conId", 0) or 0,
+                "sec_type": getattr(contract, "secType", "") or "",
                 "account": getattr(order, "account", ""),
                 "action": getattr(order, "action", ""),
                 "order_type": getattr(order, "orderType", "MKT"),

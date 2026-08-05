@@ -277,10 +277,14 @@ class OrderStatusPanel(QWidget):
     -------
     cancel_requested(str)        – emitted with the *order_id*
     refresh_requested()          – user clicked Refresh
+    symbol_clicked(dict)         – user clicked a row's Symbol cell
     """
 
     cancel_requested = Signal(str)   # order_id
     refresh_requested = Signal()     # user clicked Refresh
+    # Symbol-cell click — full order dict.  FlashTradeView routes this
+    # to BookTraderView.focus_order (jump the ladder to the instrument).
+    symbol_clicked = Signal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -382,6 +386,9 @@ class OrderStatusPanel(QWidget):
         self._cancel_delegate = CancelButtonDelegate(self._table)
         self._cancel_delegate.cancel_clicked.connect(self._on_cancel_clicked)
         self._table.setItemDelegateForColumn(COL_CANCEL, self._cancel_delegate)
+
+        # Symbol-cell click → jump Book Trader to the order's instrument
+        self._table.clicked.connect(self._on_cell_clicked)
 
         # Header setup
         hdr = self._table.horizontalHeader()
@@ -500,4 +507,16 @@ class OrderStatusPanel(QWidget):
         log.info("OrderStatus: refresh requested by user")
         self.clear_orders()
         self.refresh_requested.emit()
+
+    def _on_cell_clicked(self, idx: QModelIndex) -> None:
+        """Symbol-column click → ``symbol_clicked`` with the order dict.
+        Restricted to the Symbol cell so row selection elsewhere (and the
+        Cancel button column) never retargets the Book Trader ladder."""
+        if not idx.isValid() or idx.column() != COL_SYMBOL:
+            return
+        src = self._proxy.mapToSource(idx)
+        order = self._model.order_at(src.row())
+        if not order or not (order.get("symbol") or "").strip():
+            return
+        self.symbol_clicked.emit(dict(order))
 

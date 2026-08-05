@@ -14,6 +14,8 @@ from typing import Any
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
 from PySide6.QtGui import QColor, QFont
 
+from src.utils.helpers import format_option_symbol
+
 log = logging.getLogger(__name__)
 
 # ── Column indices ────────────────────────────────────────────────────────────
@@ -152,7 +154,8 @@ class TradesModel(QAbstractTableModel):
         if col == COL_SYMBOL:
             # Prefer localSymbol ("NQM6") over root symbol ("NQ") so the
             # trades blotter matches the orders blotter and positions view.
-            return row.get("local_symbol", "") or row.get("symbol", "") or ""
+            return format_option_symbol(
+                row.get("local_symbol", "") or row.get("symbol", "") or "")
         if col == COL_SECTYPE:
             return row.get("sec_type", "") or ""
         if col == COL_SIDE:

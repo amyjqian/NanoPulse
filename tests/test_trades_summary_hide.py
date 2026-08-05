@@ -8,6 +8,9 @@ counter in lock-step with the totals footer.
 """
 from __future__ import annotations
 
+import pytest
+from datetime import date
+
 from src.ui.widgets.trades_summary_model import (
     TradesSummaryModel,
     S_COL_NET_TOTAL,
@@ -19,6 +22,21 @@ from src.ui.widgets.trades_panel import TradesPanel
 # (days_back=1, anchor falls back to the newest fill date) keeps them
 # regardless of when the suite runs.
 _DAY = "2026-05-29T10:00:00"
+
+@pytest.fixture(autouse=True)
+def _pin_today(monkeypatch):
+    """The date filter is strict-today (trading-day lookback), so pin
+    "today" to the fixture fills' date — otherwise every fill would fall
+    outside the default 1-day window whenever the suite runs later."""
+    from datetime import date
+
+    import src.ui.widgets.trades_filter_proxy as tfp
+    import src.ui.widgets.trades_summary_model as tsm
+    pinned = date(2026, 5, 29)          # the Friday the fills are dated
+    monkeypatch.setattr(tfp, "today_et", lambda: pinned)
+    monkeypatch.setattr(tsm, "today_et", lambda: pinned)
+
+
 
 
 def _fill(exec_id, symbol, side, shares, price, *, con_id):

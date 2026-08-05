@@ -235,6 +235,9 @@ class FlashTradeView(QWidget):
 
         # ── Wire order status cancel button → cancel logic ───────────────────
         self._order_status.cancel_requested.connect(self._on_cancel_requested)
+        # Symbol-cell click in the Orders view → jump the Book Trader
+        # ladder to that instrument (same flow as a position-row click).
+        self._order_status.symbol_clicked.connect(self._on_order_symbol_clicked)
         self._order_status.refresh_requested.connect(
             self._on_refresh_requested)
 
@@ -267,6 +270,9 @@ class FlashTradeView(QWidget):
             self._on_account_action_requested)
         self._account_position.position_action_requested.connect(
             self._on_position_action_requested)
+        # Row click → jump the Book Trader ladder to that instrument
+        self._account_position.position_row_clicked.connect(
+            self._on_position_row_clicked)
 
         # ── Wire account-list action buttons ─────────────────────────────────
         # 25% · 50% · 75% · Flatten · Reverse · Cancel
@@ -717,6 +723,14 @@ class FlashTradeView(QWidget):
             self._open_options_ticket(account,
                                       symbol=data.get("symbol") or None)
 
+    def _on_position_row_clicked(self, pos: dict) -> None:
+        """Position row click → jump Book Trader to that instrument."""
+        self._book_trading.focus_position(pos)
+
+    def _on_order_symbol_clicked(self, order: dict) -> None:
+        """Order-blotter Symbol click → jump Book Trader to that instrument."""
+        self._book_trading.focus_order(order)
+
     def _open_options_ticket(self, account: str,
                              symbol: str | None = None) -> None:
         """Open the Options Income ticket pre-filled with *account* (and
@@ -917,6 +931,11 @@ class FlashTradeView(QWidget):
         self._order_status.update_order(order_id, {
             "order_ref": data.get("order_ref", ""),
             "symbol": data.get("symbol", "–"),
+            # Contract identity — carried on the row so a Symbol-cell
+            # click can jump the Book Trader ladder to an option that
+            # isn't in contracts.db (options are placed from live chains).
+            "con_id": data.get("con_id", 0),
+            "sec_type": data.get("sec_type", ""),
             "account": display_account,
             "action": data.get("action", "–"),
             "order_type": data.get("order_type", "–"),
@@ -936,6 +955,20 @@ class FlashTradeView(QWidget):
         """Receive portfolio position batch from worker thread → update panel."""
         log.debug("FlashTrade: portfolio batch received (%d positions)", len(batch))
         self._account_position.update_positions(batch)
+
+        # Feed each position's IB market price into the trades-summary
+        # price cache.  Portfolio updates cover every HELD symbol without
+        # a market-data subscription, so summary rows for symbols outside
+        # the active/background feeds (e.g. SGOV) still mark to a real
+        # price instead of falling back to their last fill.  Keyed by
+        # local symbol so option rows match exactly (their market_price
+        # is the option's own premium, not the underlying).
+        for pos in batch:
+            mkt = float(pos.get("market_price", 0.0) or 0.0)
+            if mkt > 0:
+                sym = pos.get("local_symbol", "") or pos.get("symbol", "")
+                if sym:
+                    self._trades_panel.update_last_price(sym, mkt)
 
         # Feed account balance info from accounts_model if available.
         # RC #2: use O(1) reverse-index lookup (_acct_to_label + _row_map)
@@ -977,6 +1010,9 @@ class FlashTradeView(QWidget):
         balances for the selected accounts so a flat account's Net/Excess/BP
         show right away (rather than only after the next pnlEvent)."""
         self._account_position.set_selected_accounts(accounts)
+        # Trades view follows the same checked-accounts selection
+        # (empty set = show all, matching the positions view).
+        self._trades_panel.set_selected_accounts(accounts)
         for account in (accounts or []):
             self._push_account_balances(account)
 
@@ -1042,11 +1078,15 @@ class FlashTradeView(QWidget):
         """Execution arrived (startup snapshot or live execDetailsEvent) →
         insert/refresh a row in the Trades view.  Dedupe by execId is
         handled in the model."""
-        display_account = fill.get("account", "")
-        if self._accounts_model and display_account:
-            alias = self._accounts_model._aliases.get(display_account, "")
+        account_id = fill.get("account", "")
+        fill = dict(fill)
+        # Keep the raw IB account id on the row — ``account`` becomes the
+        # display alias, but the checked-accounts filter matches on id
+        # (aliases can be renamed mid-session).
+        fill["account_id"] = account_id
+        if self._accounts_model and account_id:
+            alias = self._accounts_model._aliases.get(account_id, "")
             if alias:
-                fill = dict(fill)
                 fill["account"] = alias
         self._trades_panel.add_fill(fill)
 

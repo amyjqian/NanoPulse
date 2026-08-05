@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.ui.theme import Theme
+from src.ui.theme import Theme, hover_shades
 from src.core.options_income import snap_to_tick, to_dec
 
 ACCENT_BLUE = "#539BF5"
@@ -194,14 +194,13 @@ class OrderRail(QWidget):
         self._cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         # Same look as the order-entry panel's Cancel action button
         # (order_entry_panel._make_btn with Theme.CLR_CANCEL).
+        _cancel_hover, _cancel_pressed = hover_shades(Theme.CLR_CANCEL)
         self._cancel_btn.setStyleSheet(
             f"QPushButton{{ background:{Theme.CLR_CANCEL}; color:#ffffff;"
             " border:none; border-radius:6px; padding:9px 16px;"
             " font-size:11px; font-weight:bold; }"
-            f"QPushButton:hover{{ background:{Theme.CLR_CANCEL};"
-            " border:1px solid #ffffff30; }"
-            f"QPushButton:pressed{{ background:{Theme.CLR_CANCEL};"
-            " border:1px solid #ffffff60; }")
+            f"QPushButton:hover{{ background:{_cancel_hover}; }}"
+            f"QPushButton:pressed{{ background:{_cancel_pressed}; }}")
         self._cancel_btn.clicked.connect(self.cancel_clicked.emit)
         self._sell_btn = QPushButton("Submit order", self)
         self._sell_btn.setCursor(Qt.CursorShape.PointingHandCursor)

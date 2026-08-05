@@ -30,6 +30,7 @@ from .accounts_model import (
     COL_TYPE,
 )
 from src.core import config_manager
+from src.ui.theme import hover_shades
 
 log = logging.getLogger(__name__)
 
@@ -120,6 +121,7 @@ _TITLE_FONT.setWeight(QFont.Weight.Bold)
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _btn_qss(colour: str, fg: str = "#ffffff") -> str:
+    hover, pressed = hover_shades(colour)
     return f"""
         QPushButton {{
             background: {colour};
@@ -130,8 +132,8 @@ def _btn_qss(colour: str, fg: str = "#ffffff") -> str:
             font-weight: bold;
             font-size: 11px;
         }}
-        QPushButton:hover {{ background: {colour}; border: 1px solid #ffffff30; }}
-        QPushButton:pressed {{ background: {colour}; border: 1px solid #ffffff60; }}
+        QPushButton:hover {{ background: {hover}; }}
+        QPushButton:pressed {{ background: {pressed}; }}
     """
 
 
@@ -1447,6 +1449,17 @@ class AccountListPanel(QWidget):
     def get_selected_accounts(self) -> set[str]:
         """Return the set of currently checked account IDs."""
         return {a for a, r in self._account_rows.items() if r.is_checked}
+
+    def get_all_accounts(self) -> set[str]:
+        """Every account known to the accounts model — regardless of the
+        active group, the hidden list, or check state.  The status bar
+        compares the checked set against THIS to decide whether the
+        selection is a real subset: while a group is active the visible
+        rows are only that group's members, so comparing against
+        ``_account_rows`` would make any fully-checked group look like
+        "everything selected"."""
+        return {row[COL_ACCOUNT] for row in self._model._table_data
+                if row[COL_ACCOUNT]}
 
     def _emit_selection_changed(self) -> None:
         """Broadcast the current selected-account set."""

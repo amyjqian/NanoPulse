@@ -29,6 +29,8 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import QColor, QFont
 
+from src.utils.helpers import format_option_symbol
+
 log = logging.getLogger(__name__)
 
 # ── Column indices ────────────────────────────────────────────────────────────
@@ -189,6 +191,8 @@ class OrderStatusModel(QAbstractTableModel):
                 return None  # delegate handles this column
             if col == COL_STATUS and error_msg:
                 return f"{status} ⚠"
+            if col == COL_SYMBOL:
+                return format_option_symbol(order.get("symbol", "–"))
             key = _KEY_FOR_COL.get(col)
             return order.get(key, "–") if key else None
 
@@ -336,10 +340,16 @@ class OrderStatusModel(QAbstractTableModel):
                 order[key] = new_val
                 changed_cols.append(col)
 
-        # Also update non-column meta fields
+        # Also update non-column meta fields.  con_id/sec_type may be
+        # absent or zero on the first (pre-check) emit and arrive with a
+        # later status — only overwrite with truthy values.
         for meta_key in ("order_ref", "error_message", "time_sort", "order_id"):
             new_val = data.get(meta_key)
             if new_val is not None:
+                order[meta_key] = new_val
+        for meta_key in ("con_id", "sec_type"):
+            new_val = data.get(meta_key)
+            if new_val:
                 order[meta_key] = new_val
 
         # Status change may affect the cancel column appearance

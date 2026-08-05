@@ -2,7 +2,7 @@
 TradesControlBar – toolbar that lives above the Trades table.
 
 Hosts:
-  * ``Summary`` toggle (pill-style checkbox) — flips QStackedWidget pages.
+  * ``Summary`` pill button (checkable) — flips QStackedWidget pages.
   * Date range combo (Today / Last N Days, up to 7).
   * Search line-edit — filters by symbol / side / account / sec-type.
   * Gear button — opens the columns preferences dialog.
@@ -12,8 +12,8 @@ Pure view layer: emits Qt signals; holds no state beyond widget values.
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QFont, QFontMetrics
 from PySide6.QtWidgets import (
-    QCheckBox,
     QComboBox,
     QHBoxLayout,
     QLabel,
@@ -38,13 +38,6 @@ _BAR_QSS = f"""
         background: transparent;
         border: none;
     }}
-    QLabel#tbSummaryLabel {{
-        color: {TEXT};
-        font-family: Inter, "Helvetica Neue", Arial, sans-serif;
-        font-size: 11px;
-        font-weight: 600;
-        letter-spacing: 0.04em;
-    }}
     QLabel#tbTradeCount {{
         color: {TEXT_DIM};
         font-family: Inter, "Helvetica Neue", Arial, sans-serif;
@@ -54,22 +47,26 @@ _BAR_QSS = f"""
     QLabel#tbTradeCount[hasTrades="true"] {{
         color: {TEXT};
     }}
-    QCheckBox#tbSummaryToggle {{
-        spacing: 0;
-    }}
-    QCheckBox#tbSummaryToggle::indicator {{
-        width: 34px;
-        height: 18px;
-        border-radius: 9px;
-        background: #262E3F;
+    QPushButton#tbSummaryPill {{
+        background: transparent;
+        color: {TEXT_DIM};
         border: 1px solid {BORDER};
+        border-radius: 8px;
+        padding: 0;
+        font-size: 11px;
+        font-weight: 600;
     }}
-    QCheckBox#tbSummaryToggle::indicator:hover {{
-        border-color: #334058;
+    QPushButton#tbSummaryPill:hover {{
+        color: #ffffff;
+        border-color: #5D8EF0;
     }}
-    QCheckBox#tbSummaryToggle::indicator:checked {{
-        background: {ACCENT};
-        border-color: {ACCENT};
+    QPushButton#tbSummaryPill:checked {{
+        background: #5D8EF0;
+        color: #ffffff;
+        border: none;
+    }}
+    QPushButton#tbSummaryPill:checked:hover {{
+        background: #6E9AF2;
     }}
     QComboBox#tbDateCombo {{
         background: {BG_INPUT};
@@ -165,21 +162,23 @@ class TradesControlBar(QWidget):
 
         lay.addSpacing(10)
 
-        # Summary toggle + label (pair, label after switch)
-        self._summary_toggle = QCheckBox(self)
-        self._summary_toggle.setObjectName("tbSummaryToggle")
+        # Summary pill button — same style/size as the Pos view's pills
+        # (width sized to the wider of that view's two labels so the
+        # Summary buttons line up when switching tabs).
+        self._summary_toggle = QPushButton("Summary", self)
+        self._summary_toggle.setObjectName("tbSummaryPill")
+        self._summary_toggle.setCheckable(True)
         self._summary_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._summary_toggle.setFixedHeight(24)
+        pill_font = QFont(self._summary_toggle.font())
+        pill_font.setPixelSize(11)
+        pill_font.setWeight(QFont.Weight.DemiBold)
+        fm = QFontMetrics(pill_font)
+        self._summary_toggle.setFixedWidth(
+            max(fm.horizontalAdvance(t)
+                for t in ("Summary", "Zero Pos")) + 22)
         self._summary_toggle.toggled.connect(self.summaryToggled.emit)
-
-        self._summary_label = QLabel("Summary", self)
-        self._summary_label.setObjectName("tbSummaryLabel")
-
-        # Clicking the label toggles the switch too
-        self._summary_label.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._summary_label.mousePressEvent = self._toggle_from_label  # type: ignore[assignment]
-
         lay.addWidget(self._summary_toggle)
-        lay.addWidget(self._summary_label)
 
         # Spacer
         lay.addSpacing(12)
@@ -249,6 +248,10 @@ class TradesControlBar(QWidget):
     def filterKey(self) -> str:
         return str(self._date_combo.currentData() or "today")
 
+    def filterLabel(self) -> str:
+        """Display text of the active date filter ("Today", "Noon", …)."""
+        return self._date_combo.currentText()
+
     def setFilterKey(self, key: str) -> None:
         idx = self._date_combo.findData(key)
         if idx >= 0:
@@ -261,6 +264,3 @@ class TradesControlBar(QWidget):
 
     def _on_date_changed(self, _idx: int) -> None:
         self.dateFilterChanged.emit(self.filterKey())
-
-    def _toggle_from_label(self, _event) -> None:
-        self._summary_toggle.toggle()
