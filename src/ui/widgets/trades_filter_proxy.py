@@ -138,9 +138,10 @@ class TradesFilterProxy(QSortFilterProxyModel):
         self._anchor_date: date = today_et()
         # Fills the user has temporarily hidden (flat view), keyed by
         # ``exec_id`` so the hide stays attached to the right fill as rows
-        # shift on new inserts.  Cleared whenever a filter changes — see
-        # the setters below — so a hide can't silently exclude rows from a
-        # different window the user may not realise are gone.
+        # shift on new inserts.  SESSION-LEVEL: hides survive filter /
+        # date-window changes and drop those fills from every calculation
+        # (view, summary aggregates, status-bar P&L) until the user
+        # explicitly restores them via ``restoreHidden``.
         self._hidden_keys: set[str] = set()
         # Checked accounts from the Account List panel, matched against
         # the row's raw ``account_id`` (the ``account`` column shows the
@@ -184,7 +185,6 @@ class TradesFilterProxy(QSortFilterProxyModel):
             return
         self._search = new_search
         self._time_threshold = new_threshold
-        self._clear_hidden_keys()
         self.invalidateFilter()
 
     def setDaysBack(self, days: int) -> None:
@@ -194,15 +194,11 @@ class TradesFilterProxy(QSortFilterProxyModel):
         if days == self._days_back:
             return
         self._days_back = days
-        self._clear_hidden_keys()
         self.invalidateFilter()
 
     def setSelectedAccounts(self, accounts) -> None:
         """Restrict rows to fills whose ``account_id`` is in *accounts*
-        (raw IB account ids).  Empty/None shows every account.  Unlike
-        the other setters this does NOT clear user-hidden fills — the
-        checkboxes toggle constantly during normal trading and a hide
-        should survive that."""
+        (raw IB account ids).  Empty/None shows every account."""
         new = {a for a in (accounts or ()) if a}
         if new == self._selected_accounts:
             return
@@ -215,7 +211,6 @@ class TradesFilterProxy(QSortFilterProxyModel):
         if dt == self._preset_threshold:
             return
         self._preset_threshold = dt
-        self._clear_hidden_keys()
         self.invalidateFilter()
 
     def daysBack(self) -> int:

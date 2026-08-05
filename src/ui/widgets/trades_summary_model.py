@@ -516,9 +516,12 @@ class TradesSummaryModel(QAbstractTableModel):
         today ET (1 = today, 2 = today + the previous trading day,
         0/negative = everything).
 
-        Deliberately independent of the view's search text, account
-        filter, and hidden rows/fills — this feeds the always-on
-        status-bar aggregate.  Same math as the summary rows: in-window
+        Deliberately independent of the view's search text and account
+        filter — this feeds the always-on status-bar aggregate.  Fills
+        the user has HIDDEN are excluded, though: a hide is session-level
+        ("stop counting this transaction") and drops the fill from every
+        calculation until Restore hidden.  Same math as the summary rows:
+        in-window
         FIFO pairs, plus IB realized on unpaired closing fills, plus the
         opening remainder marked to the last cached price (newest fill
         price when no quote is cached).  The commission element sums the
@@ -553,6 +556,9 @@ class TradesSummaryModel(QAbstractTableModel):
         groups: dict[tuple[str, str], list[dict]] = {}
         comm_total = 0.0
         for f in self._fills.values():
+            if self._hidden_fills and (
+                    f.get("exec_id", "") in self._hidden_fills):
+                continue
             if sel:
                 aid = f.get("account_id", "")
                 if aid and aid not in sel:
