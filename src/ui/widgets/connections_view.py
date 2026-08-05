@@ -3,7 +3,13 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from PySide6.QtCore import QModelIndex, QSortFilterProxyModel, Qt, Signal
+from PySide6.QtCore import (
+    QModelIndex,
+    QSortFilterProxyModel,
+    Qt,
+    QTimer,
+    Signal,
+)
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -115,6 +121,10 @@ _DELETE_SS = _ADD_SS
 _NEUTRAL_SS = _TOOLBAR_BTN
 
 # Connection config table columns
+# Layout-dict key for the Connect page's top/bottom splitter sizes
+# (config_manager.load_layout / save_layout).
+_K_CONNECT_SPLIT = "connect_v_splitter"
+
 _CFG_COLS = ["Label", "Host", "Port", "Client ID", "Type",
              "Priority", "Auto Start", "Auto Reconnect", "Status", "Action"]
 _COL_LABEL = 0
@@ -666,6 +676,22 @@ class ConnectionsView(QWidget):
         splitter.addWidget(bottom_pane)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 4)
+
+        # Restore the user's top/bottom split; the stretch factors above
+        # remain the first-run default.  Persisted (debounced) on every
+        # handle drag — same pattern as FlashTradeView's splitters.
+        self._splitter = splitter
+        saved = config_manager.load_layout().get(_K_CONNECT_SPLIT)
+        if (isinstance(saved, list) and len(saved) == 2
+                and all(isinstance(v, (int, float)) and v > 0
+                        for v in saved)):
+            splitter.setSizes([int(v) for v in saved])
+        self._split_save_timer = QTimer(self)
+        self._split_save_timer.setSingleShot(True)
+        self._split_save_timer.setInterval(300)     # debounce 300 ms
+        self._split_save_timer.timeout.connect(self._persist_splitter)
+        splitter.splitterMoved.connect(
+            lambda _pos, _idx: self._split_save_timer.start())
 
         layout.addWidget(splitter)
 
@@ -1257,6 +1283,14 @@ class ConnectionsView(QWidget):
             label = r.get("label")
             if label and label in self._active_threads:
                 self._active_threads[label].set_auto_reconnect(r.get("auto_reconnect", True))
+
+    def _persist_splitter(self) -> None:
+        """Save the top/bottom split so the Connect page reopens with the
+        same proportions next launch."""
+        layout = config_manager.load_layout()
+        layout[_K_CONNECT_SPLIT] = self._splitter.sizes()
+        config_manager.save_layout(layout)
+        log.debug("Connect splitter layout saved")
 
     def _load_config(self) -> None:
         rows = config_manager.load_connections()

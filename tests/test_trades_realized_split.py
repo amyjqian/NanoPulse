@@ -175,7 +175,15 @@ class TestPnlTotalsToday:
         m = self._model()
         m.set_selected_accounts({"U222"})   # view filtered to one account
         m.set_search_text("zzz-no-match")   # view shows nothing
-        m.set_hidden_fills({"e1"})          # e1 hidden in the view
+        assert m.pnl_totals_today() == (57.0, 30.0, 87.0, 0.0)
+
+    def test_hidden_fills_excluded_until_restored(self):
+        # A hide is session-level "stop counting this transaction" — it
+        # drops out of the status-bar totals too, until restored.
+        m = self._model()
+        m.set_hidden_fills({"e1"})          # hide the realized +57 fill
+        assert m.pnl_totals_today() == (0.0, 30.0, 30.0, 0.0)
+        m.set_hidden_fills(set())           # restore
         assert m.pnl_totals_today() == (57.0, 30.0, 87.0, 0.0)
 
     def test_empty_model(self):
@@ -222,17 +230,16 @@ def test_status_bar_pnl_display(qtbot):
     from src.ui.widgets.statusbar import StatusBar
     bar = StatusBar()
     qtbot.addWidget(bar)
-    # Default caption is SEL; zero renders as a green unsigned 0.
+    # No account-scope caption — the bar always reports every account,
+    # so a label would be noise.  Zero renders as a green unsigned 0.
     bar.set_pnl_summary((57.0, 0.0, 57.0))
     html = bar._pnl_lbl.text()
-    assert "SEL" in html and "+57" in html
+    assert "ALL" not in html and "SEL" not in html
+    assert "+57" in html
     assert ">0</span>" in html and "#3FB950" in html
-    # Active group name replaces the generic SEL caption (upper-cased,
-    # HTML-escaped); frame label from the trades date combo leads.
-    bar.set_pnl_summary((57.0, 30.0, 87.0), label="Gamma <1>",
-                        frame_label="Noon")
+    # Frame label from the trades date combo leads.
+    bar.set_pnl_summary((57.0, 30.0, 87.0), frame_label="Noon")
     html = bar._pnl_lbl.text()
-    assert "GAMMA &lt;1&gt;" in html and "SEL" not in html
     assert "NOON" in html
     # 3-tuples render no commission segments — gross P&L is the total.
     assert "NET" not in html

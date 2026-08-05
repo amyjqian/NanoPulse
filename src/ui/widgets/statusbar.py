@@ -164,11 +164,9 @@ class StatusBar(QWidget):
         return (f"<span style='color:{TEXT_SECONDARY};font-size:12px;"
                 f"font-weight:600'>{v:,.2f}</span>")
 
-    def _fmt_triple(self, label: str, triple) -> str:
-        from html import escape
+    def _fmt_triple(self, triple) -> str:
         r, u, total, *rest = triple
-        body = (f"{self._fmt_caption(escape(label))}&nbsp;"
-                f"{self._fmt_caption('R')}&nbsp;{self._fmt_pnl(r)}&nbsp; "
+        body = (f"{self._fmt_caption('R')}&nbsp;{self._fmt_pnl(r)}&nbsp; "
                 f"{self._fmt_caption('U')}&nbsp;{self._fmt_pnl(u)}")
         # 4th element = reported commissions over the same fill set.
         # NET (total − commissions) replaces the gross P&L segment —
@@ -185,26 +183,23 @@ class StatusBar(QWidget):
                      f"{self._fmt_pnl(total)}")
         return body
 
-    def set_pnl_summary(self, triple, label: str | None = None,
+    def set_pnl_summary(self, triple,
                         frame_label: str | None = None) -> None:
-        """Show transaction P&L for the checked accounts over the active
+        """Show transaction P&L across every account over the active
         time frame.  *triple* = (R, U, total) or (R, U, total,
         commission) — with the 4th element the bar shows "C" (reported
         commissions) and "NET" (total − commissions) instead of the
-        gross P&L segment; *label* names the
-        selection (the active account group, "ALL" when everything is
-        checked, "SEL" for a hand-picked subset).  *frame_label* names
-        the time frame ("Today", "Morning", "Last 3 Days" — mirrors the
-        Trades view's date combo) so the numbers are self-describing.
-        Pass ``triple=None`` to hide the section entirely (admin role,
-        no trades panel, or nothing checked)."""
+        gross P&L segment.  *frame_label* names the time frame ("Today",
+        "Morning", "Last 3 Days" — mirrors the Trades view's date combo)
+        so the numbers are self-describing.  Pass ``triple=None`` to
+        hide the section entirely (admin role / no trades panel)."""
         if triple is None:
             self._pnl_sep.setText("")
             self._pnl_lbl.setText("")
             return
         from html import escape
         self._pnl_sep.setText("|")
-        body = self._fmt_triple((label or "SEL").upper(), triple)
+        body = self._fmt_triple(triple)
         if frame_label:
             body = (self._fmt_caption(escape(frame_label.upper()))
                     + "&nbsp;&nbsp;" + body)

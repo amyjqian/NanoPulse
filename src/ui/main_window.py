@@ -107,30 +107,15 @@ class MainWindow(QWidget):
             label = None
         self._tab_bar.set_active_group(label, selected_count)
 
-        # Today's transaction P&L (all accounts + checked subset) on the
-        # status bar.  Computed from in-memory fills + cached prices —
-        # a few ms worst case, so the 1 s cadence is effectively free.
+        # Transaction P&L across ALL accounts on the status bar —
+        # deliberately independent of the checked-account selection so
+        # the bar always reports the whole book.  Computed from
+        # in-memory fills + cached prices — a few ms worst case, so the
+        # 1 s cadence is effectively free.
         try:
             panel = self._flash_trade._trades_panel
-            account_list = self._flash_trade._account_list
-            selected = account_list.get_selected_accounts()
-            if not selected:
-                # Nothing checked — no selection to report.  (An empty
-                # set means "all" to pnl_totals, so don't pass it.)
-                self._status_bar.set_pnl_summary(None)
-            else:
-                # Name the selection after the active group ("GAMMA …");
-                # "ALL" when everything is checked, generic "SEL" for a
-                # hand-picked subset.
-                if label and label not in ("All", "None"):
-                    sel_label = label
-                elif selected == account_list.get_all_accounts():
-                    sel_label = "ALL"
-                else:
-                    sel_label = "SEL"
-                self._status_bar.set_pnl_summary(
-                    panel.pnl_totals(selected), sel_label,
-                    panel.pnl_timeframe_label())
+            self._status_bar.set_pnl_summary(
+                panel.pnl_totals(None), panel.pnl_timeframe_label())
         except AttributeError:
             self._status_bar.set_pnl_summary(None)
 

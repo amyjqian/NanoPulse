@@ -226,7 +226,9 @@ def test_flat_hide_propagates_to_summary(qtbot):
     assert agg_for("AAA")["fill_count"] == 2
 
 
-def test_flat_hide_cleared_on_filter_change(qtbot):
+def test_flat_hide_is_session_level(qtbot):
+    """Hides survive every filter change — a hidden transaction stays out
+    of the view and the calculations until the user restores it."""
     panel = TradesPanel()
     qtbot.addWidget(panel)
     panel.add_fill(_fill("e1", "AAA", "BOT", 10, 100.0, con_id=1))
@@ -235,9 +237,17 @@ def test_flat_hide_cleared_on_filter_change(qtbot):
     panel._flat_proxy.hideKeys(["e1"])
     assert panel._flat_proxy.hiddenCount() == 1
 
-    # A date-window change rebuilds the visible set — the hide is cleared
-    # so it can't silently exclude rows from a different window.
-    panel._flat_proxy.setDaysBack(3)
+    panel._flat_proxy.setDaysBack(3)                 # date window
+    panel._flat_proxy.setSearchText("AAA")           # substring search
+    panel._flat_proxy.setSearchText("")
+    panel._flat_proxy.setSelectedAccounts({"U1"})    # account filter
+    panel._flat_proxy.setSelectedAccounts(set())
+    assert panel._flat_proxy.hiddenCount() == 1      # hide survived it all
+    # The summary mirror kept the fill excluded throughout.
+    assert panel._summary_model._hidden_fills == {"e1"}
+
+    # Only an explicit restore brings it back.
+    panel._flat_proxy.restoreHidden()
     assert panel._flat_proxy.hiddenCount() == 0
 
 
