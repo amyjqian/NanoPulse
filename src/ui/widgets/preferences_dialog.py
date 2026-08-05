@@ -1007,6 +1007,19 @@ class PreferencesDialog(QDialog):
         chip.addStretch()
         fl.addLayout(chip)
 
+        # "Lock" sits with the other session actions.  Only offered when
+        # the host provided an on_lock callback (MainWindow's session
+        # lock) — the dialog itself can't lock anything.
+        if callable(self._auth_context.get("on_lock")):
+            lock_btn = QPushButton("Lock  (⌘L)")
+            lock_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            lock_btn.setStyleSheet(
+                f"QPushButton {{ background: transparent; border: 1px solid {_BORDER};"
+                f" border-radius: 6px; color: {_TEXT_DIM}; font-size: 12px; padding: 6px; }}"
+                f"QPushButton:hover {{ background: {_BG_SIDEBAR_HOVER}; color: {_TEXT}; }}")
+            lock_btn.clicked.connect(self._on_lock)
+            fl.addWidget(lock_btn)
+
         pw_btn = QPushButton("Change password")
         pw_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         pw_btn.setStyleSheet(
@@ -1030,6 +1043,12 @@ class PreferencesDialog(QDialog):
         from src.ui.auth.change_pw_dialog import ChangePasswordDialog
         ChangePasswordDialog(
             self._auth_service, self._auth_user.username, self).exec()
+
+    def _on_lock(self) -> None:
+        cb = self._auth_context.get("on_lock")
+        self.close()
+        if callable(cb):
+            cb()
 
     def _on_sign_out(self) -> None:
         cb = self._auth_context.get("on_sign_out")

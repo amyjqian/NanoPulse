@@ -127,6 +127,8 @@ class TopTabBar(QWidget):
     # Account Management panel (and switch to the Nano tab when the
     # current tab is something else).
     accountsToggleRequested = Signal()
+    # User clicked the padlock — host should lock the session.
+    lockRequested = Signal()
 
     _TABS = ["Connect", "Contracts", "Nano", "StrategyEditor", "Settings"]
 
@@ -200,6 +202,28 @@ class TopTabBar(QWidget):
             self.accountsToggleRequested.emit)
         layout.addWidget(self._accounts_pill)
 
+        # Padlock — locks the session (opaque overlay, password to
+        # resume; ⌘L does the same).  Neutral chip styling so it reads
+        # as chrome, not a trading action.  Hidden until the host
+        # confirms an authenticated session (set_lock_visible).
+        self._lock_btn = QPushButton("🔒", self)
+        self._lock_btn.setFont(_FONT_NORMAL)
+        self._lock_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._lock_btn.setFixedHeight(_CHIP_HEIGHT)
+        self._lock_btn.setToolTip("Lock session (⌘L)")
+        self._lock_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._lock_btn.setStyleSheet(
+            "QPushButton {"
+            " background: #232A3B; color: #A3AFC2;"
+            " border: none; border-radius: 6px;"
+            " padding: 4px 10px; margin-right: 12px;"
+            " font-size: 12px;"
+            "}"
+            "QPushButton:hover { background: #334058; color: white; }")
+        self._lock_btn.clicked.connect(self.lockRequested.emit)
+        self._lock_btn.hide()
+        layout.addWidget(self._lock_btn)
+
         # Activate first tab
         first = next(iter(self._buttons.values()))
         first.set_active(True)
@@ -228,6 +252,11 @@ class TopTabBar(QWidget):
 
     def set_accounts_pill_visible(self, visible: bool) -> None:
         self._accounts_pill.setVisible(visible)
+
+    def set_lock_visible(self, visible: bool) -> None:
+        """Show the padlock only for authenticated sessions — legacy /
+        test construction has no user to re-authenticate."""
+        self._lock_btn.setVisible(visible)
 
     def _on_tab_click(self, name: str) -> None:
         for label, btn in self._buttons.items():
