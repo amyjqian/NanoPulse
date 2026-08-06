@@ -277,7 +277,13 @@ class TestBracketChildren:
             _parent(outside_rth=False, allow_pre_open=False),
             params, ref_price=17500.0, tick=0.25)
         for ch in out:
-            assert ch.outsideRth is True
+            if ch.orderType == "LMT":
+                # Plain LMT children are exempt: CME ignores the flag
+                # for them and emits Warning 2109, which the blotter
+                # renders as a scary ValidationError.
+                assert not getattr(ch, "outsideRth", False)
+            else:
+                assert ch.outsideRth is True
             # allowPreOpen is STK-only; FUT path shouldn't touch it.
             assert not getattr(ch, "allowPreOpen", False)
 
@@ -680,3 +686,75 @@ class TestChildPriceParams:
         assert self._f("LMT", big, None) == {}
         assert self._f("TRAIL", None, big) == {}
         assert self._f("STP", None, 0.0) == {}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  _convert_mkt_parent_for_trail — IB error 328 guard
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _mkt_parent(action="BUY"):
+    return SimpleNamespace(
+        action=action,
+        orderType="MKT",
+        orderRef="nano_0419_120000_abcd",
+    )
+
+
+class TestConvertMktParentForTrail:
+    def test_buy_mkt_becomes_lmt_capped_above_ref(self):
+        wt = _make_worker()
+        params = {"tick_size": 0.25}
+        order = _mkt_parent("BUY")
+        assert wt._convert_mkt_parent_for_trail(order, params, 17500.0)
+        # No cap preference → 10 ticks through the market.
+        assert order.orderType == "LMT"
+        assert order.lmtPrice == 17502.50
+        # Blotter params reflect the converted parent.
+        assert params["order_type"] == "LMT"
+        assert params["limit_price"] == 17502.50
+
+    def test_sell_mkt_caps_below_ref(self):
+        wt = _make_worker()
+        order = _mkt_parent("SELL")
+        assert wt._convert_mkt_parent_for_trail(order, {"tick_size": 0.25},
+                                                17500.0)
+        assert order.lmtPrice == 17497.50
+
+    def test_limit_cap_offset_preference_wins(self):
+        wt = _make_worker()
+        params = {"tick_size": 0.25, "limit_cap_offset": 1.0}
+        order = _mkt_parent("BUY")
+        assert wt._convert_mkt_parent_for_trail(order, params, 17500.0)
+        assert order.lmtPrice == 17501.00
+
+    def test_cap_snaps_to_tick_grid(self):
+        wt = _make_worker()
+        params = {"tick_size": 0.25, "limit_cap_offset": 0.30}
+        order = _mkt_parent("BUY")
+        assert wt._convert_mkt_parent_for_trail(order, params, 17500.0)
+        assert order.lmtPrice == 17500.25  # 17500.30 snapped to 0.25 grid
+
+    def test_non_mkt_parent_untouched(self):
+        wt = _make_worker()
+        params = {"tick_size": 0.25}
+        order = SimpleNamespace(action="BUY", orderType="LMT",
+                                lmtPrice=17499.0,
+                                orderRef="nano_0419_120000_abcd")
+        assert not wt._convert_mkt_parent_for_trail(order, params, 17500.0)
+        assert order.orderType == "LMT"
+        assert order.lmtPrice == 17499.0
+        assert "order_type" not in params
+
+    def test_zero_ref_price_leaves_mkt(self):
+        """A SELL against a tiny ref can only produce lmt<=0 — no convert."""
+        wt = _make_worker()
+        order = _mkt_parent("SELL")
+        assert not wt._convert_mkt_parent_for_trail(
+            order, {"tick_size": 0.25}, 1.0)
+        assert order.orderType == "MKT"
+
+    def test_default_penny_tick_for_stocks(self):
+        wt = _make_worker()
+        order = _mkt_parent("BUY")
+        assert wt._convert_mkt_parent_for_trail(order, {}, 150.00)
+        assert order.lmtPrice == 150.10  # 10 * 0.01 default tick

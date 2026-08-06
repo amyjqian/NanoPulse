@@ -1936,6 +1936,9 @@ class IBWorkerThread(QThread):
                             "for %s (last_price was 0)",
                             self._label, ref_price, sym)
                 if ref_price > 0:
+                    if tr_tier and self._convert_mkt_parent_for_trail(
+                            order, params, ref_price):
+                        order_type = "LMT"
                     order.orderId = self._ib.client.getReqId()
                     order.transmit = False
                     bracket_children = self._build_bracket_children(
@@ -2191,6 +2194,44 @@ class IBWorkerThread(QThread):
             out["stop_price"] = aux_val
         return out
 
+    def _convert_mkt_parent_for_trail(self, order, params: dict,
+                                      ref_price: float) -> bool:
+        """Convert a MKT bracket parent to a marketable capped LMT.
+
+        IB error 328: a TRAIL child can only attach to a LMT / STP LMT
+        parent — on a MKT parent the trailing leg is auto-cancelled and,
+        worse, the rejected (transmitting) child can strand the whole
+        bracket.  The cap is the limit-cap preference when set, else 10
+        ticks through the market — fills like a market order but
+        bounded, and IB accepts the TRAIL.
+
+        Mutates *order* (orderType/lmtPrice) and *params*
+        (order_type/limit_price — blotter rows freeze `params`, so the
+        converted parent must be reflected there too).  Returns True if
+        the order was converted; False leaves both untouched (non-MKT
+        parent, or no valid limit price could be built).
+        """
+        if getattr(order, "orderType", "") != "MKT":
+            return False
+        tick_sz = float(params.get("tick_size") or 0.01)
+        cap = float(params.get("limit_cap_offset") or 0.0)
+        if cap <= 0:
+            cap = 10 * tick_sz
+        sign = 1 if order.action == "BUY" else -1
+        lmt_px = _round_to_tick(ref_price + sign * cap, tick_sz)
+        if lmt_px <= 0:
+            return False
+        order.orderType = "LMT"
+        order.lmtPrice = lmt_px
+        params["order_type"] = "LMT"
+        params["limit_price"] = lmt_px
+        order_log.info(
+            "[%s] BRACKET-TRAIL  MKT parent converted to marketable "
+            "LMT @ %.4f (cap %.4f) — TRAIL children need a LMT/STP LMT "
+            "parent (IB error 328), orderRef=%s",
+            self._label, lmt_px, cap, getattr(order, "orderRef", ""))
+        return True
+
     def _build_bracket_children(self, parent, params: dict,
                                 ref_price: float, tick: float) -> list:
         """Construct attached TP / SL / Trail-stop children for *parent*.
@@ -2300,15 +2341,18 @@ class IBWorkerThread(QThread):
             if is_stk:
                 ch.outsideRth = parent_outside_rth
                 ch.allowPreOpen = parent_allow_pre
-            else:
+            elif ch.orderType in ("STP", "STP LMT", "TRAIL"):
                 # Futures: STP / STP LMT / TRAIL orders are held by TWS
                 # until the next RTH open by default (Warning 399 /
                 # "placed at the exchange until 08:30 US/Central").  For
                 # CME products that trade ~23 hours this leaves a stop
                 # dormant overnight — long enough for the market to blow
                 # past it before the flag un-holds.  outsideRth=True keeps
-                # the child armed during extended hours.  Stocks keep
-                # their existing RTH semantics (see parent_outside_rth).
+                # the child armed during extended hours.  Plain LMT
+                # children are exempt: CME ignores the attribute for
+                # them and emits Warning 2109, which ib_async surfaces
+                # as a scary "ValidationError" status in the blotter.
+                # Stocks keep their RTH semantics (parent_outside_rth).
                 ch.outsideRth = True
 
         # Last child flushes the bundle to TWS.
