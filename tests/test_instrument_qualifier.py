@@ -159,3 +159,17 @@ class TestQueue:
         assert sorted(p["symbol"] for p in worker.browsed) == \
             ["BARE2", "SPCX"]
         assert len(worker.browsed) == 2
+
+
+class TestPinnedChipsNeverRequalify:
+    def test_pinned_expired_fut_is_skipped(self):
+        # Re-qualifying a pinned chip would roll it to the front month
+        # and silently un-pin it — it must stay frozen even expired.
+        assert needs_qualification(
+            {"symbol": "NQZ6", "conid": "555", "sec_type": "FUT",
+             "expiry": "20200619", "local_symbol": "NQZ6"}) is False
+
+    def test_root_expired_fut_still_requalifies(self):
+        assert needs_qualification(
+            {"symbol": "NQ", "conid": "444", "sec_type": "FUT",
+             "expiry": "20200619", "local_symbol": "NQM0"}) is True

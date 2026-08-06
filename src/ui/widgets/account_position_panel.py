@@ -431,9 +431,7 @@ class FlattenButtonDelegate(QStyledItemDelegate):
             painter.setBrush(bg)
             painter.drawRoundedRect(btn_rect, self._HDR_RADIUS, self._HDR_RADIUS)
 
-            # Amber flatten carries dark text (restyle); the armed red
-            # confirm state keeps white for contrast.
-            painter.setPen(QColor("#ffffff" if armed else "#1c1206"))
+            painter.setPen(QColor("#ffffff"))
             painter.setFont(QFont("Inter, Helvetica Neue, Arial", 10, QFont.Weight.Bold))
             painter.drawText(btn_rect, Qt.AlignmentFlag.AlignCenter,
                              self._HDR_ARMED_TEXT if armed
@@ -465,9 +463,7 @@ class FlattenButtonDelegate(QStyledItemDelegate):
                 painter.setBrush(bg)
                 painter.drawRoundedRect(rect, _POS_BTN_RADIUS, _POS_BTN_RADIUS)
 
-                # Light-background buttons take dark text (restyle):
-                # amber Flatten #1c1206, grey 25/50/75% #0f1319.
-                painter.setPen(QColor("#1c1206" if i == 0 else "#0f1319"))
+                painter.setPen(QColor("#ffffff"))
                 painter.setFont(btn_font)
                 painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, lbl)
 

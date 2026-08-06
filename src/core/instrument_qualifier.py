@@ -61,6 +61,10 @@ def needs_qualification(entry: dict) -> bool:
     from src.utils.helpers import format_option_symbol
     if format_option_symbol(sym) != sym:
         return False
+    # Expiry-keyed (pinned) futures chips are frozen to their contract —
+    # "re-qualifying" one to the front month would silently un-pin it.
+    if instruments.is_pinned_fut(entry):
+        return False
     if not str(entry.get("conid", "") or ""):
         return True
     if sec == "FUT":

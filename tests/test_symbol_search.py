@@ -331,12 +331,12 @@ class TestApplyFuturePick:
         return state
 
     @staticmethod
-    def _answer(monkeypatch, button):
-        from PySide6.QtWidgets import QMessageBox
+    def _answer(monkeypatch, action):
+        """Patch the three-way dialog (replace / pin / cancel)."""
         calls = []
         monkeypatch.setattr(
-            QMessageBox, "question",
-            lambda *a, **k: calls.append(a) or button)
+            ssp, "_ask_future_action",
+            lambda *a, **k: calls.append(a) or action)
         return calls
 
     def _entry(self, conid=2, expiry="20261218"):
@@ -344,8 +344,7 @@ class TestApplyFuturePick:
                 "name": "E-mini Nasdaq 100"}
 
     def test_new_root_saves_without_prompt(self, store, monkeypatch):
-        from PySide6.QtWidgets import QMessageBox
-        calls = self._answer(monkeypatch, QMessageBox.StandardButton.No)
+        calls = self._answer(monkeypatch, "cancel")
         sym, replaced = ssp.apply_future_pick(None, self._entry())
         assert (sym, replaced) == ("NQ", False)
         assert calls == []  # no confirmation needed
@@ -363,10 +362,9 @@ class TestApplyFuturePick:
 
     def test_different_expiry_yes_replaces_everywhere(self, store,
                                                       monkeypatch):
-        from PySide6.QtWidgets import QMessageBox
         store["stored"] = {"symbol": "NQ", "conid": "1",
                            "sec_type": "FUT", "expiry": "20260918"}
-        calls = self._answer(monkeypatch, QMessageBox.StandardButton.Yes)
+        calls = self._answer(monkeypatch, "replace")
         sym, replaced = ssp.apply_future_pick(
             None, self._entry(conid=2, expiry="20261218"))
         assert (sym, replaced) == ("NQ", True)
@@ -375,14 +373,27 @@ class TestApplyFuturePick:
         assert store["upserts"][0][1]["expiry"] == "20261218"
 
     def test_different_expiry_no_cancels(self, store, monkeypatch):
-        from PySide6.QtWidgets import QMessageBox
         store["stored"] = {"symbol": "NQ", "conid": "1",
                            "sec_type": "FUT", "expiry": "20260918"}
-        self._answer(monkeypatch, QMessageBox.StandardButton.No)
+        self._answer(monkeypatch, "cancel")
         sym, replaced = ssp.apply_future_pick(
             None, self._entry(conid=2, expiry="20261218"))
         assert (sym, replaced) == ("", False)
         assert store["upserts"] == []
+
+    def test_different_expiry_pin_adds_local_symbol_chip(self, store,
+                                                         monkeypatch):
+        """Pin keeps the root untouched and returns the picked
+        contract's LOCAL symbol as the chip key — an expiry-keyed chip
+        frozen to that contract."""
+        store["stored"] = {"symbol": "NQ", "conid": "1",
+                           "sec_type": "FUT", "expiry": "20260918"}
+        self._answer(monkeypatch, "pin")
+        sym, replaced = ssp.apply_future_pick(
+            None, self._entry(conid=2, expiry="20261218"))
+        assert replaced is False
+        assert sym == "NQ20261218"        # _chain_row's local_symbol
+        assert store["upserts"] == []     # root references untouched
 
 
 class TestDisplayExchange:

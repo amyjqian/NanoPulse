@@ -465,7 +465,7 @@ class BookTraderView(QWidget):
             short_title="SL")
         self._tr_section = _TierSection(
             "Trailing", [], label_color=Theme.CLR_CLOSE,
-            short_title="TS", label_fg="#000000")
+            short_title="TS")
 
         root.addSpacing(8)
 
@@ -635,8 +635,7 @@ class BookTraderView(QWidget):
         pm_row.setContentsMargins(0, 0, 0, 0)
         pm_row.setSpacing(4)
         self._btn_reverse = _make_btn("Reverse", Theme.CLR_REVERSE, 30)
-        self._btn_flatten = _make_btn("Flatten", Theme.CLR_FLATTEN, 30,
-                                      fg="#1c1206")
+        self._btn_flatten = _make_btn("Flatten", Theme.CLR_FLATTEN, 30)
         self._btn_cancel = _make_btn("Cancel", Theme.CLR_CANCEL, 30)
         pm_row.addWidget(self._btn_reverse)
         pm_row.addWidget(self._btn_flatten)

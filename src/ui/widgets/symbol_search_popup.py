@@ -290,18 +290,54 @@ def merge_rows(local_entries: list[dict], remote: list[dict],
     return enriched, remote_shown, already_added
 
 
+def _ask_future_action(parent, sym: str, old_desc: str, new_desc: str,
+                       local: str) -> str:
+    """Modal choice when picking an expiry that differs from the stored
+    root contract.  Returns ``"replace"`` | ``"pin"`` | ``"cancel"``.
+    Module-level so tests can monkeypatch the answer."""
+    from PySide6.QtWidgets import QMessageBox
+    box = QMessageBox(parent)
+    box.setWindowTitle("Different expiration")
+    box.setText(
+        f"{sym} is currently {old_desc}.\n\n"
+        f"Replace: roll {sym} to {new_desc} everywhere it is used —\n"
+        f"the ladder, order entry and hot buttons.\n\n"
+        f"Pin: keep {sym} on {old_desc} and add a separate {local} chip\n"
+        f"frozen to {new_desc} (it never auto-rolls).")
+    replace_btn = box.addButton(f"Replace {sym}",
+                                QMessageBox.ButtonRole.YesRole)
+    pin_btn = box.addButton(f"Add pinned {local}",
+                            QMessageBox.ButtonRole.ActionRole)
+    box.addButton(QMessageBox.StandardButton.Cancel)
+    box.setDefaultButton(replace_btn)
+    box.exec()
+    clicked = box.clickedButton()
+    if clicked is replace_btn:
+        return "replace"
+    if clicked is pin_btn:
+        return "pin"
+    return "cancel"
+
+
 def apply_future_pick(parent, entry: dict) -> tuple[str, bool]:
     """Apply a futures-expiration pick from the search popup.
 
-    Returns ``(root_symbol, replaced)``:
+    Returns ``(symbol_to_add, replaced)``:
 
     * root not stored yet            → write the pick's metadata onto
       any existing references (the new chip gets it via ``_add_symbol``)
     * picked contract already stored → heal-only, no change
     * root stored with a *different*
       expiration                     → ask (modal, parented to the host
-      view) and re-point every chip / hot button on Yes; ``("", False)``
-      when the user declines.
+      view):
+
+      - **Replace** → re-point every root reference; returns
+        ``(root, True)`` so hosts resubscribe.
+      - **Pin** → nothing existing changes; returns the picked
+        contract's LOCAL symbol (e.g. ``"NQZ6"``) as the symbol to add
+        — an expiry-keyed chip frozen to that contract (same pattern as
+        OPT chips keyed by their OCC symbol; never auto-rolls).
+      - **Cancel** → ``("", False)``.
     """
     from src.core import instruments
     sym = (entry.get("symbol") or "").strip().upper()
@@ -316,21 +352,18 @@ def apply_future_pick(parent, entry: dict) -> tuple[str, bool]:
     old_desc = (format_expiry(stored.get("expiry", ""))
                 or "another expiration")
     new_desc = format_expiry(entry.get("expiry", ""))
-    from PySide6.QtWidgets import QMessageBox
-    resp = QMessageBox.question(
-        parent, "Replace future",
-        f"{sym} is already saved as {old_desc}.\n"
-        f"Replace it with {new_desc}?\n\n"
-        f"This updates {sym} everywhere it is used — the ladder, "
-        f"order entry and hot buttons.",
-        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        QMessageBox.StandardButton.No)
-    if resp != QMessageBox.StandardButton.Yes:
-        return "", False
-    _upsert_entry_meta(sym, entry)   # re-point existing chips/hot buttons
-    log.info("SymbolSearch: replaced %s futures contract with expiry %s",
-             sym, entry.get("expiry", "?"))
-    return sym, True
+    local = (entry.get("local_symbol") or "").strip().upper() or sym
+    action = _ask_future_action(parent, sym, old_desc, new_desc, local)
+    if action == "replace":
+        _upsert_entry_meta(sym, entry)   # re-point existing references
+        log.info("SymbolSearch: replaced %s futures contract with expiry "
+                 "%s", sym, entry.get("expiry", "?"))
+        return sym, True
+    if action == "pin":
+        log.info("SymbolSearch: pinning %s (%s) as its own chip",
+                 local, new_desc)
+        return local, False
+    return "", False
 
 
 def _upsert_entry_meta(sym: str, entry: dict) -> None:

@@ -225,3 +225,44 @@ class TestHotButtonTrailingLeg:
         assert _auto_hot_button_label(
             **base, tp=off, sl=off,
             tr={"on": True, "v": 25, "u": "abs"}).endswith("0 - 0 - 25")
+
+
+class TestPinnedFutures:
+    """Expiry-keyed futures chips (symbol == local_symbol, e.g. NQZ6)
+    are frozen to one contract: root fan-out misses them by key and
+    they resolve/subscribe through their own metadata."""
+
+    _PINNED = {"symbol": "NQZ6", "conid": "555", "sec_type": "FUT",
+               "exchange": "CME", "currency": "USD", "expiry": "20261218",
+               "local_symbol": "NQZ6", "multiplier": "20"}
+    _ROOT = {"symbol": "NQ", "conid": "444", "sec_type": "FUT",
+             "exchange": "CME", "currency": "USD", "expiry": "20260918",
+             "local_symbol": "NQU6", "multiplier": "20"}
+
+    def test_is_pinned_fut(self):
+        assert instruments.is_pinned_fut(self._PINNED) is True
+        assert instruments.is_pinned_fut(self._ROOT) is False
+        assert instruments.is_pinned_fut({"symbol": "AAPL",
+                                          "sec_type": "STK",
+                                          "local_symbol": "AAPL"}) is False
+
+    def test_pinned_chip_resolves_and_subscribes(self, cfg):
+        _write(cfg, {"book_trader_symbols": [self._ROOT, self._PINNED]})
+        assert instruments.get_contract("NQZ6")["conid"] == "555"
+        assert instruments.get_contract("NQ")["conid"] == "444"
+        assert instruments.build_md_params("NQZ6")["conid"] == 555
+
+    def test_root_upsert_does_not_touch_pinned(self, cfg):
+        _write(cfg, {"book_trader_symbols": [self._ROOT, self._PINNED]})
+        rolled = dict(self._ROOT, conid="999", expiry="20261218",
+                      local_symbol="NQZ6")
+        cm.upsert_instrument("NQ", rolled)
+        assert instruments.get_contract("NQZ6")["conid"] == "555"  # frozen
+        assert instruments.get_contract("NQ")["conid"] == "999"    # rolled
+
+    def test_is_expired_fut(self, cfg):
+        expired = dict(self._PINNED, expiry="20200619")
+        _write(cfg, {"book_trader_symbols": [expired, self._ROOT]})
+        assert instruments.is_expired_fut("NQZ6") is True
+        assert instruments.is_expired_fut("NQ") is False    # future expiry
+        assert instruments.is_expired_fut("ZZZ") is False   # unknown

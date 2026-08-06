@@ -103,9 +103,7 @@ _PRICE_FONT.setWeight(QFont.Weight.Bold)
 
 def _make_btn(text: str, colour: str, min_h: int = 32,
               fg: str = "#ffffff") -> QPushButton:
-    """Flat styled action button.  *fg* overrides the label colour —
-    the restyle gives light-background buttons (Flatten, 25/50/75%)
-    dark text."""
+    """Flat styled action button.  *fg* overrides the label colour."""
     btn = QPushButton(text)
     btn.setMinimumHeight(min_h)
     btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -237,6 +235,15 @@ def _sec_type_for(sym: str) -> str:
 
 def _apply_chip_style(btn: QPushButton, selected: bool) -> None:
     """Apply blue-selected or grey-unselected style to a symbol chip button."""
+    if bool(btn.property("chip_expired")):
+        # Dead pinned future — dimmed + dashed so the user removes it.
+        btn.setStyleSheet(
+            "QPushButton{background:#1B2130;color:#5A6478;"
+            "border:1px dashed #334058;"
+            "border-radius:6px;padding:4px 12px;font-weight:500;"
+            "font-size:12px}"
+            "QPushButton:hover{background:#232A3B}")
+        return
     if selected:
         btn.setStyleSheet(
             "QPushButton{background:#539BF5;color:white;border:none;"
@@ -1137,8 +1144,7 @@ class _TierSection(QWidget):
         # button doesn't blow out width when the dollar suffix lands.
         self._short_title  = short_title or title
         self._label_color  = label_color
-        # Label colour on the title button — light backgrounds
-        # (Trailing's grey) pass black for contrast.
+        # Label colour on the title button.
         self._label_fg     = label_fg
         self._tiers:             list[dict]  = tiers
         self._dollar_per_tier:   list[float] = []
@@ -3191,7 +3197,7 @@ class OrderEntryPanel(QWidget):
             lambda: self._on_tier_submit("sl"))
         self._tr_section = _TierSection(
             "Trailing", tr_tiers, label_color=Theme.CLR_CLOSE,
-            short_title="TS", label_fg="#000000")
+            short_title="TS")
         self._tr_section.submit_requested.connect(
             lambda: self._on_tier_submit("tr"))
 
@@ -3255,9 +3261,9 @@ class OrderEntryPanel(QWidget):
         pm_grid.setContentsMargins(0, 0, 0, 0)
 
 
-        self._btn_close25 = _make_btn("25%", Theme.CLR_CLOSE, 30, fg="#0f1319")
-        self._btn_close50 = _make_btn("50%", Theme.CLR_CLOSE, 30, fg="#0f1319")
-        self._btn_close75 = _make_btn("75%", Theme.CLR_CLOSE, 30, fg="#0f1319")
+        self._btn_close25 = _make_btn("25%", Theme.CLR_CLOSE, 30)
+        self._btn_close50 = _make_btn("50%", Theme.CLR_CLOSE, 30)
+        self._btn_close75 = _make_btn("75%", Theme.CLR_CLOSE, 30)
         pm_grid.addWidget(self._btn_close25, 1, 0)
         pm_grid.addWidget(self._btn_close50, 1, 1)
         pm_grid.addWidget(self._btn_close75, 2, 1)
@@ -3265,8 +3271,7 @@ class OrderEntryPanel(QWidget):
         self._btn_close50.clicked.connect(lambda: self._on_close_pct(50))
         self._btn_close75.clicked.connect(lambda: self._on_close_pct(75))
 
-        self._btn_flatten = _make_btn("Flatten", Theme.CLR_FLATTEN, 30,
-                                      fg="#1c1206")
+        self._btn_flatten = _make_btn("Flatten", Theme.CLR_FLATTEN, 30)
         pm_grid.addWidget(self._btn_flatten, 0, 0)
         self._btn_flatten.clicked.connect(self._on_flatten)
 
@@ -4098,6 +4103,13 @@ class OrderEntryPanel(QWidget):
         btn = DraggableChip(sym, sec_type, self._on_chip_drop)
         btn.setFixedHeight(self._CHIP_HEIGHT)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        try:
+            from src.core import instruments
+            if instruments.is_expired_fut(sym):
+                btn.setProperty("chip_expired", True)
+                btn.setToolTip("Expired contract — right-click to remove")
+        except Exception:
+            pass
         _apply_chip_style(btn, sym == self._active_symbol)
         attach_exchange_badge(btn, sym)
         btn.clicked.connect(lambda checked, s=sym: self._on_symbol_clicked(s))

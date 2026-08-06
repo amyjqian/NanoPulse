@@ -95,6 +95,29 @@ def entry_has_meta(e: dict[str, Any]) -> bool:
     return bool(str(e.get("conid", "") or ""))
 
 
+def is_pinned_fut(entry: dict[str, Any]) -> bool:
+    """True when *entry* is an expiry-keyed futures chip — its symbol IS
+    the contract's local symbol (e.g. ``"NQZ6"``), the same pattern OPT
+    chips use with their OCC key.  Pinned chips are frozen to one
+    contract: root replaces don't touch them (different key) and the
+    reconnect qualifier never rolls them."""
+    if str(entry.get("sec_type", "") or "").upper() != "FUT":
+        return False
+    sym = str(entry.get("symbol", "") or "").strip().upper()
+    local = str(entry.get("local_symbol", "") or "").strip().upper()
+    return bool(sym) and sym == local
+
+
+def is_expired_fut(symbol: str) -> bool:
+    """True when *symbol*'s stored FUT contract expired (ET) — used to
+    render dead pinned chips dimmed so the user removes them."""
+    e = get_contract(symbol)
+    if not e or str(e.get("sec_type", "") or "").upper() != "FUT":
+        return False
+    d = _parse_expiry_date(str(e.get("expiry", "") or ""))
+    return d is not None and d < datetime.now(_ET).date()
+
+
 def _parse_expiry_date(expiry: str) -> date | None:
     """Parse IB's ``YYYYMMDD`` / ``YYYYMM`` expiry into a date (monthly
     form → last day of the month).  ``None`` for empty/unparseable."""
@@ -206,18 +229,21 @@ def all_contracts() -> list[dict[str, Any]]:
 
 
 def get_contract(query: str) -> dict[str, Any] | None:
-    """Resolve *query* (root symbol, OCC key, or local symbol) to one
-    entry.  An exact ``local_symbol`` match wins (pin-to-expiry); then
-    symbol matches in order order-entry → book-trader → hot buttons,
-    preferring entries that carry a conid."""
+    """Resolve *query* (chip key — root symbol, pinned local symbol, or
+    OCC key — or a bare local symbol) to one entry.
+
+    The entry's SYMBOL key is the identity and wins first (in order
+    order-entry → book-trader → hot buttons, preferring entries that
+    carry a conid) — this keeps a pinned ``NQZ6`` chip resolvable even
+    when the root ``NQ`` entry rolls onto the same local symbol.  An
+    exact ``local_symbol`` match is the fallback so a root contract can
+    still be looked up by its local symbol (e.g. ``"NQU6"`` → the NQ
+    entry)."""
     if not query:
         return None
     q = query.upper().strip()
     oe, bt, hot = _load_state()
     ordered = [*oe, *bt, *hot]
-    for e in ordered:
-        if str(e.get("local_symbol", "") or "").upper().strip() == q:
-            return e
     fallback: dict | None = None
     for e in ordered:
         if e["symbol"].upper() != q:
@@ -226,7 +252,12 @@ def get_contract(query: str) -> dict[str, Any] | None:
             return e
         if fallback is None:
             fallback = e
-    return fallback
+    if fallback is not None:
+        return fallback
+    for e in ordered:
+        if str(e.get("local_symbol", "") or "").upper().strip() == q:
+            return e
+    return None
 
 
 def get_sec_type(symbol: str) -> str:
