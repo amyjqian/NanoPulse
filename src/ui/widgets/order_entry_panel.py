@@ -1943,6 +1943,10 @@ class _HotButtonModal(QDialog):
         # Connected IB workers for the live symbol search (may be empty —
         # the popup then shows known instruments only).
         self._workers = list(workers or [])
+        # Inline results dropdown under the SPECIFIC symbol field —
+        # created lazily, reused across shows.
+        self._symbol_dropdown = None
+        self._suppress_dropdown = False
         self._draft = dict(draft) if draft else _hot_button_default_draft()
         # Symbol the user last picked from the search popup — a manual
         # edit away from it invalidates the stored contract metadata.
@@ -2571,6 +2575,10 @@ class _HotButtonModal(QDialog):
         if (self._draft.get("contract")
                 and self._draft["symbol"].upper() != self._picked_symbol):
             self._draft.pop("contract", None)
+        # Typing in the focused field surfaces the live-search dropdown
+        # (programmatic setText — draft load, pick adoption — doesn't).
+        if self._inp_symbol.hasFocus() and not self._suppress_dropdown:
+            self._show_symbol_dropdown()
         if self._draft["symbol"]:
             self._seg_sym_mode.set_selected("specific")
         # Auto-fill QTY from trading prefs when the symbol resolves to
@@ -2633,35 +2641,46 @@ class _HotButtonModal(QDialog):
         self._inp_qty.setEnabled(True)
 
     def eventFilter(self, obj, event):  # noqa: N802 – Qt override
-        # The SPECIFIC symbol field opens the live search popup on a
-        # click (refine the current symbol) or on the first typed
-        # character (fresh search — the keystroke lands in the popup's
-        # search box and typing continues there).  Disabled fields
-        # never receive either event.
+        # The SPECIFIC symbol field drives an inline results dropdown:
+        # typing searches directly from the field (no separate search
+        # box), ↑/↓/Enter/Esc are forwarded to the dropdown while it's
+        # visible, and losing focus dismisses it.  Disabled fields never
+        # receive these events.
         if obj is getattr(self, "_inp_symbol", None):
-            if event.type() == QEvent.Type.MouseButtonPress:
-                self._open_symbol_search_popup()
-            elif event.type() == QEvent.Type.KeyPress:
-                text = event.text()
-                if text and text.isprintable():
-                    self._open_symbol_search_popup(seed=text)
-                    return True   # consumed — the popup owns typing now
+            t = event.type()
+            if t == QEvent.Type.KeyPress:
+                dd = self._symbol_dropdown
+                if (dd is not None and dd.isVisible()
+                        and dd.handle_key(event)):
+                    return True
+            elif t == QEvent.Type.MouseButtonPress:
+                self._show_symbol_dropdown()
+            elif t == QEvent.Type.FocusOut:
+                # Clicking the dropdown itself briefly activates its
+                # window (ActiveWindowFocusReason) — that must not
+                # dismiss it before the row click lands.
+                if (self._symbol_dropdown is not None
+                        and event.reason()
+                        != Qt.FocusReason.ActiveWindowFocusReason):
+                    self._symbol_dropdown.close()
         return super().eventFilter(obj, event)
 
-    def _open_symbol_search_popup(self, seed: str | None = None) -> None:
-        """Live IBKR symbol search anchored under the symbol field —
-        the same popup the chip bars use (known instruments instantly,
+    def _show_symbol_dropdown(self) -> None:
+        """Inline live search under the symbol field — the same engine
+        as the chip bars' popup (known instruments instantly,
         reqMatchingSymbols streaming as the user types, futures roots
-        expanding into pickable expirations).  *seed* pre-fills the
-        popup's search box (a typed character starts a fresh search;
-        a click refines the field's current text)."""
-        from src.ui.widgets.symbol_search_popup import SymbolSearchPopup
-        dlg = SymbolSearchPopup(self, workers=self._workers, exclude=set())
-        seed = seed if seed is not None else self._inp_symbol.text().strip()
-        if seed:
-            dlg._search.setText(seed)   # noqa: SLF001 — seeds the live search
-        dlg.symbol_selected.connect(self._on_symbol_picked)
-        dlg.open_below(self._inp_symbol)
+        expanding into pickable expirations), but querying THIS field
+        directly instead of its own search box."""
+        if self._suppress_dropdown:
+            return
+        if self._symbol_dropdown is None:
+            from src.ui.widgets.symbol_search_popup import SymbolSearchPopup
+            self._symbol_dropdown = SymbolSearchPopup(
+                self, workers=self._workers, exclude=set(),
+                external_input=self._inp_symbol)
+            self._symbol_dropdown.symbol_selected.connect(
+                self._on_symbol_picked)
+        self._symbol_dropdown.open_below(self._inp_symbol)
 
     def _on_symbol_picked(self, entry: dict) -> None:
         """A search-popup pick: resolve the row into contract metadata,
@@ -2689,7 +2708,13 @@ class _HotButtonModal(QDialog):
             # Without a conid the metadata could never subscribe or
             # order — leave the draft bare (resolves via chip entries).
             self._draft.pop("contract", None)
-        self._inp_symbol.setText(sym)   # fires _on_symbol_changed
+        self._suppress_dropdown = True
+        try:
+            self._inp_symbol.setText(sym)   # fires _on_symbol_changed
+        finally:
+            self._suppress_dropdown = False
+        if self._symbol_dropdown is not None:
+            self._symbol_dropdown.close()
 
     def _update_symbol_status(self) -> None:
         """Validate the SPECIFIC-mode symbol against the saved-contracts

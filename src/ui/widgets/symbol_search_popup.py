@@ -397,10 +397,18 @@ class SymbolSearchPopup(QDialog):
     symbol_selected = Signal(dict)  # row dict incl. "symbol" + "source"
 
     def __init__(self, parent: QWidget, workers: list,
-                 exclude: set[str] | None = None) -> None:
+                 exclude: set[str] | None = None,
+                 external_input=None) -> None:
+        """*external_input* (a QLineEdit) switches the popup into
+        dropdown mode: its own search box is hidden, the query is read
+        live from that field, and the window never steals focus — the
+        host keeps typing in its own field and forwards ↑/↓/Enter/Esc
+        via :meth:`handle_key`.  The instance is reusable (``close()``
+        hides instead of deleting)."""
         super().__init__(parent)
         self._workers = workers
         self._exclude = {s.upper() for s in (exclude or set())}
+        self._ext_input = external_input
         self._wired: list = []
 
         # Remote-search state
@@ -423,8 +431,17 @@ class SymbolSearchPopup(QDialog):
 
         self._local = self._collect_local()
 
-        self.setWindowFlags(Qt.WindowType.Popup)
-        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        if self._ext_input is None:
+            self.setWindowFlags(Qt.WindowType.Popup)
+            self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        else:
+            # Dropdown mode: a floating, non-activating tool window so
+            # focus (and typing) stays in the host's own field.
+            self.setWindowFlags(
+                Qt.WindowType.Tool
+                | Qt.WindowType.FramelessWindowHint
+                | Qt.WindowType.WindowStaysOnTopHint)
+            self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         # Truly rounded corners: the window is transparent and the card
         # is painted as a rounded rect in paintEvent — a stylesheet
         # radius alone leaves square window corners poking out.
@@ -476,6 +493,10 @@ class SymbolSearchPopup(QDialog):
 
         self._search.textChanged.connect(self._on_text_changed)
         self._search.returnPressed.connect(self._commit_current)
+        if self._ext_input is not None:
+            # Dropdown mode: the host's field IS the search box.
+            self._search.hide()
+            self._ext_input.textChanged.connect(self._on_text_changed)
         self._lst.itemClicked.connect(lambda _it: self._commit_current())
 
         def _key(event) -> None:
@@ -507,10 +528,32 @@ class SymbolSearchPopup(QDialog):
     # ── Public ────────────────────────────────────────────────────────────────
 
     def open_below(self, anchor: QWidget) -> None:
-        """Show the popup anchored under *anchor* and focus the search box."""
+        """Show the popup anchored under *anchor*; standalone mode also
+        focuses the internal search box (dropdown mode leaves focus in
+        the host's field)."""
         self.move(anchor.mapToGlobal(anchor.rect().bottomLeft()))
         self.show()
-        self._search.setFocus()
+        if self._ext_input is None:
+            self._search.setFocus()
+
+    def handle_key(self, event) -> bool:
+        """Dropdown mode: the host forwards key events from its own
+        field.  Returns True when the event was consumed (↑/↓ move the
+        selection, Enter commits, Esc dismisses)."""
+        key = event.key()
+        if key == Qt.Key.Key_Down:
+            self._step(+1)
+            return True
+        if key == Qt.Key.Key_Up:
+            self._step(-1)
+            return True
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._commit_current()
+            return True
+        if key == Qt.Key.Key_Escape:
+            self.close()
+            return True
+        return False
 
     # ── Local (saved-contract) entries ────────────────────────────────────────
 
@@ -557,7 +600,8 @@ class SymbolSearchPopup(QDialog):
         self._rebuild()
 
     def _query(self) -> str:
-        return self._search.text().strip()
+        src = self._ext_input if self._ext_input is not None else self._search
+        return src.text().strip()
 
     def _fire_search(self) -> None:
         pattern = self._query()

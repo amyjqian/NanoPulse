@@ -61,16 +61,36 @@ def test_conidless_pick_stores_no_contract(modal):
     assert "contract" not in modal._draft
 
 
-def test_typing_in_symbol_field_opens_live_search(modal, qtbot):
-    """The first typed character opens the search popup seeded with that
-    character — the user doesn't have to click first."""
-    from src.ui.widgets.symbol_search_popup import SymbolSearchPopup
+def test_typing_in_symbol_field_searches_inline(modal, qtbot):
+    """Typing stays in the modal's own field and drives an inline
+    results dropdown — no separate search box to click into."""
+    from PySide6.QtCore import Qt
+
     modal.show()
     qtbot.waitExposed(modal)
+    qtbot.mouseClick(modal._inp_symbol, Qt.MouseButton.LeftButton)
+    dd = modal._symbol_dropdown
+    assert dd is not None and dd.isVisible()
+
     qtbot.keyClick(modal._inp_symbol, "c")
-    popup = next((w for w in modal.findChildren(SymbolSearchPopup)), None)
-    assert popup is not None
-    assert popup._search.text() == "c"
-    # The keystroke was consumed — the modal's field is untouched.
-    assert modal._inp_symbol.text() == ""
-    popup.close()
+    assert modal._inp_symbol.text() == "c"     # typing stays in the field
+    assert dd._query() == "c"                  # dropdown reads it live
+
+    # Esc dismisses the dropdown only — the dialog stays open.
+    qtbot.keyClick(modal._inp_symbol, Qt.Key.Key_Escape)
+    assert not dd.isVisible()
+    assert modal.isVisible()
+
+
+def test_pick_closes_dropdown_and_keeps_field(modal, qtbot):
+    from PySide6.QtCore import Qt
+    modal.show()
+    qtbot.waitExposed(modal)
+    qtbot.mouseClick(modal._inp_symbol, Qt.MouseButton.LeftButton)
+    modal._on_symbol_picked({
+        "symbol": "NVDA", "sec_type": "STK", "conid": "4815747",
+        "currency": "USD", "source": "ibkr",
+    })
+    assert modal._inp_symbol.text() == "NVDA"
+    assert modal._symbol_dropdown is not None
+    assert not modal._symbol_dropdown.isVisible()   # closed after pick

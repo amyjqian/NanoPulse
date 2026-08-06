@@ -152,7 +152,9 @@ class InstrumentQualifier(QObject):
         try:
             from PySide6.QtWidgets import QApplication
             from src.ui.widgets.symbol_search_popup import SymbolSearchPopup
-            return any(isinstance(w, SymbolSearchPopup)
+            # Only a VISIBLE popup owns the browse signals — dropdown-
+            # mode instances persist hidden between shows.
+            return any(isinstance(w, SymbolSearchPopup) and w.isVisible()
                        for w in QApplication.topLevelWidgets())
         except Exception:
             return False
