@@ -29,7 +29,6 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
-    QCompleter,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -1932,9 +1931,17 @@ class _HotButtonModal(QDialog):
         groups: list[str] | None = None,
         edit_mode: bool = False,
         default_specific: bool = False,
+        workers: list | None = None,
     ) -> None:
         super().__init__(parent)
+        # Connected IB workers for the live symbol search (may be empty —
+        # the popup then shows known instruments only).
+        self._workers = list(workers or [])
         self._draft = dict(draft) if draft else _hot_button_default_draft()
+        # Symbol the user last picked from the search popup — a manual
+        # edit away from it invalidates the stored contract metadata.
+        self._picked_symbol = str(
+            self._draft.get("symbol", "") or "").strip().upper()
         # Bracket legs are nested dicts — copy them too so cancelling
         # the dialog doesn't mutate the caller's data.
         self._draft["tp"] = dict(self._draft.get(
@@ -2169,7 +2176,10 @@ class _HotButtonModal(QDialog):
         self._inp_symbol.setStyleSheet(self._INPUT_QSS)
         self._inp_symbol.setFixedHeight(30)
         self._inp_symbol.textChanged.connect(self._on_symbol_changed)
-        self._install_symbol_completer(self._inp_symbol)
+        # Clicking the field opens the live IBKR symbol search (same
+        # popup as the chip bars) — picks store qualified contract
+        # metadata on the hot button itself.
+        self._inp_symbol.installEventFilter(self)
         col.addWidget(self._inp_symbol)
         # Match-status hint — populated by _update_symbol_status() based
         # on a lookup against the saved-contracts cache.
@@ -2550,6 +2560,11 @@ class _HotButtonModal(QDialog):
 
     def _on_symbol_changed(self, text: str) -> None:
         self._draft["symbol"] = text.strip()
+        # A manual edit away from the last popup pick invalidates the
+        # stored contract metadata — it belongs to the picked symbol.
+        if (self._draft.get("contract")
+                and self._draft["symbol"].upper() != self._picked_symbol):
+            self._draft.pop("contract", None)
         if self._draft["symbol"]:
             self._seg_sym_mode.set_selected("specific")
         # Auto-fill QTY from trading prefs when the symbol resolves to
@@ -2611,53 +2626,54 @@ class _HotButtonModal(QDialog):
         self._seg_qty_mode.set_selected("specific")
         self._inp_qty.setEnabled(True)
 
-    def _install_symbol_completer(self, line: QLineEdit) -> None:
-        """Wire a case-insensitive ``contains``-match QCompleter against
-        the chip / hot-button instrument entries.  The completer's
-        popup picks up the modal's dark QSS so it doesn't render
-        light-on-light, and selecting a row fires
-        :meth:`_on_symbol_changed` via the line-edit's ``textChanged``.
-        """
-        try:
-            from src.core import instruments
-            cache: dict[str, list[dict]] = {}
-            for c in instruments.all_contracts():
-                cache.setdefault(c["symbol"].upper(), []).append(c)
-        except Exception:
-            log.exception(
-                "HotButtonModal: instrument entries unavailable for completer")
-            cache = {}
-        # Build an ordered, deduped list of symbols + local_symbols
-        # (e.g. ``"NQ"`` and ``"NQM6"`` both navigate to the same contract).
-        seen: set[str] = set()
-        items: list[str] = []
-        for sym, rows in sorted(cache.items()):
-            for label in (sym,) + tuple(
-                    str(r.get("local_symbol") or "") for r in rows):
-                if not label:
-                    continue
-                key = label.upper()
-                if key in seen:
-                    continue
-                seen.add(key)
-                items.append(label)
-        completer = QCompleter(items, line)
-        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-        completer.setFilterMode(Qt.MatchFlag.MatchContains)
-        completer.setCompletionMode(
-            QCompleter.CompletionMode.PopupCompletion)
-        # Style the completer popup to match the modal's dark theme.
-        popup = completer.popup()
-        popup.setStyleSheet(
-            "QListView{"
-            " background:#1B2130; color:#E6EBF2;"
-            " selection-background-color:#539BF5;"
-            " selection-color:#ffffff;"
-            " border:1px solid #232A3B; outline:none;"
-            "}"
-            "QListView::item{ padding:4px 10px; min-height:22px; }"
+    def eventFilter(self, obj, event):  # noqa: N802 – Qt override
+        # Clicking the SPECIFIC symbol field opens the live search
+        # popup (disabled fields never receive the press).
+        if (obj is getattr(self, "_inp_symbol", None)
+                and event.type() == QEvent.Type.MouseButtonPress):
+            self._open_symbol_search_popup()
+        return super().eventFilter(obj, event)
+
+    def _open_symbol_search_popup(self) -> None:
+        """Live IBKR symbol search anchored under the symbol field —
+        the same popup the chip bars use (known instruments instantly,
+        reqMatchingSymbols streaming as the user types, futures roots
+        expanding into pickable expirations)."""
+        from src.ui.widgets.symbol_search_popup import SymbolSearchPopup
+        dlg = SymbolSearchPopup(self, workers=self._workers, exclude=set())
+        seed = self._inp_symbol.text().strip()
+        if seed:
+            dlg._search.setText(seed)   # noqa: SLF001 — seeds the live search
+        dlg.symbol_selected.connect(self._on_symbol_picked)
+        dlg.open_below(self._inp_symbol)
+
+    def _on_symbol_picked(self, entry: dict) -> None:
+        """A search-popup pick: resolve the row into contract metadata,
+        store it on the draft (the hot button owns its contract), and
+        adopt the symbol."""
+        from src.core import instruments
+        from src.ui.widgets.symbol_search_popup import (
+            apply_future_pick,
+            ensure_contract_saved,
         )
-        line.setCompleter(completer)
+        if (entry.get("source") == "ibkr"
+                and entry.get("sec_type") == "FUT"):
+            sym, _replaced = apply_future_pick(self, entry)
+            if not sym:
+                return  # user declined the expiry replacement
+            meta = instruments.contract_meta_from_result(entry)
+        else:
+            sym, meta = ensure_contract_saved(entry)
+            if not sym:
+                return
+        self._picked_symbol = sym.upper()
+        if meta and meta.get("conid"):
+            self._draft["contract"] = meta
+        else:
+            # Without a conid the metadata could never subscribe or
+            # order — leave the draft bare (resolves via chip entries).
+            self._draft.pop("contract", None)
+        self._inp_symbol.setText(sym)   # fires _on_symbol_changed
 
     def _update_symbol_status(self) -> None:
         """Validate the SPECIFIC-mode symbol against the saved-contracts
@@ -2671,8 +2687,14 @@ class _HotButtonModal(QDialog):
             return
         try:
             from src.core import instruments
-            c0 = instruments.get_contract(sym)
-            contracts = [c0] if c0 else []
+            # The draft's own metadata (fresh popup pick) wins — it may
+            # not be resolvable through the chip entries yet.
+            meta = self._draft.get("contract")
+            if meta and meta.get("conid"):
+                contracts = [{"symbol": sym, **meta}]
+            else:
+                c0 = instruments.get_contract(sym)
+                contracts = [c0] if c0 else []
         except Exception:
             log.exception("HotButtonModal: contract lookup failed")
             contracts = []
@@ -3463,7 +3485,12 @@ class OrderEntryPanel(QWidget):
         """
         draft = _hot_button_default_draft()
         draft["ord_type"] = "MKT"
-        dlg = _HotButtonModal(self, draft=draft, default_specific=True)
+        from src.ui.widgets.symbol_search_popup import (
+            connected_workers_by_priority,
+        )
+        dlg = _HotButtonModal(
+            self, draft=draft, default_specific=True,
+            workers=connected_workers_by_priority(self._active_threads))
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         if dlg.delete_requested():
@@ -3482,8 +3509,12 @@ class OrderEntryPanel(QWidget):
         Delete (modal footer), drop the entry."""
         if not (0 <= index < len(self._hot_buttons)):
             return
+        from src.ui.widgets.symbol_search_popup import (
+            connected_workers_by_priority,
+        )
         dlg = _HotButtonModal(
-            self, draft=self._hot_buttons[index], edit_mode=True)
+            self, draft=self._hot_buttons[index], edit_mode=True,
+            workers=connected_workers_by_priority(self._active_threads))
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         if dlg.delete_requested():
