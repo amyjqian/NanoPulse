@@ -3,15 +3,13 @@
 Shared by Book Trader's ticker "+" button and OrderEntryPanel's chip-bar
 "+" button.  Two result sources merge into one list:
 
-  * **Saved contracts** (ReferenceData) — shown instantly, works with no
-    TWS connection.  This keeps futures/options chips addable exactly as
-    before.
+  * **Known instruments** (chip / hot-button entries) — shown instantly,
+    works with no TWS connection.
   * **Live IBKR matches** (``reqMatchingSymbols``) — as the user types,
     a debounced search runs on the highest-priority connected worker and
-    STK matches stream in below the saved ones.  Picking one auto-saves
-    the contract to the Contracts universe (SQLite) so the ladder /
-    order paths can resolve it — the user never has to visit the
-    Contracts tab first.
+    STK matches stream in below the saved ones.  Picking one hands its
+    qualified contract metadata to the host, which stores it on the new
+    chip entry — the chip owns its contract identity.
 
 Keyboard: Up/Down navigate, Enter adds the highlighted row, Esc closes
 (Popup window flag also closes on outside click).
@@ -43,8 +41,10 @@ log = logging.getLogger(__name__)
 # Debounce between the last keystroke and the reqMatchingSymbols call.
 # IB rate-limits matching-symbol requests to ~1 per second.
 _SEARCH_DEBOUNCE_MS = 500
-_POPUP_WIDTH = 420
-_LIST_MAX_HEIGHT = 320
+_POPUP_WIDTH = 520
+_AVATAR_PX = 30          # circular ticker monogram diameter
+_VISIBLE_ROWS = 5        # dropdown shows at most this many rows
+_CORNER_RADIUS = 14
 
 
 def connected_workers_by_priority(active_threads: dict) -> list:
@@ -136,13 +136,29 @@ def format_expiry(raw: str) -> str:
     return s
 
 
+def _venue_rank(r: dict) -> tuple:
+    """Sort key for choosing ONE row per expiration.  Lower is better:
+    IB's QBALGO algo-routing venue ranks last, and a row trading on its
+    own primary listing venue beats one that doesn't."""
+    exch = (r.get("exchange") or "").upper()
+    primary = (r.get("primary_exchange") or "").upper()
+    return (exch == "QBALGO",
+            0 if (primary and exch == primary) else 1)
+
+
 def pick_front_expiries(chain: list[dict], count: int = 2,
                         today: date | None = None) -> list[dict]:
     """The *count* nearest unexpired USD futures from a browse chain,
     sorted by expiry.  Rows that aren't USD FUTs or whose expiry can't
-    be parsed are dropped."""
+    be parsed are dropped.
+
+    One row per expiration DATE: reqContractDetails lists the same
+    expiry on several venues (e.g. ES on CME *and* QBALGO), and without
+    dedup the two front slots would both be the same month — the user
+    would see Sep twice and never Dec.  Within an expiry the primary
+    venue wins (see :func:`_venue_rank`)."""
     today = today or date.today()
-    dated: list[tuple[date, dict]] = []
+    best: dict[date, dict] = {}
     for r in chain:
         if r.get("sec_type") != "FUT":
             continue
@@ -151,43 +167,10 @@ def pick_front_expiries(chain: list[dict], count: int = 2,
         d = _expiry_date(r.get("expiry", ""))
         if d is None or d < today:
             continue
-        dated.append((d, r))
-    dated.sort(key=lambda t: (t[0], str(t[1].get("local_symbol", ""))))
-    return [r for _d, r in dated[:count]]
-
-
-def save_future_chain(results: list[dict], root_name: str = "") -> str:
-    """Persist a reqContractDetails month chain for a futures root.
-
-    Keeps USD FUT rows only, dedupes by conId against the stored
-    universe, and saves the whole chain — ``pick_active_contract``
-    then resolves the root to the front month exactly like a chain
-    added from the Contracts tab.  Returns the root symbol ("" when
-    the chain had no usable rows).
-    """
-    rows = [r for r in results
-            if r.get("sec_type") == "FUT"
-            and (r.get("currency") or "").upper() == "USD"]
-    if not rows:
-        return ""
-    sym = (rows[0].get("symbol") or "").strip().upper()
-    existing = config_manager.load_contracts()
-    have = {str(c.get("conid", "")) for c in existing if c.get("conid")}
-    added = 0
-    for r in rows:
-        cid = str(r.get("conid", "") or "")
-        if not cid or cid in have:
-            continue
-        have.add(cid)
-        existing.append({**r, "name": root_name})
-        added += 1
-    if added:
-        config_manager.save_contracts(existing)
-        from src.core.reference_data import get_instance as _rd
-        _rd().reload_contracts()
-        log.info("SymbolSearch: saved %d %s futures contract(s) from "
-                 "IBKR chain", added, sym)
-    return sym
+        cur = best.get(d)
+        if cur is None or _venue_rank(r) < _venue_rank(cur):
+            best[d] = r
+    return [r for _d, r in sorted(best.items())[:count]]
 
 
 def display_exchange(code: str) -> str:
@@ -196,10 +179,37 @@ def display_exchange(code: str) -> str:
     return _EXCHANGE_DISPLAY.get(code.upper(), code)
 
 
+def _match_rank(e: dict, q: str) -> int | None:
+    """Relevance of row *e* for query *q* — lower is better:
+
+    0. exact symbol match ("ES" → ES)
+    1. symbol prefix match ("ES" → ESRX, ESLT)
+    2. name/detail substring — but only for 3+ character queries, so a
+       short query like "ES" can't drag in every "iShar**ES**" /
+       "S**ERIES**" fund by name.
+    ``None`` = no match (row is hidden).
+    """
+    sym = (e.get("symbol") or "").upper()
+    if sym == q:
+        return 0
+    if sym.startswith(q):
+        return 1
+    if len(q) >= 3:
+        hay = f"{e.get('name') or ''} {e.get('detail') or ''}".upper()
+        if q in hay:
+            return 2
+    return None
+
+
 def merge_rows(local_entries: list[dict], remote: list[dict],
                exclude: set[str], query: str
                ) -> tuple[list[dict], list[dict], list[str]]:
     """Merge saved-contract rows with live IBKR matches for display.
+
+    Rows are relevance-ranked via :func:`_match_rank` — exact symbol
+    matches first, then symbol prefixes, then name hits — and among
+    equally-ranked remote rows futures lead (this is a trading app;
+    typing "es" means the E-mini before Eversource Energy).
 
     Returns ``(locals_shown, remote_shown, already_added)``.  Remote
     rows are deduped against the shown locals by **conId** — never by
@@ -214,12 +224,13 @@ def merge_rows(local_entries: list[dict], remote: list[dict],
     caller can explain why those rows are hidden.
     """
     q = query.strip().upper()
-    locals_shown = [
-        e for e in local_entries
-        if not q or q in e["symbol"].upper()
-        or q in (e.get("name") or "").upper()
-        or q in (e.get("detail") or "").upper()
-    ]
+    if q:
+        ranked = [(_match_rank(e, q), e) for e in local_entries]
+        ranked = [(r, e) for r, e in ranked if r is not None]
+        ranked.sort(key=lambda t: t[0])          # stable — keeps saved order
+        locals_shown = [e for _r, e in ranked]
+    else:
+        locals_shown = list(local_entries)
     # Live futures roots always show their front expirations — even when
     # the root is already saved or on the chip bar — so the user can
     # switch the active expiration.  The saved per-expiry rows (and the
@@ -264,119 +275,120 @@ def merge_rows(local_entries: list[dict], remote: list[dict],
                 e["primary_exchange"] = r.get("primary_exchange", "")
         enriched.append(e)
 
+    # Relevance-order the remote rows: exact symbol > prefix > name hit
+    # (IB's fuzzy matches without any visible relation rank last), and
+    # futures before stocks within a rank.  Stable sort keeps IB's
+    # relevance order inside each group.
+    if q:
+        remote_shown.sort(key=lambda r: (
+            _match_rank(r, q) if _match_rank(r, q) is not None else 3,
+            r.get("sec_type") != "FUT"))
+
     already_added = sorted(s for s in exclude
                            if q and s.startswith(q)
                            and s not in remote_fut_syms)
     return enriched, remote_shown, already_added
 
 
-def replace_future_contract(entry: dict, root_name: str = "") -> str:
-    """Swap the saved futures contract(s) for *entry*'s root with just
-    *entry* — every stored FUT row for the root is dropped, so chips,
-    hot buttons and subscriptions (all root-symbol-keyed, resolved via
-    ReferenceData) re-point to the new expiration.  Returns the root
-    symbol."""
-    sym = (entry.get("symbol") or "").strip().upper()
-    if not sym:
-        return ""
-    existing = config_manager.load_contracts()
-    kept = [c for c in existing
-            if c.get("sec_type") != "FUT"
-            or c.get("symbol", "").upper() != sym]
-    kept.append({**entry, "name": root_name})
-    config_manager.save_contracts(kept)
-    from src.core.reference_data import get_instance as _rd
-    _rd().reload_contracts()
-    log.info("SymbolSearch: replaced %s futures contract(s) with expiry "
-             "%s", sym, entry.get("expiry", "?"))
-    return sym
+def _ask_future_action(parent, sym: str, old_desc: str, new_desc: str,
+                       local: str) -> str:
+    """Modal choice when picking an expiry that differs from the stored
+    root contract.  Returns ``"replace"`` | ``"pin"`` | ``"cancel"``.
+    Module-level so tests can monkeypatch the answer."""
+    from PySide6.QtWidgets import QMessageBox
+    box = QMessageBox(parent)
+    box.setWindowTitle("Different expiration")
+    box.setText(
+        f"{sym} is currently {old_desc}.\n\n"
+        f"Replace: roll {sym} to {new_desc} everywhere it is used —\n"
+        f"the ladder, order entry and hot buttons.\n\n"
+        f"Pin: keep {sym} on {old_desc} and add a separate {local} chip\n"
+        f"frozen to {new_desc} (it never auto-rolls).")
+    replace_btn = box.addButton(f"Replace {sym}",
+                                QMessageBox.ButtonRole.YesRole)
+    pin_btn = box.addButton(f"Add pinned {local}",
+                            QMessageBox.ButtonRole.ActionRole)
+    box.addButton(QMessageBox.StandardButton.Cancel)
+    box.setDefaultButton(replace_btn)
+    box.exec()
+    clicked = box.clickedButton()
+    if clicked is replace_btn:
+        return "replace"
+    if clicked is pin_btn:
+        return "pin"
+    return "cancel"
 
 
 def apply_future_pick(parent, entry: dict) -> tuple[str, bool]:
-    """Persist a futures-expiration pick from the search popup.
+    """Apply a futures-expiration pick from the search popup.
 
-    Returns ``(root_symbol, replaced)``:
+    Returns ``(symbol_to_add, replaced)``:
 
-    * root not saved yet             → save the picked contract
-    * picked contract already saved  → no change
-    * root saved with a *different*
+    * root not stored yet            → write the pick's metadata onto
+      any existing references (the new chip gets it via ``_add_symbol``)
+    * picked contract already stored → heal-only, no change
+    * root stored with a *different*
       expiration                     → ask (modal, parented to the host
-      view) and replace on Yes; ``("", False)`` when the user declines.
+      view):
+
+      - **Replace** → re-point every root reference; returns
+        ``(root, True)`` so hosts resubscribe.
+      - **Pin** → nothing existing changes; returns the picked
+        contract's LOCAL symbol (e.g. ``"NQZ6"``) as the symbol to add
+        — an expiry-keyed chip frozen to that contract (same pattern as
+        OPT chips keyed by their OCC symbol; never auto-rolls).
+      - **Cancel** → ``("", False)``.
     """
+    from src.core import instruments
     sym = (entry.get("symbol") or "").strip().upper()
     if not sym:
         return "", False
-    root_name = entry.get("name", "")
-    existing = [c for c in config_manager.load_contracts()
-                if c.get("sec_type") == "FUT"
-                and c.get("symbol", "").upper() == sym]
-    if not existing:
-        save_future_chain([entry], root_name=root_name)
+    stored = instruments.get_contract(sym)
+    stored_conid = str(stored.get("conid", "") or "") if stored else ""
+    if not stored_conid or stored_conid == str(entry.get("conid", "")):
+        _upsert_entry_meta(sym, entry)   # first pick / heal — no prompt
         return sym, False
-    if str(entry.get("conid", "")) in {str(c.get("conid", ""))
-                                       for c in existing}:
-        return sym, False  # same contract — nothing to do
 
-    old_labels = [format_expiry(c.get("expiry", "")) for c in existing]
-    old_desc = ", ".join(x for x in old_labels if x) or "another expiration"
+    old_desc = (format_expiry(stored.get("expiry", ""))
+                or "another expiration")
     new_desc = format_expiry(entry.get("expiry", ""))
-    from PySide6.QtWidgets import QMessageBox
-    resp = QMessageBox.question(
-        parent, "Replace future",
-        f"{sym} is already saved as {old_desc}.\n"
-        f"Replace it with {new_desc}?\n\n"
-        f"This updates {sym} everywhere it is used — the ladder, "
-        f"order entry and hot buttons.",
-        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        QMessageBox.StandardButton.No)
-    if resp != QMessageBox.StandardButton.Yes:
-        return "", False
-    replace_future_contract(entry, root_name=root_name)
-    return sym, True
+    local = (entry.get("local_symbol") or "").strip().upper() or sym
+    action = _ask_future_action(parent, sym, old_desc, new_desc, local)
+    if action == "replace":
+        _upsert_entry_meta(sym, entry)   # re-point existing references
+        log.info("SymbolSearch: replaced %s futures contract with expiry "
+                 "%s", sym, entry.get("expiry", "?"))
+        return sym, True
+    if action == "pin":
+        log.info("SymbolSearch: pinning %s (%s) as its own chip",
+                 local, new_desc)
+        return local, False
+    return "", False
 
 
-def ensure_contract_saved(result: dict) -> str:
-    """Persist an IBKR search pick into the contracts universe.
+def _upsert_entry_meta(sym: str, entry: dict) -> None:
+    """Write *entry*'s contract metadata onto every existing chip /
+    hot-button reference of *sym* (rollover keeps them in sync; the
+    newly-added chip gets its metadata from the host's ``_add_symbol``)."""
+    from src.core import instruments
+    meta = instruments.contract_meta_from_result(entry)
+    if meta:
+        config_manager.upsert_instrument(sym, meta)
 
-    No-op for rows that came from saved contracts (``source != "ibkr"``),
-    for futures (handled by ``apply_future_pick`` in the host view), or
-    when an equal contract is already stored.  Returns the upper-cased
-    symbol ("" if the result carries none).
+
+def ensure_contract_saved(result: dict) -> tuple[str, dict | None]:
+    """Resolve a search pick into chip metadata.
+
+    Returns ``(symbol, meta)`` — *meta* is the normalised contract
+    metadata for the picked row (the host stores it on the new chip via
+    ``_add_symbol``), or ``None`` when the row carries no conid.
+    Nothing is persisted here: the chip entry IS the store.
     """
+    from src.core import instruments
     sym = (result.get("symbol") or "").strip().upper()
-    if (not sym or result.get("source") != "ibkr"
-            or result.get("sec_type", "STK") != "STK"):
-        return sym
-
-    existing = config_manager.load_contracts()
-    conid = str(result.get("conid") or "")
-    for c in existing:
-        if conid and str(c.get("conid", "")) == conid:
-            return sym
-        if (c.get("symbol", "").upper() == sym
-                and c.get("sec_type") == result.get("sec_type", "STK")):
-            return sym
-
-    existing.append({
-        "conid": result.get("conid", ""),
-        "symbol": sym,
-        "sec_type": result.get("sec_type", "STK"),
-        "exchange": "SMART",
-        "currency": result.get("currency", "USD") or "USD",
-        "expiry": "",
-        "strike": "",
-        "right": "",
-        "local_symbol": sym,
-        "multiplier": "",
-        "primary_exchange": result.get("primary_exchange", ""),
-        "name": result.get("name", ""),
-    })
-    config_manager.save_contracts(existing)
-    from src.core.reference_data import get_instance as _rd
-    _rd().reload_contracts()
-    log.info("SymbolSearch: saved %s (%s) from IBKR lookup",
-             sym, result.get("primary_exchange", ""))
-    return sym
+    if not sym:
+        return "", None
+    return sym, instruments.contract_meta_from_result(result)
 
 
 class SymbolSearchPopup(QDialog):
@@ -385,10 +397,18 @@ class SymbolSearchPopup(QDialog):
     symbol_selected = Signal(dict)  # row dict incl. "symbol" + "source"
 
     def __init__(self, parent: QWidget, workers: list,
-                 exclude: set[str] | None = None) -> None:
+                 exclude: set[str] | None = None,
+                 external_input=None) -> None:
+        """*external_input* (a QLineEdit) switches the popup into
+        dropdown mode: its own search box is hidden, the query is read
+        live from that field, and the window never steals focus — the
+        host keeps typing in its own field and forwards ↑/↓/Enter/Esc
+        via :meth:`handle_key`.  The instance is reusable (``close()``
+        hides instead of deleting)."""
         super().__init__(parent)
         self._workers = workers
         self._exclude = {s.upper() for s in (exclude or set())}
+        self._ext_input = external_input
         self._wired: list = []
 
         # Remote-search state
@@ -411,40 +431,59 @@ class SymbolSearchPopup(QDialog):
 
         self._local = self._collect_local()
 
-        self.setWindowFlags(Qt.WindowType.Popup)
-        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        if self._ext_input is None:
+            self.setWindowFlags(Qt.WindowType.Popup)
+            self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        else:
+            # Dropdown mode: a floating, non-activating tool window so
+            # focus (and typing) stays in the host's own field.
+            self.setWindowFlags(
+                Qt.WindowType.Tool
+                | Qt.WindowType.FramelessWindowHint
+                | Qt.WindowType.WindowStaysOnTopHint)
+            self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        # Truly rounded corners: the window is transparent and the card
+        # is painted as a rounded rect in paintEvent — a stylesheet
+        # radius alone leaves square window corners poking out.
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setFixedWidth(_POPUP_WIDTH)
-        self.setStyleSheet(
-            f"QDialog{{background:{Theme.BG_PANEL};"
-            f"border:1px solid {Theme.BORDER};border-radius:8px}}")
+        self.setStyleSheet("QDialog{background:transparent;border:none}")
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(10, 10, 10, 10)
-        lay.setSpacing(6)
+        lay.setContentsMargins(12, 12, 12, 10)
+        lay.setSpacing(8)
 
         self._search = QLineEdit()
         self._search.setPlaceholderText("Search symbol…")
         self._search.setStyleSheet(
             f"QLineEdit{{background:{Theme.BG_INPUT};color:{Theme.TEXT};"
-            f"border:1px solid {Theme.BORDER};border-radius:6px;"
-            f"padding:8px 10px;font-size:14px}}"
+            f"border:1px solid {Theme.BORDER};border-radius:9px;"
+            f"padding:8px 12px;font-size:14px}}"
             f"QLineEdit:focus{{border-color:{Theme.ACCENT}}}")
         lay.addWidget(self._search)
 
         self._hdr = QLabel("Saved contracts")
         self._hdr.setStyleSheet(
-            f"color:{Theme.TEXT_DIM};font-size:11px;padding:2px 2px 0 2px")
+            f"color:{Theme.TEXT_DIM};font-size:11px;padding:0 4px")
         lay.addWidget(self._hdr)
 
         self._lst = QListWidget()
-        self._lst.setMaximumHeight(_LIST_MAX_HEIGHT)
         self._lst.setStyleSheet(
             f"QListWidget{{background:transparent;color:{Theme.TEXT};"
             f"border:none;outline:none}}"
-            f"QListWidget::item{{border-radius:6px;padding:0px}}"
+            f"QListWidget::item{{border-radius:10px;padding:0px}}"
             f"QListWidget::item:selected{{background:#334058}}"
             f"QListWidget::item:hover{{background:#232A3B}}")
         self._lst.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        # No scrollbars — the list scrolls with the mouse wheel /
+        # trackpad, and ↑/↓ step the selection (wired on the search box).
+        self._lst.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._lst.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        from PySide6.QtWidgets import QAbstractItemView
+        self._lst.setVerticalScrollMode(
+            QAbstractItemView.ScrollMode.ScrollPerPixel)
         lay.addWidget(self._lst)
 
         self._debounce = QTimer(self)
@@ -454,6 +493,10 @@ class SymbolSearchPopup(QDialog):
 
         self._search.textChanged.connect(self._on_text_changed)
         self._search.returnPressed.connect(self._commit_current)
+        if self._ext_input is not None:
+            # Dropdown mode: the host's field IS the search box.
+            self._search.hide()
+            self._ext_input.textChanged.connect(self._on_text_changed)
         self._lst.itemClicked.connect(lambda _it: self._commit_current())
 
         def _key(event) -> None:
@@ -470,21 +513,56 @@ class SymbolSearchPopup(QDialog):
 
         self._rebuild()
 
+    def paintEvent(self, event) -> None:  # noqa: N802
+        """Rounded card on a transparent window (see __init__)."""
+        from PySide6.QtGui import QPainter, QPen
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(QPen(QColor(Theme.BORDER), 1))
+        p.setBrush(QColor(Theme.BG_PANEL))
+        p.drawRoundedRect(
+            self.rect().adjusted(0, 0, -1, -1),
+            _CORNER_RADIUS, _CORNER_RADIUS)
+        p.end()
+
     # ── Public ────────────────────────────────────────────────────────────────
 
     def open_below(self, anchor: QWidget) -> None:
-        """Show the popup anchored under *anchor* and focus the search box."""
+        """Show the popup anchored under *anchor*; standalone mode also
+        focuses the internal search box (dropdown mode leaves focus in
+        the host's field)."""
         self.move(anchor.mapToGlobal(anchor.rect().bottomLeft()))
         self.show()
-        self._search.setFocus()
+        if self._ext_input is None:
+            self._search.setFocus()
+
+    def handle_key(self, event) -> bool:
+        """Dropdown mode: the host forwards key events from its own
+        field.  Returns True when the event was consumed (↑/↓ move the
+        selection, Enter commits, Esc dismisses)."""
+        key = event.key()
+        if key == Qt.Key.Key_Down:
+            self._step(+1)
+            return True
+        if key == Qt.Key.Key_Up:
+            self._step(-1)
+            return True
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._commit_current()
+            return True
+        if key == Qt.Key.Key_Escape:
+            self.close()
+            return True
+        return False
 
     # ── Local (saved-contract) entries ────────────────────────────────────────
 
     def _collect_local(self) -> list[dict]:
-        from src.core.reference_data import get_instance as _rd
+        from src.core import instruments
         seen: set[str] = set()
         entries: list[dict] = []
-        for c in sorted(_rd().contracts, key=lambda x: x.get("symbol", "")):
+        for c in sorted(instruments.all_contracts(),
+                        key=lambda x: x.get("symbol", "")):
             sym = c.get("symbol", "")
             if not sym or sym.upper() in self._exclude:
                 continue
@@ -522,7 +600,8 @@ class SymbolSearchPopup(QDialog):
         self._rebuild()
 
     def _query(self) -> str:
-        return self._search.text().strip()
+        src = self._ext_input if self._ext_input is not None else self._search
+        return src.text().strip()
 
     def _fire_search(self) -> None:
         pattern = self._query()
@@ -631,6 +710,14 @@ class SymbolSearchPopup(QDialog):
                 self._lst.setCurrentRow(i)
                 break
 
+        # Size the list to at most _VISIBLE_ROWS rows, using the rows'
+        # real heights so a partial row never pokes out at the bottom;
+        # more results scroll (wheel / ↑↓) behind the cut.
+        total = sum(self._lst.sizeHintForRow(i)
+                    for i in range(min(self._lst.count(), _VISIBLE_ROWS)))
+        self._lst.setFixedHeight(total)
+        self.adjustSize()
+
     def _add_fut_rows(self, root: dict) -> None:
         """Render a live futures root: its two nearest expirations as
         pickable rows once the chain has loaded, a status note before
@@ -656,13 +743,31 @@ class SymbolSearchPopup(QDialog):
                 "badge": "FUT",
             })
 
+    @staticmethod
+    def _make_avatar(symbol: str) -> QLabel:
+        """Circular ticker monogram (the reference design's logo slot —
+        we have no logo assets, so the ticker itself fills the circle,
+        font-sized down for longer tickers)."""
+        text = (symbol or "?")[:4].upper()
+        size = {1: 12, 2: 12, 3: 10}.get(len(text), 8)
+        av = QLabel(text)
+        av.setFixedSize(_AVATAR_PX, _AVATAR_PX)
+        av.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        av.setStyleSheet(
+            f"background:#2A3245;color:{Theme.TEXT};"
+            f"border:none;border-radius:{_AVATAR_PX // 2}px;"
+            f"font-size:{size}px;font-weight:700")
+        return av
+
     def _add_row(self, entry: dict) -> None:
         row = QWidget()
         row.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         h = QHBoxLayout(row)
-        h.setContentsMargins(10, 7, 10, 7)
+        h.setContentsMargins(8, 6, 8, 6)
         h.setSpacing(10)
+
+        h.addWidget(self._make_avatar(entry["symbol"]))
 
         sym = QLabel(entry["symbol"])
         sym.setStyleSheet(
@@ -682,7 +787,7 @@ class SymbolSearchPopup(QDialog):
         name.setStyleSheet(f"color:{Theme.TEXT_DIM};font-size:12px")
         fm = QFontMetrics(name.font())
         name.setText(fm.elidedText(
-            name_text, Qt.TextElideMode.ElideRight, 230))
+            name_text, Qt.TextElideMode.ElideRight, 300))
         h.addWidget(name, 1)
 
         # Listing exchange preferred over the generic sec-type badge;
@@ -696,8 +801,8 @@ class SymbolSearchPopup(QDialog):
         badge = QLabel(badge_text)
         badge.setStyleSheet(
             f"color:{Theme.TEXT_DIM};font-size:11px;"
-            f"border:1px solid {Theme.BORDER};border-radius:4px;"
-            f"padding:2px 8px")
+            f"border:1px solid {Theme.BORDER};border-radius:10px;"
+            f"padding:3px 11px")
         h.addWidget(badge, 0, Qt.AlignmentFlag.AlignRight)
 
         item = QListWidgetItem()

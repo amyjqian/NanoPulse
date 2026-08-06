@@ -44,15 +44,10 @@ class TestBookTraderReplaceLast:
         monkeypatch.setattr(btv.config_manager,
                             "save_book_trader_active_symbol",
                             lambda s, path=None: None)
-        removed = []
-        monkeypatch.setattr(btv.config_manager,
-                            "remove_stock_contract_if_unused",
-                            removed.append)
         monkeypatch.setattr(btv, "_sec_type_for",
                             lambda s: "FUT" if s.startswith("F") else "STK")
         v = btv.BookTraderView(active_threads={})
         qtbot.addWidget(v)
-        v._removed_contracts = removed
         return v
 
     def test_full_stk_group_replaces_last_chip(self, view):
@@ -61,8 +56,9 @@ class TestBookTraderReplaceLast:
         stk = [s for s in view._symbols if not s.startswith("F")]
         assert len(stk) == 15
         assert stk[-1] == "NEW"                 # takes row 3, column 5
+        # Dropping the chip entry IS the cleanup — its metadata leaves
+        # with it (no shared contract store to scrub any more).
         assert "S14" not in view._symbols       # previous last dropped
-        assert view._removed_contracts == ["S14"]
         assert view._active_symbol == "NEW"
         # FUT membership untouched.
         assert "F00" in view._symbols
@@ -71,10 +67,33 @@ class TestBookTraderReplaceLast:
         view._symbols = [f"S{i:02d}" for i in range(14)]
         view._add_symbol("NEW")
         assert len(view._symbols) == 15
-        assert view._removed_contracts == []
 
     def test_fut_add_never_evicts_stk(self, view):
         view._symbols = [f"S{i:02d}" for i in range(15)]
         view._add_symbol("F99")
         assert len(view._symbols) == 16         # future appended, no eviction
-        assert view._removed_contracts == []
+
+
+class TestChipMetadataLifecycle:
+    """A chip owns its contract identity: added with metadata it can
+    resolve/subscribe; removing the chip removes the metadata with it."""
+
+    def test_add_with_meta_persists_and_remove_drops(self, qtbot, monkeypatch):
+        import src.core.config_manager as cm
+        from src.core import instruments
+        monkeypatch.setattr(btv.config_manager,
+                            "save_book_trader_active_symbol",
+                            lambda s, path=None: None)
+        v = btv.BookTraderView(active_threads={})
+        qtbot.addWidget(v)
+
+        v._add_symbol("NVDA", meta={"conid": "4815747", "sec_type": "STK",
+                                    "exchange": "SMART", "currency": "USD",
+                                    "local_symbol": "NVDA"})
+        entries = {e["symbol"]: e for e in cm.load_book_trader_entries()}
+        assert entries["NVDA"]["conid"] == "4815747"
+        assert instruments.get_contract("NVDA")["conid"] == "4815747"
+        assert instruments.build_md_params("NVDA")["conid"] == 4815747
+
+        v._on_symbol_remove("NVDA")
+        assert instruments.get_contract("NVDA") is None   # gone with the chip

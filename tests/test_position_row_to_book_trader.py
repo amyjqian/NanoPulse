@@ -165,77 +165,63 @@ class TestAddSymbolInsertPosition:
 # ── OPT contract save helper ──────────────────────────────────────────────────
 
 @pytest.fixture
-def contracts_env(monkeypatch):
-    state = {"contracts": [], "saved": None, "reloaded": 0}
-    monkeypatch.setattr(btv.config_manager, "load_contracts",
-                        lambda path=None: list(state["contracts"]))
+def entry_env(monkeypatch):
+    """Fake entry store for the OPT chip-metadata flow: get_contract
+    resolves from it, upsert_instrument records into it."""
+    import src.core.instruments as instruments
+    state = {"entries": {}, "upserts": []}
 
-    def _save(contracts, path=None):
-        state["saved"] = contracts
-        state["contracts"] = list(contracts)
-    monkeypatch.setattr(btv.config_manager, "save_contracts", _save)
+    def _get_contract(q):
+        e = state["entries"].get((q or "").upper())
+        return dict(e) if e else None
+    monkeypatch.setattr(instruments, "get_contract", _get_contract)
 
-    import src.core.reference_data as rd
-
-    def _reload():
-        state["reloaded"] += 1
-    monkeypatch.setattr(
-        rd, "get_instance",
-        lambda: SimpleNamespace(reload_contracts=_reload))
-    # Unresolvable until a row is saved.
-    monkeypatch.setattr(
-        btv, "_sec_type_for",
-        lambda sym: "OPT" if any(
-            c.get("symbol") == sym for c in state["contracts"]) else "?")
+    def _upsert(sym, meta, path=None):
+        state["upserts"].append((sym, dict(meta)))
+        cur = state["entries"].setdefault(sym.upper(), {"symbol": sym})
+        cur.update(meta)
+        return True
+    monkeypatch.setattr(btv.config_manager, "upsert_instrument", _upsert)
     return state
 
 
 class TestEnsurePositionContractSaved:
-    def test_saves_row_with_occ_symbol_key(self, contracts_env):
-        btv._ensure_position_contract_saved(_pos())
-        row = contracts_env["saved"][0]
-        assert row["symbol"] == _OCC.upper()
-        assert row["local_symbol"] == _OCC
-        assert row["sec_type"] == "OPT"
-        assert row["conid"] == "111"
-        assert row["multiplier"] == "100"
-        assert row["exchange"] == "SMART"
-        assert contracts_env["reloaded"] == 1
+    def test_stores_meta_under_occ_symbol_key(self, entry_env):
+        meta = btv._ensure_position_contract_saved(_pos())
+        assert meta["conid"] == "111"
+        assert meta["sec_type"] == "OPT"
+        assert meta["local_symbol"] == _OCC
+        assert meta["multiplier"] == "100"
+        assert meta["exchange"] == "SMART"
+        assert entry_env["upserts"][0][0] == _OCC.upper()
 
-    def test_second_call_is_noop(self, contracts_env):
+    def test_second_call_is_noop(self, entry_env):
         btv._ensure_position_contract_saved(_pos())
         btv._ensure_position_contract_saved(_pos())
-        assert contracts_env["reloaded"] == 1
+        assert len(entry_env["upserts"]) == 1   # already resolvable
 
-    def test_dedupes_on_conid(self, contracts_env):
-        contracts_env["contracts"] = [
-            {"conid": "111", "symbol": "SOMETHING", "sec_type": "OPT"}]
-        btv._ensure_position_contract_saved(_pos())
-        assert contracts_env["saved"] is None
+    def test_ignores_non_opt(self, entry_env):
+        assert btv._ensure_position_contract_saved(
+            _pos(sec_type="STK")) is None
+        assert entry_env["upserts"] == []
 
-    def test_ignores_non_opt(self, contracts_env):
-        btv._ensure_position_contract_saved(_pos(sec_type="STK"))
-        assert contracts_env["saved"] is None
+    def test_missing_conid_does_not_store(self, entry_env):
+        """A conid-less entry could never subscribe market data — the
+        chip stays bare so the retry that has the conid completes it."""
+        assert btv._ensure_position_contract_saved(_pos(con_id=None)) is None
+        assert entry_env["upserts"] == []
+        # A later call WITH the conid must still be able to store.
+        meta = btv._ensure_position_contract_saved(_pos())
+        assert meta["conid"] == "111"
 
-    def test_missing_conid_does_not_save(self, contracts_env):
-        """A conid-less row could never subscribe market data, and saving
-        it would permanently block the retry that has the conid."""
-        btv._ensure_position_contract_saved(_pos(con_id=None))
-        assert contracts_env["saved"] is None
-        # A later call WITH the conid must still be able to save.
+    def test_heals_entry_stored_without_conid(self, entry_env):
+        """Chip entries persisted without a conid get healed in place
+        instead of blocking on 'already resolvable'."""
+        entry_env["entries"][_OCC.upper()] = {
+            "symbol": _OCC.upper(), "sec_type": "OPT",
+            "local_symbol": _OCC, "multiplier": "100"}
         btv._ensure_position_contract_saved(_pos())
-        assert contracts_env["saved"][0]["conid"] == "111"
-
-    def test_heals_row_saved_without_conid(self, contracts_env):
-        """Rows saved by older builds with conid='' get their conid
-        filled in instead of blocking on 'already resolvable'."""
-        contracts_env["contracts"] = [
-            {"conid": "", "symbol": _OCC.upper(), "sec_type": "OPT",
-             "local_symbol": _OCC, "multiplier": "100"}]
-        btv._ensure_position_contract_saved(_pos())
-        assert len(contracts_env["saved"]) == 1
-        assert contracts_env["saved"][0]["conid"] == "111"
-        assert contracts_env["reloaded"] == 1
+        assert entry_env["entries"][_OCC.upper()]["conid"] == "111"
 
 
 # ── Panel signal filtering ────────────────────────────────────────────────────
@@ -283,6 +269,21 @@ class TestPanelSignal:
                                    COL_FLATTEN)
         with qtbot.assertNotEmitted(panel.position_row_clicked):
             panel._on_table_row_clicked(idx)
+
+    def test_non_symbol_column_does_not_emit(self, panel, qtbot):
+        """Only the Symbol cell jumps the ladder — clicking elsewhere on
+        the row (P&L, qty, …) must not retarget Book Trader."""
+        idx = _first_index_of_type(panel._model, ROW_TYPE_POSITION,
+                                   COL_SYMBOL + 1)
+        with qtbot.assertNotEmitted(panel.position_row_clicked):
+            panel._on_table_row_clicked(idx)
+
+    def test_summary_non_symbol_column_does_not_emit(self, panel, qtbot):
+        model = panel._summary_model
+        target = next(row for row in range(model.rowCount())
+                      if model.row_data(row) is not None)
+        with qtbot.assertNotEmitted(panel.position_row_clicked):
+            panel._on_summary_row_clicked(model.index(target, 1))
 
     def test_summary_row_emits_with_blank_account(self, panel, qtbot):
         model = panel._summary_model
@@ -468,3 +469,75 @@ class TestSetQtyCustomInput:
         with qtbot.assertNotEmitted(row.qty_changed):
             row.set_qty(37)
             row.set_qty(100)
+
+
+# ── Trailing header button → close-tier request ───────────────────────────────
+
+def test_trailing_button_emits_close_tier_tr(qtbot, monkeypatch):
+    """The TS header button mirrors TP/SL: an armed trailing distance
+    emits close_tier_requested with side='tr' and the raw points."""
+    monkeypatch.setattr(btv.config_manager, "save_book_trader_symbols",
+                        lambda s, path=None: None)
+    monkeypatch.setattr(btv.config_manager,
+                        "save_book_trader_active_symbol",
+                        lambda s, path=None: None)
+    v = btv.BookTraderView(active_threads={})
+    qtbot.addWidget(v)
+    v._active_symbol = "MNQ"
+    v._last_price = 26697.0
+    monkeypatch.setattr(v._tr_section, "get_value",
+                        lambda: {"value": 0.5, "unit": "price",
+                                 "label": "Custom"})
+    monkeypatch.setattr(v._qty_row, "current_qty", lambda: 2)
+    with qtbot.waitSignal(v.close_tier_requested, timeout=1000) as blocker:
+        v._emit_close_tier("tr")
+    payload = blocker.args[0]
+    assert payload["side"] == "tr"
+    assert payload["symbol"] == "MNQ"
+    assert payload["offset_pts"] == 0.5
+    assert payload["qty"] == 2
+
+
+# ── Futures tick-size resolution ──────────────────────────────────────────────
+
+class TestTickSizeResolution:
+    """One canonical futures tick table (helpers._FUT_TICK_SIZES) feeds
+    every panel; captured min_tick always wins; stocks/options step 0.01."""
+
+    def test_reference_table_coverage(self):
+        from src.utils.helpers import _FUT_TICK_SIZES as t
+        # Spot-check the expanded reference table (IB quote convention).
+        assert t["NQ"] == t["MNQ"] == t["ES"] == t["MES"] == 0.25
+        assert t["YM"] == t["MYM"] == 1.0
+        assert t["PL"] == 0.10 and t["PA"] == 0.05
+        assert t["BZ"] == 0.01 and t["MNG"] == 0.001
+        assert t["HO"] == t["RB"] == 0.0001
+        assert t["ZO"] == 0.25 and t["ZM"] == 0.10 and t["ZL"] == 0.01
+        assert t["LE"] == t["GF"] == t["HE"] == 0.025   # ¢/lb quoting
+        assert t["ZT"] == 0.00390625 and t["TN"] == 0.0078125
+        assert t["UB"] == 0.03125
+        assert t["6C"] == t["6S"] == t["6A"] == 0.0001
+        assert t["6M"] == 0.00001
+        assert t["BTC"] == t["MBT"] == 5.0
+        assert t["ETH"] == 0.25 and t["MET"] == 0.50
+
+    def test_min_tick_meta_wins(self):
+        assert btv._tick_size_for_contract(
+            {"symbol": "NQ", "sec_type": "FUT", "min_tick": 0.5}) == 0.5
+
+    def test_table_fallback_by_root_and_local(self):
+        assert btv._tick_size_for_contract(
+            {"symbol": "PL", "sec_type": "FUT"}) == 0.10
+        assert btv._tick_size_for_contract(
+            {"symbol": "", "local_symbol": "6CZ6",
+             "sec_type": "FUT"}) == 0.0001
+
+    def test_stock_and_option_step_a_cent(self):
+        assert btv._tick_size_for_contract(
+            {"symbol": "AAPL", "sec_type": "STK"}) == 0.01
+        assert btv._tick_size_for_contract(
+            {"symbol": "QQQ   260807P00670000", "sec_type": "OPT"}) == 0.01
+
+    def test_unknown_future_defaults_quarter(self):
+        assert btv._tick_size_for_contract(
+            {"symbol": "XYZ9", "sec_type": "FUT"}) == 0.25

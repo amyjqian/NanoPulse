@@ -265,8 +265,8 @@ def attach_exchange_badge(btn: QPushButton, symbol: str) -> None:
     through resizes without a custom paintEvent.
     """
     try:
-        from src.core.reference_data import get_instance as _rd
-        if _rd().get_primary_exchange(symbol) not in _TORONTO_EXCHANGES:
+        from src.core import instruments
+        if instruments.get_primary_exchange(symbol) not in _TORONTO_EXCHANGES:
             return
     except Exception:
         return
@@ -298,6 +298,16 @@ def _apply_chip_style(btn: QPushButton, selected: bool) -> None:
         font, pad = "9px", "1px 4px"
     else:
         font, pad = "12px", "4px 12px"
+    if bool(btn.property("chip_expired")):
+        # Dead pinned future — dimmed with a dashed border so the user
+        # notices and right-click-removes it.  Still clickable.
+        btn.setStyleSheet(
+            "QPushButton{background:#1B2130;color:#5A6478;"
+            "border:1px dashed #334058;"
+            f"border-radius:6px;padding:{pad};font-weight:500;"
+            f"font-size:{font}}}"
+            "QPushButton:hover{background:#232A3B}")
+        return
     if selected:
         btn.setStyleSheet(
             "QPushButton{background:#539BF5;color:white;border:none;"
@@ -534,6 +544,13 @@ class SymbolChipBar(QWidget):
         btn = DraggableChip(sym, sec_type, self._on_drop,
                             label=disp if is_opt else None)
         btn.setProperty("chip_small", is_opt)
+        try:
+            from src.core import instruments
+            if instruments.is_expired_fut(sym):
+                btn.setProperty("chip_expired", True)
+                btn.setToolTip("Expired contract — right-click to remove")
+        except Exception:
+            pass
         btn.setFixedHeight(self._CHIP_HEIGHT)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         _apply_chip_style(btn, sym == self._active)

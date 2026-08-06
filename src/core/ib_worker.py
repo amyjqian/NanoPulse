@@ -189,12 +189,11 @@ def _contract_to_dict(contract) -> dict:
     }
     if not d["exchange"]:
         try:
-            from src.core.reference_data import get_instance as _rd
-            rd = _rd()
-            # Try the root symbol first (what the saved-contracts cache
-            # is keyed by), then fall back to the local symbol.
-            cached = (rd.pick_active_contract(d["symbol"])
-                      or rd.pick_active_contract(d["local_symbol"]))
+            from src.core import instruments
+            # Try the root symbol first (what the chip entries are
+            # keyed by), then fall back to the local symbol.
+            cached = (instruments.get_contract(d["symbol"])
+                      or instruments.get_contract(d["local_symbol"]))
             if cached:
                 if not d["exchange"] and cached.get("exchange"):
                     d["exchange"] = cached["exchange"]
@@ -1330,6 +1329,10 @@ class IBWorkerThread(QThread):
                         "local_symbol": q.localSymbol,
                         "multiplier": getattr(q, "multiplier", ""),
                         "primary_exchange": getattr(q, "primaryExchange", ""),
+                        # Real tick size from ContractDetails — persisted
+                        # on the chip entry (min_tick) so UI ladders stop
+                        # relying on hardcoded per-symbol tables.
+                        "min_tick": float(getattr(d, "minTick", 0) or 0),
                     })
 
                 log.info("Worker %s browse returned %d contract(s) for %s",
@@ -1906,6 +1909,11 @@ class IBWorkerThread(QThread):
             sl_tier = params.get("stop_loss")
             tr_tier = params.get("trailing")
             bracket_children: list = []
+            # (trade, key, blotter-params) triples appended as children
+            # are placed below — the parent's fill callback re-anchors
+            # them to the actual fill price.
+            bracket_reanchor: list = []
+            bracket_ref_used = 0.0
             if any((tp_tier, sl_tier, tr_tier)):
                 # FlashTradeView sets bracket_ref_price to the expected-fill
                 # anchor — last_price for Adaptive / PEG / cap-wrapped MKT
@@ -1933,8 +1941,12 @@ class IBWorkerThread(QThread):
                             "for %s (last_price was 0)",
                             self._label, ref_price, sym)
                 if ref_price > 0:
+                    if tr_tier and self._convert_mkt_parent_for_trail(
+                            order, params, ref_price):
+                        order_type = "LMT"
                     order.orderId = self._ib.client.getReqId()
                     order.transmit = False
+                    bracket_ref_used = ref_price
                     bracket_children = self._build_bracket_children(
                         order, params, ref_price,
                         float(params.get("tick_size") or 0.01),
@@ -2072,6 +2084,9 @@ class IBWorkerThread(QThread):
             # trivially simple — no migration, no supersedes.
             frozen_params = dict(params)
             frozen_oid = order_id
+            # One-shot latch: Filled can be reported more than once
+            # (Filled then Completed) — re-anchor only on the first.
+            _reanchored = [False]
 
             def _on_status(t, _oid=frozen_oid, _p=frozen_params):
                 new_status = t.orderStatus.status
@@ -2093,6 +2108,17 @@ class IBWorkerThread(QThread):
                 # (not a full snapshot), so a closed position would simply be
                 # absent and the UI would never learn it went to zero.
                 if new_status in ("Filled", "Completed"):
+                    if bracket_reanchor and not _reanchored[0]:
+                        _reanchored[0] = True
+                        try:
+                            self._reanchor_bracket_children(
+                                c, t, bracket_reanchor,
+                                bracket_ref_used, _p)
+                        except Exception:
+                            order_log.exception(
+                                "[%s] BRACKET-REANCHOR failed "
+                                "(children keep submit-time prices)",
+                                self._label)
                     self._apply_fill_to_position(t, _p)
 
             trade.statusEvent += _on_status
@@ -2132,24 +2158,18 @@ class IBWorkerThread(QThread):
                 ch_params["order_type"] = ch.orderType
                 ch_params["action"]     = ch.action
                 ch_params["qty"]        = int(ch.totalQuantity)
-                # Child-specific price columns for the blotter.  TRAIL's
-                # auxPrice is a *distance* not a stop level, so leave stop
-                # empty; TRAIL shows the trail distance in its own column.
-                lmt_val = getattr(ch, "lmtPrice", None)
-                aux_val = getattr(ch, "auxPrice", None)
-                if ch.orderType in ("LMT",) and lmt_val and lmt_val < _IB_DBL_MAX:
-                    ch_params["limit_price"] = lmt_val
-                else:
-                    ch_params.pop("limit_price", None)
-                if ch.orderType in ("STP", "STP LMT") and aux_val \
-                        and aux_val < _IB_DBL_MAX:
-                    ch_params["stop_price"] = aux_val
-                    if ch.orderType == "STP LMT" and lmt_val \
-                            and lmt_val < _IB_DBL_MAX:
-                        ch_params["limit_price"] = lmt_val
-                else:
-                    ch_params.pop("stop_price", None)
+                # Child-specific price columns for the blotter.
+                ch_params.pop("limit_price", None)
+                ch_params.pop("stop_price", None)
+                ch_params.update(self._child_price_params(
+                    ch.orderType,
+                    getattr(ch, "lmtPrice", None),
+                    getattr(ch, "auxPrice", None)))
                 ch_frozen_oid = ch_key
+                # Same ch_params dict the status closure holds — the
+                # re-anchor updates it in place so the blotter row
+                # reflects the new prices.
+                bracket_reanchor.append((ch_trade, ch_key, ch_params))
 
                 def _on_child_status(t, _oid=ch_frozen_oid, _p=ch_params):
                     new_status = t.orderStatus.status
@@ -2178,6 +2198,170 @@ class IBWorkerThread(QThread):
                 "[%s] API-ERR   placeOrder failed: %s", self._label, exc)
             order_log.error("[%s] ORDER-ERROR  placeOrder failed: %s | params=%s",
                             self._label, exc, params)
+
+    @staticmethod
+    def _child_price_params(order_type: str, lmt_val, aux_val) -> dict:
+        """Blotter price columns for a bracket child / exit order.
+
+        LMT → limit only; STP → stop only; STP LMT → both; TRAIL →
+        the trail *distance* (auxPrice) in the stop column — the Type
+        column reads TRAIL so the cell is unambiguous (same convention
+        TWS uses for the aux field).  IB's DBL_MAX "no data" sentinel
+        is dropped.
+        """
+        def _ok(v) -> bool:
+            return bool(v) and v < _IB_DBL_MAX
+        out: dict = {}
+        if order_type in ("LMT", "STP LMT") and _ok(lmt_val):
+            out["limit_price"] = lmt_val
+        if order_type in ("STP", "STP LMT", "TRAIL") and _ok(aux_val):
+            out["stop_price"] = aux_val
+        return out
+
+    def _convert_mkt_parent_for_trail(self, order, params: dict,
+                                      ref_price: float) -> bool:
+        """Convert a MKT bracket parent to a marketable capped LMT.
+
+        IB error 328: a TRAIL child can only attach to a LMT / STP LMT
+        parent — on a MKT parent the trailing leg is auto-cancelled and,
+        worse, the rejected (transmitting) child can strand the whole
+        bracket.  The cap is the limit-cap preference when set, else 10
+        ticks through the market — fills like a market order but
+        bounded, and IB accepts the TRAIL.
+
+        Mutates *order* (orderType/lmtPrice) and *params*
+        (order_type/limit_price — blotter rows freeze `params`, so the
+        converted parent must be reflected there too).  Returns True if
+        the order was converted; False leaves both untouched (non-MKT
+        parent, or no valid limit price could be built).
+        """
+        if getattr(order, "orderType", "") != "MKT":
+            return False
+        tick_sz = float(params.get("tick_size") or 0.01)
+        cap = float(params.get("limit_cap_offset") or 0.0)
+        if cap <= 0:
+            cap = 10 * tick_sz
+        sign = 1 if order.action == "BUY" else -1
+        lmt_px = _round_to_tick(ref_price + sign * cap, tick_sz)
+        if lmt_px <= 0:
+            return False
+        order.orderType = "LMT"
+        order.lmtPrice = lmt_px
+        params["order_type"] = "LMT"
+        params["limit_price"] = lmt_px
+        order_log.info(
+            "[%s] BRACKET-TRAIL  MKT parent converted to marketable "
+            "LMT @ %.4f (cap %.4f) — TRAIL children need a LMT/STP LMT "
+            "parent (IB error 328), orderRef=%s",
+            self._label, lmt_px, cap, getattr(order, "orderRef", ""))
+        return True
+
+    @staticmethod
+    def _reanchored_child_prices(order_type: str, parent_action: str,
+                                 params: dict, fill_price: float,
+                                 tick: float) -> dict:
+        """Absolute prices for a bracket child re-anchored to *fill_price*.
+
+        Children are priced at submit time from the reference price (the
+        limit price for resting LMT parents), so a fill with price
+        improvement leaves them offset from the wrong anchor.  This
+        recomputes the same tier math as ``_build_bracket_children``
+        against the actual fill.  The child kind is inferred from its
+        order type — the builder emits TP as LMT, SL as STP / STP LMT,
+        and the trailing leg as TRAIL (already fill-relative → ``{}``).
+        Returns a ``{attr: price}`` dict to apply to the child order, or
+        ``{}`` when nothing applies / a price would go non-positive.
+        """
+        sign = 1 if parent_action == "BUY" else -1
+
+        def _offset_points(tier: dict) -> float:
+            v = float(tier.get("value", 0.0))
+            return v * tick if tier.get("unit") == "ticks" else v
+
+        if order_type == "LMT":
+            tier = params.get("profit_take")
+            if not tier:
+                return {}
+            px = _round_to_tick(fill_price + sign * _offset_points(tier),
+                                tick)
+            return {"lmtPrice": px} if px > 0 else {}
+
+        if order_type in ("STP", "STP LMT"):
+            tier = params.get("stop_loss")
+            if not tier:
+                return {}
+            aux = _round_to_tick(fill_price - sign * _offset_points(tier),
+                                 tick)
+            if aux <= 0:
+                return {}
+            out = {"auxPrice": aux}
+            if order_type == "STP LMT":
+                cap = float(params.get("limit_cap_offset") or 0.0)
+                lmt = _round_to_tick(aux - sign * cap, tick)
+                if lmt <= 0:
+                    return {}
+                out["lmtPrice"] = lmt
+            return out
+
+        return {}
+
+    def _reanchor_bracket_children(self, contract, parent_trade,
+                                   children, ref_price: float,
+                                   params: dict) -> None:
+        """Re-price live TP / SL children to the parent's actual fill.
+
+        Called once from the parent's statusEvent when it reaches
+        Filled.  The bracket is transmitted whole before any fill
+        exists, so the children were anchored to the submit-time
+        reference; when the fill lands elsewhere (resting limit filled
+        with price improvement, market moved), each still-working child
+        is modified in place — same orderId, new price — which IB
+        treats as an order modification and the OCA linkage survives.
+        *children* is a list of ``(trade, order_key, blotter_params)``
+        triples captured at placement.
+        """
+        fill = float(getattr(parent_trade.orderStatus,
+                             "avgFillPrice", 0.0) or 0.0)
+        if not (0.0 < fill < _IB_DBL_MAX):
+            return
+        tick = float(params.get("tick_size") or 0.01)
+        if ref_price > 0 and abs(fill - ref_price) < tick / 2:
+            return  # filled at the anchor — children already correct
+        parent_action = getattr(parent_trade.order, "action", "BUY")
+
+        for ch_trade, ch_key, ch_params in children:
+            st = getattr(ch_trade.orderStatus, "status", "") or ""
+            if st in ("Filled", "Cancelled", "ApiCancelled", "Inactive"):
+                continue
+            ch_order = ch_trade.order
+            new_px = self._reanchored_child_prices(
+                ch_order.orderType, parent_action, params, fill, tick)
+            if not new_px:
+                continue
+            if all(abs(float(getattr(ch_order, a, 0.0) or 0.0) - v) < 1e-9
+                   for a, v in new_px.items()):
+                continue
+            for a, v in new_px.items():
+                setattr(ch_order, a, v)
+            # Modify = re-place with the same orderId; each modify
+            # transmits on its own (the bundle-level staging only
+            # applies to the initial submission).
+            ch_order.transmit = True
+            self._ib.placeOrder(contract, ch_order)
+            # Refresh the blotter's frozen price columns and push the
+            # row so the UI shows the re-anchored prices immediately.
+            ch_params.pop("limit_price", None)
+            ch_params.pop("stop_price", None)
+            ch_params.update(self._child_price_params(
+                ch_order.orderType,
+                getattr(ch_order, "lmtPrice", None),
+                getattr(ch_order, "auxPrice", None)))
+            self._emit_order_status(ch_trade, ch_key, ch_params, st)
+            order_log.info(
+                "[%s] BRACKET-REANCHOR  %s child re-priced to fill "
+                "%.4f (submit ref %.4f): %s, orderRef=%s",
+                self._label, ch_order.orderType, fill, ref_price,
+                new_px, getattr(ch_order, "orderRef", ""))
 
     def _build_bracket_children(self, parent, params: dict,
                                 ref_price: float, tick: float) -> list:
@@ -2288,15 +2472,18 @@ class IBWorkerThread(QThread):
             if is_stk:
                 ch.outsideRth = parent_outside_rth
                 ch.allowPreOpen = parent_allow_pre
-            else:
+            elif ch.orderType in ("STP", "STP LMT", "TRAIL"):
                 # Futures: STP / STP LMT / TRAIL orders are held by TWS
                 # until the next RTH open by default (Warning 399 /
                 # "placed at the exchange until 08:30 US/Central").  For
                 # CME products that trade ~23 hours this leaves a stop
                 # dormant overnight — long enough for the market to blow
                 # past it before the flag un-holds.  outsideRth=True keeps
-                # the child armed during extended hours.  Stocks keep
-                # their existing RTH semantics (see parent_outside_rth).
+                # the child armed during extended hours.  Plain LMT
+                # children are exempt: CME ignores the attribute for
+                # them and emits Warning 2109, which ib_async surfaces
+                # as a scary "ValidationError" status in the blotter.
+                # Stocks keep their RTH semantics (parent_outside_rth).
                 ch.outsideRth = True
 
         # Last child flushes the bundle to TWS.
@@ -2762,7 +2949,7 @@ class IBWorkerThread(QThread):
                              current_price: float,
                              cap_offset: float) -> None:
         """Read the position for *symbol*/*account* and submit a single
-        LMT (tp) / STP / STP LMT (sl) exit order.
+        LMT (tp) / STP / STP LMT (sl) / TRAIL (tr) exit order.
 
         Sizing: ``qty = min(|position|, requested_qty)``.  A zero-position
         account is silently skipped so we never submit an empty order.
@@ -2778,17 +2965,23 @@ class IBWorkerThread(QThread):
         And when ``cap_offset > 0`` the limit sits that far further
         into the loss zone from the stop, giving the post-trigger limit
         a small execution window.
+
+        TS trail (auxPrice — the trail *distance*, not a level):
+          aux = offset (unsigned; IB tracks the stop server-side at
+          high-water ∓ aux).  ``current_price`` and ``cap_offset`` play
+          no role in the maths — the price guard just mirrors tp/sl.
         """
         if self._ib is None or not self._ib.isConnected():
             return
-        if side not in ("tp", "sl") or offset_pts <= 0 or current_price <= 0:
+        if (side not in ("tp", "sl", "tr")
+                or offset_pts <= 0 or current_price <= 0):
             order_log.warning(
                 "[%s] ORDER-CLOSE-TIER  invalid args side=%s offset=%.4f "
                 "ref=%.4f — skipping", self._label, side, offset_pts,
                 current_price)
             return
 
-        from ib_async import LimitOrder, StopOrder, StopLimitOrder
+        from ib_async import LimitOrder, Order, StopLimitOrder, StopOrder
 
         symbol_upper = symbol.upper()
         try:
@@ -2825,11 +3018,11 @@ class IBWorkerThread(QThread):
             # ib.positions() returns contracts without `exchange` populated
             # (among other routing fields), which causes placeOrder to fail
             # with Warning 321 "Missing order exchange".  The exchange lives
-            # in the local Contracts table already — look it up in memory
-            # via ReferenceData instead of doing a round-trip to TWS.
+            # on the chip's instrument entry already — look it up locally
+            # instead of doing a round-trip to TWS.
             if not getattr(contract, "exchange", ""):
-                from src.core.reference_data import get_instance as _rd
-                cached = _rd().get_contract(symbol_upper)
+                from src.core import instruments
+                cached = instruments.get_contract(symbol_upper)
                 if cached and cached.get("exchange"):
                     contract.exchange = cached["exchange"]
                 else:
@@ -2850,6 +3043,18 @@ class IBWorkerThread(QThread):
                     continue
                 order = LimitOrder(exit_action, qty, target)
                 tp_desc = f"LMT @ {target:.4f}"
+            elif side == "tr":
+                # Trailing stop: auxPrice is the unsigned trail DISTANCE
+                # — IB tracks the stop level server-side.
+                aux = _round_to_tick(offset_pts, tick)
+                if aux <= 0:
+                    order_log.warning(
+                        "[%s] ORDER-CLOSE-TIER TR-SKIP  non-positive "
+                        "trail %.4f", self._label, aux)
+                    continue
+                order = Order(orderType="TRAIL", action=exit_action,
+                              totalQuantity=qty, auxPrice=aux)
+                tp_desc = f"TRAIL dist={aux:.4f}"
             else:  # side == "sl"
                 # Loss direction: long → down, short → up.
                 stop_px = _round_to_tick(
@@ -2927,6 +3132,11 @@ class IBWorkerThread(QThread):
             }
             if side == "tp":
                 status_params["limit_price"] = target
+            elif side == "tr":
+                # The Type column reads TRAIL, so the STP cell
+                # unambiguously shows the trail distance (same
+                # convention TWS uses for the aux field).
+                status_params["stop_price"] = aux
             elif cap_offset > 0:
                 status_params["stop_price"] = stop_px
                 status_params["limit_price"] = lmt_px
@@ -3428,12 +3638,13 @@ class IBWorkerThread(QThread):
         if sym in self._depth_tickers:
             return   # already subscribed
 
-        # Resolve contract from the local ReferenceData cache.  This
-        # mirrors what OrderEntryPanel already does for L1 subscriptions
-        # and avoids a round-trip to TWS for contract-details.
+        # Resolve the contract from the chip's instrument entry (the
+        # resolver is Qt-free and thread-safe).  This mirrors what
+        # OrderEntryPanel already does for L1 subscriptions and avoids
+        # a round-trip to TWS for contract-details.
         try:
-            from src.core.reference_data import get_instance as _rd
-            cached = _rd().get_contract(sym)
+            from src.core import instruments
+            cached = instruments.get_contract(sym)
         except Exception:
             cached = None
         if not cached:
@@ -4102,17 +4313,17 @@ class IBWorkerThread(QThread):
                 symbol = self._order_symbols.get(order_ref, "")
 
             # Fallback 2: if symbol is still empty (contract built with conId
-            # only and ib_async didn't update it), resolve from saved config.
+            # only and ib_async didn't update it), resolve from the chip /
+            # hot-button instrument entries.
             if not symbol:
                 con_id = getattr(contract, "conId", 0)
                 if con_id:
                     try:
-                        from src.core import config_manager
-                        for sc in config_manager.load_contracts():
-                            if sc.get("conid") == con_id:
-                                symbol = (sc.get("local_symbol", "")
-                                          or sc.get("symbol", ""))
-                                break
+                        from src.core import instruments
+                        sc = instruments.find_by_conid(con_id)
+                        if sc:
+                            symbol = (sc.get("local_symbol", "")
+                                      or sc.get("symbol", ""))
                     except Exception:
                         pass
 

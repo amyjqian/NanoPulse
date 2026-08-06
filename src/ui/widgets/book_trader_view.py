@@ -135,7 +135,7 @@ def _position_like_from_order(order: dict) -> dict | None:
     The blotter's ``symbol`` is a display symbol — a bare root ("AAPL"),
     a futures localSymbol ("MNQU6"), or a raw OCC option symbol — so it
     is first matched against the saved-contracts cache (localSymbol
-    match wins over root match, mirroring ``pick_active_contract``).
+    match wins over root match, mirroring ``instruments.get_contract``).
     Unsaved symbols fall back to the order dict itself: OCC-shaped ones
     become OPT payloads (``con_id``/``sec_type`` travel on the order
     dict, so ``_ensure_position_contract_saved`` can still register
@@ -150,19 +150,16 @@ def _position_like_from_order(order: dict) -> dict | None:
     except (TypeError, ValueError):
         qty = 0
 
-    from src.core.reference_data import get_instance as _rd
+    from src.core import instruments
     root_match: dict | None = None
     local_match: dict | None = None
-    for rows in _rd().contracts_by_symbol.values():
-        for c in rows:
-            if (c.get("local_symbol") or "").strip().upper() == raw:
-                local_match = c
-                break
-            if root_match is None and (
-                    (c.get("symbol") or "").strip().upper() == raw):
-                root_match = c
-        if local_match:
+    for c in instruments.all_contracts():
+        if (c.get("local_symbol") or "").strip().upper() == raw:
+            local_match = c
             break
+        if root_match is None and (
+                (c.get("symbol") or "").strip().upper() == raw):
+            root_match = c
     row = local_match or root_match
     if row:
         return {
@@ -195,62 +192,55 @@ def _position_like_from_order(order: dict) -> dict | None:
     }
 
 
-def _ensure_position_contract_saved(pos: dict) -> None:
-    """Save an OPT position's contract into the contracts universe.
+def _contract_meta_from_position(pos: dict) -> dict | None:
+    """Contract metadata for an OPT position's chip, or ``None``.
 
-    Option contracts generally are not in ``contracts.db`` (the options
-    flows fetch chains live), but Book Trader resolves a chip's sec_type,
-    conid and multiplier through ``ReferenceData.contracts_by_symbol`` —
-    keyed by the row's ``symbol`` field.  Storing the row with
-    ``symbol`` = the raw OCC local symbol makes ``_sec_type_for`` and
-    ``_build_l1_params_for`` work for the OCC chip key with no
-    ReferenceData changes.  Root-symbol lookups are unaffected.
-    Idempotent: no-op when the key already resolves or the conid is
-    already saved.  Mirrors ``symbol_search_popup.ensure_contract_saved``.
+    Option contracts arrive via the position feed, not the symbol
+    search, so the chip's metadata is built from the position dict
+    itself (conid, exchange, multiplier).  Without a conid the entry
+    could never subscribe market data — return ``None`` so the chip
+    stays bare and a later click that DOES carry a conid completes it.
     """
     key, sec = _chip_key_for_position(pos)
     if sec != "OPT" or not key:
-        return
+        return None
     con_id = str(pos.get("con_id") or "")
-    existing = config_manager.load_contracts()
-    row = next((c for c in existing
-                if (c.get("symbol") or "").strip().upper() == key), None)
-    if row is not None and str(row.get("conid") or ""):
-        return  # saved with a real conid — market data can resolve
     if not con_id:
-        # Without a conid the row could never subscribe market data —
-        # and saving it would make the key "resolvable", permanently
-        # blocking a later save that DOES have the conid.  Skip; the
-        # chip still selects, and the next click that carries a conid
-        # completes the save.
-        log.warning("BookTrader: no conid for OPT %s — contract not "
-                    "saved, ladder will not stream", key)
-        return
-    if row is not None:
-        # Heal a row saved by an older build with an empty conid.
-        row["conid"] = con_id
-    elif any(str(c.get("conid", "")) == con_id for c in existing):
-        return
-    else:
-        existing.append({
-            "conid": con_id,
-            "symbol": key,                 # raw OCC upper — the chip key
-            "sec_type": "OPT",
-            "exchange": pos.get("exchange") or "SMART",
-            "currency": pos.get("currency") or "USD",
-            "expiry": "",
-            "strike": "",
-            "right": "",
-            "local_symbol": pos.get("local_symbol") or "",
-            "multiplier": str(pos.get("multiplier") or "100"),
-            "primary_exchange": "",
-            "name": "",
-        })
-    config_manager.save_contracts(existing)
-    from src.core.reference_data import get_instance as _rd
-    _rd().reload_contracts()
-    log.info("BookTrader: saved OPT contract %s (conid %s) from position",
-             key, con_id)
+        log.warning("BookTrader: no conid for OPT %s — contract metadata "
+                    "not stored, ladder will not stream", key)
+        return None
+    return {
+        "conid": con_id,
+        "sec_type": "OPT",
+        "exchange": pos.get("exchange") or "SMART",
+        "currency": pos.get("currency") or "USD",
+        "local_symbol": pos.get("local_symbol") or "",
+        "multiplier": str(pos.get("multiplier") or "100"),
+    }
+
+
+def _ensure_position_contract_saved(pos: dict) -> dict | None:
+    """Resolve (and heal) an OPT position's chip metadata.
+
+    Returns the metadata dict for the chip key, or ``None`` when the
+    position carries no conid.  Existing chip / hot-button references
+    are healed in place via ``upsert_instrument``.  Idempotent: no-op
+    when the key already resolves with a conid.
+    """
+    from src.core import instruments
+    key, sec = _chip_key_for_position(pos)
+    if sec != "OPT" or not key:
+        return None
+    existing_entry = instruments.get_contract(key)
+    if existing_entry is not None and str(existing_entry.get("conid") or ""):
+        return None  # already resolvable — market data can stream
+    meta = _contract_meta_from_position(pos)
+    if meta is None:
+        return None
+    if config_manager.upsert_instrument(key, meta):   # heal existing refs
+        log.info("BookTrader: stored OPT metadata %s (conid %s) from "
+                 "position", key, meta["conid"])
+    return meta
 
 
 # Known-futures per-symbol tick sizes — used as a fallback when a saved
@@ -260,14 +250,9 @@ def _ensure_position_contract_saved(pos: dict) -> None:
 # for the metals (GC/MGC = 0.1) and energies (CL/MCL = 0.01).  Mirror
 # of the table in ``order_entry_panel._tick_size_for_symbol`` so both
 # panels agree on the default tick.
-_FUT_TICK: dict[str, float] = {
-    "MNQ": 0.25, "NQ":  0.25,
-    "MES": 0.25, "ES":  0.25,
-    "M2K": 0.1,  "RTY": 0.1,
-    "MYM": 1.0,  "YM":  1.0,
-    "MGC": 0.1,  "GC":  0.1,
-    "MCL": 0.01, "CL":  0.01,
-}
+# Canonical per-root futures tick table lives in helpers — one source
+# for every panel.
+from src.utils.helpers import _FUT_TICK_SIZES as _FUT_TICK
 
 
 def _tick_size_for_contract(cached: dict | None) -> float:
@@ -275,11 +260,10 @@ def _tick_size_for_contract(cached: dict | None) -> float:
 
     Lookup order:
       1. ``tick_size`` / ``min_tick`` / ``minTick`` field on the cached
-         row (populated by ContractsView since the Tick column landed).
-      2. Per-symbol :data:`_FUT_TICK` table — covers contracts saved
-         before the Tick column existed, and ensures GC / MGC default
-         to 0.1 and CL / MCL to 0.01 instead of the generic 0.25 FUT
-         fallback.
+         entry (min_tick, captured from TWS contract details).
+      2. Canonical per-symbol futures table
+         (``helpers._FUT_TICK_SIZES``) — covers entries saved before
+         min_tick was captured.
       3. Coarse sec-type fallback: FUT → 0.25, everything else → 0.01.
     """
     if cached:
@@ -645,8 +629,7 @@ class BookTraderView(QWidget):
         pm_row.setContentsMargins(0, 0, 0, 0)
         pm_row.setSpacing(4)
         self._btn_reverse = _make_btn("Reverse", Theme.CLR_REVERSE, 30)
-        self._btn_flatten = _make_btn("Flatten", Theme.CLR_FLATTEN, 30,
-                                      fg="#1c1206")
+        self._btn_flatten = _make_btn("Flatten", Theme.CLR_FLATTEN, 30)
         self._btn_cancel = _make_btn("Cancel", Theme.CLR_CANCEL, 30)
         pm_row.addWidget(self._btn_reverse)
         pm_row.addWidget(self._btn_flatten)
@@ -699,6 +682,8 @@ class BookTraderView(QWidget):
             lambda: self._emit_close_tier("tp"))
         self._sl_section.submit_requested.connect(
             lambda: self._emit_close_tier("sl"))
+        self._tr_section.submit_requested.connect(
+            lambda: self._emit_close_tier("tr"))
 
     # ── Public data-in methods (called from FlashTradeView) ──────────────────
 
@@ -878,8 +863,9 @@ class BookTraderView(QWidget):
         # — the worker emits either the bare symbol (STK) or the local
         # symbol (FUT, e.g. "MNQM6").  We accept either.
         accepted: set[str] = {active_u}
-        from src.core.reference_data import get_instance as _rd
-        for c in _rd().contracts_by_symbol.get(active_u, []):
+        from src.core import instruments
+        c = instruments.get_contract(active_u)
+        if c:
             local = (c.get("local_symbol") or "").upper()
             if local:
                 accepted.add(local)
@@ -1016,10 +1002,9 @@ class BookTraderView(QWidget):
         if sym not in self._symbols:
             return
         self._symbols.remove(sym)
+        # Dropping the chip entry drops its contract metadata with it —
+        # no external cleanup needed.
         config_manager.save_book_trader_symbols(self._symbols)
-        # Drop the STK contract from the universe too, unless the Order
-        # Entry chip bar or a hot button still needs it.
-        config_manager.remove_stock_contract_if_unused(sym)
         self._chip_bar.set_symbols(
             [(s, _sec_type_for(s)) for s in self._symbols])
         if self._active_symbol == sym:
@@ -1163,9 +1148,9 @@ class BookTraderView(QWidget):
             # (futures' order blotter uses the local symbol, e.g. "MNQM6").
             accepted: set[str] = {self._active_symbol.upper()}
             try:
-                from src.core.reference_data import get_instance as _rd
-                for c in _rd().contracts_by_symbol.get(
-                        self._active_symbol.upper(), []):
+                from src.core import instruments
+                c = instruments.get_contract(self._active_symbol)
+                if c:
                     local = (c.get("local_symbol") or "").upper()
                     if local:
                         accepted.add(local)
@@ -1255,7 +1240,8 @@ class BookTraderView(QWidget):
         self.order_requested.emit(payload)
 
     def _emit_close_tier(self, side: str) -> None:
-        section = self._pt_section if side == "tp" else self._sl_section
+        section = {"tp": self._pt_section, "sl": self._sl_section,
+                   "tr": self._tr_section}[side]
         tier = section.get_value()
         if tier is None or not self._active_symbol:
             return
@@ -1317,41 +1303,22 @@ class BookTraderView(QWidget):
         if not self._active_symbol:
             return None
         try:
-            from src.core.reference_data import get_instance as _rd
-            return _rd().get_contract(self._active_symbol)
+            from src.core import instruments
+            return instruments.get_contract(self._active_symbol)
         except Exception:
             return None
 
     @staticmethod
     def _build_l1_params_for(sym: str) -> dict | None:
         """Return the param dict ``IBWorkerThread.subscribe_background_symbols``
-        expects for *sym*, or ``None`` when no saved contract row exists
-        (in which case L1 can't be subscribed regardless).  Mirror of
-        :meth:`OrderEntryPanel._build_bg_params_for_symbol` so BookTrader
-        can subscribe its active symbol's L1 directly when OrderEntry's
-        chip bar doesn't already cover it.
+        expects for *sym*, or ``None`` when the chip's instrument entry
+        has no conid (in which case L1 can't be subscribed regardless).
+        Mirror of :meth:`OrderEntryPanel._build_bg_params_for_symbol` so
+        BookTrader can subscribe its active symbol's L1 directly when
+        OrderEntry's chip bar doesn't already cover it.
         """
-        if not sym:
-            return None
-        try:
-            from src.core.reference_data import get_instance as _rd
-            rows = _rd().contracts_by_symbol.get(sym.upper(), [])
-        except Exception:
-            return None
-        for c in rows:
-            conid = c.get("conid")
-            if conid:
-                return {
-                    "conid":        int(conid),
-                    "symbol":       sym,
-                    "sec_type":     c.get("sec_type", ""),
-                    "exchange":     c.get("exchange", "SMART"),
-                    "currency":     c.get("currency", "USD"),
-                    "local_symbol": c.get("local_symbol", ""),
-                    "expiry":       c.get("expiry", ""),
-                    "multiplier":   c.get("multiplier", ""),
-                }
-        return None
+        from src.core import instruments
+        return instruments.build_md_params(sym) if sym else None
 
     def _capture_tier_state(self, sym: str | None) -> None:
         if not sym or not hasattr(self, "_pt_section"):
@@ -1409,7 +1376,8 @@ class BookTraderView(QWidget):
                         self._tr_section):
             section.set_qty(self._active_qty)
 
-        mult = rd.get_multiplier(sym) or 1.0
+        from src.core import instruments
+        mult = instruments.get_multiplier(sym) or 1.0
         for section in (self._pt_section, self._sl_section,
                         self._tr_section):
             section.set_multiplier(mult)
@@ -1586,13 +1554,17 @@ class BookTraderView(QWidget):
         key, sec = _chip_key_for_position(pos)
         if not key:
             return
+        meta = None
         if sec == "OPT":
             # Before selection: sec_type + L1 params must resolve.
-            _ensure_position_contract_saved(pos)
+            # Heals existing references and returns the metadata for a
+            # chip that doesn't exist yet.
+            meta = (_ensure_position_contract_saved(pos)
+                    or _contract_meta_from_position(pos))
         if key in {s.upper() for s in self._symbols}:
             self._on_symbol_selected(key, _sec_type_for(key))
         else:
-            self._add_symbol(key)
+            self._add_symbol(key, meta=meta)
         from src.ui.widgets.size_unit_parts import UNIT_PCT
         try:
             qty = abs(int(float(pos.get("position") or 0)))
@@ -1640,40 +1612,46 @@ class BookTraderView(QWidget):
             exclude={s.upper() for s in self._symbols})
 
         def _picked(entry: dict) -> None:
+            from src.core import instruments
             if (entry.get("source") == "ibkr"
                     and entry.get("sec_type") == "FUT"):
                 sym, replaced = apply_future_pick(self, entry)
                 if not sym:
                     return  # user declined the replacement
-                self._add_symbol(sym)
+                self._add_symbol(
+                    sym, meta=instruments.contract_meta_from_result(entry))
                 if replaced:
                     self.contract_replaced.emit(sym)
                 return
-            sym = ensure_contract_saved(entry)
+            sym, meta = ensure_contract_saved(entry)
             if sym:
-                self._add_symbol(sym)
+                self._add_symbol(sym, meta=meta)
 
         dlg.symbol_selected.connect(_picked)
         # Anchor below the ticker's "+" button.
         btn = self._ticker._btn_add      # noqa: SLF001 — private-ish, single-caller
         dlg.open_below(btn)
 
-    def _add_symbol(self, sym: str) -> None:
+    def _add_symbol(self, sym: str, meta: dict | None = None) -> None:
         sym = (sym or "").strip().upper()
         if not sym or sym in {s.upper() for s in self._symbols}:
             return
-        new_sec = _sec_type_for(sym)
+        if meta:
+            # Classify from the incoming metadata when the entry isn't
+            # stored yet (the resolver can't know a brand-new symbol).
+            new_sec = str(meta.get("sec_type", "") or "") or _sec_type_for(sym)
+        else:
+            new_sec = _sec_type_for(sym)
         if new_sec != "FUT":
             # The STK group renders at most 5 × 3 chips.  When it's
             # full, the new symbol replaces the LAST chip (row 3,
             # column 5) instead of becoming an invisible overflow
-            # entry.  Mirrors _on_symbol_remove's contract cleanup.
+            # entry.  Dropping the chip entry IS the cleanup.
             stk_group = [s for s in self._symbols
                          if _sec_type_for(s) != "FUT"]
             if len(stk_group) >= 15:
                 replaced = stk_group[-1]
                 self._symbols.remove(replaced)
-                config_manager.remove_stock_contract_if_unused(replaced)
                 log.info("BookTrader: STK chip group full — %s replaces "
                          "%s", sym, replaced)
         # Option chips always occupy the LAST position of the chip bar:
@@ -1693,6 +1671,8 @@ class BookTraderView(QWidget):
             else:
                 self._symbols.insert(opt_idx, sym)
         config_manager.save_book_trader_symbols(self._symbols)
+        if meta:
+            config_manager.upsert_instrument(sym, meta)
         entries = [(s, _sec_type_for(s)) for s in self._symbols]
         self._chip_bar.set_symbols(entries)
         # The FUT group still renders at most 5 × 2 chips; an

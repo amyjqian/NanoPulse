@@ -18,12 +18,18 @@ def env(tmp_path, monkeypatch):
     data.mkdir()
     db_files = {
         "users.db": data / "users.db",
-        "contracts.db": data / "contracts.db",
         "strategy_tiers.db": data / "strategy_tiers.db",
     }
     for i, p in enumerate(db_files.values()):
         p.write_bytes(f"ORIGINAL-DB-{i}".encode())
     monkeypatch.setattr("src.backup.service._DB_FILES", db_files)
+    # Legacy-archive compatibility path (contracts.db) — pointed at the
+    # temp dir so no test can ever touch the real data/ files.
+    restore_only = {"contracts.db": data / "contracts.db"}
+    monkeypatch.setattr("src.backup.service._RESTORE_ONLY_DB_FILES",
+                        restore_only)
+    import src.core.instruments as instruments
+    monkeypatch.setattr(instruments, "_LEGACY_DB", data / "contracts.db")
 
     cfg = tmp_path / "app_config-tester.json"
     cfg.write_text(json.dumps({"preferences": {"display": {"theme": "Dark"}},
@@ -45,7 +51,9 @@ def test_export_creates_valid_archive(env):
     with zipfile.ZipFile(dest) as z:
         names = set(z.namelist())
         assert {"manifest.json", "config.json", "db/users.db",
-                "db/contracts.db", "db/strategy_tiers.db"} <= names
+                "db/strategy_tiers.db"} <= names
+        # Contract identity travels inside config.json now.
+        assert "db/contracts.db" not in names
         manifest = json.loads(z.read("manifest.json"))
         assert manifest["format"] == "npbak"
         assert manifest["username"] == "tester"
@@ -187,3 +195,43 @@ def test_last_backup_display(env):
     assert svc.last_backup_display() == "Never"
     svc.export(env["tmp"] / "b.npbak")
     assert svc.last_backup_display() != "Never"
+
+
+def test_legacy_archive_restores_contracts_db_and_migrates(env):
+    """Archives exported before the contract DB was retired carry
+    db/contracts.db and string chip lists — restore writes the file to
+    disk and runs the migration so chips regain their metadata."""
+    import sqlite3
+
+    import src.core.instruments as instruments
+
+    svc = ConfigBackup("tester")
+    legacy = env["tmp"] / "legacy.npbak"
+    cols = ("conid", "symbol", "sec_type", "exchange", "currency", "expiry",
+            "strike", "right", "local_symbol", "multiplier",
+            "primary_exchange", "name")
+    dbf = env["tmp"] / "legacy_contracts.db"
+    conn = sqlite3.connect(dbf)
+    conn.execute(f"CREATE TABLE contracts ({', '.join(cols)})")
+    conn.execute(
+        f"INSERT INTO contracts VALUES ({', '.join('?' * len(cols))})",
+        ("265598", "AAPL", "STK", "SMART", "USD", "", "", "", "AAPL", "",
+         "ISLAND", "Apple Inc"))
+    conn.commit()
+    conn.close()
+    with zipfile.ZipFile(legacy, "w") as z:
+        z.writestr("manifest.json", json.dumps(
+            {"format": "npbak", "version": 1, "username": "tester"}))
+        z.writestr("config.json", json.dumps(
+            {"order_entry_symbols": ["AAPL"], "connections": []}))
+        z.write(dbf, "db/contracts.db")
+
+    svc.restore(legacy)
+
+    # The legacy DB landed on disk and the migration enriched the chip.
+    assert (env["data"] / "contracts.db").exists()
+    restored = json.loads(env["cfg"].read_text())
+    (entry,) = restored["order_entry_symbols"]
+    assert entry["symbol"] == "AAPL"
+    assert entry["conid"] == "265598"
+    assert entry["primary_exchange"] == "ISLAND"

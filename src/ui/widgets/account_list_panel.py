@@ -45,7 +45,7 @@ TEXT = "#E6EBF2"
 TEXT_DIM = "#A3AFC2"
 
 CLR_FLATTEN = "#E08A3C"
-CLR_CLOSE = "#9DA3AB"
+CLR_CLOSE = "#6E757E"
 CLR_REVERSE = "#A371F7"
 CLR_CANCEL = "#3A414C"
 
@@ -777,9 +777,9 @@ class AccountListPanel(QWidget):
         ag.setContentsMargins(0, 4, 0, 0)
 
         for col, (txt, clr, fg, act) in enumerate([
-            ("25%",     CLR_CLOSE,   "#0f1319", "close_25"),
-            ("50%",     CLR_CLOSE,   "#0f1319", "close_50"),
-            ("Flatten", CLR_FLATTEN, "#1c1206", "flatten"),
+            ("25%",     CLR_CLOSE,   "#ffffff", "close_25"),
+            ("50%",     CLR_CLOSE,   "#ffffff", "close_50"),
+            ("Flatten", CLR_FLATTEN, "#ffffff", "flatten"),
         ]):
             b = _make_btn(txt, clr, fg=fg)
             b.clicked.connect(lambda _, a=act: self._emit_action(a))
@@ -799,7 +799,7 @@ class AccountListPanel(QWidget):
 
         for col, (txt, clr, fg, act) in enumerate([
             ("Reverse", CLR_REVERSE, "#ffffff", "reverse"),
-            ("75%",     CLR_CLOSE,   "#0f1319", "close_75"),
+            ("75%",     CLR_CLOSE,   "#ffffff", "close_75"),
             ("Cancel",  CLR_CANCEL,  "#E6EBF2", "cancel_all"),
         ]):
             b = _make_btn(txt, clr, fg=fg)
@@ -1698,7 +1698,7 @@ class AccountListPanel(QWidget):
             self._flatten_armed = False
             self._flatten_btn.setText("Flatten")
             self._flatten_btn.setStyleSheet(
-                _btn_qss(CLR_FLATTEN, fg="#1c1206"))
+                _btn_qss(CLR_FLATTEN))
 
     def _confirm_reverse(self, accounts: list[str]) -> bool:
         """Show a styled confirmation dialog before reversing.

@@ -277,7 +277,13 @@ class TestBracketChildren:
             _parent(outside_rth=False, allow_pre_open=False),
             params, ref_price=17500.0, tick=0.25)
         for ch in out:
-            assert ch.outsideRth is True
+            if ch.orderType == "LMT":
+                # Plain LMT children are exempt: CME ignores the flag
+                # for them and emits Warning 2109, which the blotter
+                # renders as a scary ValidationError.
+                assert not getattr(ch, "outsideRth", False)
+            else:
+                assert ch.outsideRth is True
             # allowPreOpen is STK-only; FUT path shouldn't touch it.
             assert not getattr(ch, "allowPreOpen", False)
 
@@ -575,3 +581,326 @@ class TestCloseTier:
             order = wt._ib.placed[0][1]
             assert order.outsideRth is True, \
                 f"{side}: expected outsideRth=True on FUT exit, got False"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  close_tier — Trailing (TS) header-button path
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestCloseTierTrailing:
+    def test_tr_long_submits_sell_trail_with_distance(self):
+        pos = _make_position("MNQ", "FUT", 111, net_pos=3,
+                             account="DU1", minTick=0.25)
+        wt = _make_close_tier_worker([pos])
+        _run(wt._do_close_tier(
+            symbol="MNQ", account="DU1", side="tr",
+            offset_pts=0.5, requested_qty=5,
+            current_price=26697.0, cap_offset=0.0,
+        ))
+        assert len(wt._ib.placed) == 1
+        _, order = wt._ib.placed[0]
+        assert order.orderType == "TRAIL"
+        assert order.action == "SELL"
+        assert order.totalQuantity == 3       # min(|pos|=3, req=5)
+        assert order.auxPrice == 0.5          # trail DISTANCE, not a level
+
+    def test_tr_short_submits_buy_trail_same_unsigned_distance(self):
+        pos = _make_position("MNQ", "FUT", 111, net_pos=-4, account="DU1")
+        wt = _make_close_tier_worker([pos])
+        _run(wt._do_close_tier("MNQ", "DU1", "tr", 0.5, 10, 26697.0, 0.0))
+        _, order = wt._ib.placed[0]
+        assert order.action == "BUY"
+        assert order.totalQuantity == 4
+        assert order.auxPrice == 0.5          # unsigned either direction
+
+    def test_tr_distance_snaps_to_tick(self):
+        pos = _make_position("MNQ", "FUT", 111, net_pos=1,
+                             account="DU1", minTick=0.25)
+        wt = _make_close_tier_worker([pos])
+        _run(wt._do_close_tier("MNQ", "DU1", "tr", 0.63, 1, 26697.0, 0.0))
+        assert wt._ib.placed[0][1].auxPrice == 0.75
+
+    def test_tr_flat_account_places_nothing(self):
+        """Parity with tp/sl: a zero-position account is silently
+        skipped — no phantom trailing stop."""
+        pos = _make_position("MNQ", "FUT", 111, net_pos=0, account="DU1")
+        wt = _make_close_tier_worker([pos])
+        _run(wt._do_close_tier("MNQ", "DU1", "tr", 0.5, 5, 26697.0, 0.0))
+        assert wt._ib.placed == []
+
+    def test_tr_cap_offset_ignored(self):
+        """cap_offset shapes SL's STP LMT only — a trail must stay a
+        plain TRAIL regardless."""
+        pos = _make_position("MNQ", "FUT", 111, net_pos=2, account="DU1")
+        wt = _make_close_tier_worker([pos])
+        _run(wt._do_close_tier("MNQ", "DU1", "tr", 0.5, 2, 26697.0, 1.0))
+        assert wt._ib.placed[0][1].orderType == "TRAIL"
+
+    def test_tr_fut_forces_outside_rth(self):
+        pos = _make_position("MNQ", "FUT", 111, net_pos=2, account="DU1")
+        wt = _make_close_tier_worker([pos])
+        _run(wt._do_close_tier("MNQ", "DU1", "tr", 0.5, 5, 26697.0, 0.0))
+        assert wt._ib.placed[0][1].outsideRth is True
+
+    def test_tr_status_params_carry_distance_and_type(self):
+        pos = _make_position("MNQ", "FUT", 111, net_pos=2, account="DU1")
+        wt = _make_close_tier_worker([pos])
+        seen = []
+        wt._emit_order_status = (
+            lambda trade, oid, params, status: seen.append(params))
+        _run(wt._do_close_tier("MNQ", "DU1", "tr", 0.5, 5, 26697.0, 0.0))
+        params = seen[0]
+        assert params["order_type"] == "TRAIL"
+        assert params["stop_price"] == 0.5    # distance in the STP cell
+        assert "limit_price" not in params
+
+    def test_invalid_side_still_rejected(self):
+        pos = _make_position("MNQ", "FUT", 111, net_pos=2, account="DU1")
+        wt = _make_close_tier_worker([pos])
+        _run(wt._do_close_tier("MNQ", "DU1", "zz", 0.5, 5, 26697.0, 0.0))
+        assert wt._ib.placed == []
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  _child_price_params — blotter price cells per child order type
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestChildPriceParams:
+    _f = staticmethod(IBWorkerThread._child_price_params)
+
+    def test_lmt_limit_only(self):
+        assert self._f("LMT", 101.5, None) == {"limit_price": 101.5}
+
+    def test_stp_stop_only(self):
+        assert self._f("STP", None, 99.0) == {"stop_price": 99.0}
+
+    def test_stp_lmt_both(self):
+        assert self._f("STP LMT", 98.5, 99.0) == {
+            "limit_price": 98.5, "stop_price": 99.0}
+
+    def test_trail_distance_in_stop_cell(self):
+        assert self._f("TRAIL", None, 0.5) == {"stop_price": 0.5}
+
+    def test_dbl_max_sentinels_dropped(self):
+        big = 1.8e308
+        assert self._f("LMT", big, None) == {}
+        assert self._f("TRAIL", None, big) == {}
+        assert self._f("STP", None, 0.0) == {}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  _convert_mkt_parent_for_trail — IB error 328 guard
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _mkt_parent(action="BUY"):
+    return SimpleNamespace(
+        action=action,
+        orderType="MKT",
+        orderRef="nano_0419_120000_abcd",
+    )
+
+
+class TestConvertMktParentForTrail:
+    def test_buy_mkt_becomes_lmt_capped_above_ref(self):
+        wt = _make_worker()
+        params = {"tick_size": 0.25}
+        order = _mkt_parent("BUY")
+        assert wt._convert_mkt_parent_for_trail(order, params, 17500.0)
+        # No cap preference → 10 ticks through the market.
+        assert order.orderType == "LMT"
+        assert order.lmtPrice == 17502.50
+        # Blotter params reflect the converted parent.
+        assert params["order_type"] == "LMT"
+        assert params["limit_price"] == 17502.50
+
+    def test_sell_mkt_caps_below_ref(self):
+        wt = _make_worker()
+        order = _mkt_parent("SELL")
+        assert wt._convert_mkt_parent_for_trail(order, {"tick_size": 0.25},
+                                                17500.0)
+        assert order.lmtPrice == 17497.50
+
+    def test_limit_cap_offset_preference_wins(self):
+        wt = _make_worker()
+        params = {"tick_size": 0.25, "limit_cap_offset": 1.0}
+        order = _mkt_parent("BUY")
+        assert wt._convert_mkt_parent_for_trail(order, params, 17500.0)
+        assert order.lmtPrice == 17501.00
+
+    def test_cap_snaps_to_tick_grid(self):
+        wt = _make_worker()
+        params = {"tick_size": 0.25, "limit_cap_offset": 0.30}
+        order = _mkt_parent("BUY")
+        assert wt._convert_mkt_parent_for_trail(order, params, 17500.0)
+        assert order.lmtPrice == 17500.25  # 17500.30 snapped to 0.25 grid
+
+    def test_non_mkt_parent_untouched(self):
+        wt = _make_worker()
+        params = {"tick_size": 0.25}
+        order = SimpleNamespace(action="BUY", orderType="LMT",
+                                lmtPrice=17499.0,
+                                orderRef="nano_0419_120000_abcd")
+        assert not wt._convert_mkt_parent_for_trail(order, params, 17500.0)
+        assert order.orderType == "LMT"
+        assert order.lmtPrice == 17499.0
+        assert "order_type" not in params
+
+    def test_zero_ref_price_leaves_mkt(self):
+        """A SELL against a tiny ref can only produce lmt<=0 — no convert."""
+        wt = _make_worker()
+        order = _mkt_parent("SELL")
+        assert not wt._convert_mkt_parent_for_trail(
+            order, {"tick_size": 0.25}, 1.0)
+        assert order.orderType == "MKT"
+
+    def test_default_penny_tick_for_stocks(self):
+        wt = _make_worker()
+        order = _mkt_parent("BUY")
+        assert wt._convert_mkt_parent_for_trail(order, {}, 150.00)
+        assert order.lmtPrice == 150.10  # 10 * 0.01 default tick
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Fill re-anchoring — children re-priced to the parent's actual fill
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_reprice = staticmethod(IBWorkerThread._reanchored_child_prices).__func__
+
+
+class TestReanchoredChildPrices:
+    """The user's MNQ case: TP/SL 20 pts, limit buy 29530, fill 29516 —
+    children must move to 29536 / 29496, not stay at 29550 / 29510."""
+
+    _params = {
+        "profit_take": {"value": 20, "unit": "price"},
+        "stop_loss": {"value": 20, "unit": "price"},
+    }
+
+    def test_tp_lmt_reanchors_to_fill(self):
+        out = _reprice("LMT", "BUY", self._params, 29516.0, 0.25)
+        assert out == {"lmtPrice": 29536.0}
+
+    def test_sl_stp_reanchors_to_fill(self):
+        out = _reprice("STP", "BUY", self._params, 29516.0, 0.25)
+        assert out == {"auxPrice": 29496.0}
+
+    def test_sell_parent_signs_invert(self):
+        assert _reprice("LMT", "SELL", self._params, 29516.0, 0.25) == \
+            {"lmtPrice": 29496.0}
+        assert _reprice("STP", "SELL", self._params, 29516.0, 0.25) == \
+            {"auxPrice": 29536.0}
+
+    def test_stp_lmt_carries_cap(self):
+        params = dict(self._params, limit_cap_offset=1.0)
+        out = _reprice("STP LMT", "BUY", params, 29516.0, 0.25)
+        assert out == {"auxPrice": 29496.0, "lmtPrice": 29495.0}
+
+    def test_ticks_unit_converts(self):
+        params = {"profit_take": {"value": 20, "unit": "ticks"}}  # 5 pts
+        out = _reprice("LMT", "BUY", params, 29516.0, 0.25)
+        assert out == {"lmtPrice": 29521.0}
+
+    def test_trail_untouched(self):
+        assert _reprice("TRAIL", "BUY", self._params, 29516.0, 0.25) == {}
+
+    def test_missing_tier_returns_empty(self):
+        assert _reprice("LMT", "BUY", {}, 29516.0, 0.25) == {}
+        assert _reprice("STP", "BUY", {}, 29516.0, 0.25) == {}
+
+    def test_prices_snap_to_tick(self):
+        params = {"profit_take": {"value": 20.1, "unit": "price"}}
+        out = _reprice("LMT", "BUY", params, 29516.0, 0.25)
+        assert out == {"lmtPrice": 29536.0}  # 29536.1 snapped to grid
+
+
+def _fake_child(order_type, action="SELL", lmt=None, aux=None,
+                status="PreSubmitted"):
+    o = SimpleNamespace(orderType=order_type, action=action,
+                        totalQuantity=1, orderRef="nano_0419_120000_chld",
+                        transmit=False)
+    if lmt is not None:
+        o.lmtPrice = lmt
+    if aux is not None:
+        o.auxPrice = aux
+    return SimpleNamespace(order=o,
+                           orderStatus=SimpleNamespace(status=status,
+                                                       avgFillPrice=0.0))
+
+
+def _fake_parent(fill=29516.0, action="BUY"):
+    return SimpleNamespace(
+        order=SimpleNamespace(action=action),
+        orderStatus=SimpleNamespace(status="Filled", avgFillPrice=fill))
+
+
+def _reanchor_worker():
+    wt = _make_worker()
+    placed = []
+    wt._ib = SimpleNamespace(client=_FakeClient(),
+                             placeOrder=lambda c, o: placed.append(o))
+    emitted = []
+    wt._emit_order_status = (
+        lambda trade, key, params, status, **kw:
+        emitted.append((key, dict(params), status)))
+    return wt, placed, emitted
+
+
+class TestReanchorBracketChildren:
+    _params = {
+        "tick_size": 0.25,
+        "profit_take": {"value": 20, "unit": "price"},
+        "stop_loss": {"value": 20, "unit": "price"},
+    }
+
+    def test_children_repriced_and_modified(self):
+        wt, placed, emitted = _reanchor_worker()
+        tp = _fake_child("LMT", lmt=29550.0)
+        sl = _fake_child("STP", aux=29510.0)
+        children = [(tp, "acct_tpref", {"limit_price": 29550.0}),
+                    (sl, "acct_slref", {"stop_price": 29510.0})]
+        wt._reanchor_bracket_children(object(), _fake_parent(29516.0),
+                                      children, 29530.0, self._params)
+        assert tp.order.lmtPrice == 29536.0
+        assert sl.order.auxPrice == 29496.0
+        # Both modifies went to IB, each transmitting on its own.
+        assert placed == [tp.order, sl.order]
+        assert tp.order.transmit is True and sl.order.transmit is True
+        # Blotter rows re-emitted with the new prices.
+        assert emitted[0][1]["limit_price"] == 29536.0
+        assert emitted[1][1]["stop_price"] == 29496.0
+
+    def test_fill_at_reference_is_noop(self):
+        wt, placed, _ = _reanchor_worker()
+        tp = _fake_child("LMT", lmt=29550.0)
+        wt._reanchor_bracket_children(object(), _fake_parent(29530.0),
+                                      [(tp, "k", {})], 29530.0,
+                                      self._params)
+        assert placed == []
+        assert tp.order.lmtPrice == 29550.0
+
+    def test_trail_child_left_alone(self):
+        wt, placed, _ = _reanchor_worker()
+        tr = _fake_child("TRAIL", aux=25.0)
+        wt._reanchor_bracket_children(object(), _fake_parent(29516.0),
+                                      [(tr, "k", {})], 29530.0,
+                                      self._params)
+        assert placed == []
+        assert tr.order.auxPrice == 25.0
+
+    def test_finished_children_skipped(self):
+        wt, placed, _ = _reanchor_worker()
+        done = _fake_child("LMT", lmt=29550.0, status="Filled")
+        gone = _fake_child("STP", aux=29510.0, status="Cancelled")
+        wt._reanchor_bracket_children(
+            object(), _fake_parent(29516.0),
+            [(done, "k1", {}), (gone, "k2", {})], 29530.0, self._params)
+        assert placed == []
+
+    def test_bogus_fill_price_is_noop(self):
+        wt, placed, _ = _reanchor_worker()
+        tp = _fake_child("LMT", lmt=29550.0)
+        for bad in (0.0, 1.7976931348623157e308):
+            wt._reanchor_bracket_children(
+                object(), _fake_parent(bad), [(tp, "k", {})],
+                29530.0, self._params)
+        assert placed == []

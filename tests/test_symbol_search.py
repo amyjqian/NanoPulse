@@ -109,6 +109,38 @@ class TestMergeRows:
         locals_shown, _, _ = merge_rows(local, [], set(), "amz")
         assert [e["symbol"] for e in locals_shown] == ["AMZN"]
 
+    def test_short_query_does_not_match_names(self):
+        """Searching "es" must not drag in every fund whose NAME contains
+        the letters (iShar**ES**, QQQ Trust S**ERIES** 1)."""
+        local = [
+            _local_row(symbol="IWM", name="ISHARES RUSSELL 2000 ETF"),
+            _local_row(symbol="QQQ", name="INVESCO QQQ TRUST SERIES 1"),
+            _local_row(symbol="ES", sec_type="FUT", name="E-mini S&P 500"),
+        ]
+        locals_shown, _, _ = merge_rows(local, [], set(), "es")
+        assert [e["symbol"] for e in locals_shown] == ["ES"]
+        # 3+ character queries still search names.
+        locals_shown, _, _ = merge_rows(local, [], set(), "russell")
+        assert [e["symbol"] for e in locals_shown] == ["IWM"]
+
+    def test_remote_ranked_exact_then_prefix_futures_first(self):
+        """The "es" scenario: the ES future must lead — before the ES
+        stock (Eversource), before prefix matches (ESRX/ESLT), before
+        IB fuzzy matches with no visible relation."""
+        remote = [
+            _remote_row(symbol="VGSX", conid=1),                 # fuzzy noise
+            _remote_row(symbol="ESRX", conid=2),                 # prefix
+            _remote_row(symbol="ES", conid=3),                   # exact STK
+            {**_remote_row(symbol="ES", conid=4), "sec_type": "FUT"},
+            _remote_row(symbol="ESLT", conid=5),                 # prefix
+        ]
+        _, remote_shown, _ = merge_rows([], remote, set(), "es")
+        assert [(r["symbol"], r["sec_type"]) for r in remote_shown] == [
+            ("ES", "FUT"), ("ES", "STK"),
+            ("ESRX", "STK"), ("ESLT", "STK"),
+            ("VGSX", "STK"),
+        ]
+
     def test_live_fut_root_supersedes_saved_chain_rows(self):
         """A live FUT root always shows (it expands into pickable
         expirations) — the saved per-expiry rows step aside."""
@@ -234,6 +266,28 @@ class TestPickFrontExpiries:
         out = ssp.pick_front_expiries(chain, today=self._TODAY)
         assert [r["conid"] for r in out] == [1]
 
+    def test_same_expiry_on_two_venues_consumes_one_slot(self):
+        """ES lists each expiration on CME AND IB's QBALGO algo venue —
+        without per-date dedup the user saw Sep twice and never Dec."""
+        chain = [
+            _chain_row(1, "20260918"),                      # Sep @ CME
+            {**_chain_row(2, "20260918"), "exchange": "QBALGO"},
+            {**_chain_row(3, "20261218"), "exchange": "QBALGO"},
+            _chain_row(4, "20261218"),                      # Dec @ CME
+        ]
+        out = ssp.pick_front_expiries(chain, today=self._TODAY)
+        # Two DISTINCT months, primary venue preferred on each.
+        assert [r["conid"] for r in out] == [1, 4]
+        assert all(r["exchange"] == "CME" for r in out)
+
+    def test_qbalgo_only_expiry_still_shown(self):
+        # If an expiry ONLY trades on the algo venue it must still appear
+        # rather than being filtered out entirely.
+        chain = [_chain_row(1, "20260918"),
+                 {**_chain_row(2, "20261218"), "exchange": "QBALGO"}]
+        out = ssp.pick_front_expiries(chain, today=self._TODAY)
+        assert [r["conid"] for r in out] == [1, 2]
+
     def test_non_usd_bad_expiry_and_non_fut_dropped(self):
         chain = [_chain_row(1, "20261218", currency="EUR"),
                  _chain_row(2, "garbage"),
@@ -260,82 +314,29 @@ class TestFormatExpiry:
         assert ssp.format_expiry("") == ""
 
 
-class TestSaveFutureChain:
-    @pytest.fixture
-    def store(self, monkeypatch):
-        state = {"contracts": [], "saved": None, "reloaded": False}
-        monkeypatch.setattr(ssp.config_manager, "load_contracts",
-                            lambda: list(state["contracts"]))
-
-        def _save(contracts):
-            state["saved"] = contracts
-        monkeypatch.setattr(ssp.config_manager, "save_contracts", _save)
-
-        import src.core.reference_data as rd
-
-        def _reload():
-            state["reloaded"] = True
-        monkeypatch.setattr(
-            rd, "get_instance",
-            lambda: SimpleNamespace(reload_contracts=_reload))
-        return state
-
-    def test_saves_whole_usd_chain(self, store):
-        sym = ssp.save_future_chain(
-            [_chain_row(1, "20260918"), _chain_row(2, "20261218")],
-            root_name="E-mini Nasdaq 100")
-        assert sym == "NQ"
-        assert store["reloaded"]
-        assert [c["conid"] for c in store["saved"]] == [1, 2]
-        assert all(c["name"] == "E-mini Nasdaq 100"
-                   for c in store["saved"])
-
-    def test_dedupes_against_existing_conids(self, store):
-        store["contracts"] = [_chain_row(1, "20260918")]
-        ssp.save_future_chain(
-            [_chain_row(1, "20260918"), _chain_row(2, "20261218")])
-        assert [c["conid"] for c in store["saved"]] == [1, 2]
-
-    def test_fully_saved_chain_writes_nothing(self, store):
-        store["contracts"] = [_chain_row(1, "20260918")]
-        assert ssp.save_future_chain([_chain_row(1, "20260918")]) == "NQ"
-        assert store["saved"] is None
-
-    def test_non_usd_and_non_fut_rows_ignored(self, store):
-        assert ssp.save_future_chain(
-            [_chain_row(1, "20260918", currency="EUR"),
-             {"conid": 9, "symbol": "NQ", "sec_type": "STK",
-              "currency": "USD"}]) == ""
-        assert store["saved"] is None
-
-
 class TestApplyFuturePick:
     @pytest.fixture
     def store(self, monkeypatch):
-        state = {"contracts": [], "saved": None, "reloaded": False}
-        monkeypatch.setattr(ssp.config_manager, "load_contracts",
-                            lambda: [dict(c) for c in state["contracts"]])
-
-        def _save(contracts):
-            state["saved"] = contracts
-        monkeypatch.setattr(ssp.config_manager, "save_contracts", _save)
-
-        import src.core.reference_data as rd
-
-        def _reload():
-            state["reloaded"] = True
+        """Patch the resolver + upsert: apply_future_pick now re-points
+        chip/hot-button metadata instead of rewriting a contracts DB."""
+        import src.core.instruments as instruments
+        state = {"stored": None, "upserts": []}
         monkeypatch.setattr(
-            rd, "get_instance",
-            lambda: SimpleNamespace(reload_contracts=_reload))
+            instruments, "get_contract",
+            lambda q: dict(state["stored"]) if state["stored"] else None)
+        monkeypatch.setattr(
+            ssp.config_manager, "upsert_instrument",
+            lambda sym, meta, path=None:
+                state["upserts"].append((sym, meta)) or True)
         return state
 
     @staticmethod
-    def _answer(monkeypatch, button):
-        from PySide6.QtWidgets import QMessageBox
+    def _answer(monkeypatch, action):
+        """Patch the three-way dialog (replace / pin / cancel)."""
         calls = []
         monkeypatch.setattr(
-            QMessageBox, "question",
-            lambda *a, **k: calls.append(a) or button)
+            ssp, "_ask_future_action",
+            lambda *a, **k: calls.append(a) or action)
         return calls
 
     def _entry(self, conid=2, expiry="20261218"):
@@ -343,46 +344,56 @@ class TestApplyFuturePick:
                 "name": "E-mini Nasdaq 100"}
 
     def test_new_root_saves_without_prompt(self, store, monkeypatch):
-        from PySide6.QtWidgets import QMessageBox
-        calls = self._answer(monkeypatch, QMessageBox.StandardButton.No)
+        calls = self._answer(monkeypatch, "cancel")
         sym, replaced = ssp.apply_future_pick(None, self._entry())
         assert (sym, replaced) == ("NQ", False)
         assert calls == []  # no confirmation needed
-        assert [c["conid"] for c in store["saved"]] == [2]
+        assert store["upserts"][0][0] == "NQ"
+        assert store["upserts"][0][1]["conid"] == "2"
 
-    def test_same_contract_is_noop(self, store, monkeypatch):
-        store["contracts"] = [_chain_row(2, "20261218")]
+    def test_same_contract_heals_without_prompt(self, store, monkeypatch):
+        store["stored"] = {"symbol": "NQ", "conid": "2",
+                           "sec_type": "FUT", "expiry": "20261218"}
         calls = self._answer(monkeypatch, None)
         sym, replaced = ssp.apply_future_pick(None, self._entry(conid=2))
         assert (sym, replaced) == ("NQ", False)
-        assert calls == [] and store["saved"] is None
+        assert calls == []
+        assert len(store["upserts"]) == 1   # heal writes metadata through
 
     def test_different_expiry_yes_replaces_everywhere(self, store,
                                                       monkeypatch):
-        from PySide6.QtWidgets import QMessageBox
-        store["contracts"] = [
-            _chain_row(1, "20260918"),
-            {"conid": "9", "symbol": "MSFT", "sec_type": "STK"},
-        ]
-        self._answer(monkeypatch, QMessageBox.StandardButton.Yes)
+        store["stored"] = {"symbol": "NQ", "conid": "1",
+                           "sec_type": "FUT", "expiry": "20260918"}
+        calls = self._answer(monkeypatch, "replace")
         sym, replaced = ssp.apply_future_pick(
             None, self._entry(conid=2, expiry="20261218"))
         assert (sym, replaced) == ("NQ", True)
-        assert store["reloaded"]
-        saved = store["saved"]
-        # old NQ expiry gone, new one in, unrelated contracts untouched
-        assert [c["conid"] for c in saved
-                if c.get("sec_type") == "FUT"] == [2]
-        assert any(c.get("symbol") == "MSFT" for c in saved)
+        assert len(calls) == 1              # user was asked
+        # upsert fans the new expiry out to every chip / hot button.
+        assert store["upserts"][0][1]["expiry"] == "20261218"
 
     def test_different_expiry_no_cancels(self, store, monkeypatch):
-        from PySide6.QtWidgets import QMessageBox
-        store["contracts"] = [_chain_row(1, "20260918")]
-        self._answer(monkeypatch, QMessageBox.StandardButton.No)
+        store["stored"] = {"symbol": "NQ", "conid": "1",
+                           "sec_type": "FUT", "expiry": "20260918"}
+        self._answer(monkeypatch, "cancel")
         sym, replaced = ssp.apply_future_pick(
             None, self._entry(conid=2, expiry="20261218"))
         assert (sym, replaced) == ("", False)
-        assert store["saved"] is None
+        assert store["upserts"] == []
+
+    def test_different_expiry_pin_adds_local_symbol_chip(self, store,
+                                                         monkeypatch):
+        """Pin keeps the root untouched and returns the picked
+        contract's LOCAL symbol as the chip key — an expiry-keyed chip
+        frozen to that contract."""
+        store["stored"] = {"symbol": "NQ", "conid": "1",
+                           "sec_type": "FUT", "expiry": "20260918"}
+        self._answer(monkeypatch, "pin")
+        sym, replaced = ssp.apply_future_pick(
+            None, self._entry(conid=2, expiry="20261218"))
+        assert replaced is False
+        assert sym == "NQ20261218"        # _chain_row's local_symbol
+        assert store["upserts"] == []     # root references untouched
 
 
 class TestDisplayExchange:
@@ -397,79 +408,41 @@ class TestDisplayExchange:
 
 
 class TestEnsureContractSaved:
-    @pytest.fixture
-    def store(self, monkeypatch):
-        """Patch config_manager + ReferenceData; returns the fake DB state."""
-        state = {"contracts": [], "saved": False, "reloaded": False}
-        monkeypatch.setattr(ssp.config_manager, "load_contracts",
-                            lambda: list(state["contracts"]))
+    """ensure_contract_saved no longer persists anything — it resolves a
+    popup pick into (symbol, chip metadata) for the host's _add_symbol."""
 
-        def _save(contracts):
-            state["contracts"] = contracts
-            state["saved"] = True
-        monkeypatch.setattr(ssp.config_manager, "save_contracts", _save)
-
-        import src.core.reference_data as rd
-
-        def _reload():
-            state["reloaded"] = True
-        monkeypatch.setattr(
-            rd, "get_instance",
-            lambda: SimpleNamespace(reload_contracts=_reload))
-        return state
-
-    def test_local_source_is_noop(self, store):
-        sym = ssp.ensure_contract_saved(
-            {"symbol": "nq", "sec_type": "FUT", "source": "local"})
+    def test_local_row_resolves_meta(self):
+        sym, meta = ssp.ensure_contract_saved(
+            {"symbol": "nq", "sec_type": "FUT", "conid": "11",
+             "source": "local"})
         assert sym == "NQ"
-        assert not store["saved"]
+        assert meta["conid"] == "11" and meta["sec_type"] == "FUT"
 
-    def test_ibkr_future_is_noop(self, store):
-        """FUT picks are chain-saved by the popup — never as a single
-        SMART pseudo-contract here."""
-        sym = ssp.ensure_contract_saved(
+    def test_ibkr_future_returns_meta(self):
+        sym, meta = ssp.ensure_contract_saved(
             {"symbol": "es", "sec_type": "FUT", "conid": 11004968,
              "currency": "USD", "source": "ibkr"})
         assert sym == "ES"
-        assert not store["saved"]
+        assert meta["conid"] == "11004968"
 
-    def test_ibkr_pick_saves_contract(self, store):
-        sym = ssp.ensure_contract_saved({
+    def test_ibkr_stk_pick_defaults_smart_and_local(self):
+        sym, meta = ssp.ensure_contract_saved({
             "symbol": "googl", "sec_type": "STK", "conid": 208813720,
             "currency": "USD", "primary_exchange": "NASDAQ",
             "name": "Alphabet Inc (Class A)",
             "source": "ibkr",
         })
         assert sym == "GOOGL"
-        assert store["saved"] and store["reloaded"]
-        (c,) = store["contracts"]
-        assert c["symbol"] == "GOOGL"
-        assert c["sec_type"] == "STK"
-        assert c["exchange"] == "SMART"
-        assert c["currency"] == "USD"
-        assert c["local_symbol"] == "GOOGL"
-        assert c["primary_exchange"] == "NASDAQ"
-        assert c["name"] == "Alphabet Inc (Class A)"
+        assert meta["exchange"] == "SMART"
+        assert meta["local_symbol"] == "GOOGL"
+        assert meta["primary_exchange"] == "NASDAQ"
+        assert meta["name"] == "Alphabet Inc (Class A)"
 
-    def test_duplicate_conid_not_resaved(self, store):
-        store["contracts"] = [
-            {"conid": "208813720", "symbol": "GOOGL", "sec_type": "STK"}]
-        sym = ssp.ensure_contract_saved({
-            "symbol": "GOOGL", "sec_type": "STK", "conid": 208813720,
-            "source": "ibkr",
-        })
-        assert sym == "GOOGL"
-        assert not store["saved"]
+    def test_conidless_row_returns_no_meta(self):
+        sym, meta = ssp.ensure_contract_saved(
+            {"symbol": "nq", "sec_type": "FUT", "source": "local"})
+        assert sym == "NQ"
+        assert meta is None or "conid" not in meta
 
-    def test_duplicate_symbol_sectype_not_resaved(self, store):
-        store["contracts"] = [
-            {"conid": "", "symbol": "GOOGL", "sec_type": "STK"}]
-        ssp.ensure_contract_saved({
-            "symbol": "googl", "sec_type": "STK", "conid": 1,
-            "source": "ibkr",
-        })
-        assert not store["saved"]
-
-    def test_empty_symbol_returns_empty(self, store):
-        assert ssp.ensure_contract_saved({"source": "ibkr"}) == ""
-        assert not store["saved"]
+    def test_empty_symbol_returns_empty(self):
+        assert ssp.ensure_contract_saved({"source": "ibkr"}) == ("", None)

@@ -25,11 +25,9 @@ from PySide6.QtGui import (
     QPainter,
 )
 from PySide6.QtWidgets import (
-    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
-    QCompleter,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -38,14 +36,11 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QListWidget,
-    QListWidgetItem,
     QMenu,
     QPushButton,
     QSizePolicy,
     QStyle,
     QStyleOptionButton,
-    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -104,9 +99,7 @@ _PRICE_FONT.setWeight(QFont.Weight.Bold)
 
 def _make_btn(text: str, colour: str, min_h: int = 32,
               fg: str = "#ffffff") -> QPushButton:
-    """Flat styled action button.  *fg* overrides the label colour —
-    the restyle gives light-background buttons (Flatten, 25/50/75%)
-    dark text."""
+    """Flat styled action button.  *fg* overrides the label colour."""
     btn = QPushButton(text)
     btn.setMinimumHeight(min_h)
     btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -230,13 +223,23 @@ class _ActionButton(QPushButton):
 
 
 def _sec_type_for(sym: str) -> str:
-    """Return 'FUT', 'STK', 'OPT', or '?' for *sym* via ReferenceData cache."""
-    from src.core.reference_data import get_instance as _rd
-    return _rd().get_sec_type(sym)
+    """Return 'FUT', 'STK', 'OPT', or '?' for *sym* via the chip /
+    hot-button instrument entries."""
+    from src.core import instruments
+    return instruments.get_sec_type(sym)
 
 
 def _apply_chip_style(btn: QPushButton, selected: bool) -> None:
     """Apply blue-selected or grey-unselected style to a symbol chip button."""
+    if bool(btn.property("chip_expired")):
+        # Dead pinned future — dimmed + dashed so the user removes it.
+        btn.setStyleSheet(
+            "QPushButton{background:#1B2130;color:#5A6478;"
+            "border:1px dashed #334058;"
+            "border-radius:6px;padding:4px 12px;font-weight:500;"
+            "font-size:12px}"
+            "QPushButton:hover{background:#232A3B}")
+        return
     if selected:
         btn.setStyleSheet(
             "QPushButton{background:#539BF5;color:white;border:none;"
@@ -256,88 +259,52 @@ def _apply_chip_style(btn: QPushButton, selected: bool) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  TickPriceInput – tick-aware price spinner with floating price-ladder popup
+#  TickPriceInput – tick-aware price input stepped by mouse wheel / ↑↓ keys
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TickPriceInput(QWidget):
-    """Tick-aware price spinner with a floating price-ladder popup.
+    """Tick-aware price input.
 
-    Popup behaviour
-    ---------------
-    * Uses ``Qt.Tool + WA_ShowWithoutActivating`` instead of ``Qt.Popup``.
-      ``Qt.Popup`` grabs the mouse exclusively so clicking outside consumes
-      the click and users feel "trapped".  ``Qt.Tool`` lets outside clicks
-      pass straight through to their targets while still appearing on top.
-    * An application-level event filter watches for ``MouseButtonPress``
-      events outside the popup rectangle and closes it without swallowing
-      the click.
-    * Initial list: ``_LADDER_ROWS`` rows each side.  When the user scrolls
-      within ``_EXTEND_THRESHOLD`` rows of either end, ``_EXTEND_ROWS`` more
-      rows are silently prepended / appended — giving unlimited scroll.
+    Deliberately minimal (matches :class:`_QtyInput`): one rounded box,
+    no ▲/▼ arrow column and no price-ladder popup — the mouse wheel and
+    ↑/↓ keys step the value by one tick (seeded from the market price
+    when the field is empty), and editing-finished snaps to the grid.
 
     Public API
     ----------
     text()                            → str
     clear()                           → silently clears (no textChanged)
     textChanged  Signal[str]
-    set_market_price(price, tick)     → refresh the spin / ladder reference
+    set_market_price(price, tick)     → refresh the stepping reference
     """
 
     textChanged = Signal(str)
 
-    _LADDER_ROWS      = 150   # initial rows above *and* below the mid price
-    _EXTEND_ROWS      = 100   # rows added each time the edge is approached
-    _EXTEND_THRESHOLD = 5     # trigger when within this many rows of the edge
-    _ROW_H            = 22    # px height of each popup row
-    _VISIBLE_ROWS     = 14    # how many rows are visible without scrolling
-    _BTN_W            = 16    # px width of the up/down arrow column
-    _CHIP_H           = 28    # must match _TierSection._CHIP_H
+    _CHIP_H = 28    # must match _TierSection._CHIP_H
 
-    # Stylesheets — split into "normal" (idle) and "armed" (positive
-    # value typed) so the whole control can flip to the same blue
-    # background a selected tier chip uses.  Triggered by the host
-    # ``_TierSection`` via :meth:`set_armed`.
+    # Stylesheets — "normal" (idle) and "armed" (positive value typed)
+    # so the control can flip to the same blue background a selected
+    # tier chip uses.  Triggered by ``_TierSection.set_armed``.
     _EDIT_SS_NORMAL = (
         "QLineEdit{background:#232A3B;color:#A3AFC2;border:none;"
-        "border-radius:6px 0 0 6px;padding:2px 6px;font-size:11px;"
+        "border-radius:6px;padding:2px 6px;font-size:11px;"
         "font-family:'JetBrains Mono'}"
         "QLineEdit:focus{background:#334058;color:white}"
         "QLineEdit:disabled{background:#1B2130;color:#444;border:none}"
     )
     _EDIT_SS_ARMED = (
         "QLineEdit{background:#539BF5;color:white;border:none;"
-        "border-radius:6px 0 0 6px;padding:2px 6px;font-size:11px;"
+        "border-radius:6px;padding:2px 6px;font-size:11px;"
         "font-weight:bold;font-family:'JetBrains Mono'}"
         "QLineEdit:focus{background:#6BA8F6;color:white}"
         "QLineEdit:disabled{background:#1B2130;color:#444;border:none}"
     )
-    _ARROW_SS_NORMAL = (
-        "QToolButton{background:#232A3B;color:#6A7690;border:none;"
-        "font-size:7px;padding:0;margin:0}"
-        "QToolButton:hover{background:#334058;color:white}"
-        "QToolButton:pressed{background:#539BF5;color:white}"
-    )
-    _ARROW_SS_ARMED = (
-        "QToolButton{background:#539BF5;color:white;border:none;"
-        "font-size:7px;padding:0;margin:0}"
-        "QToolButton:hover{background:#6BA8F6;color:white}"
-        "QToolButton:pressed{background:#6BA8F6;color:white}"
-    )
-    _ARROW_W_SS_NORMAL = (
-        "QWidget{background:#232A3B;border:none;border-radius:0 6px 6px 0}"
-    )
-    _ARROW_W_SS_ARMED = (
-        "QWidget{background:#539BF5;border:none;border-radius:0 6px 6px 0}"
-    )
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self._market_price: float           = 0.0
-        self._tick_size:    float           = 0.25
-        self._popup:        QListWidget | None = None
-        self._app_filter_installed          = False
-        self._extending_popup               = False
-        self._arrow_w:      QWidget | None  = None   # set in _build_ui; used for popup X alignment
+        self._market_price: float = 0.0
+        self._tick_size:    float = 0.25
+        self._wheel_accum:  int   = 0
         self._build_ui()
 
     # ── Construction ──────────────────────────────────────────────────────────
@@ -359,76 +326,46 @@ class TickPriceInput(QWidget):
         _dv.setNotation(QDoubleValidator.Notation.StandardNotation)
         self._edit.setValidator(_dv)
         self._edit.textChanged.connect(self._relay_text)
-        self._edit.returnPressed.connect(self._close_popup)
         self._edit.editingFinished.connect(self._snap_to_tick)
         self._edit.installEventFilter(self)
-
-        self._btn_up = QToolButton()
-        self._btn_up.setText("▲")
-        self._btn_up.setFixedSize(self._BTN_W, self._CHIP_H // 2)
-        self._btn_up.setStyleSheet(self._ARROW_SS_NORMAL)
-        self._btn_up.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._btn_up.setAutoRepeat(True)
-        self._btn_up.setAutoRepeatDelay(400)    # ms before repeat starts
-        self._btn_up.setAutoRepeatInterval(80)  # ms between each repeat tick
-        self._btn_up.clicked.connect(self._on_up)
-
-        self._btn_dn = QToolButton()
-        self._btn_dn.setText("▼")
-        self._btn_dn.setFixedSize(self._BTN_W, self._CHIP_H // 2)
-        self._btn_dn.setStyleSheet(self._ARROW_SS_NORMAL)
-        self._btn_dn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._btn_dn.setAutoRepeat(True)
-        self._btn_dn.setAutoRepeatDelay(400)
-        self._btn_dn.setAutoRepeatInterval(80)
-        self._btn_dn.clicked.connect(self._on_dn)
-
-        arrow_col = QVBoxLayout()
-        arrow_col.setSpacing(0)
-        arrow_col.setContentsMargins(0, 0, 0, 0)
-        arrow_col.addWidget(self._btn_up)
-        arrow_col.addWidget(self._btn_dn)
-
-        self._arrow_w = QWidget()
-        self._arrow_w.setFixedSize(self._BTN_W, self._CHIP_H)
-        self._arrow_w.setStyleSheet(self._ARROW_W_SS_NORMAL)
-        self._arrow_w.setLayout(arrow_col)
         # Track the current armed state so set_armed() can early-return
         # when nothing changed (avoids needless QSS unpolish/polish).
         self._armed: bool = False
 
         lay.addWidget(self._edit, 1)
-        lay.addWidget(self._arrow_w)
 
-    # ── Event filter (popup trigger + outside-click dismissal) ────────────────
+    # ── Events (keyboard / wheel stepping) ────────────────────────────────────
 
     def eventFilter(self, obj, event) -> bool:          # noqa: N802
-        t = event.type()
+        # ↑/↓ in the edit step the value by one tick.
+        if obj is self._edit and event.type() == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Up:
+                self._on_up()
+                return True
+            if event.key() == Qt.Key.Key_Down:
+                self._on_dn()
+                return True
+            # Esc wipes the value (and thus disarms the tier) in one
+            # keystroke.  Only swallow the key when there is something
+            # to clear — an empty field lets Esc bubble up normally.
+            if (event.key() == Qt.Key.Key_Escape
+                    and self._edit.text().strip()):
+                self._edit.setText("")
+                return True
+        return False
 
-        # ── Outside-click closes the popup WITHOUT consuming the click ────
-        # This filter is active both on _edit (always) and on QApplication
-        # (only while the popup is visible).
-        if (self._popup_open()
-                and t == QEvent.Type.MouseButtonPress
-                and obj is not self._popup):
-            # event is QMouseEvent at runtime when type == MouseButtonPress
-            try:
-                gpos = event.globalPosition().toPoint()  # type: ignore[attr-defined]
-            except AttributeError:
-                gpos = event.globalPos()                  # type: ignore[attr-defined]
-            if not self._popup.geometry().contains(gpos):
-                self._close_popup()
-                return False                # let the click reach its target
-
-        # ── Trigger popup when user clicks the field (empty or not) ──────────
-        if obj is self._edit and t == QEvent.Type.MouseButtonPress:
-            if not self._popup_open():
-                QTimer.singleShot(50, self._show_popup)
-
-        return False   # never consume events
-
-    def _popup_open(self) -> bool:
-        return self._popup is not None and self._popup.isVisible()
+    def wheelEvent(self, event) -> None:                # noqa: N802
+        """Scroll steps the value by one tick per notch.  Deltas
+        accumulate so trackpads (many small deltas) step at the same
+        rate as a wheel (±120 per notch)."""
+        self._wheel_accum += event.angleDelta().y()
+        while self._wheel_accum >= 120:
+            self._wheel_accum -= 120
+            self._on_up()
+        while self._wheel_accum <= -120:
+            self._wheel_accum += 120
+            self._on_dn()
+        event.accept()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -466,14 +403,8 @@ class TickPriceInput(QWidget):
         if armed == self._armed:
             return
         self._armed = armed
-        edit_ss = self._EDIT_SS_ARMED if armed else self._EDIT_SS_NORMAL
-        arrow_ss = self._ARROW_SS_ARMED if armed else self._ARROW_SS_NORMAL
-        arrow_w_ss = (self._ARROW_W_SS_ARMED if armed
-                      else self._ARROW_W_SS_NORMAL)
-        self._edit.setStyleSheet(edit_ss)
-        self._btn_up.setStyleSheet(arrow_ss)
-        self._btn_dn.setStyleSheet(arrow_ss)
-        self._arrow_w.setStyleSheet(arrow_w_ss)
+        self._edit.setStyleSheet(
+            self._EDIT_SS_ARMED if armed else self._EDIT_SS_NORMAL)
 
     # ── Signal relay ──────────────────────────────────────────────────────────
 
@@ -516,7 +447,12 @@ class TickPriceInput(QWidget):
             return max(0, -int(math.floor(math.log10(self._tick_size))))
 
     def _fmt(self, price: float) -> str:
-        return f"{price:.{self._decimals()}f}"
+        """Tick-precision format with trailing zeros stripped — the MNQ
+        distance ladder reads 0.25, 0.5, 0.75, 1, 1.25 … (never 2.00)."""
+        text = f"{price:.{self._decimals()}f}"
+        if "." in text:
+            text = text.rstrip("0").rstrip(".")
+        return text
 
     def _snap_to_tick(self) -> None:
         """If the field holds a non-tick-aligned number, round it to the nearest tick."""
@@ -538,276 +474,31 @@ class TickPriceInput(QWidget):
     # ── Up / Down spin ────────────────────────────────────────────────────────
 
     def _on_up(self) -> None:
+        """Step the DISTANCE up one tick.  The field holds an offset
+        from the market (0.25, 0.50, 0.75 … for MNQ), never an absolute
+        price level — an empty field starts at one tick."""
         text = self._edit.text().strip()
         if not text:
-            if self._market_price > 0:
-                self._edit.setText(self._fmt(self._snap(
-                    self._market_price + self._tick_size)))
-        else:
-            try:
-                self._edit.setText(self._fmt(self._snap(
-                    float(text) + self._tick_size)))
-            except ValueError:
-                pass
+            self._edit.setText(self._fmt(self._snap(self._tick_size)))
+            return
+        try:
+            self._edit.setText(self._fmt(self._snap(
+                float(text) + self._tick_size)))
+        except ValueError:
+            pass
 
     def _on_dn(self) -> None:
+        """Step the distance down one tick, flooring at one tick (a
+        zero/negative distance is meaningless).  Empty stays empty."""
         text = self._edit.text().strip()
         if not text:
-            if self._market_price > 0:
-                new = self._snap(self._market_price - self._tick_size)
-                if new > 0:
-                    self._edit.setText(self._fmt(new))
-        else:
-            try:
-                new = self._snap(float(text) - self._tick_size)
-                if new > 0:
-                    self._edit.setText(self._fmt(new))
-            except ValueError:
-                pass
-
-    # ── Price ladder popup ────────────────────────────────────────────────────
-
-    def _show_popup(self) -> None:
-        if self._popup_open():
-            return
-        self._close_popup()          # remove any stale hidden reference
-
-        popup = QListWidget()
-        popup.setUniformItemSizes(True)
-
-        popup.setWindowFlags(
-            Qt.WindowType.Tool
-            | Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
-        )
-        popup.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        popup.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        popup.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        popup.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        popup.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-        popup.setStyleSheet("""
-            QListWidget {
-                background: #1B2130;
-                color: #E6EBF2;
-                border: 1px solid #334058;
-                border-radius: 4px;
-                font-size: 12px;
-                outline: none;
-            }
-            QListWidget::item            { padding: 3px 14px; border: none; }
-            QListWidget::item:selected,
-            QListWidget::item:hover      { background: #539BF5; color: white; }
-        """)
-
-        # ── Populate tick-based offset rows (1*tick, 2*tick, ..., N*tick) ──
-        # Large values at top, small values at bottom.  Scroll defaults to
-        # the bottom so the smallest tick is visible on open.
-        centre_item = None
-        if self._tick_size > 0:
-            current_text = self._edit.text().strip()
-            try:
-                current_val = self._snap(float(current_text)) if current_text else 0.0
-            except ValueError:
-                current_val = 0.0
-
-            ladder_max = 5000  # number of tick multiples to populate
-            for i in range(ladder_max, 0, -1):
-                tick_val = self._snap(self._tick_size * i)
-                item = QListWidgetItem(self._fmt(tick_val))
-                if current_val > 0 and abs(tick_val - current_val) < self._tick_size / 2:
-                    f = item.font()
-                    f.setBold(True)
-                    item.setFont(f)
-                    item.setForeground(QColor("#3FB950"))
-                    centre_item = item
-                popup.addItem(item)
-        else:
-            ph = QListWidgetItem("  Tick size unknown")
-            ph.setForeground(QColor("#6A7690"))
-            ph.setFlags(ph.flags()
-                        & ~Qt.ItemFlag.ItemIsSelectable
-                        & ~Qt.ItemFlag.ItemIsEnabled)
-            popup.addItem(ph)
-
-        # ── Geometry ──────────────────────────────────────────────────────
-        popup_w = max(self._BTN_W + 4, 120)
-        popup_h = self._VISIBLE_ROWS * self._ROW_H + 8
-        popup.setFixedSize(popup_w, popup_h)
-
-        from PySide6.QtCore import QPoint
-        from PySide6.QtWidgets import QApplication as _QApp
-
-        # X ── ask the arrow widget directly for its global left edge.
-        #      This is exact; computing self.width()-_BTN_W is fragile
-        #      because layout rounding can shift it by 1-2 px.
-        if self._arrow_w is not None:
-            arrow_global_x = self._arrow_w.mapToGlobal(QPoint(0, 0)).x()
-        else:
-            arrow_global_x = self.mapToGlobal(QPoint(self.width() - self._BTN_W, 0)).x()
-
-        # Y ── vertical centre of the popup aligns with the vertical centre
-        #      of the TickPriceInput so the highlighted price row sits flush
-        #      with the input field once scrollToItem centres it.
-        widget_global_cy = self.mapToGlobal(QPoint(0, self.height() // 2)).y()
-        popup_top_y      = widget_global_cy - popup_h // 2
-
-        global_origin = QPoint(arrow_global_x, popup_top_y)
-
-        # Clamp to the screen that actually contains the widget.
-        # primaryScreen() is wrong on multi-monitor setups — it always
-        # references the main display even when the widget lives on a
-        # secondary one.  screenAt() resolves the correct screen.
-        widget_centre_global = self.mapToGlobal(
-            QPoint(self.width() // 2, self.height() // 2))
-        screen = _QApp.screenAt(widget_centre_global) or _QApp.primaryScreen()
-        if screen:
-            sg = screen.availableGeometry()
-            gx = max(sg.left(),  min(global_origin.x(), sg.right()  - popup_w))
-            gy = max(sg.top(),   min(global_origin.y(), sg.bottom() - popup_h))
-            global_origin = QPoint(gx, gy)
-
-        # ── Wire signals ──────────────────────────────────────────────────
-        popup.itemClicked.connect(self._on_popup_picked)
-        popup.destroyed.connect(self._on_popup_destroyed)
-        self._popup = popup
-
-        # show() first, then move() — on macOS the window manager repositions
-        # Tool windows during show(), so any pre-show move() is ignored.
-        # Calling move() immediately after show() overrides that adjustment.
-        popup.show()
-        popup.move(global_origin)   # ← exact alignment enforced post-show
-        popup.raise_()              # keep it on top of the main window
-
-        # Scroll: highlight current value if any, otherwise show smallest tick
-        # at the bottom.  Deferred to after show() so Qt has computed the
-        # viewport height.
-        if centre_item is not None:
-            _ci = centre_item   # local ref for the lambda capture
-            QTimer.singleShot(0, lambda: popup.scrollToItem(
-                _ci, QAbstractItemView.ScrollHint.PositionAtCenter))
-        else:
-            QTimer.singleShot(0, popup.scrollToBottom)
-
-        # App-level filter: detect outside clicks to close without swallowing them
-        app = _QApp.instance()
-        if app and not self._app_filter_installed:
-            app.installEventFilter(self)
-            self._app_filter_installed = True
-
-
-    # ── Dynamic scroll extension ──────────────────────────────────────────────
-
-    def _on_popup_scroll(self, value: int) -> None:
-        """Extend the ladder when the user scrolls near either end."""
-        if not self._popup_open() or self._extending_popup:
-            return
-        vbar      = self._popup.verticalScrollBar()
-        threshold = self._EXTEND_THRESHOLD * self._ROW_H
-        if value <= threshold:
-            self._extend_popup_top()
-        elif value >= vbar.maximum() - threshold:
-            self._extend_popup_bottom()
-
-    def _extend_popup_top(self) -> None:
-        """Prepend _EXTEND_ROWS price rows above the current top of the list.
-
-        Uses scrollToItem instead of manual pixel arithmetic so the viewport
-        stays perfectly stable regardless of the actual rendered row height.
-        """
-        popup = self._popup
-        if not popup:
-            return
-        # Item 0 = "Market" header (non-selectable); item 1 = current top price
-        top_item = popup.item(1)
-        if not top_item:
             return
         try:
-            top_price = float(top_item.text().strip())
+            new = self._snap(float(text) - self._tick_size)
+            if new > 0:
+                self._edit.setText(self._fmt(new))
         except ValueError:
-            return
-
-        self._extending_popup = True
-        N = self._EXTEND_ROWS
-        # Insert N rows right after the header (index 1 … N), highest price first
-        for i in range(N):
-            price_val = top_price + (N - i) * self._tick_size
-            popup.insertItem(1 + i, QListWidgetItem(
-                self._fmt(self._snap(price_val))))
-
-        # The original top-price row has moved from index 1 → index N+1.
-        # Scroll it back to the top of the viewport — Qt handles the exact pixels.
-        popup.scrollToItem(popup.item(N + 1),
-                           QAbstractItemView.ScrollHint.PositionAtTop)
-        self._extending_popup = False
-
-    def _extend_popup_bottom(self) -> None:
-        """Append _EXTEND_ROWS price rows below the current bottom of the list.
-
-        Uses scrollToItem to keep the viewport stable after appending.
-        """
-        popup = self._popup
-        if not popup:
-            return
-        old_count   = popup.count()
-        bottom_item = popup.item(old_count - 1)
-        if not bottom_item:
-            return
-        try:
-            bottom_price = float(bottom_item.text().strip())
-        except ValueError:
-            return
-
-        self._extending_popup = True
-        N = self._EXTEND_ROWS
-        for i in range(1, N + 1):
-            price_val = bottom_price - i * self._tick_size
-            if price_val <= 0:
-                break
-            popup.addItem(QListWidgetItem(self._fmt(self._snap(price_val))))
-
-        # Scroll the old last row back to the bottom of the viewport
-        popup.scrollToItem(popup.item(old_count - 1),
-                           QAbstractItemView.ScrollHint.PositionAtBottom)
-        self._extending_popup = False
-
-    # ── Item selection ────────────────────────────────────────────────────────
-
-    def _on_popup_picked(self, item: QListWidgetItem) -> None:
-        if item.flags() & Qt.ItemFlag.ItemIsEnabled:
-            self._edit.setText(item.text().strip())
-        self._close_popup()
-        self._edit.setFocus()
-
-    def _on_popup_destroyed(self) -> None:
-        self._popup = None
-        self._extending_popup = False
-        self._remove_app_filter()
-
-    def _remove_app_filter(self) -> None:
-        if self._app_filter_installed:
-            from PySide6.QtWidgets import QApplication
-            app = QApplication.instance()
-            if app:
-                try:
-                    app.removeEventFilter(self)
-                except RuntimeError:
-                    pass
-            self._app_filter_installed = False
-
-    def _close_popup(self) -> None:
-        self._extending_popup = False
-        self._remove_app_filter()
-        if self._popup is not None:
-            try:
-                self._popup.destroyed.disconnect(self._on_popup_destroyed)
-            except RuntimeError:
-                pass
-            self._popup.close()
-            self._popup.deleteLater()
-            self._popup = None
-
-
-
+            pass
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  _QtyInput  –  integer quantity field stepped by mouse wheel / ↑↓ keys
@@ -1127,6 +818,7 @@ class _TierSection(QWidget):
                  label_color: str = Theme.ACCENT,
                  *,
                  short_title: str | None = None,
+                 label_fg: str = "#ffffff",
                  parent=None):
         super().__init__(parent)
         self._title_str    = title
@@ -1136,6 +828,8 @@ class _TierSection(QWidget):
         # button doesn't blow out width when the dollar suffix lands.
         self._short_title  = short_title or title
         self._label_color  = label_color
+        # Label colour on the title button.
+        self._label_fg     = label_fg
         self._tiers:             list[dict]  = tiers
         self._dollar_per_tier:   list[float] = []
         self._qty:               int         = 1
@@ -1211,7 +905,8 @@ class _TierSection(QWidget):
         # something is armed).  Wider stretch factor so it absorbs the
         # 30% trimmed off the chips and Dist input.
         self._dollar_lbl = _make_btn(
-            self._title_str, self._label_color, self._CHIP_H)
+            self._title_str, self._label_color, self._CHIP_H,
+            fg=self._label_fg)
         self._dollar_lbl.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._dollar_lbl.clicked.connect(self._on_header_submit)
@@ -1800,6 +1495,7 @@ def _hot_button_default_draft() -> dict:
         "label": "",
         "tp": {"on": False, "v": 80.0, "u": "abs"},
         "sl": {"on": False, "v": 80.0, "u": "abs"},
+        "tr": {"on": False, "v": 80.0, "u": "abs"},
         "disabled": False,
     }
 
@@ -1807,7 +1503,8 @@ def _hot_button_default_draft() -> dict:
 def _auto_hot_button_label(side: str, qty: str, sym: str,
                            ord_type: str, anchor: str, offset: int,
                            tp: dict | None = None,
-                           sl: dict | None = None) -> str:
+                           sl: dict | None = None,
+                           tr: dict | None = None) -> str:
     """Generate the auto-label shown when the user leaves the label
     field blank.
 
@@ -1826,6 +1523,10 @@ def _auto_hot_button_label(side: str, qty: str, sym: str,
       * Take-profit / stop-loss values are appended only when their
         respective leg toggle is on.  When both are on they're joined
         with ``" - "`` so the label reads e.g. ``NQ @MKT 80 - 50``.
+        An armed Trailing leg appends a third value (``80 - 50 - 25``)
+        — appended ONLY when on, so pre-existing two-leg auto-labels
+        keep matching :meth:`_HotButtonModal._compute_auto_label` and
+        aren't misread as user-edited labels.
     Falls back to ``QTY`` / ``SYM`` placeholders so the preview still
     reads naturally before the user picks values.
     """
@@ -1876,6 +1577,10 @@ def _auto_hot_button_label(side: str, qty: str, sym: str,
         bracket = f"{_fmt_leg_value(tp)} - {_fmt_leg_value(sl)}"
     else:
         bracket = ""
+    if _leg_active(tr):
+        # Third value only when armed (backwards-compatible labels).
+        bracket = (f"{bracket} - {_fmt_leg_value(tr)}" if bracket
+                   else f"0 - 0 - {_fmt_leg_value(tr)}")
 
     chunks = [c for c in (qty_part, sym_part, venue, bracket) if c]
     return " ".join(chunks)
@@ -1916,15 +1621,29 @@ class _HotButtonModal(QDialog):
         groups: list[str] | None = None,
         edit_mode: bool = False,
         default_specific: bool = False,
+        workers: list | None = None,
     ) -> None:
         super().__init__(parent)
+        # Connected IB workers for the live symbol search (may be empty —
+        # the popup then shows known instruments only).
+        self._workers = list(workers or [])
+        # Inline results dropdown under the SPECIFIC symbol field —
+        # created lazily, reused across shows.
+        self._symbol_dropdown = None
+        self._suppress_dropdown = False
         self._draft = dict(draft) if draft else _hot_button_default_draft()
+        # Symbol the user last picked from the search popup — a manual
+        # edit away from it invalidates the stored contract metadata.
+        self._picked_symbol = str(
+            self._draft.get("symbol", "") or "").strip().upper()
         # Bracket legs are nested dicts — copy them too so cancelling
         # the dialog doesn't mutate the caller's data.
         self._draft["tp"] = dict(self._draft.get(
             "tp", {"on": False, "v": 80.0, "u": "abs"}))
         self._draft["sl"] = dict(self._draft.get(
             "sl", {"on": False, "v": 80.0, "u": "abs"}))
+        self._draft["tr"] = dict(self._draft.get(
+            "tr", {"on": False, "v": 80.0, "u": "abs"}))
         self._edit_mode = edit_mode
         # Force the SYMBOL / QTY mode segments to "specific" with empty
         # inputs even when the draft has no value — used by Add mode so
@@ -2151,7 +1870,10 @@ class _HotButtonModal(QDialog):
         self._inp_symbol.setStyleSheet(self._INPUT_QSS)
         self._inp_symbol.setFixedHeight(30)
         self._inp_symbol.textChanged.connect(self._on_symbol_changed)
-        self._install_symbol_completer(self._inp_symbol)
+        # Clicking the field opens the live IBKR symbol search (same
+        # popup as the chip bars) — picks store qualified contract
+        # metadata on the hot button itself.
+        self._inp_symbol.installEventFilter(self)
         col.addWidget(self._inp_symbol)
         # Match-status hint — populated by _update_symbol_status() based
         # on a lookup against the saved-contracts cache.
@@ -2226,8 +1948,12 @@ class _HotButtonModal(QDialog):
         self._sl_widgets = self._build_bracket_row(
             "Stop Loss", "stop · opposite side · same qty",
             Theme.CLR_SELL, "sl", card)
+        self._tr_widgets = self._build_bracket_row(
+            "Trailing", "trailing stop · opposite side · same qty",
+            Theme.CLR_CLOSE, "tr", card)
         lay.addLayout(self._tp_widgets["row"])
         lay.addLayout(self._sl_widgets["row"])
+        lay.addLayout(self._tr_widgets["row"])
         return card
 
     def _build_bracket_row(self, name: str, sublabel: str,
@@ -2248,27 +1974,21 @@ class _HotButtonModal(QDialog):
         sub.setStyleSheet(f"color:{Theme.TEXT_DIM}; font-size:9px;")
         lbl_box.addWidget(nm)
         lbl_box.addWidget(sub)
-        val = QLineEdit("80", parent)
-        val.setValidator(QDoubleValidator(0.0, 1e9, 4, parent))
-        val.setStyleSheet(self._INPUT_QSS)
-        val.setFixedHeight(28)
+        # Same minimal input as the panels' Dist fields: one rounded
+        # box, no arrows/popup, wheel + ↑/↓ step by the target symbol's
+        # tick, trailing zeros stripped ("80", never "80.0").  The old
+        # "$ price" unit label is gone — the value is always a dollar
+        # offset.
+        val = TickPriceInput(parent)
+        val.setText("80")
+        val.setPlaceholderText("")
         val.setFixedWidth(80)
         val.textChanged.connect(
             lambda t, k=key: self._on_bracket_value_changed(k, t))
-        # Static "$ price" label — replaces the previous unit dropdown
-        # since the only supported unit is absolute dollar offset.
-        unit_lbl = QLabel("$ price", parent)
-        unit_lbl.setStyleSheet(
-            f"color:{Theme.TEXT_DIM}; font-size:11px;"
-            " padding:0 6px;")
-        unit_lbl.setFixedWidth(70)
-        unit_lbl.setAlignment(Qt.AlignmentFlag.AlignVCenter
-                              | Qt.AlignmentFlag.AlignLeft)
         row.addWidget(chk)
         row.addLayout(lbl_box, stretch=1)
         row.addWidget(val)
-        row.addWidget(unit_lbl)
-        return {"row": row, "chk": chk, "val": val, "unit_lbl": unit_lbl,
+        return {"row": row, "chk": chk, "val": val,
                 "name": nm, "sub": sub}
 
     def _preview_row(self) -> QFrame:
@@ -2424,7 +2144,8 @@ class _HotButtonModal(QDialog):
             bool(saved_label) and saved_label != auto_now)
         # Brackets — only the toggle + dollar value are user-editable
         # now (unit is fixed at "abs").
-        for key, w in (("tp", self._tp_widgets), ("sl", self._sl_widgets)):
+        for key, w in (("tp", self._tp_widgets), ("sl", self._sl_widgets),
+                       ("tr", self._tr_widgets)):
             leg = d.get(key, {})
             # Force the unit to the only supported option so any old
             # ticks / % drafts upgrade cleanly.
@@ -2433,10 +2154,15 @@ class _HotButtonModal(QDialog):
             w["chk"].blockSignals(True)
             w["chk"].setChecked(bool(leg.get("on", False)))
             w["chk"].blockSignals(False)
+            try:
+                leg_txt = f"{float(leg.get('v', 80)):g}"   # 80, not 80.0
+            except (TypeError, ValueError):
+                leg_txt = "80"
             w["val"].blockSignals(True)
-            w["val"].setText(str(leg.get("v", 80)))
+            w["val"].setText(leg_txt)
             w["val"].blockSignals(False)
             self._restyle_bracket_row(key)
+        self._update_bracket_ticks()
         # Limit-anchor row faded when MKT.  Also covers the CANCEL
         # case (which hides everything order-type-related).
         self._update_side_dependent_state()
@@ -2462,6 +2188,7 @@ class _HotButtonModal(QDialog):
             offset=int(d.get("offset", 0) or 0),
             tp=d.get("tp"),
             sl=d.get("sl"),
+            tr=d.get("tr"),
         )
 
     def _refresh_auto_label_field(self) -> None:
@@ -2526,6 +2253,17 @@ class _HotButtonModal(QDialog):
 
     def _on_symbol_changed(self, text: str) -> None:
         self._draft["symbol"] = text.strip()
+        # A manual edit away from the last popup pick invalidates the
+        # stored contract metadata — it belongs to the picked symbol.
+        if (self._draft.get("contract")
+                and self._draft["symbol"].upper() != self._picked_symbol):
+            self._draft.pop("contract", None)
+        # Typing in the focused field surfaces the live-search dropdown
+        # (programmatic setText — draft load, pick adoption — doesn't).
+        if self._inp_symbol.hasFocus() and not self._suppress_dropdown:
+            self._show_symbol_dropdown()
+        # Bracket inputs step by the new target symbol's tick.
+        self._update_bracket_ticks()
         if self._draft["symbol"]:
             self._seg_sym_mode.set_selected("specific")
         # Auto-fill QTY from trading prefs when the symbol resolves to
@@ -2552,9 +2290,9 @@ class _HotButtonModal(QDialog):
         if not sym:
             return
         try:
-            from src.core.reference_data import get_instance as _rd
+            from src.core import instruments
             from src.core.trading_prefs import trading_prefs
-            sec = _rd().get_sec_type(sym)
+            sec = instruments.get_sec_type(sym)
         except Exception:
             log.debug("HotButton: prefs auto-fill lookup failed",
                       exc_info=True)
@@ -2587,51 +2325,97 @@ class _HotButtonModal(QDialog):
         self._seg_qty_mode.set_selected("specific")
         self._inp_qty.setEnabled(True)
 
-    def _install_symbol_completer(self, line: QLineEdit) -> None:
-        """Wire a case-insensitive ``contains``-match QCompleter against
-        :attr:`ReferenceData.contracts_by_symbol`.  The completer's
-        popup picks up the modal's dark QSS so it doesn't render
-        light-on-light, and selecting a row fires
-        :meth:`_on_symbol_changed` via the line-edit's ``textChanged``.
-        """
-        try:
-            from src.core.reference_data import get_instance as _rd
-            cache = _rd().contracts_by_symbol
-        except Exception:
-            log.exception(
-                "HotButtonModal: contract cache unavailable for completer")
-            cache = {}
-        # Build an ordered, deduped list of symbols + local_symbols
-        # (e.g. ``"NQ"`` and ``"NQM6"`` both navigate to the same contract).
-        seen: set[str] = set()
-        items: list[str] = []
-        for sym, rows in sorted(cache.items()):
-            for label in (sym,) + tuple(
-                    str(r.get("local_symbol") or "") for r in rows):
-                if not label:
-                    continue
-                key = label.upper()
-                if key in seen:
-                    continue
-                seen.add(key)
-                items.append(label)
-        completer = QCompleter(items, line)
-        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-        completer.setFilterMode(Qt.MatchFlag.MatchContains)
-        completer.setCompletionMode(
-            QCompleter.CompletionMode.PopupCompletion)
-        # Style the completer popup to match the modal's dark theme.
-        popup = completer.popup()
-        popup.setStyleSheet(
-            "QListView{"
-            " background:#1B2130; color:#E6EBF2;"
-            " selection-background-color:#539BF5;"
-            " selection-color:#ffffff;"
-            " border:1px solid #232A3B; outline:none;"
-            "}"
-            "QListView::item{ padding:4px 10px; min-height:22px; }"
+    def eventFilter(self, obj, event):  # noqa: N802 – Qt override
+        # The SPECIFIC symbol field drives an inline results dropdown:
+        # typing searches directly from the field (no separate search
+        # box), ↑/↓/Enter/Esc are forwarded to the dropdown while it's
+        # visible, and losing focus dismisses it.  Disabled fields never
+        # receive these events.
+        if obj is getattr(self, "_inp_symbol", None):
+            t = event.type()
+            if t == QEvent.Type.KeyPress:
+                dd = self._symbol_dropdown
+                if (dd is not None and dd.isVisible()
+                        and dd.handle_key(event)):
+                    return True
+            elif t == QEvent.Type.MouseButtonPress:
+                self._show_symbol_dropdown()
+            elif t == QEvent.Type.FocusOut:
+                # Clicking the dropdown itself briefly activates its
+                # window (ActiveWindowFocusReason) — that must not
+                # dismiss it before the row click lands.
+                if (self._symbol_dropdown is not None
+                        and event.reason()
+                        != Qt.FocusReason.ActiveWindowFocusReason):
+                    self._symbol_dropdown.close()
+        return super().eventFilter(obj, event)
+
+    def done(self, result: int) -> None:  # noqa: N802 – Qt override
+        # The dropdown is a floating tool window — it doesn't close with
+        # the dialog on its own (Save/Cancel/Esc/✕ all route through
+        # done()).
+        if self._symbol_dropdown is not None:
+            self._symbol_dropdown.close()
+        super().done(result)
+
+    def moveEvent(self, event) -> None:  # noqa: N802 – Qt override
+        # Dragging the dialog re-anchors a visible dropdown under the
+        # symbol field instead of leaving it floating at the old spot.
+        if (self._symbol_dropdown is not None
+                and self._symbol_dropdown.isVisible()):
+            self._symbol_dropdown.open_below(self._inp_symbol)
+        super().moveEvent(event)
+
+    def _show_symbol_dropdown(self) -> None:
+        """Inline live search under the symbol field — the same engine
+        as the chip bars' popup (known instruments instantly,
+        reqMatchingSymbols streaming as the user types, futures roots
+        expanding into pickable expirations), but querying THIS field
+        directly instead of its own search box."""
+        if self._suppress_dropdown:
+            return
+        if self._symbol_dropdown is None:
+            from src.ui.widgets.symbol_search_popup import SymbolSearchPopup
+            self._symbol_dropdown = SymbolSearchPopup(
+                self, workers=self._workers, exclude=set(),
+                external_input=self._inp_symbol)
+            self._symbol_dropdown.symbol_selected.connect(
+                self._on_symbol_picked)
+        self._symbol_dropdown.open_below(self._inp_symbol)
+
+    def _on_symbol_picked(self, entry: dict) -> None:
+        """A search-popup pick: resolve the row into contract metadata,
+        store it on the draft (the hot button owns its contract), and
+        adopt the symbol."""
+        from src.core import instruments
+        from src.ui.widgets.symbol_search_popup import (
+            apply_future_pick,
+            ensure_contract_saved,
         )
-        line.setCompleter(completer)
+        if (entry.get("source") == "ibkr"
+                and entry.get("sec_type") == "FUT"):
+            sym, _replaced = apply_future_pick(self, entry)
+            if not sym:
+                return  # user declined the expiry replacement
+            meta = instruments.contract_meta_from_result(entry)
+        else:
+            sym, meta = ensure_contract_saved(entry)
+            if not sym:
+                return
+        self._picked_symbol = sym.upper()
+        if meta and meta.get("conid"):
+            self._draft["contract"] = meta
+        else:
+            # Without a conid the metadata could never subscribe or
+            # order — leave the draft bare (resolves via chip entries).
+            self._draft.pop("contract", None)
+        self._suppress_dropdown = True
+        try:
+            self._inp_symbol.setText(sym)   # fires _on_symbol_changed
+        finally:
+            self._suppress_dropdown = False
+        if self._symbol_dropdown is not None:
+            self._symbol_dropdown.close()
 
     def _update_symbol_status(self) -> None:
         """Validate the SPECIFIC-mode symbol against the saved-contracts
@@ -2644,8 +2428,15 @@ class _HotButtonModal(QDialog):
             self._lbl_sym_status.setText("")
             return
         try:
-            from src.core.reference_data import get_instance as _rd
-            contracts = _rd().contracts_by_symbol.get(sym.upper(), [])
+            from src.core import instruments
+            # The draft's own metadata (fresh popup pick) wins — it may
+            # not be resolvable through the chip entries yet.
+            meta = self._draft.get("contract")
+            if meta and meta.get("conid"):
+                contracts = [{"symbol": sym, **meta}]
+            else:
+                c0 = instruments.get_contract(sym)
+                contracts = [c0] if c0 else []
         except Exception:
             log.exception("HotButtonModal: contract lookup failed")
             contracts = []
@@ -2728,6 +2519,41 @@ class _HotButtonModal(QDialog):
             self._label_user_edited = text != self._compute_auto_label()
         self._update_preview()
 
+    def _bracket_tick(self) -> float:
+        """Step size for the TP/SL/Trailing dollar-offset inputs —
+        resolved from the draft's target symbol: captured min_tick →
+        canonical futures table → sec-type fallback (FUT 0.25,
+        STK/OPT 0.01) → whole dollars when the symbol is unknown or
+        DEFAULT-mode."""
+        meta = self._draft.get("contract") or {}
+        try:
+            mt = float(meta.get("min_tick") or 0)
+            if mt > 0:
+                return mt
+        except (TypeError, ValueError):
+            pass
+        sym = str(self._draft.get("symbol", "") or "").strip().upper()
+        if sym:
+            from src.core import instruments
+            from src.utils.helpers import _FUT_TICK_SIZES
+            mt = instruments.get_min_tick(sym)
+            if mt:
+                return mt
+            if sym in _FUT_TICK_SIZES:
+                return _FUT_TICK_SIZES[sym]
+            sec = (str(meta.get("sec_type") or "")
+                   or instruments.get_sec_type(sym))
+            if sec == "FUT":
+                return 0.25
+            if sec in ("STK", "OPT"):
+                return 0.01
+        return 1.0
+
+    def _update_bracket_ticks(self) -> None:
+        tick = self._bracket_tick()
+        for w in (self._tp_widgets, self._sl_widgets, self._tr_widgets):
+            w["val"].set_market_price(0.0, tick)
+
     def _on_bracket_toggled(self, key: str, on: bool) -> None:
         self._draft[key]["on"] = bool(on)
         self._restyle_bracket_row(key)
@@ -2755,26 +2581,24 @@ class _HotButtonModal(QDialog):
             " font-weight:bold; font-size:10px; letter-spacing:1px; }}")
 
     def _restyle_bracket_row(self, key: str) -> None:
-        w = self._tp_widgets if key == "tp" else self._sl_widgets
+        w = {"tp": self._tp_widgets, "sl": self._sl_widgets,
+             "tr": self._tr_widgets}[key]
         on = self._draft[key]["on"]
         # QSS opacity isn't supported per-rule; use enable/disable +
         # palette swap instead.
         w["val"].setEnabled(on)
-        # Dim the labels (and the static "$ price" tail) when off.
+        # Dim the labels when off.
         if on:
-            colour = (Theme.CLR_BUY if key == "tp" else Theme.CLR_SELL)
+            colour = {"tp": Theme.CLR_BUY, "sl": Theme.CLR_SELL,
+                      "tr": Theme.CLR_CLOSE}[key]
             w["name"].setStyleSheet(
                 f"color:{colour}; font-size:11px; font-weight:bold;")
             w["sub"].setStyleSheet(
                 f"color:{Theme.TEXT_DIM}; font-size:9px;")
-            w["unit_lbl"].setStyleSheet(
-                f"color:{Theme.TEXT_DIM}; font-size:11px; padding:0 6px;")
         else:
             w["name"].setStyleSheet(
                 "color:#6A7690; font-size:11px; font-weight:bold;")
             w["sub"].setStyleSheet("color:#334058; font-size:9px;")
-            w["unit_lbl"].setStyleSheet(
-                "color:#334058; font-size:11px; padding:0 6px;")
 
     def _update_limit_row_state(self) -> None:
         is_lmt = self._draft.get("ord_type") == "LMT"
@@ -2808,7 +2632,7 @@ class _HotButtonModal(QDialog):
         # Auto label when blank.
         text = label or _auto_hot_button_label(
             side, qty, sym, ord_type, anchor, offset,
-            tp=d.get("tp"), sl=d.get("sl"))
+            tp=d.get("tp"), sl=d.get("sl"), tr=d.get("tr"))
         colour = _HOT_BUTTON_COLOURS.get(side, Theme.CLR_BUY)
         self._preview_btn.setText(text)
         self._preview_btn.setStyleSheet(
@@ -2842,6 +2666,8 @@ class _HotButtonModal(QDialog):
             attached.append(self._fmt_leg("TP", d["tp"]))
         if d["sl"]["on"]:
             attached.append(self._fmt_leg("SL", d["sl"]))
+        if d["tr"]["on"]:
+            attached.append(self._fmt_leg("TS", d["tr"]))
         if attached:
             summary += "\n↳ attached: " + " · ".join(attached)
         self._preview_line.setText(summary)
@@ -2906,7 +2732,6 @@ class OrderEntryPanel(QWidget):
     def __init__(self, active_threads: dict | None = None, parent=None):
         super().__init__(parent)
         self._active_threads: dict = active_threads if active_threads is not None else {}
-        self._connected_worker = None  # track worker for TWS lookup
         self._bg_worker = None         # track worker for background price streams
         # sym → (last, bid, ask)
         self._price_cache: dict[str, tuple[float, float, float]] = {}
@@ -2967,8 +2792,9 @@ class OrderEntryPanel(QWidget):
         # so the custom Dist input calculates dollars correctly before the user
         # first clicks a different symbol chip (which would call
         # _reload_tier_sections).
+        from src.core import instruments
         from src.core.reference_data import get_instance as _rd
-        _init_mult = _rd().get_multiplier(self._active_symbol or "") or 1.0
+        _init_mult = instruments.get_multiplier(self._active_symbol or "") or 1.0
         self._pt_section.set_multiplier(_init_mult)
         self._sl_section.set_multiplier(_init_mult)
         self._tr_section.set_multiplier(_init_mult)
@@ -2977,9 +2803,9 @@ class OrderEntryPanel(QWidget):
         self._sl_section.set_market_price(self._last_price, _init_ts)
         self._tr_section.set_market_price(self._last_price, _init_ts)
 
-        # Auto-refresh when reference data changes (contract added/removed or
-        # strategy tiers saved from the StrategyEditor tab).
-        _rd().contracts_changed.connect(self._refresh_combo_items)
+        # Auto-refresh when strategy tiers are saved from the
+        # StrategyEditor tab.  (Chip additions refresh the combo through
+        # _add_symbol; Enter-to-add matches against live entries anyway.)
         _rd().strategy_tiers_changed.connect(self._reload_tier_sections)
 
     # ── UI construction ───────────────────────────────────────────────────────
@@ -3139,6 +2965,8 @@ class OrderEntryPanel(QWidget):
         self._tr_section = _TierSection(
             "Trailing", tr_tiers, label_color=Theme.CLR_CLOSE,
             short_title="TS")
+        self._tr_section.submit_requested.connect(
+            lambda: self._on_tier_submit("tr"))
 
         # The TP / SL / Trail amounts that used to live in a separate
         # ARMED banner above the buttons are now drawn directly on each
@@ -3200,9 +3028,9 @@ class OrderEntryPanel(QWidget):
         pm_grid.setContentsMargins(0, 0, 0, 0)
 
 
-        self._btn_close25 = _make_btn("25%", Theme.CLR_CLOSE, 30, fg="#0f1319")
-        self._btn_close50 = _make_btn("50%", Theme.CLR_CLOSE, 30, fg="#0f1319")
-        self._btn_close75 = _make_btn("75%", Theme.CLR_CLOSE, 30, fg="#0f1319")
+        self._btn_close25 = _make_btn("25%", Theme.CLR_CLOSE, 30)
+        self._btn_close50 = _make_btn("50%", Theme.CLR_CLOSE, 30)
+        self._btn_close75 = _make_btn("75%", Theme.CLR_CLOSE, 30)
         pm_grid.addWidget(self._btn_close25, 1, 0)
         pm_grid.addWidget(self._btn_close50, 1, 1)
         pm_grid.addWidget(self._btn_close75, 2, 1)
@@ -3210,8 +3038,7 @@ class OrderEntryPanel(QWidget):
         self._btn_close50.clicked.connect(lambda: self._on_close_pct(50))
         self._btn_close75.clicked.connect(lambda: self._on_close_pct(75))
 
-        self._btn_flatten = _make_btn("Flatten", Theme.CLR_FLATTEN, 30,
-                                      fg="#1c1206")
+        self._btn_flatten = _make_btn("Flatten", Theme.CLR_FLATTEN, 30)
         pm_grid.addWidget(self._btn_flatten, 0, 0)
         self._btn_flatten.clicked.connect(self._on_flatten)
 
@@ -3336,6 +3163,7 @@ class OrderEntryPanel(QWidget):
             offset=int(entry.get("offset", 0) or 0),
             tp=entry.get("tp"),
             sl=entry.get("sl"),
+            tr=entry.get("tr"),
         )
         is_disabled = bool(entry.get("disabled", False))
         # Disabled buttons render in a neutral grey so the user sees the
@@ -3365,9 +3193,8 @@ class OrderEntryPanel(QWidget):
         return cell
 
     def reload_hot_buttons(self) -> None:
-        """Reload the hot-button list from disk and rebuild the grid.
-        Used by ContractsView after a contract deletion that updated
-        related hot-button symbols (auto-rolled or disabled)."""
+        """Reload the hot-button list from disk and rebuild the grid
+        (e.g. after an external write updated hot-button entries)."""
         try:
             self._hot_buttons = config_manager.load_hot_buttons()
         except Exception:
@@ -3385,12 +3212,13 @@ class OrderEntryPanel(QWidget):
         if not sym:
             return ""
         try:
-            from src.core.reference_data import get_instance as _rd
-            c = _rd().pick_active_contract(sym)
+            from src.core import instruments
+            c = instruments.get_contract(sym)
         except Exception:
             return ""
         if not c:
-            return f"{sym}: no saved contract — add one in Contracts"
+            return (f"{sym}: no saved contract — add it via the "
+                    f"symbol search (+)")
         local = (c.get("local_symbol") or "").strip()
         expiry = (c.get("expiry") or "").strip()
         if not local or local.upper() == sym:
@@ -3429,7 +3257,12 @@ class OrderEntryPanel(QWidget):
         """
         draft = _hot_button_default_draft()
         draft["ord_type"] = "MKT"
-        dlg = _HotButtonModal(self, draft=draft, default_specific=True)
+        from src.ui.widgets.symbol_search_popup import (
+            connected_workers_by_priority,
+        )
+        dlg = _HotButtonModal(
+            self, draft=draft, default_specific=True,
+            workers=connected_workers_by_priority(self._active_threads))
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         if dlg.delete_requested():
@@ -3448,8 +3281,12 @@ class OrderEntryPanel(QWidget):
         Delete (modal footer), drop the entry."""
         if not (0 <= index < len(self._hot_buttons)):
             return
+        from src.ui.widgets.symbol_search_popup import (
+            connected_workers_by_priority,
+        )
         dlg = _HotButtonModal(
-            self, draft=self._hot_buttons[index], edit_mode=True)
+            self, draft=self._hot_buttons[index], edit_mode=True,
+            workers=connected_workers_by_priority(self._active_threads))
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         if dlg.delete_requested():
@@ -3710,14 +3547,15 @@ class OrderEntryPanel(QWidget):
         # ── Attached brackets ─────────────────────────────────────────────
         payload["profit_take"] = self._bracket_payload(entry.get("tp"))
         payload["stop_loss"] = self._bracket_payload(entry.get("sl"))
-        payload["trailing"] = None  # hot buttons don't expose a trail leg
+        payload["trailing"] = self._bracket_payload(entry.get("tr"))
 
         log.info(
             "HotButton[%d]: emit order side=%s qty=%d sym=%s type=%s "
-            "limit=%s tp=%s sl=%s",
+            "limit=%s tp=%s sl=%s tr=%s",
             index, side, qty, sym, payload.get("type"),
             payload.get("limit_price"),
-            payload.get("profit_take"), payload.get("stop_loss"))
+            payload.get("profit_take"), payload.get("stop_loss"),
+            payload.get("trailing"))
         self.order_requested.emit(payload)
 
     @staticmethod
@@ -3797,11 +3635,12 @@ class OrderEntryPanel(QWidget):
                 "OrderEntryPanel: Close %d%% clicked but no active symbol", pct)
 
     def _on_tier_submit(self, side: str) -> None:
-        """Take Profit / Stop Loss header button clicked → emit
-        ``close_tier_requested`` with the active symbol, selected tier
-        offset, last price and user's qty.  FlashTradeView fans this out
-        to each checked account, reads the live position there, and
-        submits a LMT (tp) or STP/STP LMT (sl) exit order sized to
+        """Take Profit / Stop Loss / Trailing header button clicked →
+        emit ``close_tier_requested`` with the active symbol, selected
+        tier offset, last price and user's qty.  FlashTradeView fans
+        this out to each checked account, reads the live position there,
+        and submits a LMT (tp), STP/STP LMT (sl), or TRAIL (tr — the
+        offset is the trail distance) exit order sized to
         min(|position|, qty).  No-op for zero-position accounts.
         """
         sym = self._active_symbol
@@ -3811,7 +3650,8 @@ class OrderEntryPanel(QWidget):
                 side.upper())
             return
 
-        section = self._pt_section if side == "tp" else self._sl_section
+        section = {"tp": self._pt_section, "sl": self._sl_section,
+                   "tr": self._tr_section}[side]
         tier = section.get_value()
         if tier is None:
             # Button is disabled in this state; defensive no-op.
@@ -3844,11 +3684,12 @@ class OrderEntryPanel(QWidget):
         })
 
     def _refresh_combo_items(self) -> None:
-        """Populate the combo dropdown with saved contracts not already added."""
-        from src.core.reference_data import get_instance as _rd
+        """Populate the combo dropdown with known instruments (chips on
+        the other panel, hot buttons) not already added here."""
+        from src.core import instruments
         self._combo.blockSignals(True)
         self._combo.clear()
-        contracts = _rd().contracts
+        contracts = instruments.all_contracts()
         added_upper = {s.upper() for s in self._symbols}
         seen: set[str] = set()
         for c in contracts:
@@ -3889,9 +3730,9 @@ class OrderEntryPanel(QWidget):
                 self._add_symbol(self._combo.itemData(idx))
                 return
 
-        # Find all matching contracts
-        from src.core.reference_data import get_instance as _rd
-        contracts = _rd().contracts
+        # Find all matching known instruments
+        from src.core import instruments
+        contracts = instruments.all_contracts()
         matches: list[dict] = []
         seen: set[str] = set()
         for c in contracts:
@@ -3922,11 +3763,15 @@ class OrderEntryPanel(QWidget):
             self._combo.blockSignals(False)
             self._combo.showPopup()
         else:
-            # No local match → try TWS lookup (assume STK)
-            self._tws_lookup(text)
+            # No local match → open the live IBKR symbol search, the
+            # single add path for new instruments.
+            self.open_symbol_search()
 
-    def _add_symbol(self, sym: str) -> None:
-        """Add a symbol to the chip bar and activate it."""
+    def _add_symbol(self, sym: str, meta: dict | None = None) -> None:
+        """Add a symbol to the chip bar and activate it.  *meta* is the
+        contract metadata from the symbol search pick — stored on the
+        new chip entry so it can subscribe and order without any
+        external contract store."""
         if not sym:
             return
         sym = sym.upper()
@@ -3936,13 +3781,13 @@ class OrderEntryPanel(QWidget):
                 # The STK group renders at most 5 × 3 chips.  When it's
                 # full, the new symbol replaces the LAST chip (row 3,
                 # column 5) instead of becoming an invisible overflow
-                # entry.  Mirrors _remove_symbol's cleanup.
+                # entry.  Dropping the chip entry IS the cleanup — its
+                # metadata leaves with it.
                 stk_group = [s for s in self._symbols
                              if _sec_type_for(s) != "FUT"]
                 if len(stk_group) >= self._CHIP_COLS * self._MAX_STK_ROWS:
                     replaced = stk_group[-1]
                     self._symbols.remove(replaced)
-                    config_manager.remove_stock_contract_if_unused(replaced)
                     if self._bg_worker is not None:
                         self._bg_worker.unsubscribe_background_symbol(
                             replaced)
@@ -3951,6 +3796,8 @@ class OrderEntryPanel(QWidget):
                              "replaces %s", sym, replaced)
             self._symbols.append(sym)
             config_manager.save_order_entry_symbols(self._symbols)
+            if meta:
+                config_manager.upsert_instrument(sym, meta)
             # Subscribe new symbol to background stream
             if (self._bg_worker is not None
                     and self._bg_worker.isRunning()
@@ -4023,6 +3870,13 @@ class OrderEntryPanel(QWidget):
         btn = DraggableChip(sym, sec_type, self._on_chip_drop)
         btn.setFixedHeight(self._CHIP_HEIGHT)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        try:
+            from src.core import instruments
+            if instruments.is_expired_fut(sym):
+                btn.setProperty("chip_expired", True)
+                btn.setToolTip("Expired contract — right-click to remove")
+        except Exception:
+            pass
         _apply_chip_style(btn, sym == self._active_symbol)
         attach_exchange_badge(btn, sym)
         btn.clicked.connect(lambda checked, s=sym: self._on_symbol_clicked(s))
@@ -4154,10 +4008,9 @@ class OrderEntryPanel(QWidget):
         """Right-click removes a symbol button."""
         if sym in self._symbols:
             self._symbols.remove(sym)
+            # Dropping the chip entry drops its contract metadata with
+            # it — no external cleanup needed.
             config_manager.save_order_entry_symbols(self._symbols)
-            # Drop the STK contract from the universe too, unless the
-            # Book Trader chip bar or a hot button still needs it.
-            config_manager.remove_stock_contract_if_unused(sym)
         # Unsubscribe from background stream
         if self._bg_worker is not None:
             self._bg_worker.unsubscribe_background_symbol(sym)
@@ -4576,11 +4429,12 @@ class OrderEntryPanel(QWidget):
 
         # Fall back to preferences when ReferenceData has no rows
         if pt is None or sl is None or tr is None:
+            from src.core import instruments
             sec  = _sec_type_for(sym)
             key  = "trading_futures" if sec == "FUT" else "trading_stocks"
             prefs = config_manager.load_preferences()
             section = prefs.get(key, {})
-            mult = rd.get_multiplier(sym)          # $/point  (e.g. 20 for NQ, 1 for stocks)
+            mult = instruments.get_multiplier(sym)  # $/point  (e.g. 20 for NQ, 1 for stocks)
             tick = self._tick_size_for_symbol(sym)  # points/tick (e.g. 0.25 for NQ, 0.01 for stocks)
             if pt is None:
                 raw = section.get("profit_take", self._TIER_FALLBACK)
@@ -4659,8 +4513,8 @@ class OrderEntryPanel(QWidget):
         self._sl_section.set_qty(self._active_qty)
         self._tr_section.set_qty(self._active_qty)
         # Push contract multiplier for custom-distance dollar math
-        from src.core.reference_data import get_instance as _rd
-        mult = _rd().get_multiplier(self._active_symbol or "") or 1.0
+        from src.core import instruments
+        mult = instruments.get_multiplier(self._active_symbol or "") or 1.0
         self._pt_section.set_multiplier(mult)
         self._sl_section.set_multiplier(mult)
         self._tr_section.set_multiplier(mult)
@@ -4682,37 +4536,22 @@ class OrderEntryPanel(QWidget):
 
         Priority
         --------
-        1. ``tick_size`` / ``min_tick`` / ``minTick`` field in the saved
-           contract row  (populated by ContractsView since the Tick column
-           was added).
-        2. Per-symbol lookup table for known futures (covers contracts saved
-           before the Tick column existed).
+        1. ``min_tick`` stored on the chip's instrument entry (captured
+           from TWS contract details at add-time).
+        2. Per-symbol lookup table for known futures (covers entries
+           saved before min_tick was captured).
         3. Coarse sec-type fallback: FUT → 0.25, everything else → 0.01.
         """
-        # ── 1. Contract-row field ─────────────────────────────────────────────
-        from src.core.reference_data import get_instance as _rd
-        for c in _rd().contracts_by_symbol.get((sym or "").upper(), []):
-            for key in ("tick_size", "min_tick", "minTick"):
-                tick = c.get(key)
-                if tick:
-                    try:
-                        v = float(tick)
-                        if v > 0:
-                            return v
-                    except (TypeError, ValueError):
-                        pass
+        # ── 1. Instrument-entry field ─────────────────────────────────────────
+        from src.core import instruments
+        mt = instruments.get_min_tick(sym or "")
+        if mt:
+            return mt
 
         # ── 2. Known-futures symbol table ─────────────────────────────────────
-        _FUT_TICK: dict[str, float] = {
-            "MNQ": 0.25, "NQ":  0.25,
-            "MES": 0.25, "ES":  0.25,
-            "M2K": 0.1,  "RTY": 0.1,
-            "MYM": 1.0,  "YM":  1.0,
-            "MGC": 0.1,  "GC":  0.1,
-            "MCL": 0.01, "CL":  0.01,
-        }
         if sym:
-            hit = _FUT_TICK.get(sym.strip().upper())
+            from src.utils.helpers import _FUT_TICK_SIZES
+            hit = _FUT_TICK_SIZES.get(sym.strip().upper())
             if hit is not None:
                 return hit
 
@@ -4822,7 +4661,7 @@ class OrderEntryPanel(QWidget):
         payload["qty_pct"] = int(self._active_pct)
         return True
 
-    # ── TWS fallback lookup ─────────────────────────────────────────────────────
+    # ── Worker selection ──────────────────────────────────────────────────────
 
     def _find_workers_by_priority(self) -> list:
         """Return connected workers sorted by config priority (1 = highest)."""
@@ -4838,129 +4677,6 @@ class OrderEntryPanel(QWidget):
             if w not in workers and w.isRunning() and w.is_ib_connected:
                 workers.append(w)
         return workers
-
-    def _tws_lookup(self, symbol: str) -> None:
-        """Query TWS to qualify a stock symbol not found locally."""
-        workers = self._find_workers_by_priority()
-        if not workers:
-            log.warning(
-                "OrderEntry: no TWS connection for lookup of '%s'", symbol)
-            self._combo.lineEdit().setPlaceholderText("No TWS connection!")
-            from PySide6.QtCore import QTimer
-            QTimer.singleShot(2000, lambda: self._combo.lineEdit().setPlaceholderText(
-                "Add symbol (look up).."))
-            return
-
-        log.info("OrderEntry: looking up '%s' via TWS", symbol)
-        self._combo.lineEdit().setPlaceholderText(f"⏳ Looking up {symbol}…")
-        self._pending_lookup = symbol
-        self._pending_lookup_workers = workers[1:]  # remaining for retry
-
-        self._start_tws_lookup_with_worker(workers[0], symbol)
-
-    def _start_tws_lookup_with_worker(self, worker, symbol: str) -> None:
-        """Wire signals to *worker* and kick off the browse request."""
-        # Disconnect previous signals if any
-        if self._connected_worker is not None:
-            try:
-                self._connected_worker.browse_results.disconnect(
-                    self._on_tws_results)
-            except (RuntimeError, TypeError):
-                pass
-            try:
-                self._connected_worker.browse_failed.disconnect(
-                    self._on_tws_failed)
-            except (RuntimeError, TypeError):
-                pass
-
-        self._connected_worker = worker
-        worker.browse_results.connect(self._on_tws_results)
-        worker.browse_failed.connect(self._on_tws_failed)
-        log.info("OrderEntry: trying worker %s for lookup of '%s'",
-                 worker._label, symbol)
-        worker.request_browse({
-            "sec_type": "STK",
-            "symbol": symbol,
-            "exchange": "SMART",
-            "currency": "USD",
-        })
-
-    def _on_tws_results(self, results: list[dict]) -> None:
-        """TWS returned contract details – save and add symbol."""
-        self._combo.lineEdit().setPlaceholderText("Add symbol (look up)..")
-        # Disconnect signals
-        if self._connected_worker is not None:
-            try:
-                self._connected_worker.browse_results.disconnect(
-                    self._on_tws_results)
-            except (RuntimeError, TypeError):
-                pass
-            try:
-                self._connected_worker.browse_failed.disconnect(
-                    self._on_tws_failed)
-            except (RuntimeError, TypeError):
-                pass
-            self._connected_worker = None
-
-        if not results:
-            log.warning("OrderEntry: TWS returned no results for '%s'",
-                        getattr(self, '_pending_lookup', '?'))
-            return
-
-        # Save the contract(s) to app_config.json
-        existing = config_manager.load_contracts()
-        existing_ids = {c.get("conid") for c in existing}
-        added = 0
-        sym_to_add = ""
-        for r in results:
-            if r.get("conid") and r["conid"] not in existing_ids:
-                existing.append(r)
-                existing_ids.add(r["conid"])
-                added += 1
-            if not sym_to_add:
-                sym_to_add = r.get("symbol", "")
-
-        if added:
-            config_manager.save_contracts(existing)
-            from src.core.reference_data import get_instance as _rd
-            _rd().reload_contracts()
-            log.info("OrderEntry: saved %d contract(s) from TWS lookup", added)
-
-        # Add the symbol chip
-        if sym_to_add:
-            self._add_symbol(sym_to_add)
-
-    def _on_tws_failed(self, msg: str) -> None:
-        """TWS lookup failed — retry next priority worker or give up."""
-        # Disconnect signals from current worker
-        if self._connected_worker is not None:
-            try:
-                self._connected_worker.browse_results.disconnect(
-                    self._on_tws_results)
-            except (RuntimeError, TypeError):
-                pass
-            try:
-                self._connected_worker.browse_failed.disconnect(
-                    self._on_tws_failed)
-            except (RuntimeError, TypeError):
-                pass
-
-        # Try next priority worker if available
-        pending = getattr(self, "_pending_lookup_workers", [])
-        pending_sym = getattr(self, "_pending_lookup", "")
-        if pending and pending_sym:
-            next_worker = pending.pop(0)
-            log.info("OrderEntry: lookup failed on %s (%s), retrying with %s",
-                     getattr(self._connected_worker, '_label', '?'), msg,
-                     next_worker._label)
-            self._start_tws_lookup_with_worker(next_worker, pending_sym)
-            return
-
-        # All workers exhausted
-        self._connected_worker = None
-        self._combo.lineEdit().setPlaceholderText("Add symbol (look up)..")
-        log.warning(
-            "OrderEntry: TWS lookup failed (all workers exhausted): %s", msg)
 
     # ── Public API for live price feed ────────────────────────────────────────
 
@@ -5053,30 +4769,12 @@ class OrderEntryPanel(QWidget):
         return params_list
 
     def _build_bg_params_for_symbol(self, sym: str) -> dict | None:
-        """Build market data params for a single symbol from the reference cache.
-
-        Routes through ``pick_active_contract`` so a root like ``NQ`` with
-        multiple saved expirations resolves to the front-month
-        automatically — keeping the panel's market-data subscription on
-        the same contract that order entry will trade against.
+        """Build market data params for a single symbol from its chip /
+        hot-button instrument entry — the same contract order entry will
+        trade against.
         """
-        from src.core.reference_data import get_instance as _rd
-        c = _rd().pick_active_contract(sym)
-        if not c:
-            return None
-        conid = c.get("conid")
-        if not conid:
-            return None
-        return {
-            "conid":        int(conid),
-            "symbol":       sym,
-            "sec_type":     c.get("sec_type", ""),
-            "exchange":     c.get("exchange", "SMART"),
-            "currency":     c.get("currency", "USD"),
-            "local_symbol": c.get("local_symbol", ""),
-            "expiry":       c.get("expiry", ""),
-            "multiplier":   c.get("multiplier", ""),
-        }
+        from src.core import instruments
+        return instruments.build_md_params(sym)
 
     def _on_bg_price_update(self, sym: str, last: float, bid: float,
                             ask: float, close: float = 0.0) -> None:
@@ -5196,18 +4894,20 @@ class OrderEntryPanel(QWidget):
             exclude={s.upper() for s in self._symbols})
 
         def _picked(entry: dict) -> None:
+            from src.core import instruments
             if (entry.get("source") == "ibkr"
                     and entry.get("sec_type") == "FUT"):
                 sym, replaced = apply_future_pick(self, entry)
                 if not sym:
                     return  # user declined the replacement
-                self._add_symbol(sym)
+                self._add_symbol(
+                    sym, meta=instruments.contract_meta_from_result(entry))
                 if replaced:
                     self.contract_replaced.emit(sym)
                 return
-            sym = ensure_contract_saved(entry)
+            sym, meta = ensure_contract_saved(entry)
             if sym:
-                self._add_symbol(sym)
+                self._add_symbol(sym, meta=meta)
 
         dlg.symbol_selected.connect(_picked)
         dlg.open_below(self._btn_add_symbol)

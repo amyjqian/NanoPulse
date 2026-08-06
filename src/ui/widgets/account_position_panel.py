@@ -64,6 +64,7 @@ from .account_position_model import (
 from .positions_summary_model import (
     PositionsSummaryModel,
     S_COL_KEYS as PS_COL_KEYS,
+    S_COL_SYMBOL,
     S_HEADERS as PS_COL_HEADERS,
 )
 
@@ -266,9 +267,9 @@ class AccountHeaderInfoDelegate(QStyledItemDelegate):
 # (label, bg_normal, bg_hover, bg_pressed, pct)   pct=100 → full flatten
 _POS_BTNS = [
     ("Flatten", "#E08A3C", "#CE7F37", "#BD742F", 100),
-    ("25%",     "#9DA3AB", "#C9CED5", "#8A9099",  25),
-    ("50%",     "#9DA3AB", "#C9CED5", "#8A9099",  50),
-    ("75%",     "#9DA3AB", "#C9CED5", "#8A9099",  75),
+    ("25%",     "#6E757E", "#7D848E", "#5E656D",  25),
+    ("50%",     "#6E757E", "#7D848E", "#5E656D",  50),
+    ("75%",     "#6E757E", "#7D848E", "#5E656D",  75),
 ]
 # ── Position column definitions (configurable via Column Management) ───────────
 _POS_COL_KEYS = [
@@ -430,9 +431,7 @@ class FlattenButtonDelegate(QStyledItemDelegate):
             painter.setBrush(bg)
             painter.drawRoundedRect(btn_rect, self._HDR_RADIUS, self._HDR_RADIUS)
 
-            # Amber flatten carries dark text (restyle); the armed red
-            # confirm state keeps white for contrast.
-            painter.setPen(QColor("#ffffff" if armed else "#1c1206"))
+            painter.setPen(QColor("#ffffff"))
             painter.setFont(QFont("Inter, Helvetica Neue, Arial", 10, QFont.Weight.Bold))
             painter.drawText(btn_rect, Qt.AlignmentFlag.AlignCenter,
                              self._HDR_ARMED_TEXT if armed
@@ -464,9 +463,7 @@ class FlattenButtonDelegate(QStyledItemDelegate):
                 painter.setBrush(bg)
                 painter.drawRoundedRect(rect, _POS_BTN_RADIUS, _POS_BTN_RADIUS)
 
-                # Light-background buttons take dark text (restyle):
-                # amber Flatten #1c1206, grey 25/50/75% #0f1319.
-                painter.setPen(QColor("#1c1206" if i == 0 else "#0f1319"))
+                painter.setPen(QColor("#ffffff"))
                 painter.setFont(btn_font)
                 painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, lbl)
 
@@ -1020,11 +1017,11 @@ class AccountPositionPanel(QWidget):
         self.position_close_requested.emit(account, con_id, pct)
 
     def _on_table_row_clicked(self, idx) -> None:
-        """Flat-table row click → ``position_row_clicked``.  Header rows
-        and the Flatten column are excluded — a near-miss of the
-        Flatten/25/50/75 buttons must not retarget the Book Trader
-        ladder."""
-        if not idx.isValid() or idx.column() == COL_FLATTEN:
+        """Flat-table SYMBOL-cell click → ``position_row_clicked``.
+        Only the Symbol cell jumps the Book Trader ladder — clicking any
+        other cell (to inspect P&L, select a row, or near-miss the
+        Flatten buttons) must not retarget it."""
+        if not idx.isValid() or idx.column() != COL_SYMBOL:
             return
         if idx.data(RowTypeRole) != ROW_TYPE_POSITION:
             return
@@ -1040,11 +1037,12 @@ class AccountPositionPanel(QWidget):
         self.position_row_clicked.emit(payload)
 
     def _on_summary_row_clicked(self, idx) -> None:
-        """Summary-table row click → ``position_row_clicked``.  The
-        TOTAL footer returns None from row_data and is ignored.  The
+        """Summary-table SYMBOL-cell click → ``position_row_clicked``
+        (mirrors the flat table: only the Symbol cell jumps the ladder).
+        The TOTAL footer returns None from row_data and is ignored.  The
         aggregate's ``position`` is the net across accounts — the right
         qty to prefill."""
-        if not idx.isValid():
+        if not idx.isValid() or idx.column() != S_COL_SYMBOL:
             return
         agg = self._summary_model.row_data(idx.row())
         if agg is None:

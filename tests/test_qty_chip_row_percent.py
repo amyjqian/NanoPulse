@@ -381,3 +381,79 @@ def test_wheel_steps_ladder_both_units(qtbot):
     assert box.text() == "100"
     box.wheelEvent(_FakeWheel(-120))
     assert box.text() == "99"
+
+
+class TestTickPriceInputStepping:
+    """The Dist price input matches the qty field's minimal style: no
+    arrows, no ladder popup — wheel and ↑/↓ step by one tick."""
+
+    def _make(self, qtbot, tick=0.25, market=100.0):
+        from src.ui.widgets.order_entry_panel import TickPriceInput
+        w = TickPriceInput()
+        qtbot.addWidget(w)
+        w.set_market_price(market, tick)
+        return w
+
+    def test_arrow_and_popup_machinery_gone(self, qtbot):
+        w = self._make(qtbot)
+        for gone in ("_btn_up", "_btn_dn", "_arrow_w", "_popup",
+                     "_show_popup", "_close_popup"):
+            assert not hasattr(w, gone)
+
+    def test_wheel_steps_one_tick(self, qtbot):
+        w = self._make(qtbot)
+        w.setText("100.00")
+        w.wheelEvent(_FakeWheel(120))
+        assert w.text() == "100.25"
+        w.wheelEvent(_FakeWheel(-120))
+        assert w.text() == "100"       # trailing zeros stripped
+        # Trackpad deltas accumulate into one step.
+        w.wheelEvent(_FakeWheel(60))
+        assert w.text() == "100"
+        w.wheelEvent(_FakeWheel(60))
+        assert w.text() == "100.25"
+
+    def test_empty_field_starts_at_one_tick_distance(self, qtbot):
+        # The Dist field holds a DISTANCE, never an absolute price —
+        # stepping from empty begins at one tick (0.25 for MNQ-style).
+        w = self._make(qtbot, market=29580.0)
+        w.wheelEvent(_FakeWheel(120))
+        assert w.text() == "0.25"
+        w.wheelEvent(_FakeWheel(120))
+        assert w.text() == "0.5"       # trailing zero stripped
+        # Down floors at one tick; from empty it stays empty.
+        w.wheelEvent(_FakeWheel(-120))
+        w.wheelEvent(_FakeWheel(-120))
+        assert w.text() == "0.25"
+        w2 = self._make(qtbot, market=29580.0)
+        w2.wheelEvent(_FakeWheel(-120))
+        assert w2.text() == ""
+
+    def test_arrow_keys_step(self, qtbot):
+        from PySide6.QtCore import Qt as _Qt
+        w = self._make(qtbot)
+        w.setText("100.00")
+        qtbot.keyClick(w._edit, _Qt.Key.Key_Up)
+        assert w.text() == "100.25"
+        qtbot.keyClick(w._edit, _Qt.Key.Key_Down)
+        assert w.text() == "100"
+
+    def test_escape_clears_value(self, qtbot):
+        from PySide6.QtCore import Qt as _Qt
+        w = self._make(qtbot)
+        w.setText("0.75")
+        fired = []
+        w.textChanged.connect(fired.append)
+        qtbot.keyClick(w._edit, _Qt.Key.Key_Escape)
+        assert w.text() == ""
+        # The clear must reach the host tier section so it disarms.
+        assert fired and fired[-1] == ""
+        # Empty field: Esc is NOT swallowed (bubbles to the window).
+        qtbot.keyClick(w._edit, _Qt.Key.Key_Escape)
+        assert w.text() == ""
+
+    def test_no_inline_clear_button(self, qtbot):
+        # Esc is the only quick-clear — the inline "x" was removed to
+        # keep the minimal one-box look.
+        w = self._make(qtbot)
+        assert not w._edit.isClearButtonEnabled()

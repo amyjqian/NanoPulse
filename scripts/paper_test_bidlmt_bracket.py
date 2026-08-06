@@ -74,9 +74,10 @@ def _make_worker_stub(ib: IB) -> IBWorkerThread:
 
 
 async def run() -> int:
-    _rd().reload_contracts()
-    mnq = _rd().contracts_by_symbol.get("MNQ", [])
-    _log(f"loaded {len(mnq)} MNQ contract(s) from cache "
+    from src.core import instruments
+    c = instruments.get_contract("MNQ")
+    mnq = [c] if c else []
+    _log(f"loaded {len(mnq)} MNQ contract(s) from chip entries "
          f"(exchange={mnq[0].get('exchange', '?') if mnq else 'n/a'})")
 
     ib = IB()

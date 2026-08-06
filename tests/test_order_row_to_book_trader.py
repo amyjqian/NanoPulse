@@ -36,40 +36,43 @@ def _order(**over) -> dict:
 
 # ── Order → position-payload translation ──────────────────────────────────────
 
-def _patch_reference_data(monkeypatch) -> dict:
-    """Point ReferenceData at a canned contracts cache: one FUT root
-    (two expiries) and one STK."""
-    by_symbol = {
-        "MNQ": [
-            {"symbol": "MNQ", "local_symbol": "MNQM6", "sec_type": "FUT",
-             "conid": "1001", "exchange": "CME", "currency": "USD",
-             "multiplier": "2"},
-            {"symbol": "MNQ", "local_symbol": "MNQU6", "sec_type": "FUT",
-             "conid": "1002", "exchange": "CME", "currency": "USD",
-             "multiplier": "2"},
-        ],
-        "AAPL": [
-            {"symbol": "AAPL", "local_symbol": "AAPL", "sec_type": "STK",
-             "conid": "2001", "exchange": "SMART", "currency": "USD",
-             "multiplier": ""},
-        ],
-    }
-    def _get_sec_type(sym: str) -> str:
-        for c in by_symbol.get(sym.upper(), []):
-            return c.get("sec_type", "?")
-        return "?"
+def _patch_instruments(monkeypatch) -> list:
+    """Point the instrument resolver at a canned entry list: one FUT
+    root (front expiry only — one contract per root) and one STK."""
+    contracts = [
+        {"symbol": "MNQ", "local_symbol": "MNQM6", "sec_type": "FUT",
+         "conid": "1001", "exchange": "CME", "currency": "USD",
+         "multiplier": "2"},
+        {"symbol": "AAPL", "local_symbol": "AAPL", "sec_type": "STK",
+         "conid": "2001", "exchange": "SMART", "currency": "USD",
+         "multiplier": ""},
+    ]
+    import src.core.instruments as instruments
 
-    import src.core.reference_data as rd
-    monkeypatch.setattr(
-        rd, "get_instance",
-        lambda: SimpleNamespace(contracts_by_symbol=by_symbol,
-                                get_sec_type=_get_sec_type))
-    return by_symbol
+    monkeypatch.setattr(instruments, "all_contracts",
+                        lambda: [dict(c) for c in contracts])
+
+    def _get_contract(q):
+        q = (q or "").upper().strip()
+        for c in contracts:
+            if (c.get("local_symbol") or "").upper() == q:
+                return dict(c)
+        for c in contracts:
+            if c["symbol"].upper() == q:
+                return dict(c)
+        return None
+    monkeypatch.setattr(instruments, "get_contract", _get_contract)
+
+    def _get_sec_type(sym: str) -> str:
+        c = _get_contract(sym)
+        return c["sec_type"] if c else "?"
+    monkeypatch.setattr(instruments, "get_sec_type", _get_sec_type)
+    return contracts
 
 
 @pytest.fixture
 def saved_contracts(monkeypatch):
-    return _patch_reference_data(monkeypatch)
+    return _patch_instruments(monkeypatch)
 
 
 class TestPositionLikeFromOrder:
@@ -79,11 +82,11 @@ class TestPositionLikeFromOrder:
 
     def test_fut_local_symbol_resolves_to_root(self, saved_contracts):
         pos = btv._position_like_from_order(
-            _order(symbol="MNQU6", quantity="2"))
+            _order(symbol="MNQM6", quantity="2"))
         assert pos["symbol"] == "MNQ"
-        assert pos["local_symbol"] == "MNQU6"
+        assert pos["local_symbol"] == "MNQM6"
         assert pos["sec_type"] == "FUT"
-        assert pos["con_id"] == "1002"
+        assert pos["con_id"] == "1001"
         assert pos["position"] == 2
         # The chip key derives from the root, exactly like a position row.
         assert btv._chip_key_for_position(pos) == ("MNQ", "FUT")
@@ -125,10 +128,10 @@ class TestPositionLikeFromOrder:
         """A saved OPT row with conid='' (older builds) must not shadow
         the con_id carried on the order dict — it's what lets
         _ensure_position_contract_saved heal the row."""
-        saved_contracts[_OCC.upper()] = [
+        saved_contracts.append(
             {"symbol": _OCC.upper(), "local_symbol": _OCC,
              "sec_type": "OPT", "conid": "", "exchange": "SMART",
-             "currency": "USD", "multiplier": "100"}]
+             "currency": "USD", "multiplier": "100"})
         pos = btv._position_like_from_order(
             _order(symbol=_OCC, con_id=896505480))
         assert pos["con_id"] == 896505480
@@ -148,13 +151,13 @@ class TestFocusOrder:
         # its full API), then swap in the canned contracts cache.
         v = btv.BookTraderView(active_threads={})
         qtbot.addWidget(v)
-        _patch_reference_data(monkeypatch)
+        _patch_instruments(monkeypatch)
         return v
 
     def test_delegates_translated_payload(self, view, monkeypatch):
         seen = []
         monkeypatch.setattr(view, "focus_position", seen.append)
-        view.focus_order(_order(symbol="MNQU6", quantity="2"))
+        view.focus_order(_order(symbol="MNQM6", quantity="2"))
         assert len(seen) == 1
         assert seen[0]["symbol"] == "MNQ"
         assert seen[0]["position"] == 2
