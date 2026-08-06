@@ -469,3 +469,30 @@ class TestSetQtyCustomInput:
         with qtbot.assertNotEmitted(row.qty_changed):
             row.set_qty(37)
             row.set_qty(100)
+
+
+# ── Trailing header button → close-tier request ───────────────────────────────
+
+def test_trailing_button_emits_close_tier_tr(qtbot, monkeypatch):
+    """The TS header button mirrors TP/SL: an armed trailing distance
+    emits close_tier_requested with side='tr' and the raw points."""
+    monkeypatch.setattr(btv.config_manager, "save_book_trader_symbols",
+                        lambda s, path=None: None)
+    monkeypatch.setattr(btv.config_manager,
+                        "save_book_trader_active_symbol",
+                        lambda s, path=None: None)
+    v = btv.BookTraderView(active_threads={})
+    qtbot.addWidget(v)
+    v._active_symbol = "MNQ"
+    v._last_price = 26697.0
+    monkeypatch.setattr(v._tr_section, "get_value",
+                        lambda: {"value": 0.5, "unit": "price",
+                                 "label": "Custom"})
+    monkeypatch.setattr(v._qty_row, "current_qty", lambda: 2)
+    with qtbot.waitSignal(v.close_tier_requested, timeout=1000) as blocker:
+        v._emit_close_tier("tr")
+    payload = blocker.args[0]
+    assert payload["side"] == "tr"
+    assert payload["symbol"] == "MNQ"
+    assert payload["offset_pts"] == 0.5
+    assert payload["qty"] == 2

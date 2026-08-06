@@ -575,3 +575,108 @@ class TestCloseTier:
             order = wt._ib.placed[0][1]
             assert order.outsideRth is True, \
                 f"{side}: expected outsideRth=True on FUT exit, got False"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  close_tier — Trailing (TS) header-button path
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestCloseTierTrailing:
+    def test_tr_long_submits_sell_trail_with_distance(self):
+        pos = _make_position("MNQ", "FUT", 111, net_pos=3,
+                             account="DU1", minTick=0.25)
+        wt = _make_close_tier_worker([pos])
+        _run(wt._do_close_tier(
+            symbol="MNQ", account="DU1", side="tr",
+            offset_pts=0.5, requested_qty=5,
+            current_price=26697.0, cap_offset=0.0,
+        ))
+        assert len(wt._ib.placed) == 1
+        _, order = wt._ib.placed[0]
+        assert order.orderType == "TRAIL"
+        assert order.action == "SELL"
+        assert order.totalQuantity == 3       # min(|pos|=3, req=5)
+        assert order.auxPrice == 0.5          # trail DISTANCE, not a level
+
+    def test_tr_short_submits_buy_trail_same_unsigned_distance(self):
+        pos = _make_position("MNQ", "FUT", 111, net_pos=-4, account="DU1")
+        wt = _make_close_tier_worker([pos])
+        _run(wt._do_close_tier("MNQ", "DU1", "tr", 0.5, 10, 26697.0, 0.0))
+        _, order = wt._ib.placed[0]
+        assert order.action == "BUY"
+        assert order.totalQuantity == 4
+        assert order.auxPrice == 0.5          # unsigned either direction
+
+    def test_tr_distance_snaps_to_tick(self):
+        pos = _make_position("MNQ", "FUT", 111, net_pos=1,
+                             account="DU1", minTick=0.25)
+        wt = _make_close_tier_worker([pos])
+        _run(wt._do_close_tier("MNQ", "DU1", "tr", 0.63, 1, 26697.0, 0.0))
+        assert wt._ib.placed[0][1].auxPrice == 0.75
+
+    def test_tr_flat_account_places_nothing(self):
+        """Parity with tp/sl: a zero-position account is silently
+        skipped — no phantom trailing stop."""
+        pos = _make_position("MNQ", "FUT", 111, net_pos=0, account="DU1")
+        wt = _make_close_tier_worker([pos])
+        _run(wt._do_close_tier("MNQ", "DU1", "tr", 0.5, 5, 26697.0, 0.0))
+        assert wt._ib.placed == []
+
+    def test_tr_cap_offset_ignored(self):
+        """cap_offset shapes SL's STP LMT only — a trail must stay a
+        plain TRAIL regardless."""
+        pos = _make_position("MNQ", "FUT", 111, net_pos=2, account="DU1")
+        wt = _make_close_tier_worker([pos])
+        _run(wt._do_close_tier("MNQ", "DU1", "tr", 0.5, 2, 26697.0, 1.0))
+        assert wt._ib.placed[0][1].orderType == "TRAIL"
+
+    def test_tr_fut_forces_outside_rth(self):
+        pos = _make_position("MNQ", "FUT", 111, net_pos=2, account="DU1")
+        wt = _make_close_tier_worker([pos])
+        _run(wt._do_close_tier("MNQ", "DU1", "tr", 0.5, 5, 26697.0, 0.0))
+        assert wt._ib.placed[0][1].outsideRth is True
+
+    def test_tr_status_params_carry_distance_and_type(self):
+        pos = _make_position("MNQ", "FUT", 111, net_pos=2, account="DU1")
+        wt = _make_close_tier_worker([pos])
+        seen = []
+        wt._emit_order_status = (
+            lambda trade, oid, params, status: seen.append(params))
+        _run(wt._do_close_tier("MNQ", "DU1", "tr", 0.5, 5, 26697.0, 0.0))
+        params = seen[0]
+        assert params["order_type"] == "TRAIL"
+        assert params["stop_price"] == 0.5    # distance in the STP cell
+        assert "limit_price" not in params
+
+    def test_invalid_side_still_rejected(self):
+        pos = _make_position("MNQ", "FUT", 111, net_pos=2, account="DU1")
+        wt = _make_close_tier_worker([pos])
+        _run(wt._do_close_tier("MNQ", "DU1", "zz", 0.5, 5, 26697.0, 0.0))
+        assert wt._ib.placed == []
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  _child_price_params — blotter price cells per child order type
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestChildPriceParams:
+    _f = staticmethod(IBWorkerThread._child_price_params)
+
+    def test_lmt_limit_only(self):
+        assert self._f("LMT", 101.5, None) == {"limit_price": 101.5}
+
+    def test_stp_stop_only(self):
+        assert self._f("STP", None, 99.0) == {"stop_price": 99.0}
+
+    def test_stp_lmt_both(self):
+        assert self._f("STP LMT", 98.5, 99.0) == {
+            "limit_price": 98.5, "stop_price": 99.0}
+
+    def test_trail_distance_in_stop_cell(self):
+        assert self._f("TRAIL", None, 0.5) == {"stop_price": 0.5}
+
+    def test_dbl_max_sentinels_dropped(self):
+        big = 1.8e308
+        assert self._f("LMT", big, None) == {}
+        assert self._f("TRAIL", None, big) == {}
+        assert self._f("STP", None, 0.0) == {}

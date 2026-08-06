@@ -1427,17 +1427,20 @@ class FlashTradeView(QWidget):
         self._book_trading.refresh_symbol_contract(sym)
 
     def _on_close_tier_requested(self, data: dict) -> None:
-        """Take Profit / Stop Loss header button clicked → submit an exit
-        order sized to the current position on every checked account.
+        """Take Profit / Stop Loss / Trailing header button clicked →
+        submit an exit order sized to the current position on every
+        checked account.
 
         * TP → LMT at last_price ± offset_pts (profit direction).
         * SL → STP or STP LMT (if limit_cap set) at last_price ∓ offset_pts.
+        * TS → TRAIL with auxPrice = offset_pts (a distance — no price
+          math; cap_offset is ignored by the worker for this side).
         * qty = min(|position|, payload.qty).  Zero-position accounts are
           silently skipped so we never submit an empty / phantom order.
         """
         symbol = data.get("symbol", "")
         side = data.get("side", "")
-        if not symbol or side not in ("tp", "sl"):
+        if not symbol or side not in ("tp", "sl", "tr"):
             log.warning("FlashTrade: close_tier invalid payload: %s", data)
             return
         if not isinstance(self._account_list, AccountListPanel):

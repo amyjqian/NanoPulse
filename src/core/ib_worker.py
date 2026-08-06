@@ -2135,23 +2135,13 @@ class IBWorkerThread(QThread):
                 ch_params["order_type"] = ch.orderType
                 ch_params["action"]     = ch.action
                 ch_params["qty"]        = int(ch.totalQuantity)
-                # Child-specific price columns for the blotter.  TRAIL's
-                # auxPrice is a *distance* not a stop level, so leave stop
-                # empty; TRAIL shows the trail distance in its own column.
-                lmt_val = getattr(ch, "lmtPrice", None)
-                aux_val = getattr(ch, "auxPrice", None)
-                if ch.orderType in ("LMT",) and lmt_val and lmt_val < _IB_DBL_MAX:
-                    ch_params["limit_price"] = lmt_val
-                else:
-                    ch_params.pop("limit_price", None)
-                if ch.orderType in ("STP", "STP LMT") and aux_val \
-                        and aux_val < _IB_DBL_MAX:
-                    ch_params["stop_price"] = aux_val
-                    if ch.orderType == "STP LMT" and lmt_val \
-                            and lmt_val < _IB_DBL_MAX:
-                        ch_params["limit_price"] = lmt_val
-                else:
-                    ch_params.pop("stop_price", None)
+                # Child-specific price columns for the blotter.
+                ch_params.pop("limit_price", None)
+                ch_params.pop("stop_price", None)
+                ch_params.update(self._child_price_params(
+                    ch.orderType,
+                    getattr(ch, "lmtPrice", None),
+                    getattr(ch, "auxPrice", None)))
                 ch_frozen_oid = ch_key
 
                 def _on_child_status(t, _oid=ch_frozen_oid, _p=ch_params):
@@ -2181,6 +2171,25 @@ class IBWorkerThread(QThread):
                 "[%s] API-ERR   placeOrder failed: %s", self._label, exc)
             order_log.error("[%s] ORDER-ERROR  placeOrder failed: %s | params=%s",
                             self._label, exc, params)
+
+    @staticmethod
+    def _child_price_params(order_type: str, lmt_val, aux_val) -> dict:
+        """Blotter price columns for a bracket child / exit order.
+
+        LMT → limit only; STP → stop only; STP LMT → both; TRAIL →
+        the trail *distance* (auxPrice) in the stop column — the Type
+        column reads TRAIL so the cell is unambiguous (same convention
+        TWS uses for the aux field).  IB's DBL_MAX "no data" sentinel
+        is dropped.
+        """
+        def _ok(v) -> bool:
+            return bool(v) and v < _IB_DBL_MAX
+        out: dict = {}
+        if order_type in ("LMT", "STP LMT") and _ok(lmt_val):
+            out["limit_price"] = lmt_val
+        if order_type in ("STP", "STP LMT", "TRAIL") and _ok(aux_val):
+            out["stop_price"] = aux_val
+        return out
 
     def _build_bracket_children(self, parent, params: dict,
                                 ref_price: float, tick: float) -> list:
@@ -2765,7 +2774,7 @@ class IBWorkerThread(QThread):
                              current_price: float,
                              cap_offset: float) -> None:
         """Read the position for *symbol*/*account* and submit a single
-        LMT (tp) / STP / STP LMT (sl) exit order.
+        LMT (tp) / STP / STP LMT (sl) / TRAIL (tr) exit order.
 
         Sizing: ``qty = min(|position|, requested_qty)``.  A zero-position
         account is silently skipped so we never submit an empty order.
@@ -2781,17 +2790,23 @@ class IBWorkerThread(QThread):
         And when ``cap_offset > 0`` the limit sits that far further
         into the loss zone from the stop, giving the post-trigger limit
         a small execution window.
+
+        TS trail (auxPrice — the trail *distance*, not a level):
+          aux = offset (unsigned; IB tracks the stop server-side at
+          high-water ∓ aux).  ``current_price`` and ``cap_offset`` play
+          no role in the maths — the price guard just mirrors tp/sl.
         """
         if self._ib is None or not self._ib.isConnected():
             return
-        if side not in ("tp", "sl") or offset_pts <= 0 or current_price <= 0:
+        if (side not in ("tp", "sl", "tr")
+                or offset_pts <= 0 or current_price <= 0):
             order_log.warning(
                 "[%s] ORDER-CLOSE-TIER  invalid args side=%s offset=%.4f "
                 "ref=%.4f — skipping", self._label, side, offset_pts,
                 current_price)
             return
 
-        from ib_async import LimitOrder, StopOrder, StopLimitOrder
+        from ib_async import LimitOrder, Order, StopLimitOrder, StopOrder
 
         symbol_upper = symbol.upper()
         try:
@@ -2853,6 +2868,18 @@ class IBWorkerThread(QThread):
                     continue
                 order = LimitOrder(exit_action, qty, target)
                 tp_desc = f"LMT @ {target:.4f}"
+            elif side == "tr":
+                # Trailing stop: auxPrice is the unsigned trail DISTANCE
+                # — IB tracks the stop level server-side.
+                aux = _round_to_tick(offset_pts, tick)
+                if aux <= 0:
+                    order_log.warning(
+                        "[%s] ORDER-CLOSE-TIER TR-SKIP  non-positive "
+                        "trail %.4f", self._label, aux)
+                    continue
+                order = Order(orderType="TRAIL", action=exit_action,
+                              totalQuantity=qty, auxPrice=aux)
+                tp_desc = f"TRAIL dist={aux:.4f}"
             else:  # side == "sl"
                 # Loss direction: long → down, short → up.
                 stop_px = _round_to_tick(
@@ -2930,6 +2957,11 @@ class IBWorkerThread(QThread):
             }
             if side == "tp":
                 status_params["limit_price"] = target
+            elif side == "tr":
+                # The Type column reads TRAIL, so the STP cell
+                # unambiguously shows the trail distance (same
+                # convention TWS uses for the aux field).
+                status_params["stop_price"] = aux
             elif cap_offset > 0:
                 status_params["stop_price"] = stop_px
                 status_params["limit_price"] = lmt_px

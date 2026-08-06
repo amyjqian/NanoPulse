@@ -689,6 +689,8 @@ class BookTraderView(QWidget):
             lambda: self._emit_close_tier("tp"))
         self._sl_section.submit_requested.connect(
             lambda: self._emit_close_tier("sl"))
+        self._tr_section.submit_requested.connect(
+            lambda: self._emit_close_tier("tr"))
 
     # ── Public data-in methods (called from FlashTradeView) ──────────────────
 
@@ -1245,7 +1247,8 @@ class BookTraderView(QWidget):
         self.order_requested.emit(payload)
 
     def _emit_close_tier(self, side: str) -> None:
-        section = self._pt_section if side == "tp" else self._sl_section
+        section = {"tp": self._pt_section, "sl": self._sl_section,
+                   "tr": self._tr_section}[side]
         tier = section.get_value()
         if tier is None or not self._active_symbol:
             return

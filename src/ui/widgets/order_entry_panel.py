@@ -3148,6 +3148,8 @@ class OrderEntryPanel(QWidget):
         self._tr_section = _TierSection(
             "Trailing", tr_tiers, label_color=Theme.CLR_CLOSE,
             short_title="TS", label_fg="#000000")
+        self._tr_section.submit_requested.connect(
+            lambda: self._on_tier_submit("tr"))
 
         # The TP / SL / Trail amounts that used to live in a separate
         # ARMED banner above the buttons are now drawn directly on each
@@ -3806,11 +3808,12 @@ class OrderEntryPanel(QWidget):
                 "OrderEntryPanel: Close %d%% clicked but no active symbol", pct)
 
     def _on_tier_submit(self, side: str) -> None:
-        """Take Profit / Stop Loss header button clicked → emit
-        ``close_tier_requested`` with the active symbol, selected tier
-        offset, last price and user's qty.  FlashTradeView fans this out
-        to each checked account, reads the live position there, and
-        submits a LMT (tp) or STP/STP LMT (sl) exit order sized to
+        """Take Profit / Stop Loss / Trailing header button clicked →
+        emit ``close_tier_requested`` with the active symbol, selected
+        tier offset, last price and user's qty.  FlashTradeView fans
+        this out to each checked account, reads the live position there,
+        and submits a LMT (tp), STP/STP LMT (sl), or TRAIL (tr — the
+        offset is the trail distance) exit order sized to
         min(|position|, qty).  No-op for zero-position accounts.
         """
         sym = self._active_symbol
@@ -3820,7 +3823,8 @@ class OrderEntryPanel(QWidget):
                 side.upper())
             return
 
-        section = self._pt_section if side == "tp" else self._sl_section
+        section = {"tp": self._pt_section, "sl": self._sl_section,
+                   "tr": self._tr_section}[side]
         tier = section.get_value()
         if tier is None:
             # Button is disabled in this state; defensive no-op.
