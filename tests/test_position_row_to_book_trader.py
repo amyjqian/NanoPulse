@@ -270,6 +270,21 @@ class TestPanelSignal:
         with qtbot.assertNotEmitted(panel.position_row_clicked):
             panel._on_table_row_clicked(idx)
 
+    def test_non_symbol_column_does_not_emit(self, panel, qtbot):
+        """Only the Symbol cell jumps the ladder — clicking elsewhere on
+        the row (P&L, qty, …) must not retarget Book Trader."""
+        idx = _first_index_of_type(panel._model, ROW_TYPE_POSITION,
+                                   COL_SYMBOL + 1)
+        with qtbot.assertNotEmitted(panel.position_row_clicked):
+            panel._on_table_row_clicked(idx)
+
+    def test_summary_non_symbol_column_does_not_emit(self, panel, qtbot):
+        model = panel._summary_model
+        target = next(row for row in range(model.rowCount())
+                      if model.row_data(row) is not None)
+        with qtbot.assertNotEmitted(panel.position_row_clicked):
+            panel._on_summary_row_clicked(model.index(target, 1))
+
     def test_summary_row_emits_with_blank_account(self, panel, qtbot):
         model = panel._summary_model
         target = None

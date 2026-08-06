@@ -64,6 +64,7 @@ from .account_position_model import (
 from .positions_summary_model import (
     PositionsSummaryModel,
     S_COL_KEYS as PS_COL_KEYS,
+    S_COL_SYMBOL,
     S_HEADERS as PS_COL_HEADERS,
 )
 
@@ -1020,11 +1021,11 @@ class AccountPositionPanel(QWidget):
         self.position_close_requested.emit(account, con_id, pct)
 
     def _on_table_row_clicked(self, idx) -> None:
-        """Flat-table row click → ``position_row_clicked``.  Header rows
-        and the Flatten column are excluded — a near-miss of the
-        Flatten/25/50/75 buttons must not retarget the Book Trader
-        ladder."""
-        if not idx.isValid() or idx.column() == COL_FLATTEN:
+        """Flat-table SYMBOL-cell click → ``position_row_clicked``.
+        Only the Symbol cell jumps the Book Trader ladder — clicking any
+        other cell (to inspect P&L, select a row, or near-miss the
+        Flatten buttons) must not retarget it."""
+        if not idx.isValid() or idx.column() != COL_SYMBOL:
             return
         if idx.data(RowTypeRole) != ROW_TYPE_POSITION:
             return
@@ -1040,11 +1041,12 @@ class AccountPositionPanel(QWidget):
         self.position_row_clicked.emit(payload)
 
     def _on_summary_row_clicked(self, idx) -> None:
-        """Summary-table row click → ``position_row_clicked``.  The
-        TOTAL footer returns None from row_data and is ignored.  The
+        """Summary-table SYMBOL-cell click → ``position_row_clicked``
+        (mirrors the flat table: only the Symbol cell jumps the ladder).
+        The TOTAL footer returns None from row_data and is ignored.  The
         aggregate's ``position`` is the net across accounts — the right
         qty to prefill."""
-        if not idx.isValid():
+        if not idx.isValid() or idx.column() != S_COL_SYMBOL:
             return
         agg = self._summary_model.row_data(idx.row())
         if agg is None:
