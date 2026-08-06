@@ -267,9 +267,9 @@ class AccountHeaderInfoDelegate(QStyledItemDelegate):
 # (label, bg_normal, bg_hover, bg_pressed, pct)   pct=100 → full flatten
 _POS_BTNS = [
     ("Flatten", "#E08A3C", "#CE7F37", "#BD742F", 100),
-    ("25%",     "#9DA3AB", "#C9CED5", "#8A9099",  25),
-    ("50%",     "#9DA3AB", "#C9CED5", "#8A9099",  50),
-    ("75%",     "#9DA3AB", "#C9CED5", "#8A9099",  75),
+    ("25%",     "#6E757E", "#7D848E", "#5E656D",  25),
+    ("50%",     "#6E757E", "#7D848E", "#5E656D",  50),
+    ("75%",     "#6E757E", "#7D848E", "#5E656D",  75),
 ]
 # ── Position column definitions (configurable via Column Management) ───────────
 _POS_COL_KEYS = [

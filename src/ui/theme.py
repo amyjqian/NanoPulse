@@ -38,7 +38,7 @@ class Theme:
     # Position Colors
     CLR_FLATTEN = "#E08A3C"
     CLR_REVERSE = "#A371F7"
-    CLR_CLOSE = "#9DA3AB"
+    CLR_CLOSE = "#6E757E"
     CLR_CANCEL = "#3A414C"
 
     # Percent-sizing accent (gold) — the SH/% unit toggle and the

@@ -59,3 +59,18 @@ def test_conidless_pick_stores_no_contract(modal):
     # local FUT row without conid → symbol adopted, no metadata stored
     assert modal._draft["symbol"] == "NQ"
     assert "contract" not in modal._draft
+
+
+def test_typing_in_symbol_field_opens_live_search(modal, qtbot):
+    """The first typed character opens the search popup seeded with that
+    character — the user doesn't have to click first."""
+    from src.ui.widgets.symbol_search_popup import SymbolSearchPopup
+    modal.show()
+    qtbot.waitExposed(modal)
+    qtbot.keyClick(modal._inp_symbol, "c")
+    popup = next((w for w in modal.findChildren(SymbolSearchPopup)), None)
+    assert popup is not None
+    assert popup._search.text() == "c"
+    # The keystroke was consumed — the modal's field is untouched.
+    assert modal._inp_symbol.text() == ""
+    popup.close()

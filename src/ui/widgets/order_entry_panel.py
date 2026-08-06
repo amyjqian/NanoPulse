@@ -2633,21 +2633,31 @@ class _HotButtonModal(QDialog):
         self._inp_qty.setEnabled(True)
 
     def eventFilter(self, obj, event):  # noqa: N802 – Qt override
-        # Clicking the SPECIFIC symbol field opens the live search
-        # popup (disabled fields never receive the press).
-        if (obj is getattr(self, "_inp_symbol", None)
-                and event.type() == QEvent.Type.MouseButtonPress):
-            self._open_symbol_search_popup()
+        # The SPECIFIC symbol field opens the live search popup on a
+        # click (refine the current symbol) or on the first typed
+        # character (fresh search — the keystroke lands in the popup's
+        # search box and typing continues there).  Disabled fields
+        # never receive either event.
+        if obj is getattr(self, "_inp_symbol", None):
+            if event.type() == QEvent.Type.MouseButtonPress:
+                self._open_symbol_search_popup()
+            elif event.type() == QEvent.Type.KeyPress:
+                text = event.text()
+                if text and text.isprintable():
+                    self._open_symbol_search_popup(seed=text)
+                    return True   # consumed — the popup owns typing now
         return super().eventFilter(obj, event)
 
-    def _open_symbol_search_popup(self) -> None:
+    def _open_symbol_search_popup(self, seed: str | None = None) -> None:
         """Live IBKR symbol search anchored under the symbol field —
         the same popup the chip bars use (known instruments instantly,
         reqMatchingSymbols streaming as the user types, futures roots
-        expanding into pickable expirations)."""
+        expanding into pickable expirations).  *seed* pre-fills the
+        popup's search box (a typed character starts a fresh search;
+        a click refines the field's current text)."""
         from src.ui.widgets.symbol_search_popup import SymbolSearchPopup
         dlg = SymbolSearchPopup(self, workers=self._workers, exclude=set())
-        seed = self._inp_symbol.text().strip()
+        seed = seed if seed is not None else self._inp_symbol.text().strip()
         if seed:
             dlg._search.setText(seed)   # noqa: SLF001 — seeds the live search
         dlg.symbol_selected.connect(self._on_symbol_picked)
