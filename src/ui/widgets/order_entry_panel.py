@@ -25,7 +25,6 @@ from PySide6.QtGui import (
     QPainter,
 )
 from PySide6.QtWidgets import (
-    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -37,14 +36,11 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QListWidget,
-    QListWidgetItem,
     QMenu,
     QPushButton,
     QSizePolicy,
     QStyle,
     QStyleOptionButton,
-    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -263,88 +259,52 @@ def _apply_chip_style(btn: QPushButton, selected: bool) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  TickPriceInput – tick-aware price spinner with floating price-ladder popup
+#  TickPriceInput – tick-aware price input stepped by mouse wheel / ↑↓ keys
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TickPriceInput(QWidget):
-    """Tick-aware price spinner with a floating price-ladder popup.
+    """Tick-aware price input.
 
-    Popup behaviour
-    ---------------
-    * Uses ``Qt.Tool + WA_ShowWithoutActivating`` instead of ``Qt.Popup``.
-      ``Qt.Popup`` grabs the mouse exclusively so clicking outside consumes
-      the click and users feel "trapped".  ``Qt.Tool`` lets outside clicks
-      pass straight through to their targets while still appearing on top.
-    * An application-level event filter watches for ``MouseButtonPress``
-      events outside the popup rectangle and closes it without swallowing
-      the click.
-    * Initial list: ``_LADDER_ROWS`` rows each side.  When the user scrolls
-      within ``_EXTEND_THRESHOLD`` rows of either end, ``_EXTEND_ROWS`` more
-      rows are silently prepended / appended — giving unlimited scroll.
+    Deliberately minimal (matches :class:`_QtyInput`): one rounded box,
+    no ▲/▼ arrow column and no price-ladder popup — the mouse wheel and
+    ↑/↓ keys step the value by one tick (seeded from the market price
+    when the field is empty), and editing-finished snaps to the grid.
 
     Public API
     ----------
     text()                            → str
     clear()                           → silently clears (no textChanged)
     textChanged  Signal[str]
-    set_market_price(price, tick)     → refresh the spin / ladder reference
+    set_market_price(price, tick)     → refresh the stepping reference
     """
 
     textChanged = Signal(str)
 
-    _LADDER_ROWS      = 150   # initial rows above *and* below the mid price
-    _EXTEND_ROWS      = 100   # rows added each time the edge is approached
-    _EXTEND_THRESHOLD = 5     # trigger when within this many rows of the edge
-    _ROW_H            = 22    # px height of each popup row
-    _VISIBLE_ROWS     = 14    # how many rows are visible without scrolling
-    _BTN_W            = 16    # px width of the up/down arrow column
-    _CHIP_H           = 28    # must match _TierSection._CHIP_H
+    _CHIP_H = 28    # must match _TierSection._CHIP_H
 
-    # Stylesheets — split into "normal" (idle) and "armed" (positive
-    # value typed) so the whole control can flip to the same blue
-    # background a selected tier chip uses.  Triggered by the host
-    # ``_TierSection`` via :meth:`set_armed`.
+    # Stylesheets — "normal" (idle) and "armed" (positive value typed)
+    # so the control can flip to the same blue background a selected
+    # tier chip uses.  Triggered by ``_TierSection.set_armed``.
     _EDIT_SS_NORMAL = (
         "QLineEdit{background:#232A3B;color:#A3AFC2;border:none;"
-        "border-radius:6px 0 0 6px;padding:2px 6px;font-size:11px;"
+        "border-radius:6px;padding:2px 6px;font-size:11px;"
         "font-family:'JetBrains Mono'}"
         "QLineEdit:focus{background:#334058;color:white}"
         "QLineEdit:disabled{background:#1B2130;color:#444;border:none}"
     )
     _EDIT_SS_ARMED = (
         "QLineEdit{background:#539BF5;color:white;border:none;"
-        "border-radius:6px 0 0 6px;padding:2px 6px;font-size:11px;"
+        "border-radius:6px;padding:2px 6px;font-size:11px;"
         "font-weight:bold;font-family:'JetBrains Mono'}"
         "QLineEdit:focus{background:#6BA8F6;color:white}"
         "QLineEdit:disabled{background:#1B2130;color:#444;border:none}"
     )
-    _ARROW_SS_NORMAL = (
-        "QToolButton{background:#232A3B;color:#6A7690;border:none;"
-        "font-size:7px;padding:0;margin:0}"
-        "QToolButton:hover{background:#334058;color:white}"
-        "QToolButton:pressed{background:#539BF5;color:white}"
-    )
-    _ARROW_SS_ARMED = (
-        "QToolButton{background:#539BF5;color:white;border:none;"
-        "font-size:7px;padding:0;margin:0}"
-        "QToolButton:hover{background:#6BA8F6;color:white}"
-        "QToolButton:pressed{background:#6BA8F6;color:white}"
-    )
-    _ARROW_W_SS_NORMAL = (
-        "QWidget{background:#232A3B;border:none;border-radius:0 6px 6px 0}"
-    )
-    _ARROW_W_SS_ARMED = (
-        "QWidget{background:#539BF5;border:none;border-radius:0 6px 6px 0}"
-    )
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self._market_price: float           = 0.0
-        self._tick_size:    float           = 0.25
-        self._popup:        QListWidget | None = None
-        self._app_filter_installed          = False
-        self._extending_popup               = False
-        self._arrow_w:      QWidget | None  = None   # set in _build_ui; used for popup X alignment
+        self._market_price: float = 0.0
+        self._tick_size:    float = 0.25
+        self._wheel_accum:  int   = 0
         self._build_ui()
 
     # ── Construction ──────────────────────────────────────────────────────────
@@ -366,76 +326,39 @@ class TickPriceInput(QWidget):
         _dv.setNotation(QDoubleValidator.Notation.StandardNotation)
         self._edit.setValidator(_dv)
         self._edit.textChanged.connect(self._relay_text)
-        self._edit.returnPressed.connect(self._close_popup)
         self._edit.editingFinished.connect(self._snap_to_tick)
         self._edit.installEventFilter(self)
-
-        self._btn_up = QToolButton()
-        self._btn_up.setText("▲")
-        self._btn_up.setFixedSize(self._BTN_W, self._CHIP_H // 2)
-        self._btn_up.setStyleSheet(self._ARROW_SS_NORMAL)
-        self._btn_up.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._btn_up.setAutoRepeat(True)
-        self._btn_up.setAutoRepeatDelay(400)    # ms before repeat starts
-        self._btn_up.setAutoRepeatInterval(80)  # ms between each repeat tick
-        self._btn_up.clicked.connect(self._on_up)
-
-        self._btn_dn = QToolButton()
-        self._btn_dn.setText("▼")
-        self._btn_dn.setFixedSize(self._BTN_W, self._CHIP_H // 2)
-        self._btn_dn.setStyleSheet(self._ARROW_SS_NORMAL)
-        self._btn_dn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._btn_dn.setAutoRepeat(True)
-        self._btn_dn.setAutoRepeatDelay(400)
-        self._btn_dn.setAutoRepeatInterval(80)
-        self._btn_dn.clicked.connect(self._on_dn)
-
-        arrow_col = QVBoxLayout()
-        arrow_col.setSpacing(0)
-        arrow_col.setContentsMargins(0, 0, 0, 0)
-        arrow_col.addWidget(self._btn_up)
-        arrow_col.addWidget(self._btn_dn)
-
-        self._arrow_w = QWidget()
-        self._arrow_w.setFixedSize(self._BTN_W, self._CHIP_H)
-        self._arrow_w.setStyleSheet(self._ARROW_W_SS_NORMAL)
-        self._arrow_w.setLayout(arrow_col)
         # Track the current armed state so set_armed() can early-return
         # when nothing changed (avoids needless QSS unpolish/polish).
         self._armed: bool = False
 
         lay.addWidget(self._edit, 1)
-        lay.addWidget(self._arrow_w)
 
-    # ── Event filter (popup trigger + outside-click dismissal) ────────────────
+    # ── Events (keyboard / wheel stepping) ────────────────────────────────────
 
     def eventFilter(self, obj, event) -> bool:          # noqa: N802
-        t = event.type()
+        # ↑/↓ in the edit step the value by one tick.
+        if obj is self._edit and event.type() == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Up:
+                self._on_up()
+                return True
+            if event.key() == Qt.Key.Key_Down:
+                self._on_dn()
+                return True
+        return False
 
-        # ── Outside-click closes the popup WITHOUT consuming the click ────
-        # This filter is active both on _edit (always) and on QApplication
-        # (only while the popup is visible).
-        if (self._popup_open()
-                and t == QEvent.Type.MouseButtonPress
-                and obj is not self._popup):
-            # event is QMouseEvent at runtime when type == MouseButtonPress
-            try:
-                gpos = event.globalPosition().toPoint()  # type: ignore[attr-defined]
-            except AttributeError:
-                gpos = event.globalPos()                  # type: ignore[attr-defined]
-            if not self._popup.geometry().contains(gpos):
-                self._close_popup()
-                return False                # let the click reach its target
-
-        # ── Trigger popup when user clicks the field (empty or not) ──────────
-        if obj is self._edit and t == QEvent.Type.MouseButtonPress:
-            if not self._popup_open():
-                QTimer.singleShot(50, self._show_popup)
-
-        return False   # never consume events
-
-    def _popup_open(self) -> bool:
-        return self._popup is not None and self._popup.isVisible()
+    def wheelEvent(self, event) -> None:                # noqa: N802
+        """Scroll steps the value by one tick per notch.  Deltas
+        accumulate so trackpads (many small deltas) step at the same
+        rate as a wheel (±120 per notch)."""
+        self._wheel_accum += event.angleDelta().y()
+        while self._wheel_accum >= 120:
+            self._wheel_accum -= 120
+            self._on_up()
+        while self._wheel_accum <= -120:
+            self._wheel_accum += 120
+            self._on_dn()
+        event.accept()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -473,14 +396,8 @@ class TickPriceInput(QWidget):
         if armed == self._armed:
             return
         self._armed = armed
-        edit_ss = self._EDIT_SS_ARMED if armed else self._EDIT_SS_NORMAL
-        arrow_ss = self._ARROW_SS_ARMED if armed else self._ARROW_SS_NORMAL
-        arrow_w_ss = (self._ARROW_W_SS_ARMED if armed
-                      else self._ARROW_W_SS_NORMAL)
-        self._edit.setStyleSheet(edit_ss)
-        self._btn_up.setStyleSheet(arrow_ss)
-        self._btn_dn.setStyleSheet(arrow_ss)
-        self._arrow_w.setStyleSheet(arrow_w_ss)
+        self._edit.setStyleSheet(
+            self._EDIT_SS_ARMED if armed else self._EDIT_SS_NORMAL)
 
     # ── Signal relay ──────────────────────────────────────────────────────────
 
@@ -571,250 +488,6 @@ class TickPriceInput(QWidget):
                     self._edit.setText(self._fmt(new))
             except ValueError:
                 pass
-
-    # ── Price ladder popup ────────────────────────────────────────────────────
-
-    def _show_popup(self) -> None:
-        if self._popup_open():
-            return
-        self._close_popup()          # remove any stale hidden reference
-
-        popup = QListWidget()
-        popup.setUniformItemSizes(True)
-
-        popup.setWindowFlags(
-            Qt.WindowType.Tool
-            | Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
-        )
-        popup.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        popup.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        popup.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        popup.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        popup.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-        popup.setStyleSheet("""
-            QListWidget {
-                background: #1B2130;
-                color: #E6EBF2;
-                border: 1px solid #334058;
-                border-radius: 4px;
-                font-size: 12px;
-                outline: none;
-            }
-            QListWidget::item            { padding: 3px 14px; border: none; }
-            QListWidget::item:selected,
-            QListWidget::item:hover      { background: #539BF5; color: white; }
-        """)
-
-        # ── Populate tick-based offset rows (1*tick, 2*tick, ..., N*tick) ──
-        # Large values at top, small values at bottom.  Scroll defaults to
-        # the bottom so the smallest tick is visible on open.
-        centre_item = None
-        if self._tick_size > 0:
-            current_text = self._edit.text().strip()
-            try:
-                current_val = self._snap(float(current_text)) if current_text else 0.0
-            except ValueError:
-                current_val = 0.0
-
-            ladder_max = 5000  # number of tick multiples to populate
-            for i in range(ladder_max, 0, -1):
-                tick_val = self._snap(self._tick_size * i)
-                item = QListWidgetItem(self._fmt(tick_val))
-                if current_val > 0 and abs(tick_val - current_val) < self._tick_size / 2:
-                    f = item.font()
-                    f.setBold(True)
-                    item.setFont(f)
-                    item.setForeground(QColor("#3FB950"))
-                    centre_item = item
-                popup.addItem(item)
-        else:
-            ph = QListWidgetItem("  Tick size unknown")
-            ph.setForeground(QColor("#6A7690"))
-            ph.setFlags(ph.flags()
-                        & ~Qt.ItemFlag.ItemIsSelectable
-                        & ~Qt.ItemFlag.ItemIsEnabled)
-            popup.addItem(ph)
-
-        # ── Geometry ──────────────────────────────────────────────────────
-        popup_w = max(self._BTN_W + 4, 120)
-        popup_h = self._VISIBLE_ROWS * self._ROW_H + 8
-        popup.setFixedSize(popup_w, popup_h)
-
-        from PySide6.QtCore import QPoint
-        from PySide6.QtWidgets import QApplication as _QApp
-
-        # X ── ask the arrow widget directly for its global left edge.
-        #      This is exact; computing self.width()-_BTN_W is fragile
-        #      because layout rounding can shift it by 1-2 px.
-        if self._arrow_w is not None:
-            arrow_global_x = self._arrow_w.mapToGlobal(QPoint(0, 0)).x()
-        else:
-            arrow_global_x = self.mapToGlobal(QPoint(self.width() - self._BTN_W, 0)).x()
-
-        # Y ── vertical centre of the popup aligns with the vertical centre
-        #      of the TickPriceInput so the highlighted price row sits flush
-        #      with the input field once scrollToItem centres it.
-        widget_global_cy = self.mapToGlobal(QPoint(0, self.height() // 2)).y()
-        popup_top_y      = widget_global_cy - popup_h // 2
-
-        global_origin = QPoint(arrow_global_x, popup_top_y)
-
-        # Clamp to the screen that actually contains the widget.
-        # primaryScreen() is wrong on multi-monitor setups — it always
-        # references the main display even when the widget lives on a
-        # secondary one.  screenAt() resolves the correct screen.
-        widget_centre_global = self.mapToGlobal(
-            QPoint(self.width() // 2, self.height() // 2))
-        screen = _QApp.screenAt(widget_centre_global) or _QApp.primaryScreen()
-        if screen:
-            sg = screen.availableGeometry()
-            gx = max(sg.left(),  min(global_origin.x(), sg.right()  - popup_w))
-            gy = max(sg.top(),   min(global_origin.y(), sg.bottom() - popup_h))
-            global_origin = QPoint(gx, gy)
-
-        # ── Wire signals ──────────────────────────────────────────────────
-        popup.itemClicked.connect(self._on_popup_picked)
-        popup.destroyed.connect(self._on_popup_destroyed)
-        self._popup = popup
-
-        # show() first, then move() — on macOS the window manager repositions
-        # Tool windows during show(), so any pre-show move() is ignored.
-        # Calling move() immediately after show() overrides that adjustment.
-        popup.show()
-        popup.move(global_origin)   # ← exact alignment enforced post-show
-        popup.raise_()              # keep it on top of the main window
-
-        # Scroll: highlight current value if any, otherwise show smallest tick
-        # at the bottom.  Deferred to after show() so Qt has computed the
-        # viewport height.
-        if centre_item is not None:
-            _ci = centre_item   # local ref for the lambda capture
-            QTimer.singleShot(0, lambda: popup.scrollToItem(
-                _ci, QAbstractItemView.ScrollHint.PositionAtCenter))
-        else:
-            QTimer.singleShot(0, popup.scrollToBottom)
-
-        # App-level filter: detect outside clicks to close without swallowing them
-        app = _QApp.instance()
-        if app and not self._app_filter_installed:
-            app.installEventFilter(self)
-            self._app_filter_installed = True
-
-
-    # ── Dynamic scroll extension ──────────────────────────────────────────────
-
-    def _on_popup_scroll(self, value: int) -> None:
-        """Extend the ladder when the user scrolls near either end."""
-        if not self._popup_open() or self._extending_popup:
-            return
-        vbar      = self._popup.verticalScrollBar()
-        threshold = self._EXTEND_THRESHOLD * self._ROW_H
-        if value <= threshold:
-            self._extend_popup_top()
-        elif value >= vbar.maximum() - threshold:
-            self._extend_popup_bottom()
-
-    def _extend_popup_top(self) -> None:
-        """Prepend _EXTEND_ROWS price rows above the current top of the list.
-
-        Uses scrollToItem instead of manual pixel arithmetic so the viewport
-        stays perfectly stable regardless of the actual rendered row height.
-        """
-        popup = self._popup
-        if not popup:
-            return
-        # Item 0 = "Market" header (non-selectable); item 1 = current top price
-        top_item = popup.item(1)
-        if not top_item:
-            return
-        try:
-            top_price = float(top_item.text().strip())
-        except ValueError:
-            return
-
-        self._extending_popup = True
-        N = self._EXTEND_ROWS
-        # Insert N rows right after the header (index 1 … N), highest price first
-        for i in range(N):
-            price_val = top_price + (N - i) * self._tick_size
-            popup.insertItem(1 + i, QListWidgetItem(
-                self._fmt(self._snap(price_val))))
-
-        # The original top-price row has moved from index 1 → index N+1.
-        # Scroll it back to the top of the viewport — Qt handles the exact pixels.
-        popup.scrollToItem(popup.item(N + 1),
-                           QAbstractItemView.ScrollHint.PositionAtTop)
-        self._extending_popup = False
-
-    def _extend_popup_bottom(self) -> None:
-        """Append _EXTEND_ROWS price rows below the current bottom of the list.
-
-        Uses scrollToItem to keep the viewport stable after appending.
-        """
-        popup = self._popup
-        if not popup:
-            return
-        old_count   = popup.count()
-        bottom_item = popup.item(old_count - 1)
-        if not bottom_item:
-            return
-        try:
-            bottom_price = float(bottom_item.text().strip())
-        except ValueError:
-            return
-
-        self._extending_popup = True
-        N = self._EXTEND_ROWS
-        for i in range(1, N + 1):
-            price_val = bottom_price - i * self._tick_size
-            if price_val <= 0:
-                break
-            popup.addItem(QListWidgetItem(self._fmt(self._snap(price_val))))
-
-        # Scroll the old last row back to the bottom of the viewport
-        popup.scrollToItem(popup.item(old_count - 1),
-                           QAbstractItemView.ScrollHint.PositionAtBottom)
-        self._extending_popup = False
-
-    # ── Item selection ────────────────────────────────────────────────────────
-
-    def _on_popup_picked(self, item: QListWidgetItem) -> None:
-        if item.flags() & Qt.ItemFlag.ItemIsEnabled:
-            self._edit.setText(item.text().strip())
-        self._close_popup()
-        self._edit.setFocus()
-
-    def _on_popup_destroyed(self) -> None:
-        self._popup = None
-        self._extending_popup = False
-        self._remove_app_filter()
-
-    def _remove_app_filter(self) -> None:
-        if self._app_filter_installed:
-            from PySide6.QtWidgets import QApplication
-            app = QApplication.instance()
-            if app:
-                try:
-                    app.removeEventFilter(self)
-                except RuntimeError:
-                    pass
-            self._app_filter_installed = False
-
-    def _close_popup(self) -> None:
-        self._extending_popup = False
-        self._remove_app_filter()
-        if self._popup is not None:
-            try:
-                self._popup.destroyed.disconnect(self._on_popup_destroyed)
-            except RuntimeError:
-                pass
-            self._popup.close()
-            self._popup.deleteLater()
-            self._popup = None
-
-
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  _QtyInput  –  integer quantity field stepped by mouse wheel / ↑↓ keys
