@@ -1128,6 +1128,7 @@ class _TierSection(QWidget):
                  label_color: str = Theme.ACCENT,
                  *,
                  short_title: str | None = None,
+                 label_fg: str = "#ffffff",
                  parent=None):
         super().__init__(parent)
         self._title_str    = title
@@ -1137,6 +1138,9 @@ class _TierSection(QWidget):
         # button doesn't blow out width when the dollar suffix lands.
         self._short_title  = short_title or title
         self._label_color  = label_color
+        # Label colour on the title button — light backgrounds
+        # (Trailing's grey) pass black for contrast.
+        self._label_fg     = label_fg
         self._tiers:             list[dict]  = tiers
         self._dollar_per_tier:   list[float] = []
         self._qty:               int         = 1
@@ -1212,7 +1216,8 @@ class _TierSection(QWidget):
         # something is armed).  Wider stretch factor so it absorbs the
         # 30% trimmed off the chips and Dist input.
         self._dollar_lbl = _make_btn(
-            self._title_str, self._label_color, self._CHIP_H)
+            self._title_str, self._label_color, self._CHIP_H,
+            fg=self._label_fg)
         self._dollar_lbl.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._dollar_lbl.clicked.connect(self._on_header_submit)
@@ -3142,7 +3147,7 @@ class OrderEntryPanel(QWidget):
             lambda: self._on_tier_submit("sl"))
         self._tr_section = _TierSection(
             "Trailing", tr_tiers, label_color=Theme.CLR_CLOSE,
-            short_title="TS")
+            short_title="TS", label_fg="#000000")
 
         # The TP / SL / Trail amounts that used to live in a separate
         # ARMED banner above the buttons are now drawn directly on each

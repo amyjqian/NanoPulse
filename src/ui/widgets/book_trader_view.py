@@ -465,7 +465,7 @@ class BookTraderView(QWidget):
             short_title="SL")
         self._tr_section = _TierSection(
             "Trailing", [], label_color=Theme.CLR_CLOSE,
-            short_title="TS")
+            short_title="TS", label_fg="#000000")
 
         root.addSpacing(8)
 
