@@ -1147,12 +1147,19 @@ class AccountListPanel(QWidget):
         # been hidden from All is still a member of any group that
         # includes it, and becomes visible again when the user
         # activates that group.
+        offline_members: set[str] = set()
         if self._active_group in _DEFAULT_GROUPS:
             visible = {a for a in model_accounts if a not in self._hidden}
         elif self._active_group is not None:
             g = self._find_group(self._active_group)
             group_members = set(g.get("accounts", [])) if g else set()
             visible = {a for a in model_accounts if a in group_members}
+            # Members whose connection never delivered accounts this
+            # session have no model entry at all.  They still get a row
+            # (dimmed, ⚠-prefixed, "–" balance) — otherwise a partially
+            # offline group silently shrinks to its online members and
+            # the user can't see who an order fan-out will skip.
+            offline_members = group_members - set(model_accounts)
         else:
             visible = {a for a in model_accounts if a not in self._hidden}
 
@@ -1166,11 +1173,21 @@ class AccountListPanel(QWidget):
             r.set_name(info["alias"] if info["alias"] else acct)
             r.set_balance(info["balance"])
             r.set_cash(self._model.get_cash_by_currency(acct))
+            r.set_connected(self._is_account_connected(acct))
+
+        for acct in offline_members:
+            if acct not in self._account_rows:
+                self._add_account_row(
+                    acct, self._model._aliases.get(acct, ""), "–", "")
+            r = self._account_rows[acct]
+            r.set_name(self._model._aliases.get(acct, "") or acct)
+            r.set_connected(False)
 
         # Remove rows whose account should no longer be visible (either
         # missing from the model entirely or filtered out by the active
         # group).
-        for acct in [a for a in self._account_rows if a not in visible]:
+        for acct in [a for a in self._account_rows
+                     if a not in visible and a not in offline_members]:
             self._remove_account_row(acct)
 
         self._refresh_add_combo(model_accounts)
@@ -1226,9 +1243,13 @@ class AccountListPanel(QWidget):
 
     def _is_account_connected(self, account: str) -> bool:
         """Resolve the live TWS connection state for ``account`` via the
-        shared model.  Defaults to True for accounts whose label hasn't
-        reported a state yet (newly-added connection)."""
+        shared model.  An account with no connection label at all was
+        never detected this session (its worker never connected) — that
+        is offline, not "state unknown", so it must NOT inherit
+        ``is_label_connected``'s default-True for fresh labels."""
         label = self._model.connection_for_account(account)
+        if label is None:
+            return False
         return self._model.is_label_connected(label)
 
     def _refresh_connected_states(self) -> None:
