@@ -92,6 +92,15 @@ class MainWindow(QWidget):
         self._apply_role_gating()
         self._restore_geometry()
 
+        # Self-healing contract metadata: whenever a worker connects,
+        # chips/hot-buttons missing a conid (or holding an expired FUT)
+        # are re-qualified via TWS and their subscriptions refreshed.
+        from src.core.instrument_qualifier import InstrumentQualifier
+        self._instrument_qualifier = InstrumentQualifier(
+            self.active_threads, self)
+        self._instrument_qualifier.contract_requalified.connect(
+            self._flash_trade._on_contract_replaced)
+
         self._status_timer = QTimer(self)
         self._status_timer.timeout.connect(self._update_status)
         self._status_timer.start(1000)
@@ -100,6 +109,9 @@ class MainWindow(QWidget):
         log.info("MainWindow initialised (%dx%d)", self.width(), self.height())
 
     def _update_status(self) -> None:
+        # Attach the re-qualifier to any worker created since the last
+        # tick (workers are created dynamically on the Connect page).
+        self._instrument_qualifier.scan_workers()
         # Selected = checked accounts in the Account List panel.
         try:
             selected_count = self._flash_trade._account_list.get_selected_count()

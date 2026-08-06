@@ -1329,6 +1329,10 @@ class IBWorkerThread(QThread):
                         "local_symbol": q.localSymbol,
                         "multiplier": getattr(q, "multiplier", ""),
                         "primary_exchange": getattr(q, "primaryExchange", ""),
+                        # Real tick size from ContractDetails — persisted
+                        # on the chip entry (min_tick) so UI ladders stop
+                        # relying on hardcoded per-symbol tables.
+                        "min_tick": float(getattr(d, "minTick", 0) or 0),
                     })
 
                 log.info("Worker %s browse returned %d contract(s) for %s",
