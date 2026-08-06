@@ -496,3 +496,48 @@ def test_trailing_button_emits_close_tier_tr(qtbot, monkeypatch):
     assert payload["symbol"] == "MNQ"
     assert payload["offset_pts"] == 0.5
     assert payload["qty"] == 2
+
+
+# ── Futures tick-size resolution ──────────────────────────────────────────────
+
+class TestTickSizeResolution:
+    """One canonical futures tick table (helpers._FUT_TICK_SIZES) feeds
+    every panel; captured min_tick always wins; stocks/options step 0.01."""
+
+    def test_reference_table_coverage(self):
+        from src.utils.helpers import _FUT_TICK_SIZES as t
+        # Spot-check the expanded reference table (IB quote convention).
+        assert t["NQ"] == t["MNQ"] == t["ES"] == t["MES"] == 0.25
+        assert t["YM"] == t["MYM"] == 1.0
+        assert t["PL"] == 0.10 and t["PA"] == 0.05
+        assert t["BZ"] == 0.01 and t["MNG"] == 0.001
+        assert t["HO"] == t["RB"] == 0.0001
+        assert t["ZO"] == 0.25 and t["ZM"] == 0.10 and t["ZL"] == 0.01
+        assert t["LE"] == t["GF"] == t["HE"] == 0.025   # ¢/lb quoting
+        assert t["ZT"] == 0.00390625 and t["TN"] == 0.0078125
+        assert t["UB"] == 0.03125
+        assert t["6C"] == t["6S"] == t["6A"] == 0.0001
+        assert t["6M"] == 0.00001
+        assert t["BTC"] == t["MBT"] == 5.0
+        assert t["ETH"] == 0.25 and t["MET"] == 0.50
+
+    def test_min_tick_meta_wins(self):
+        assert btv._tick_size_for_contract(
+            {"symbol": "NQ", "sec_type": "FUT", "min_tick": 0.5}) == 0.5
+
+    def test_table_fallback_by_root_and_local(self):
+        assert btv._tick_size_for_contract(
+            {"symbol": "PL", "sec_type": "FUT"}) == 0.10
+        assert btv._tick_size_for_contract(
+            {"symbol": "", "local_symbol": "6CZ6",
+             "sec_type": "FUT"}) == 0.0001
+
+    def test_stock_and_option_step_a_cent(self):
+        assert btv._tick_size_for_contract(
+            {"symbol": "AAPL", "sec_type": "STK"}) == 0.01
+        assert btv._tick_size_for_contract(
+            {"symbol": "QQQ   260807P00670000", "sec_type": "OPT"}) == 0.01
+
+    def test_unknown_future_defaults_quarter(self):
+        assert btv._tick_size_for_contract(
+            {"symbol": "XYZ9", "sec_type": "FUT"}) == 0.25

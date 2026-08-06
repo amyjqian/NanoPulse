@@ -174,33 +174,68 @@ def calculate_position_size(account_balance: float, risk_percent: float, stop_lo
 
 # ── Tick-size lookup ──────────────────────────────────────────────────────────
 
-# Common futures symbol → tick size.  Keyed by the *root* symbol that IB uses.
+# Common futures symbol → tick size.  Keyed by the *root* symbol that IB
+# uses, with tick sizes in IB's QUOTE convention (agriculturals in
+# cents/bushel, cattle/hogs in cents/lb — hence LE 0.025 rather than the
+# $0.00025/lb the exchanges publish).  This is the single canonical
+# fallback table — the per-instrument ``min_tick`` captured from TWS
+# contract details always wins when present.
 _FUT_TICK_SIZES: dict[str, float] = {
-    "ES":  0.25,   # E-mini S&P 500
-    "MES": 0.25,   # Micro E-mini S&P 500
-    "NQ":  0.25,   # E-mini Nasdaq-100
-    "MNQ": 0.25,   # Micro E-mini Nasdaq-100
-    "YM":  1.00,   # E-mini Dow
-    "MYM": 1.00,   # Micro E-mini Dow
-    "RTY": 0.10,   # E-mini Russell 2000
-    "M2K": 0.10,   # Micro E-mini Russell 2000
-    "CL":  0.01,   # Crude Oil
-    "MCL": 0.01,   # Micro Crude Oil
-    "GC":  0.10,   # Gold
-    "MGC": 0.10,   # Micro Gold
-    "SI":  0.005,  # Silver
-    "SIL": 0.005,  # Micro Silver (1000 oz)
-    "HG":  0.0005,  # Copper
-    "NG":  0.001,  # Natural Gas
-    "ZB":  0.03125,  # 30-Year US Treasury Bond
-    "ZN":  0.015625,  # 10-Year US Treasury Note
-    "ZF":  0.0078125,  # 5-Year US Treasury Note
-    "ZC":  0.25,   # Corn
-    "ZS":  0.25,   # Soybeans
-    "ZW":  0.25,   # Wheat
-    "6E":  0.00005,  # Euro FX
-    "6J":  0.0000005,  # Japanese Yen
-    "6B":  0.0001,  # British Pound
+    # ── Stock index ─────────────────────────────────────────────────
+    "ES":  0.25,       # E-mini S&P 500
+    "MES": 0.25,       # Micro E-mini S&P 500
+    "NQ":  0.25,       # E-mini Nasdaq-100
+    "MNQ": 0.25,       # Micro E-mini Nasdaq-100
+    "YM":  1.00,       # E-mini Dow
+    "MYM": 1.00,       # Micro E-mini Dow
+    "RTY": 0.10,       # E-mini Russell 2000
+    "M2K": 0.10,       # Micro E-mini Russell 2000
+    # ── Metals / energy ─────────────────────────────────────────────
+    "GC":  0.10,       # Gold
+    "MGC": 0.10,       # Micro Gold
+    "SI":  0.005,      # Silver
+    "SIL": 0.005,      # Micro Silver (1000 oz)
+    "HG":  0.0005,     # Copper
+    "PL":  0.10,       # Platinum
+    "PA":  0.05,       # Palladium
+    "CL":  0.01,       # WTI Crude Oil
+    "MCL": 0.01,       # Micro WTI Crude
+    "BZ":  0.01,       # Brent Crude
+    "NG":  0.001,      # Natural Gas
+    "MNG": 0.001,      # Micro Natural Gas
+    "HO":  0.0001,     # Heating Oil
+    "RB":  0.0001,     # RBOB Gasoline
+    # ── Agricultural ────────────────────────────────────────────────
+    "ZC":  0.25,       # Corn (¢/bushel)
+    "ZS":  0.25,       # Soybeans (¢/bushel)
+    "ZW":  0.25,       # Wheat (¢/bushel)
+    "ZO":  0.25,       # Oats (¢/bushel)
+    "ZM":  0.10,       # Soybean Meal ($/ton)
+    "ZL":  0.01,       # Soybean Oil (¢/lb)
+    "ZR":  0.005,      # Rough Rice
+    "LE":  0.025,      # Live Cattle (¢/lb)
+    "GF":  0.025,      # Feeder Cattle (¢/lb)
+    "HE":  0.025,      # Lean Hogs (¢/lb)
+    # ── Treasuries ──────────────────────────────────────────────────
+    "ZT":  0.00390625,   # 2-Year Note   (1/8 of 1/32)
+    "ZF":  0.0078125,    # 5-Year Note   (1/4 of 1/32)
+    "ZN":  0.015625,     # 10-Year Note  (1/2 of 1/32)
+    "TN":  0.0078125,    # Ultra 10-Year (1/4 of 1/32)
+    "ZB":  0.03125,      # Treasury Bond (1/32)
+    "UB":  0.03125,      # Ultra Bond    (1/32)
+    # ── Currencies ──────────────────────────────────────────────────
+    "6E":  0.00005,      # Euro FX
+    "6B":  0.0001,       # British Pound
+    "6J":  0.0000005,    # Japanese Yen
+    "6C":  0.0001,       # Canadian Dollar
+    "6S":  0.0001,       # Swiss Franc
+    "6A":  0.0001,       # Australian Dollar
+    "6M":  0.00001,      # Mexican Peso
+    # ── Crypto ──────────────────────────────────────────────────────
+    "BTC": 5.0,          # Bitcoin
+    "MBT": 5.0,          # Micro Bitcoin
+    "ETH": 0.25,         # Ether
+    "MET": 0.50,         # Micro Ether
 }
 
 

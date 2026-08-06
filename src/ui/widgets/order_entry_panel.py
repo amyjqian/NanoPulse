@@ -4506,16 +4506,9 @@ class OrderEntryPanel(QWidget):
             return mt
 
         # ── 2. Known-futures symbol table ─────────────────────────────────────
-        _FUT_TICK: dict[str, float] = {
-            "MNQ": 0.25, "NQ":  0.25,
-            "MES": 0.25, "ES":  0.25,
-            "M2K": 0.1,  "RTY": 0.1,
-            "MYM": 1.0,  "YM":  1.0,
-            "MGC": 0.1,  "GC":  0.1,
-            "MCL": 0.01, "CL":  0.01,
-        }
         if sym:
-            hit = _FUT_TICK.get(sym.strip().upper())
+            from src.utils.helpers import _FUT_TICK_SIZES
+            hit = _FUT_TICK_SIZES.get(sym.strip().upper())
             if hit is not None:
                 return hit
 

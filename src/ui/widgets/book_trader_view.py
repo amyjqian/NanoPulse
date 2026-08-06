@@ -250,14 +250,9 @@ def _ensure_position_contract_saved(pos: dict) -> dict | None:
 # for the metals (GC/MGC = 0.1) and energies (CL/MCL = 0.01).  Mirror
 # of the table in ``order_entry_panel._tick_size_for_symbol`` so both
 # panels agree on the default tick.
-_FUT_TICK: dict[str, float] = {
-    "MNQ": 0.25, "NQ":  0.25,
-    "MES": 0.25, "ES":  0.25,
-    "M2K": 0.1,  "RTY": 0.1,
-    "MYM": 1.0,  "YM":  1.0,
-    "MGC": 0.1,  "GC":  0.1,
-    "MCL": 0.01, "CL":  0.01,
-}
+# Canonical per-root futures tick table lives in helpers — one source
+# for every panel.
+from src.utils.helpers import _FUT_TICK_SIZES as _FUT_TICK
 
 
 def _tick_size_for_contract(cached: dict | None) -> float:
@@ -266,10 +261,9 @@ def _tick_size_for_contract(cached: dict | None) -> float:
     Lookup order:
       1. ``tick_size`` / ``min_tick`` / ``minTick`` field on the cached
          entry (min_tick, captured from TWS contract details).
-      2. Per-symbol :data:`_FUT_TICK` table — covers contracts saved
-         before the Tick column existed, and ensures GC / MGC default
-         to 0.1 and CL / MCL to 0.01 instead of the generic 0.25 FUT
-         fallback.
+      2. Canonical per-symbol futures table
+         (``helpers._FUT_TICK_SIZES``) — covers entries saved before
+         min_tick was captured.
       3. Coarse sec-type fallback: FUT → 0.25, everything else → 0.01.
     """
     if cached:
