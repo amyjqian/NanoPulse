@@ -462,32 +462,31 @@ class TickPriceInput(QWidget):
     # ── Up / Down spin ────────────────────────────────────────────────────────
 
     def _on_up(self) -> None:
+        """Step the DISTANCE up one tick.  The field holds an offset
+        from the market (0.25, 0.50, 0.75 … for MNQ), never an absolute
+        price level — an empty field starts at one tick."""
         text = self._edit.text().strip()
         if not text:
-            if self._market_price > 0:
-                self._edit.setText(self._fmt(self._snap(
-                    self._market_price + self._tick_size)))
-        else:
-            try:
-                self._edit.setText(self._fmt(self._snap(
-                    float(text) + self._tick_size)))
-            except ValueError:
-                pass
+            self._edit.setText(self._fmt(self._snap(self._tick_size)))
+            return
+        try:
+            self._edit.setText(self._fmt(self._snap(
+                float(text) + self._tick_size)))
+        except ValueError:
+            pass
 
     def _on_dn(self) -> None:
+        """Step the distance down one tick, flooring at one tick (a
+        zero/negative distance is meaningless).  Empty stays empty."""
         text = self._edit.text().strip()
         if not text:
-            if self._market_price > 0:
-                new = self._snap(self._market_price - self._tick_size)
-                if new > 0:
-                    self._edit.setText(self._fmt(new))
-        else:
-            try:
-                new = self._snap(float(text) - self._tick_size)
-                if new > 0:
-                    self._edit.setText(self._fmt(new))
-            except ValueError:
-                pass
+            return
+        try:
+            new = self._snap(float(text) - self._tick_size)
+            if new > 0:
+                self._edit.setText(self._fmt(new))
+        except ValueError:
+            pass
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  _QtyInput  –  integer quantity field stepped by mouse wheel / ↑↓ keys

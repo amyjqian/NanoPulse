@@ -413,10 +413,21 @@ class TestTickPriceInputStepping:
         w.wheelEvent(_FakeWheel(60))
         assert w.text() == "100.25"
 
-    def test_empty_field_seeds_from_market_price(self, qtbot):
-        w = self._make(qtbot, market=250.0)
+    def test_empty_field_starts_at_one_tick_distance(self, qtbot):
+        # The Dist field holds a DISTANCE, never an absolute price —
+        # stepping from empty begins at one tick (0.25 for MNQ-style).
+        w = self._make(qtbot, market=29580.0)
         w.wheelEvent(_FakeWheel(120))
-        assert w.text() == "250.25"     # market + one tick
+        assert w.text() == "0.25"
+        w.wheelEvent(_FakeWheel(120))
+        assert w.text() == "0.50"
+        # Down floors at one tick; from empty it stays empty.
+        w.wheelEvent(_FakeWheel(-120))
+        w.wheelEvent(_FakeWheel(-120))
+        assert w.text() == "0.25"
+        w2 = self._make(qtbot, market=29580.0)
+        w2.wheelEvent(_FakeWheel(-120))
+        assert w2.text() == ""
 
     def test_arrow_keys_step(self, qtbot):
         from PySide6.QtCore import Qt as _Qt
