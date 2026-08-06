@@ -328,10 +328,6 @@ class TickPriceInput(QWidget):
         self._edit.textChanged.connect(self._relay_text)
         self._edit.editingFinished.connect(self._snap_to_tick)
         self._edit.installEventFilter(self)
-        # Inline "×" that appears while the field holds text — one
-        # click disarms the tier, mirroring the click-again-to-unselect
-        # behaviour of the preset chips.
-        self._edit.setClearButtonEnabled(True)
         # Track the current armed state so set_armed() can early-return
         # when nothing changed (avoids needless QSS unpolish/polish).
         self._armed: bool = False

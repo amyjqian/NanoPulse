@@ -452,8 +452,8 @@ class TestTickPriceInputStepping:
         qtbot.keyClick(w._edit, _Qt.Key.Key_Escape)
         assert w.text() == ""
 
-    def test_inline_clear_button_enabled(self, qtbot):
-        # One-click "x" disarm, mirroring click-again-to-unselect on
-        # the preset chips.
+    def test_no_inline_clear_button(self, qtbot):
+        # Esc is the only quick-clear — the inline "x" was removed to
+        # keep the minimal one-box look.
         w = self._make(qtbot)
-        assert w._edit.isClearButtonEnabled()
+        assert not w._edit.isClearButtonEnabled()
