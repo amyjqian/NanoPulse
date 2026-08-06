@@ -234,6 +234,28 @@ class TestPickFrontExpiries:
         out = ssp.pick_front_expiries(chain, today=self._TODAY)
         assert [r["conid"] for r in out] == [1]
 
+    def test_same_expiry_on_two_venues_consumes_one_slot(self):
+        """ES lists each expiration on CME AND IB's QBALGO algo venue —
+        without per-date dedup the user saw Sep twice and never Dec."""
+        chain = [
+            _chain_row(1, "20260918"),                      # Sep @ CME
+            {**_chain_row(2, "20260918"), "exchange": "QBALGO"},
+            {**_chain_row(3, "20261218"), "exchange": "QBALGO"},
+            _chain_row(4, "20261218"),                      # Dec @ CME
+        ]
+        out = ssp.pick_front_expiries(chain, today=self._TODAY)
+        # Two DISTINCT months, primary venue preferred on each.
+        assert [r["conid"] for r in out] == [1, 4]
+        assert all(r["exchange"] == "CME" for r in out)
+
+    def test_qbalgo_only_expiry_still_shown(self):
+        # If an expiry ONLY trades on the algo venue it must still appear
+        # rather than being filtered out entirely.
+        chain = [_chain_row(1, "20260918"),
+                 {**_chain_row(2, "20261218"), "exchange": "QBALGO"}]
+        out = ssp.pick_front_expiries(chain, today=self._TODAY)
+        assert [r["conid"] for r in out] == [1, 2]
+
     def test_non_usd_bad_expiry_and_non_fut_dropped(self):
         chain = [_chain_row(1, "20261218", currency="EUR"),
                  _chain_row(2, "garbage"),

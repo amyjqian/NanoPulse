@@ -134,13 +134,29 @@ def format_expiry(raw: str) -> str:
     return s
 
 
+def _venue_rank(r: dict) -> tuple:
+    """Sort key for choosing ONE row per expiration.  Lower is better:
+    IB's QBALGO algo-routing venue ranks last, and a row trading on its
+    own primary listing venue beats one that doesn't."""
+    exch = (r.get("exchange") or "").upper()
+    primary = (r.get("primary_exchange") or "").upper()
+    return (exch == "QBALGO",
+            0 if (primary and exch == primary) else 1)
+
+
 def pick_front_expiries(chain: list[dict], count: int = 2,
                         today: date | None = None) -> list[dict]:
     """The *count* nearest unexpired USD futures from a browse chain,
     sorted by expiry.  Rows that aren't USD FUTs or whose expiry can't
-    be parsed are dropped."""
+    be parsed are dropped.
+
+    One row per expiration DATE: reqContractDetails lists the same
+    expiry on several venues (e.g. ES on CME *and* QBALGO), and without
+    dedup the two front slots would both be the same month — the user
+    would see Sep twice and never Dec.  Within an expiry the primary
+    venue wins (see :func:`_venue_rank`)."""
     today = today or date.today()
-    dated: list[tuple[date, dict]] = []
+    best: dict[date, dict] = {}
     for r in chain:
         if r.get("sec_type") != "FUT":
             continue
@@ -149,9 +165,10 @@ def pick_front_expiries(chain: list[dict], count: int = 2,
         d = _expiry_date(r.get("expiry", ""))
         if d is None or d < today:
             continue
-        dated.append((d, r))
-    dated.sort(key=lambda t: (t[0], str(t[1].get("local_symbol", ""))))
-    return [r for _d, r in dated[:count]]
+        cur = best.get(d)
+        if cur is None or _venue_rank(r) < _venue_rank(cur):
+            best[d] = r
+    return [r for _d, r in sorted(best.items())[:count]]
 
 
 def display_exchange(code: str) -> str:
