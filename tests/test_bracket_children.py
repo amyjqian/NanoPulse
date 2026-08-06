@@ -758,3 +758,149 @@ class TestConvertMktParentForTrail:
         order = _mkt_parent("BUY")
         assert wt._convert_mkt_parent_for_trail(order, {}, 150.00)
         assert order.lmtPrice == 150.10  # 10 * 0.01 default tick
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Fill re-anchoring — children re-priced to the parent's actual fill
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_reprice = staticmethod(IBWorkerThread._reanchored_child_prices).__func__
+
+
+class TestReanchoredChildPrices:
+    """The user's MNQ case: TP/SL 20 pts, limit buy 29530, fill 29516 —
+    children must move to 29536 / 29496, not stay at 29550 / 29510."""
+
+    _params = {
+        "profit_take": {"value": 20, "unit": "price"},
+        "stop_loss": {"value": 20, "unit": "price"},
+    }
+
+    def test_tp_lmt_reanchors_to_fill(self):
+        out = _reprice("LMT", "BUY", self._params, 29516.0, 0.25)
+        assert out == {"lmtPrice": 29536.0}
+
+    def test_sl_stp_reanchors_to_fill(self):
+        out = _reprice("STP", "BUY", self._params, 29516.0, 0.25)
+        assert out == {"auxPrice": 29496.0}
+
+    def test_sell_parent_signs_invert(self):
+        assert _reprice("LMT", "SELL", self._params, 29516.0, 0.25) == \
+            {"lmtPrice": 29496.0}
+        assert _reprice("STP", "SELL", self._params, 29516.0, 0.25) == \
+            {"auxPrice": 29536.0}
+
+    def test_stp_lmt_carries_cap(self):
+        params = dict(self._params, limit_cap_offset=1.0)
+        out = _reprice("STP LMT", "BUY", params, 29516.0, 0.25)
+        assert out == {"auxPrice": 29496.0, "lmtPrice": 29495.0}
+
+    def test_ticks_unit_converts(self):
+        params = {"profit_take": {"value": 20, "unit": "ticks"}}  # 5 pts
+        out = _reprice("LMT", "BUY", params, 29516.0, 0.25)
+        assert out == {"lmtPrice": 29521.0}
+
+    def test_trail_untouched(self):
+        assert _reprice("TRAIL", "BUY", self._params, 29516.0, 0.25) == {}
+
+    def test_missing_tier_returns_empty(self):
+        assert _reprice("LMT", "BUY", {}, 29516.0, 0.25) == {}
+        assert _reprice("STP", "BUY", {}, 29516.0, 0.25) == {}
+
+    def test_prices_snap_to_tick(self):
+        params = {"profit_take": {"value": 20.1, "unit": "price"}}
+        out = _reprice("LMT", "BUY", params, 29516.0, 0.25)
+        assert out == {"lmtPrice": 29536.0}  # 29536.1 snapped to grid
+
+
+def _fake_child(order_type, action="SELL", lmt=None, aux=None,
+                status="PreSubmitted"):
+    o = SimpleNamespace(orderType=order_type, action=action,
+                        totalQuantity=1, orderRef="nano_0419_120000_chld",
+                        transmit=False)
+    if lmt is not None:
+        o.lmtPrice = lmt
+    if aux is not None:
+        o.auxPrice = aux
+    return SimpleNamespace(order=o,
+                           orderStatus=SimpleNamespace(status=status,
+                                                       avgFillPrice=0.0))
+
+
+def _fake_parent(fill=29516.0, action="BUY"):
+    return SimpleNamespace(
+        order=SimpleNamespace(action=action),
+        orderStatus=SimpleNamespace(status="Filled", avgFillPrice=fill))
+
+
+def _reanchor_worker():
+    wt = _make_worker()
+    placed = []
+    wt._ib = SimpleNamespace(client=_FakeClient(),
+                             placeOrder=lambda c, o: placed.append(o))
+    emitted = []
+    wt._emit_order_status = (
+        lambda trade, key, params, status, **kw:
+        emitted.append((key, dict(params), status)))
+    return wt, placed, emitted
+
+
+class TestReanchorBracketChildren:
+    _params = {
+        "tick_size": 0.25,
+        "profit_take": {"value": 20, "unit": "price"},
+        "stop_loss": {"value": 20, "unit": "price"},
+    }
+
+    def test_children_repriced_and_modified(self):
+        wt, placed, emitted = _reanchor_worker()
+        tp = _fake_child("LMT", lmt=29550.0)
+        sl = _fake_child("STP", aux=29510.0)
+        children = [(tp, "acct_tpref", {"limit_price": 29550.0}),
+                    (sl, "acct_slref", {"stop_price": 29510.0})]
+        wt._reanchor_bracket_children(object(), _fake_parent(29516.0),
+                                      children, 29530.0, self._params)
+        assert tp.order.lmtPrice == 29536.0
+        assert sl.order.auxPrice == 29496.0
+        # Both modifies went to IB, each transmitting on its own.
+        assert placed == [tp.order, sl.order]
+        assert tp.order.transmit is True and sl.order.transmit is True
+        # Blotter rows re-emitted with the new prices.
+        assert emitted[0][1]["limit_price"] == 29536.0
+        assert emitted[1][1]["stop_price"] == 29496.0
+
+    def test_fill_at_reference_is_noop(self):
+        wt, placed, _ = _reanchor_worker()
+        tp = _fake_child("LMT", lmt=29550.0)
+        wt._reanchor_bracket_children(object(), _fake_parent(29530.0),
+                                      [(tp, "k", {})], 29530.0,
+                                      self._params)
+        assert placed == []
+        assert tp.order.lmtPrice == 29550.0
+
+    def test_trail_child_left_alone(self):
+        wt, placed, _ = _reanchor_worker()
+        tr = _fake_child("TRAIL", aux=25.0)
+        wt._reanchor_bracket_children(object(), _fake_parent(29516.0),
+                                      [(tr, "k", {})], 29530.0,
+                                      self._params)
+        assert placed == []
+        assert tr.order.auxPrice == 25.0
+
+    def test_finished_children_skipped(self):
+        wt, placed, _ = _reanchor_worker()
+        done = _fake_child("LMT", lmt=29550.0, status="Filled")
+        gone = _fake_child("STP", aux=29510.0, status="Cancelled")
+        wt._reanchor_bracket_children(
+            object(), _fake_parent(29516.0),
+            [(done, "k1", {}), (gone, "k2", {})], 29530.0, self._params)
+        assert placed == []
+
+    def test_bogus_fill_price_is_noop(self):
+        wt, placed, _ = _reanchor_worker()
+        tp = _fake_child("LMT", lmt=29550.0)
+        for bad in (0.0, 1.7976931348623157e308):
+            wt._reanchor_bracket_children(
+                object(), _fake_parent(bad), [(tp, "k", {})],
+                29530.0, self._params)
+        assert placed == []

@@ -1909,6 +1909,11 @@ class IBWorkerThread(QThread):
             sl_tier = params.get("stop_loss")
             tr_tier = params.get("trailing")
             bracket_children: list = []
+            # (trade, key, blotter-params) triples appended as children
+            # are placed below — the parent's fill callback re-anchors
+            # them to the actual fill price.
+            bracket_reanchor: list = []
+            bracket_ref_used = 0.0
             if any((tp_tier, sl_tier, tr_tier)):
                 # FlashTradeView sets bracket_ref_price to the expected-fill
                 # anchor — last_price for Adaptive / PEG / cap-wrapped MKT
@@ -1941,6 +1946,7 @@ class IBWorkerThread(QThread):
                         order_type = "LMT"
                     order.orderId = self._ib.client.getReqId()
                     order.transmit = False
+                    bracket_ref_used = ref_price
                     bracket_children = self._build_bracket_children(
                         order, params, ref_price,
                         float(params.get("tick_size") or 0.01),
@@ -2078,6 +2084,9 @@ class IBWorkerThread(QThread):
             # trivially simple — no migration, no supersedes.
             frozen_params = dict(params)
             frozen_oid = order_id
+            # One-shot latch: Filled can be reported more than once
+            # (Filled then Completed) — re-anchor only on the first.
+            _reanchored = [False]
 
             def _on_status(t, _oid=frozen_oid, _p=frozen_params):
                 new_status = t.orderStatus.status
@@ -2099,6 +2108,17 @@ class IBWorkerThread(QThread):
                 # (not a full snapshot), so a closed position would simply be
                 # absent and the UI would never learn it went to zero.
                 if new_status in ("Filled", "Completed"):
+                    if bracket_reanchor and not _reanchored[0]:
+                        _reanchored[0] = True
+                        try:
+                            self._reanchor_bracket_children(
+                                c, t, bracket_reanchor,
+                                bracket_ref_used, _p)
+                        except Exception:
+                            order_log.exception(
+                                "[%s] BRACKET-REANCHOR failed "
+                                "(children keep submit-time prices)",
+                                self._label)
                     self._apply_fill_to_position(t, _p)
 
             trade.statusEvent += _on_status
@@ -2146,6 +2166,10 @@ class IBWorkerThread(QThread):
                     getattr(ch, "lmtPrice", None),
                     getattr(ch, "auxPrice", None)))
                 ch_frozen_oid = ch_key
+                # Same ch_params dict the status closure holds — the
+                # re-anchor updates it in place so the blotter row
+                # reflects the new prices.
+                bracket_reanchor.append((ch_trade, ch_key, ch_params))
 
                 def _on_child_status(t, _oid=ch_frozen_oid, _p=ch_params):
                     new_status = t.orderStatus.status
@@ -2231,6 +2255,113 @@ class IBWorkerThread(QThread):
             "parent (IB error 328), orderRef=%s",
             self._label, lmt_px, cap, getattr(order, "orderRef", ""))
         return True
+
+    @staticmethod
+    def _reanchored_child_prices(order_type: str, parent_action: str,
+                                 params: dict, fill_price: float,
+                                 tick: float) -> dict:
+        """Absolute prices for a bracket child re-anchored to *fill_price*.
+
+        Children are priced at submit time from the reference price (the
+        limit price for resting LMT parents), so a fill with price
+        improvement leaves them offset from the wrong anchor.  This
+        recomputes the same tier math as ``_build_bracket_children``
+        against the actual fill.  The child kind is inferred from its
+        order type — the builder emits TP as LMT, SL as STP / STP LMT,
+        and the trailing leg as TRAIL (already fill-relative → ``{}``).
+        Returns a ``{attr: price}`` dict to apply to the child order, or
+        ``{}`` when nothing applies / a price would go non-positive.
+        """
+        sign = 1 if parent_action == "BUY" else -1
+
+        def _offset_points(tier: dict) -> float:
+            v = float(tier.get("value", 0.0))
+            return v * tick if tier.get("unit") == "ticks" else v
+
+        if order_type == "LMT":
+            tier = params.get("profit_take")
+            if not tier:
+                return {}
+            px = _round_to_tick(fill_price + sign * _offset_points(tier),
+                                tick)
+            return {"lmtPrice": px} if px > 0 else {}
+
+        if order_type in ("STP", "STP LMT"):
+            tier = params.get("stop_loss")
+            if not tier:
+                return {}
+            aux = _round_to_tick(fill_price - sign * _offset_points(tier),
+                                 tick)
+            if aux <= 0:
+                return {}
+            out = {"auxPrice": aux}
+            if order_type == "STP LMT":
+                cap = float(params.get("limit_cap_offset") or 0.0)
+                lmt = _round_to_tick(aux - sign * cap, tick)
+                if lmt <= 0:
+                    return {}
+                out["lmtPrice"] = lmt
+            return out
+
+        return {}
+
+    def _reanchor_bracket_children(self, contract, parent_trade,
+                                   children, ref_price: float,
+                                   params: dict) -> None:
+        """Re-price live TP / SL children to the parent's actual fill.
+
+        Called once from the parent's statusEvent when it reaches
+        Filled.  The bracket is transmitted whole before any fill
+        exists, so the children were anchored to the submit-time
+        reference; when the fill lands elsewhere (resting limit filled
+        with price improvement, market moved), each still-working child
+        is modified in place — same orderId, new price — which IB
+        treats as an order modification and the OCA linkage survives.
+        *children* is a list of ``(trade, order_key, blotter_params)``
+        triples captured at placement.
+        """
+        fill = float(getattr(parent_trade.orderStatus,
+                             "avgFillPrice", 0.0) or 0.0)
+        if not (0.0 < fill < _IB_DBL_MAX):
+            return
+        tick = float(params.get("tick_size") or 0.01)
+        if ref_price > 0 and abs(fill - ref_price) < tick / 2:
+            return  # filled at the anchor — children already correct
+        parent_action = getattr(parent_trade.order, "action", "BUY")
+
+        for ch_trade, ch_key, ch_params in children:
+            st = getattr(ch_trade.orderStatus, "status", "") or ""
+            if st in ("Filled", "Cancelled", "ApiCancelled", "Inactive"):
+                continue
+            ch_order = ch_trade.order
+            new_px = self._reanchored_child_prices(
+                ch_order.orderType, parent_action, params, fill, tick)
+            if not new_px:
+                continue
+            if all(abs(float(getattr(ch_order, a, 0.0) or 0.0) - v) < 1e-9
+                   for a, v in new_px.items()):
+                continue
+            for a, v in new_px.items():
+                setattr(ch_order, a, v)
+            # Modify = re-place with the same orderId; each modify
+            # transmits on its own (the bundle-level staging only
+            # applies to the initial submission).
+            ch_order.transmit = True
+            self._ib.placeOrder(contract, ch_order)
+            # Refresh the blotter's frozen price columns and push the
+            # row so the UI shows the re-anchored prices immediately.
+            ch_params.pop("limit_price", None)
+            ch_params.pop("stop_price", None)
+            ch_params.update(self._child_price_params(
+                ch_order.orderType,
+                getattr(ch_order, "lmtPrice", None),
+                getattr(ch_order, "auxPrice", None)))
+            self._emit_order_status(ch_trade, ch_key, ch_params, st)
+            order_log.info(
+                "[%s] BRACKET-REANCHOR  %s child re-priced to fill "
+                "%.4f (submit ref %.4f): %s, orderRef=%s",
+                self._label, ch_order.orderType, fill, ref_price,
+                new_px, getattr(ch_order, "orderRef", ""))
 
     def _build_bracket_children(self, parent, params: dict,
                                 ref_price: float, tick: float) -> list:
