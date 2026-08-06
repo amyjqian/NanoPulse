@@ -420,13 +420,11 @@ class FlashTradeView(QWidget):
         # expiration (e.g. position on NQM6, saved row already on NQU6).
         contract = payload.get("_resolved_contract")
         if not contract:
-            # Buy/Sell entry from the order panel — resolve from saved
-            # contracts.  pick_active_contract handles multi-expiry roots
-            # (NQM6 + NQU6 both saved as "NQ") by picking the soonest
-            # non-expired contract; an exact local_symbol match still
-            # pins to that specific contract.
-            from src.core.reference_data import get_instance as _rd
-            contract = _rd().pick_active_contract(symbol)
+            # Buy/Sell entry from the order panel — resolve from the
+            # chip / hot-button instrument entries.  An exact
+            # local_symbol match still pins to that specific contract.
+            from src.core import instruments
+            contract = instruments.get_contract(symbol)
 
         if not contract:
             log.warning(
@@ -1494,15 +1492,15 @@ class FlashTradeView(QWidget):
         # the stop trigger.  TP uses a plain LMT so this is ignored.
         from src.utils.helpers import calculate_offset, tick_size_for_contract
         from src.core.trading_prefs import trading_prefs
-        from src.core.reference_data import get_instance as _rd
+        from src.core import instruments
 
-        contracts = _rd().contracts_by_symbol.get(symbol.upper(), [])
-        sec_type = contracts[0].get("sec_type", "") if contracts else ""
+        c = instruments.get_contract(symbol)
+        sec_type = c.get("sec_type", "") if c else ""
         tick = tick_size_for_contract(
             sec_type,
-            symbol=contracts[0].get("symbol", "") if contracts else "",
-            local_symbol=contracts[0].get("local_symbol", "") if contracts else "",
-        ) if contracts else 0.25
+            symbol=c.get("symbol", "") if c else "",
+            local_symbol=c.get("local_symbol", "") if c else "",
+        ) if c else 0.25
         prefs = trading_prefs.get(sec_type)
         cap_raw = float(prefs.get("limit_cap", 0) or 0) if prefs else 0.0
         cap_offset = abs(calculate_offset(

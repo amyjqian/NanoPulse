@@ -278,8 +278,10 @@ class ReferenceData(QObject):
         if tiers:
             return tiers
 
-        # 2. Asset-class fallback ("FUT" or "STK")
-        sec      = self.get_sec_type(symbol)
+        # 2. Asset-class fallback ("FUT" or "STK") — sec_type resolved
+        # from the chip / hot-button instrument entries.
+        from src.core import instruments
+        sec      = instruments.get_sec_type(symbol)
         fallback = _FALLBACK_SYM.get(sec, "STK")
         tiers    = self._extract_tiers(fallback, order_type)
         if tiers:

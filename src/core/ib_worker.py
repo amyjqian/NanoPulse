@@ -189,12 +189,11 @@ def _contract_to_dict(contract) -> dict:
     }
     if not d["exchange"]:
         try:
-            from src.core.reference_data import get_instance as _rd
-            rd = _rd()
-            # Try the root symbol first (what the saved-contracts cache
-            # is keyed by), then fall back to the local symbol.
-            cached = (rd.pick_active_contract(d["symbol"])
-                      or rd.pick_active_contract(d["local_symbol"]))
+            from src.core import instruments
+            # Try the root symbol first (what the chip entries are
+            # keyed by), then fall back to the local symbol.
+            cached = (instruments.get_contract(d["symbol"])
+                      or instruments.get_contract(d["local_symbol"]))
             if cached:
                 if not d["exchange"] and cached.get("exchange"):
                     d["exchange"] = cached["exchange"]
@@ -2825,11 +2824,11 @@ class IBWorkerThread(QThread):
             # ib.positions() returns contracts without `exchange` populated
             # (among other routing fields), which causes placeOrder to fail
             # with Warning 321 "Missing order exchange".  The exchange lives
-            # in the local Contracts table already — look it up in memory
-            # via ReferenceData instead of doing a round-trip to TWS.
+            # on the chip's instrument entry already — look it up locally
+            # instead of doing a round-trip to TWS.
             if not getattr(contract, "exchange", ""):
-                from src.core.reference_data import get_instance as _rd
-                cached = _rd().get_contract(symbol_upper)
+                from src.core import instruments
+                cached = instruments.get_contract(symbol_upper)
                 if cached and cached.get("exchange"):
                     contract.exchange = cached["exchange"]
                 else:
@@ -3428,12 +3427,13 @@ class IBWorkerThread(QThread):
         if sym in self._depth_tickers:
             return   # already subscribed
 
-        # Resolve contract from the local ReferenceData cache.  This
-        # mirrors what OrderEntryPanel already does for L1 subscriptions
-        # and avoids a round-trip to TWS for contract-details.
+        # Resolve the contract from the chip's instrument entry (the
+        # resolver is Qt-free and thread-safe).  This mirrors what
+        # OrderEntryPanel already does for L1 subscriptions and avoids
+        # a round-trip to TWS for contract-details.
         try:
-            from src.core.reference_data import get_instance as _rd
-            cached = _rd().get_contract(sym)
+            from src.core import instruments
+            cached = instruments.get_contract(sym)
         except Exception:
             cached = None
         if not cached:
@@ -4102,17 +4102,17 @@ class IBWorkerThread(QThread):
                 symbol = self._order_symbols.get(order_ref, "")
 
             # Fallback 2: if symbol is still empty (contract built with conId
-            # only and ib_async didn't update it), resolve from saved config.
+            # only and ib_async didn't update it), resolve from the chip /
+            # hot-button instrument entries.
             if not symbol:
                 con_id = getattr(contract, "conId", 0)
                 if con_id:
                     try:
-                        from src.core import config_manager
-                        for sc in config_manager.load_contracts():
-                            if sc.get("conid") == con_id:
-                                symbol = (sc.get("local_symbol", "")
-                                          or sc.get("symbol", ""))
-                                break
+                        from src.core import instruments
+                        sc = instruments.find_by_conid(con_id)
+                        if sc:
+                            symbol = (sc.get("local_symbol", "")
+                                      or sc.get("symbol", ""))
                     except Exception:
                         pass
 

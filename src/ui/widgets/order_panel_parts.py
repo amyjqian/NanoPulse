@@ -265,8 +265,8 @@ def attach_exchange_badge(btn: QPushButton, symbol: str) -> None:
     through resizes without a custom paintEvent.
     """
     try:
-        from src.core.reference_data import get_instance as _rd
-        if _rd().get_primary_exchange(symbol) not in _TORONTO_EXCHANGES:
+        from src.core import instruments
+        if instruments.get_primary_exchange(symbol) not in _TORONTO_EXCHANGES:
             return
     except Exception:
         return

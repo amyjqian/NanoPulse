@@ -419,7 +419,7 @@ class TestEnsureContractSaved:
         return state
 
     def test_local_source_is_noop(self, store):
-        sym = ssp.ensure_contract_saved(
+        sym, _meta = ssp.ensure_contract_saved(
             {"symbol": "nq", "sec_type": "FUT", "source": "local"})
         assert sym == "NQ"
         assert not store["saved"]
@@ -427,14 +427,15 @@ class TestEnsureContractSaved:
     def test_ibkr_future_is_noop(self, store):
         """FUT picks are chain-saved by the popup — never as a single
         SMART pseudo-contract here."""
-        sym = ssp.ensure_contract_saved(
+        sym, meta = ssp.ensure_contract_saved(
             {"symbol": "es", "sec_type": "FUT", "conid": 11004968,
              "currency": "USD", "source": "ibkr"})
         assert sym == "ES"
         assert not store["saved"]
+        assert meta["conid"] == "11004968"   # caller still gets chip meta
 
     def test_ibkr_pick_saves_contract(self, store):
-        sym = ssp.ensure_contract_saved({
+        sym, meta = ssp.ensure_contract_saved({
             "symbol": "googl", "sec_type": "STK", "conid": 208813720,
             "currency": "USD", "primary_exchange": "NASDAQ",
             "name": "Alphabet Inc (Class A)",
@@ -442,6 +443,9 @@ class TestEnsureContractSaved:
         })
         assert sym == "GOOGL"
         assert store["saved"] and store["reloaded"]
+        assert meta["conid"] == "208813720"
+        assert meta["exchange"] == "SMART"       # chip metadata for the host
+        assert meta["local_symbol"] == "GOOGL"
         (c,) = store["contracts"]
         assert c["symbol"] == "GOOGL"
         assert c["sec_type"] == "STK"
@@ -454,7 +458,7 @@ class TestEnsureContractSaved:
     def test_duplicate_conid_not_resaved(self, store):
         store["contracts"] = [
             {"conid": "208813720", "symbol": "GOOGL", "sec_type": "STK"}]
-        sym = ssp.ensure_contract_saved({
+        sym, _meta = ssp.ensure_contract_saved({
             "symbol": "GOOGL", "sec_type": "STK", "conid": 208813720,
             "source": "ibkr",
         })
@@ -471,5 +475,5 @@ class TestEnsureContractSaved:
         assert not store["saved"]
 
     def test_empty_symbol_returns_empty(self, store):
-        assert ssp.ensure_contract_saved({"source": "ibkr"}) == ""
+        assert ssp.ensure_contract_saved({"source": "ibkr"}) == ("", None)
         assert not store["saved"]

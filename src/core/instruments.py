@@ -323,7 +323,7 @@ def contract_meta_from_result(entry: dict[str, Any]) -> dict[str, Any] | None:
         d.setdefault("exchange", "SMART")
         d.setdefault("currency", "USD")
         if not d.get("local_symbol"):
-            d["local_symbol"] = str(d.get("symbol", "") or "")
+            d["local_symbol"] = str(d.get("symbol", "") or "").strip().upper()
     return normalise_contract_meta(d)
 
 

@@ -312,9 +312,11 @@ def apply_future_pick(parent, entry: dict) -> tuple[str, bool]:
                 and c.get("symbol", "").upper() == sym]
     if not existing:
         save_future_chain([entry], root_name=root_name)
+        _upsert_entry_meta(sym, entry)
         return sym, False
     if str(entry.get("conid", "")) in {str(c.get("conid", ""))
                                        for c in existing}:
+        _upsert_entry_meta(sym, entry)   # heal chips missing metadata
         return sym, False  # same contract — nothing to do
 
     old_labels = [format_expiry(c.get("expiry", "")) for c in existing]
@@ -332,30 +334,48 @@ def apply_future_pick(parent, entry: dict) -> tuple[str, bool]:
     if resp != QMessageBox.StandardButton.Yes:
         return "", False
     replace_future_contract(entry, root_name=root_name)
+    _upsert_entry_meta(sym, entry)   # re-point existing chips/hot buttons
     return sym, True
+
+
+def _upsert_entry_meta(sym: str, entry: dict) -> None:
+    """Write *entry*'s contract metadata onto every existing chip /
+    hot-button reference of *sym* (rollover keeps them in sync; the
+    newly-added chip gets its metadata from the host's ``_add_symbol``)."""
+    from src.core import instruments
+    meta = instruments.contract_meta_from_result(entry)
+    if meta:
+        config_manager.upsert_instrument(sym, meta)
 
 
 def ensure_contract_saved(result: dict) -> str:
     """Persist an IBKR search pick into the contracts universe.
 
-    No-op for rows that came from saved contracts (``source != "ibkr"``),
-    for futures (handled by ``apply_future_pick`` in the host view), or
-    when an equal contract is already stored.  Returns the upper-cased
-    symbol ("" if the result carries none).
+    Returns ``(symbol, meta)`` — *meta* is the normalised contract
+    metadata for the picked row (the host stores it on the new chip via
+    ``_add_symbol``), or ``None`` when the row carries no conid.  The
+    legacy contracts-DB write still runs for IBKR STK picks so the
+    Contracts tab stays coherent during the transition (dropped in the
+    final stage); futures are handled by ``apply_future_pick``.
     """
+    from src.core import instruments
     sym = (result.get("symbol") or "").strip().upper()
-    if (not sym or result.get("source") != "ibkr"
+    if not sym:
+        return "", None
+    meta = instruments.contract_meta_from_result(result)
+    if (result.get("source") != "ibkr"
             or result.get("sec_type", "STK") != "STK"):
-        return sym
+        return sym, meta
 
     existing = config_manager.load_contracts()
     conid = str(result.get("conid") or "")
-    for c in existing:
-        if conid and str(c.get("conid", "")) == conid:
-            return sym
-        if (c.get("symbol", "").upper() == sym
-                and c.get("sec_type") == result.get("sec_type", "STK")):
-            return sym
+    known = any(
+        (conid and str(c.get("conid", "")) == conid)
+        or (c.get("symbol", "").upper() == sym
+            and c.get("sec_type") == result.get("sec_type", "STK"))
+        for c in existing)
+    if known:
+        return sym, meta
 
     existing.append({
         "conid": result.get("conid", ""),
@@ -376,7 +396,7 @@ def ensure_contract_saved(result: dict) -> str:
     _rd().reload_contracts()
     log.info("SymbolSearch: saved %s (%s) from IBKR lookup",
              sym, result.get("primary_exchange", ""))
-    return sym
+    return sym, meta
 
 
 class SymbolSearchPopup(QDialog):
@@ -481,10 +501,11 @@ class SymbolSearchPopup(QDialog):
     # ── Local (saved-contract) entries ────────────────────────────────────────
 
     def _collect_local(self) -> list[dict]:
-        from src.core.reference_data import get_instance as _rd
+        from src.core import instruments
         seen: set[str] = set()
         entries: list[dict] = []
-        for c in sorted(_rd().contracts, key=lambda x: x.get("symbol", "")):
+        for c in sorted(instruments.all_contracts(),
+                        key=lambda x: x.get("symbol", "")):
             sym = c.get("symbol", "")
             if not sym or sym.upper() in self._exclude:
                 continue

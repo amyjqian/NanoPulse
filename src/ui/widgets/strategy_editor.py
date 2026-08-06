@@ -1004,28 +1004,29 @@ class StrategyEditorView(QWidget):
     # ── Multiplier loader ─────────────────────────────────────────────────────
 
     def _load_multipliers(self) -> None:
-        """Read multipliers from ReferenceData (already loaded at startup)."""
-        from src.core.reference_data import get_instance as _rd
-        rd = _rd()
+        """Read multipliers from the chip / hot-button instrument entries."""
+        from src.core import instruments
 
-        # If the cache is still empty (e.g. strategy editor opened before
-        # main window had a chance to reload), fall back to a direct load.
-        if not rd.contracts and not rd.multipliers:
-            rd.reload_contracts()
+        mults: dict[str, float] = {}
+        for c in instruments.all_contracts():
+            try:
+                mults[c["symbol"].upper()] = float(c.get("multiplier") or 1.0)
+            except (TypeError, ValueError):
+                mults.setdefault(c["symbol"].upper(), 1.0)
 
-        mults   = rd.multipliers          # dict[UPPER_SYMBOL → float]
         missing = [
             sym for sym in (self._model.symbol_at(r)
                             for r in range(self._model.rowCount()))
             if sym and sym.upper() not in mults
         ]
 
-        self._model.set_multipliers({k.upper(): v for k, v in mults.items()})
+        self._model.set_multipliers(mults)
 
         if missing:
             self._set_status(
                 f"⚠  Using fallback ×1.0 for: {', '.join(missing)}"
-                f" — add them in the Contracts tab to use their real multiplier"
+                f" — add them via the symbol search (+) to use their real"
+                f" multiplier"
             )
         elif mults:
             self._set_status(

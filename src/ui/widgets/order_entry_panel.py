@@ -230,9 +230,10 @@ class _ActionButton(QPushButton):
 
 
 def _sec_type_for(sym: str) -> str:
-    """Return 'FUT', 'STK', 'OPT', or '?' for *sym* via ReferenceData cache."""
-    from src.core.reference_data import get_instance as _rd
-    return _rd().get_sec_type(sym)
+    """Return 'FUT', 'STK', 'OPT', or '?' for *sym* via the chip /
+    hot-button instrument entries."""
+    from src.core import instruments
+    return instruments.get_sec_type(sym)
 
 
 def _apply_chip_style(btn: QPushButton, selected: bool) -> None:
@@ -2552,9 +2553,9 @@ class _HotButtonModal(QDialog):
         if not sym:
             return
         try:
-            from src.core.reference_data import get_instance as _rd
+            from src.core import instruments
             from src.core.trading_prefs import trading_prefs
-            sec = _rd().get_sec_type(sym)
+            sec = instruments.get_sec_type(sym)
         except Exception:
             log.debug("HotButton: prefs auto-fill lookup failed",
                       exc_info=True)
@@ -2595,11 +2596,13 @@ class _HotButtonModal(QDialog):
         :meth:`_on_symbol_changed` via the line-edit's ``textChanged``.
         """
         try:
-            from src.core.reference_data import get_instance as _rd
-            cache = _rd().contracts_by_symbol
+            from src.core import instruments
+            cache: dict[str, list[dict]] = {}
+            for c in instruments.all_contracts():
+                cache.setdefault(c["symbol"].upper(), []).append(c)
         except Exception:
             log.exception(
-                "HotButtonModal: contract cache unavailable for completer")
+                "HotButtonModal: instrument entries unavailable for completer")
             cache = {}
         # Build an ordered, deduped list of symbols + local_symbols
         # (e.g. ``"NQ"`` and ``"NQM6"`` both navigate to the same contract).
@@ -2644,8 +2647,9 @@ class _HotButtonModal(QDialog):
             self._lbl_sym_status.setText("")
             return
         try:
-            from src.core.reference_data import get_instance as _rd
-            contracts = _rd().contracts_by_symbol.get(sym.upper(), [])
+            from src.core import instruments
+            c0 = instruments.get_contract(sym)
+            contracts = [c0] if c0 else []
         except Exception:
             log.exception("HotButtonModal: contract lookup failed")
             contracts = []
@@ -2906,7 +2910,6 @@ class OrderEntryPanel(QWidget):
     def __init__(self, active_threads: dict | None = None, parent=None):
         super().__init__(parent)
         self._active_threads: dict = active_threads if active_threads is not None else {}
-        self._connected_worker = None  # track worker for TWS lookup
         self._bg_worker = None         # track worker for background price streams
         # sym → (last, bid, ask)
         self._price_cache: dict[str, tuple[float, float, float]] = {}
@@ -2967,8 +2970,9 @@ class OrderEntryPanel(QWidget):
         # so the custom Dist input calculates dollars correctly before the user
         # first clicks a different symbol chip (which would call
         # _reload_tier_sections).
+        from src.core import instruments
         from src.core.reference_data import get_instance as _rd
-        _init_mult = _rd().get_multiplier(self._active_symbol or "") or 1.0
+        _init_mult = instruments.get_multiplier(self._active_symbol or "") or 1.0
         self._pt_section.set_multiplier(_init_mult)
         self._sl_section.set_multiplier(_init_mult)
         self._tr_section.set_multiplier(_init_mult)
@@ -3385,12 +3389,13 @@ class OrderEntryPanel(QWidget):
         if not sym:
             return ""
         try:
-            from src.core.reference_data import get_instance as _rd
-            c = _rd().pick_active_contract(sym)
+            from src.core import instruments
+            c = instruments.get_contract(sym)
         except Exception:
             return ""
         if not c:
-            return f"{sym}: no saved contract — add one in Contracts"
+            return (f"{sym}: no saved contract — add it via the "
+                    f"symbol search (+)")
         local = (c.get("local_symbol") or "").strip()
         expiry = (c.get("expiry") or "").strip()
         if not local or local.upper() == sym:
@@ -3844,11 +3849,12 @@ class OrderEntryPanel(QWidget):
         })
 
     def _refresh_combo_items(self) -> None:
-        """Populate the combo dropdown with saved contracts not already added."""
-        from src.core.reference_data import get_instance as _rd
+        """Populate the combo dropdown with known instruments (chips on
+        the other panel, hot buttons) not already added here."""
+        from src.core import instruments
         self._combo.blockSignals(True)
         self._combo.clear()
-        contracts = _rd().contracts
+        contracts = instruments.all_contracts()
         added_upper = {s.upper() for s in self._symbols}
         seen: set[str] = set()
         for c in contracts:
@@ -3889,9 +3895,9 @@ class OrderEntryPanel(QWidget):
                 self._add_symbol(self._combo.itemData(idx))
                 return
 
-        # Find all matching contracts
-        from src.core.reference_data import get_instance as _rd
-        contracts = _rd().contracts
+        # Find all matching known instruments
+        from src.core import instruments
+        contracts = instruments.all_contracts()
         matches: list[dict] = []
         seen: set[str] = set()
         for c in contracts:
@@ -3922,11 +3928,15 @@ class OrderEntryPanel(QWidget):
             self._combo.blockSignals(False)
             self._combo.showPopup()
         else:
-            # No local match → try TWS lookup (assume STK)
-            self._tws_lookup(text)
+            # No local match → open the live IBKR symbol search, the
+            # single add path for new instruments.
+            self.open_symbol_search()
 
-    def _add_symbol(self, sym: str) -> None:
-        """Add a symbol to the chip bar and activate it."""
+    def _add_symbol(self, sym: str, meta: dict | None = None) -> None:
+        """Add a symbol to the chip bar and activate it.  *meta* is the
+        contract metadata from the symbol search pick — stored on the
+        new chip entry so it can subscribe and order without any
+        external contract store."""
         if not sym:
             return
         sym = sym.upper()
@@ -3936,13 +3946,13 @@ class OrderEntryPanel(QWidget):
                 # The STK group renders at most 5 × 3 chips.  When it's
                 # full, the new symbol replaces the LAST chip (row 3,
                 # column 5) instead of becoming an invisible overflow
-                # entry.  Mirrors _remove_symbol's cleanup.
+                # entry.  Dropping the chip entry IS the cleanup — its
+                # metadata leaves with it.
                 stk_group = [s for s in self._symbols
                              if _sec_type_for(s) != "FUT"]
                 if len(stk_group) >= self._CHIP_COLS * self._MAX_STK_ROWS:
                     replaced = stk_group[-1]
                     self._symbols.remove(replaced)
-                    config_manager.remove_stock_contract_if_unused(replaced)
                     if self._bg_worker is not None:
                         self._bg_worker.unsubscribe_background_symbol(
                             replaced)
@@ -3951,6 +3961,8 @@ class OrderEntryPanel(QWidget):
                              "replaces %s", sym, replaced)
             self._symbols.append(sym)
             config_manager.save_order_entry_symbols(self._symbols)
+            if meta:
+                config_manager.upsert_instrument(sym, meta)
             # Subscribe new symbol to background stream
             if (self._bg_worker is not None
                     and self._bg_worker.isRunning()
@@ -4154,10 +4166,9 @@ class OrderEntryPanel(QWidget):
         """Right-click removes a symbol button."""
         if sym in self._symbols:
             self._symbols.remove(sym)
+            # Dropping the chip entry drops its contract metadata with
+            # it — no external cleanup needed.
             config_manager.save_order_entry_symbols(self._symbols)
-            # Drop the STK contract from the universe too, unless the
-            # Book Trader chip bar or a hot button still needs it.
-            config_manager.remove_stock_contract_if_unused(sym)
         # Unsubscribe from background stream
         if self._bg_worker is not None:
             self._bg_worker.unsubscribe_background_symbol(sym)
@@ -4576,11 +4587,12 @@ class OrderEntryPanel(QWidget):
 
         # Fall back to preferences when ReferenceData has no rows
         if pt is None or sl is None or tr is None:
+            from src.core import instruments
             sec  = _sec_type_for(sym)
             key  = "trading_futures" if sec == "FUT" else "trading_stocks"
             prefs = config_manager.load_preferences()
             section = prefs.get(key, {})
-            mult = rd.get_multiplier(sym)          # $/point  (e.g. 20 for NQ, 1 for stocks)
+            mult = instruments.get_multiplier(sym)  # $/point  (e.g. 20 for NQ, 1 for stocks)
             tick = self._tick_size_for_symbol(sym)  # points/tick (e.g. 0.25 for NQ, 0.01 for stocks)
             if pt is None:
                 raw = section.get("profit_take", self._TIER_FALLBACK)
@@ -4659,8 +4671,8 @@ class OrderEntryPanel(QWidget):
         self._sl_section.set_qty(self._active_qty)
         self._tr_section.set_qty(self._active_qty)
         # Push contract multiplier for custom-distance dollar math
-        from src.core.reference_data import get_instance as _rd
-        mult = _rd().get_multiplier(self._active_symbol or "") or 1.0
+        from src.core import instruments
+        mult = instruments.get_multiplier(self._active_symbol or "") or 1.0
         self._pt_section.set_multiplier(mult)
         self._sl_section.set_multiplier(mult)
         self._tr_section.set_multiplier(mult)
@@ -4682,25 +4694,17 @@ class OrderEntryPanel(QWidget):
 
         Priority
         --------
-        1. ``tick_size`` / ``min_tick`` / ``minTick`` field in the saved
-           contract row  (populated by ContractsView since the Tick column
-           was added).
-        2. Per-symbol lookup table for known futures (covers contracts saved
-           before the Tick column existed).
+        1. ``min_tick`` stored on the chip's instrument entry (captured
+           from TWS contract details at add-time).
+        2. Per-symbol lookup table for known futures (covers entries
+           saved before min_tick was captured).
         3. Coarse sec-type fallback: FUT → 0.25, everything else → 0.01.
         """
-        # ── 1. Contract-row field ─────────────────────────────────────────────
-        from src.core.reference_data import get_instance as _rd
-        for c in _rd().contracts_by_symbol.get((sym or "").upper(), []):
-            for key in ("tick_size", "min_tick", "minTick"):
-                tick = c.get(key)
-                if tick:
-                    try:
-                        v = float(tick)
-                        if v > 0:
-                            return v
-                    except (TypeError, ValueError):
-                        pass
+        # ── 1. Instrument-entry field ─────────────────────────────────────────
+        from src.core import instruments
+        mt = instruments.get_min_tick(sym or "")
+        if mt:
+            return mt
 
         # ── 2. Known-futures symbol table ─────────────────────────────────────
         _FUT_TICK: dict[str, float] = {
@@ -4822,7 +4826,7 @@ class OrderEntryPanel(QWidget):
         payload["qty_pct"] = int(self._active_pct)
         return True
 
-    # ── TWS fallback lookup ─────────────────────────────────────────────────────
+    # ── Worker selection ──────────────────────────────────────────────────────
 
     def _find_workers_by_priority(self) -> list:
         """Return connected workers sorted by config priority (1 = highest)."""
@@ -4838,129 +4842,6 @@ class OrderEntryPanel(QWidget):
             if w not in workers and w.isRunning() and w.is_ib_connected:
                 workers.append(w)
         return workers
-
-    def _tws_lookup(self, symbol: str) -> None:
-        """Query TWS to qualify a stock symbol not found locally."""
-        workers = self._find_workers_by_priority()
-        if not workers:
-            log.warning(
-                "OrderEntry: no TWS connection for lookup of '%s'", symbol)
-            self._combo.lineEdit().setPlaceholderText("No TWS connection!")
-            from PySide6.QtCore import QTimer
-            QTimer.singleShot(2000, lambda: self._combo.lineEdit().setPlaceholderText(
-                "Add symbol (look up).."))
-            return
-
-        log.info("OrderEntry: looking up '%s' via TWS", symbol)
-        self._combo.lineEdit().setPlaceholderText(f"⏳ Looking up {symbol}…")
-        self._pending_lookup = symbol
-        self._pending_lookup_workers = workers[1:]  # remaining for retry
-
-        self._start_tws_lookup_with_worker(workers[0], symbol)
-
-    def _start_tws_lookup_with_worker(self, worker, symbol: str) -> None:
-        """Wire signals to *worker* and kick off the browse request."""
-        # Disconnect previous signals if any
-        if self._connected_worker is not None:
-            try:
-                self._connected_worker.browse_results.disconnect(
-                    self._on_tws_results)
-            except (RuntimeError, TypeError):
-                pass
-            try:
-                self._connected_worker.browse_failed.disconnect(
-                    self._on_tws_failed)
-            except (RuntimeError, TypeError):
-                pass
-
-        self._connected_worker = worker
-        worker.browse_results.connect(self._on_tws_results)
-        worker.browse_failed.connect(self._on_tws_failed)
-        log.info("OrderEntry: trying worker %s for lookup of '%s'",
-                 worker._label, symbol)
-        worker.request_browse({
-            "sec_type": "STK",
-            "symbol": symbol,
-            "exchange": "SMART",
-            "currency": "USD",
-        })
-
-    def _on_tws_results(self, results: list[dict]) -> None:
-        """TWS returned contract details – save and add symbol."""
-        self._combo.lineEdit().setPlaceholderText("Add symbol (look up)..")
-        # Disconnect signals
-        if self._connected_worker is not None:
-            try:
-                self._connected_worker.browse_results.disconnect(
-                    self._on_tws_results)
-            except (RuntimeError, TypeError):
-                pass
-            try:
-                self._connected_worker.browse_failed.disconnect(
-                    self._on_tws_failed)
-            except (RuntimeError, TypeError):
-                pass
-            self._connected_worker = None
-
-        if not results:
-            log.warning("OrderEntry: TWS returned no results for '%s'",
-                        getattr(self, '_pending_lookup', '?'))
-            return
-
-        # Save the contract(s) to app_config.json
-        existing = config_manager.load_contracts()
-        existing_ids = {c.get("conid") for c in existing}
-        added = 0
-        sym_to_add = ""
-        for r in results:
-            if r.get("conid") and r["conid"] not in existing_ids:
-                existing.append(r)
-                existing_ids.add(r["conid"])
-                added += 1
-            if not sym_to_add:
-                sym_to_add = r.get("symbol", "")
-
-        if added:
-            config_manager.save_contracts(existing)
-            from src.core.reference_data import get_instance as _rd
-            _rd().reload_contracts()
-            log.info("OrderEntry: saved %d contract(s) from TWS lookup", added)
-
-        # Add the symbol chip
-        if sym_to_add:
-            self._add_symbol(sym_to_add)
-
-    def _on_tws_failed(self, msg: str) -> None:
-        """TWS lookup failed — retry next priority worker or give up."""
-        # Disconnect signals from current worker
-        if self._connected_worker is not None:
-            try:
-                self._connected_worker.browse_results.disconnect(
-                    self._on_tws_results)
-            except (RuntimeError, TypeError):
-                pass
-            try:
-                self._connected_worker.browse_failed.disconnect(
-                    self._on_tws_failed)
-            except (RuntimeError, TypeError):
-                pass
-
-        # Try next priority worker if available
-        pending = getattr(self, "_pending_lookup_workers", [])
-        pending_sym = getattr(self, "_pending_lookup", "")
-        if pending and pending_sym:
-            next_worker = pending.pop(0)
-            log.info("OrderEntry: lookup failed on %s (%s), retrying with %s",
-                     getattr(self._connected_worker, '_label', '?'), msg,
-                     next_worker._label)
-            self._start_tws_lookup_with_worker(next_worker, pending_sym)
-            return
-
-        # All workers exhausted
-        self._connected_worker = None
-        self._combo.lineEdit().setPlaceholderText("Add symbol (look up)..")
-        log.warning(
-            "OrderEntry: TWS lookup failed (all workers exhausted): %s", msg)
 
     # ── Public API for live price feed ────────────────────────────────────────
 
@@ -5053,30 +4934,12 @@ class OrderEntryPanel(QWidget):
         return params_list
 
     def _build_bg_params_for_symbol(self, sym: str) -> dict | None:
-        """Build market data params for a single symbol from the reference cache.
-
-        Routes through ``pick_active_contract`` so a root like ``NQ`` with
-        multiple saved expirations resolves to the front-month
-        automatically — keeping the panel's market-data subscription on
-        the same contract that order entry will trade against.
+        """Build market data params for a single symbol from its chip /
+        hot-button instrument entry — the same contract order entry will
+        trade against.
         """
-        from src.core.reference_data import get_instance as _rd
-        c = _rd().pick_active_contract(sym)
-        if not c:
-            return None
-        conid = c.get("conid")
-        if not conid:
-            return None
-        return {
-            "conid":        int(conid),
-            "symbol":       sym,
-            "sec_type":     c.get("sec_type", ""),
-            "exchange":     c.get("exchange", "SMART"),
-            "currency":     c.get("currency", "USD"),
-            "local_symbol": c.get("local_symbol", ""),
-            "expiry":       c.get("expiry", ""),
-            "multiplier":   c.get("multiplier", ""),
-        }
+        from src.core import instruments
+        return instruments.build_md_params(sym)
 
     def _on_bg_price_update(self, sym: str, last: float, bid: float,
                             ask: float, close: float = 0.0) -> None:
@@ -5196,18 +5059,20 @@ class OrderEntryPanel(QWidget):
             exclude={s.upper() for s in self._symbols})
 
         def _picked(entry: dict) -> None:
+            from src.core import instruments
             if (entry.get("source") == "ibkr"
                     and entry.get("sec_type") == "FUT"):
                 sym, replaced = apply_future_pick(self, entry)
                 if not sym:
                     return  # user declined the replacement
-                self._add_symbol(sym)
+                self._add_symbol(
+                    sym, meta=instruments.contract_meta_from_result(entry))
                 if replaced:
                     self.contract_replaced.emit(sym)
                 return
-            sym = ensure_contract_saved(entry)
+            sym, meta = ensure_contract_saved(entry)
             if sym:
-                self._add_symbol(sym)
+                self._add_symbol(sym, meta=meta)
 
         dlg.symbol_selected.connect(_picked)
         dlg.open_below(self._btn_add_symbol)
