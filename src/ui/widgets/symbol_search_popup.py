@@ -41,9 +41,10 @@ log = logging.getLogger(__name__)
 # Debounce between the last keystroke and the reqMatchingSymbols call.
 # IB rate-limits matching-symbol requests to ~1 per second.
 _SEARCH_DEBOUNCE_MS = 500
-_POPUP_WIDTH = 560
-_LIST_MAX_HEIGHT = 420
-_AVATAR_PX = 36          # circular ticker monogram diameter
+_POPUP_WIDTH = 520
+_AVATAR_PX = 30          # circular ticker monogram diameter
+_VISIBLE_ROWS = 5        # dropdown shows at most this many rows
+_CORNER_RADIUS = 14
 
 
 def connected_workers_by_priority(active_threads: dict) -> list:
@@ -391,36 +392,36 @@ class SymbolSearchPopup(QDialog):
 
         self.setWindowFlags(Qt.WindowType.Popup)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        # Truly rounded corners: the window is transparent and the card
+        # is painted as a rounded rect in paintEvent — a stylesheet
+        # radius alone leaves square window corners poking out.
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setFixedWidth(_POPUP_WIDTH)
-        self.setStyleSheet(
-            f"QDialog{{background:{Theme.BG_PANEL};"
-            f"border:1px solid {Theme.BORDER};border-radius:14px}}")
+        self.setStyleSheet("QDialog{background:transparent;border:none}")
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(16, 16, 16, 12)
-        lay.setSpacing(10)
+        lay.setContentsMargins(12, 12, 12, 10)
+        lay.setSpacing(8)
 
         self._search = QLineEdit()
         self._search.setPlaceholderText("Search symbol…")
         self._search.setStyleSheet(
             f"QLineEdit{{background:{Theme.BG_INPUT};color:{Theme.TEXT};"
-            f"border:1px solid {Theme.BORDER};border-radius:10px;"
-            f"padding:11px 14px;font-size:15px}}"
+            f"border:1px solid {Theme.BORDER};border-radius:9px;"
+            f"padding:8px 12px;font-size:14px}}"
             f"QLineEdit:focus{{border-color:{Theme.ACCENT}}}")
         lay.addWidget(self._search)
 
         self._hdr = QLabel("Saved contracts")
         self._hdr.setStyleSheet(
-            f"color:{Theme.TEXT_DIM};font-size:12px;padding:0 4px")
+            f"color:{Theme.TEXT_DIM};font-size:11px;padding:0 4px")
         lay.addWidget(self._hdr)
 
         self._lst = QListWidget()
-        self._lst.setMaximumHeight(_LIST_MAX_HEIGHT)
         self._lst.setStyleSheet(
             f"QListWidget{{background:transparent;color:{Theme.TEXT};"
             f"border:none;outline:none}}"
-            f"QListWidget::item{{border-radius:10px;padding:0px;"
-            f"margin:1px 0}}"
+            f"QListWidget::item{{border-radius:10px;padding:0px}}"
             f"QListWidget::item:selected{{background:#334058}}"
             f"QListWidget::item:hover{{background:#232A3B}}")
         self._lst.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -457,6 +458,18 @@ class SymbolSearchPopup(QDialog):
         self._search.keyPressEvent = _key  # type: ignore[method-assign]
 
         self._rebuild()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        """Rounded card on a transparent window (see __init__)."""
+        from PySide6.QtGui import QPainter, QPen
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(QPen(QColor(Theme.BORDER), 1))
+        p.setBrush(QColor(Theme.BG_PANEL))
+        p.drawRoundedRect(
+            self.rect().adjusted(0, 0, -1, -1),
+            _CORNER_RADIUS, _CORNER_RADIUS)
+        p.end()
 
     # ── Public ────────────────────────────────────────────────────────────────
 
@@ -620,6 +633,14 @@ class SymbolSearchPopup(QDialog):
                 self._lst.setCurrentRow(i)
                 break
 
+        # Size the list to at most _VISIBLE_ROWS rows, using the rows'
+        # real heights so a partial row never pokes out at the bottom;
+        # more results scroll (wheel / ↑↓) behind the cut.
+        total = sum(self._lst.sizeHintForRow(i)
+                    for i in range(min(self._lst.count(), _VISIBLE_ROWS)))
+        self._lst.setFixedHeight(total)
+        self.adjustSize()
+
     def _add_fut_rows(self, root: dict) -> None:
         """Render a live futures root: its two nearest expirations as
         pickable rows once the chain has loaded, a status note before
@@ -651,7 +672,7 @@ class SymbolSearchPopup(QDialog):
         we have no logo assets, so the ticker itself fills the circle,
         font-sized down for longer tickers)."""
         text = (symbol or "?")[:4].upper()
-        size = {1: 13, 2: 13, 3: 11}.get(len(text), 9)
+        size = {1: 12, 2: 12, 3: 10}.get(len(text), 8)
         av = QLabel(text)
         av.setFixedSize(_AVATAR_PX, _AVATAR_PX)
         av.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -666,14 +687,14 @@ class SymbolSearchPopup(QDialog):
         row.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         h = QHBoxLayout(row)
-        h.setContentsMargins(10, 8, 10, 8)
-        h.setSpacing(12)
+        h.setContentsMargins(8, 6, 8, 6)
+        h.setSpacing(10)
 
         h.addWidget(self._make_avatar(entry["symbol"]))
 
         sym = QLabel(entry["symbol"])
         sym.setStyleSheet(
-            f"color:{Theme.TEXT};font-size:14px;font-weight:bold")
+            f"color:{Theme.TEXT};font-size:13px;font-weight:bold")
         h.addWidget(sym)
 
         # Company/fund name preferred; legacy saved rows without one fall
@@ -686,10 +707,10 @@ class SymbolSearchPopup(QDialog):
             exp = format_expiry(entry["expiry"])
             name_text = f"{exp}  ·  {name_text}" if name_text else exp
         name = QLabel()
-        name.setStyleSheet(f"color:{Theme.TEXT_DIM};font-size:13px")
+        name.setStyleSheet(f"color:{Theme.TEXT_DIM};font-size:12px")
         fm = QFontMetrics(name.font())
         name.setText(fm.elidedText(
-            name_text, Qt.TextElideMode.ElideRight, 320))
+            name_text, Qt.TextElideMode.ElideRight, 300))
         h.addWidget(name, 1)
 
         # Listing exchange preferred over the generic sec-type badge;
@@ -702,9 +723,9 @@ class SymbolSearchPopup(QDialog):
             badge_text = exch or entry.get("badge", "")
         badge = QLabel(badge_text)
         badge.setStyleSheet(
-            f"color:{Theme.TEXT_DIM};font-size:12px;"
-            f"border:1px solid {Theme.BORDER};border-radius:12px;"
-            f"padding:4px 14px")
+            f"color:{Theme.TEXT_DIM};font-size:11px;"
+            f"border:1px solid {Theme.BORDER};border-radius:10px;"
+            f"padding:3px 11px")
         h.addWidget(badge, 0, Qt.AlignmentFlag.AlignRight)
 
         item = QListWidgetItem()
