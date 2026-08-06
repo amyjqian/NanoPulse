@@ -2665,6 +2665,22 @@ class _HotButtonModal(QDialog):
                     self._symbol_dropdown.close()
         return super().eventFilter(obj, event)
 
+    def done(self, result: int) -> None:  # noqa: N802 – Qt override
+        # The dropdown is a floating tool window — it doesn't close with
+        # the dialog on its own (Save/Cancel/Esc/✕ all route through
+        # done()).
+        if self._symbol_dropdown is not None:
+            self._symbol_dropdown.close()
+        super().done(result)
+
+    def moveEvent(self, event) -> None:  # noqa: N802 – Qt override
+        # Dragging the dialog re-anchors a visible dropdown under the
+        # symbol field instead of leaving it floating at the old spot.
+        if (self._symbol_dropdown is not None
+                and self._symbol_dropdown.isVisible()):
+            self._symbol_dropdown.open_below(self._inp_symbol)
+        super().moveEvent(event)
+
     def _show_symbol_dropdown(self) -> None:
         """Inline live search under the symbol field — the same engine
         as the chip bars' popup (known instruments instantly,

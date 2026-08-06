@@ -94,3 +94,15 @@ def test_pick_closes_dropdown_and_keeps_field(modal, qtbot):
     assert modal._inp_symbol.text() == "NVDA"
     assert modal._symbol_dropdown is not None
     assert not modal._symbol_dropdown.isVisible()   # closed after pick
+
+
+def test_closing_dialog_closes_dropdown(modal, qtbot):
+    """Cancel/Save/Esc on the dialog must take the floating dropdown
+    down with it — it's a tool window that won't close on its own."""
+    from PySide6.QtCore import Qt
+    modal.show()
+    qtbot.waitExposed(modal)
+    qtbot.mouseClick(modal._inp_symbol, Qt.MouseButton.LeftButton)
+    assert modal._symbol_dropdown.isVisible()
+    modal.reject()                              # Cancel path → done()
+    assert not modal._symbol_dropdown.isVisible()
