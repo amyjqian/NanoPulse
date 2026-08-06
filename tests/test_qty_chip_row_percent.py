@@ -437,3 +437,23 @@ class TestTickPriceInputStepping:
         assert w.text() == "100.25"
         qtbot.keyClick(w._edit, _Qt.Key.Key_Down)
         assert w.text() == "100"
+
+    def test_escape_clears_value(self, qtbot):
+        from PySide6.QtCore import Qt as _Qt
+        w = self._make(qtbot)
+        w.setText("0.75")
+        fired = []
+        w.textChanged.connect(fired.append)
+        qtbot.keyClick(w._edit, _Qt.Key.Key_Escape)
+        assert w.text() == ""
+        # The clear must reach the host tier section so it disarms.
+        assert fired and fired[-1] == ""
+        # Empty field: Esc is NOT swallowed (bubbles to the window).
+        qtbot.keyClick(w._edit, _Qt.Key.Key_Escape)
+        assert w.text() == ""
+
+    def test_inline_clear_button_enabled(self, qtbot):
+        # One-click "x" disarm, mirroring click-again-to-unselect on
+        # the preset chips.
+        w = self._make(qtbot)
+        assert w._edit.isClearButtonEnabled()
