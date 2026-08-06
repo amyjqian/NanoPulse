@@ -1967,27 +1967,21 @@ class _HotButtonModal(QDialog):
         sub.setStyleSheet(f"color:{Theme.TEXT_DIM}; font-size:9px;")
         lbl_box.addWidget(nm)
         lbl_box.addWidget(sub)
-        val = QLineEdit("80", parent)
-        val.setValidator(QDoubleValidator(0.0, 1e9, 4, parent))
-        val.setStyleSheet(self._INPUT_QSS)
-        val.setFixedHeight(28)
+        # Same minimal input as the panels' Dist fields: one rounded
+        # box, no arrows/popup, wheel + ↑/↓ step by the target symbol's
+        # tick, trailing zeros stripped ("80", never "80.0").  The old
+        # "$ price" unit label is gone — the value is always a dollar
+        # offset.
+        val = TickPriceInput(parent)
+        val.setText("80")
+        val.setPlaceholderText("")
         val.setFixedWidth(80)
         val.textChanged.connect(
             lambda t, k=key: self._on_bracket_value_changed(k, t))
-        # Static "$ price" label — replaces the previous unit dropdown
-        # since the only supported unit is absolute dollar offset.
-        unit_lbl = QLabel("$ price", parent)
-        unit_lbl.setStyleSheet(
-            f"color:{Theme.TEXT_DIM}; font-size:11px;"
-            " padding:0 6px;")
-        unit_lbl.setFixedWidth(70)
-        unit_lbl.setAlignment(Qt.AlignmentFlag.AlignVCenter
-                              | Qt.AlignmentFlag.AlignLeft)
         row.addWidget(chk)
         row.addLayout(lbl_box, stretch=1)
         row.addWidget(val)
-        row.addWidget(unit_lbl)
-        return {"row": row, "chk": chk, "val": val, "unit_lbl": unit_lbl,
+        return {"row": row, "chk": chk, "val": val,
                 "name": nm, "sub": sub}
 
     def _preview_row(self) -> QFrame:
@@ -2153,10 +2147,15 @@ class _HotButtonModal(QDialog):
             w["chk"].blockSignals(True)
             w["chk"].setChecked(bool(leg.get("on", False)))
             w["chk"].blockSignals(False)
+            try:
+                leg_txt = f"{float(leg.get('v', 80)):g}"   # 80, not 80.0
+            except (TypeError, ValueError):
+                leg_txt = "80"
             w["val"].blockSignals(True)
-            w["val"].setText(str(leg.get("v", 80)))
+            w["val"].setText(leg_txt)
             w["val"].blockSignals(False)
             self._restyle_bracket_row(key)
+        self._update_bracket_ticks()
         # Limit-anchor row faded when MKT.  Also covers the CANCEL
         # case (which hides everything order-type-related).
         self._update_side_dependent_state()
@@ -2256,6 +2255,8 @@ class _HotButtonModal(QDialog):
         # (programmatic setText — draft load, pick adoption — doesn't).
         if self._inp_symbol.hasFocus() and not self._suppress_dropdown:
             self._show_symbol_dropdown()
+        # Bracket inputs step by the new target symbol's tick.
+        self._update_bracket_ticks()
         if self._draft["symbol"]:
             self._seg_sym_mode.set_selected("specific")
         # Auto-fill QTY from trading prefs when the symbol resolves to
@@ -2511,6 +2512,41 @@ class _HotButtonModal(QDialog):
             self._label_user_edited = text != self._compute_auto_label()
         self._update_preview()
 
+    def _bracket_tick(self) -> float:
+        """Step size for the TP/SL/Trailing dollar-offset inputs —
+        resolved from the draft's target symbol: captured min_tick →
+        canonical futures table → sec-type fallback (FUT 0.25,
+        STK/OPT 0.01) → whole dollars when the symbol is unknown or
+        DEFAULT-mode."""
+        meta = self._draft.get("contract") or {}
+        try:
+            mt = float(meta.get("min_tick") or 0)
+            if mt > 0:
+                return mt
+        except (TypeError, ValueError):
+            pass
+        sym = str(self._draft.get("symbol", "") or "").strip().upper()
+        if sym:
+            from src.core import instruments
+            from src.utils.helpers import _FUT_TICK_SIZES
+            mt = instruments.get_min_tick(sym)
+            if mt:
+                return mt
+            if sym in _FUT_TICK_SIZES:
+                return _FUT_TICK_SIZES[sym]
+            sec = (str(meta.get("sec_type") or "")
+                   or instruments.get_sec_type(sym))
+            if sec == "FUT":
+                return 0.25
+            if sec in ("STK", "OPT"):
+                return 0.01
+        return 1.0
+
+    def _update_bracket_ticks(self) -> None:
+        tick = self._bracket_tick()
+        for w in (self._tp_widgets, self._sl_widgets, self._tr_widgets):
+            w["val"].set_market_price(0.0, tick)
+
     def _on_bracket_toggled(self, key: str, on: bool) -> None:
         self._draft[key]["on"] = bool(on)
         self._restyle_bracket_row(key)
@@ -2544,7 +2580,7 @@ class _HotButtonModal(QDialog):
         # QSS opacity isn't supported per-rule; use enable/disable +
         # palette swap instead.
         w["val"].setEnabled(on)
-        # Dim the labels (and the static "$ price" tail) when off.
+        # Dim the labels when off.
         if on:
             colour = {"tp": Theme.CLR_BUY, "sl": Theme.CLR_SELL,
                       "tr": Theme.CLR_CLOSE}[key]
@@ -2552,14 +2588,10 @@ class _HotButtonModal(QDialog):
                 f"color:{colour}; font-size:11px; font-weight:bold;")
             w["sub"].setStyleSheet(
                 f"color:{Theme.TEXT_DIM}; font-size:9px;")
-            w["unit_lbl"].setStyleSheet(
-                f"color:{Theme.TEXT_DIM}; font-size:11px; padding:0 6px;")
         else:
             w["name"].setStyleSheet(
                 "color:#6A7690; font-size:11px; font-weight:bold;")
             w["sub"].setStyleSheet("color:#334058; font-size:9px;")
-            w["unit_lbl"].setStyleSheet(
-                "color:#334058; font-size:11px; padding:0 6px;")
 
     def _update_limit_row_state(self) -> None:
         is_lmt = self._draft.get("ord_type") == "LMT"

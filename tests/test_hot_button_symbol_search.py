@@ -106,3 +106,31 @@ def test_closing_dialog_closes_dropdown(modal, qtbot):
     assert modal._symbol_dropdown.isVisible()
     modal.reject()                              # Cancel path → done()
     assert not modal._symbol_dropdown.isVisible()
+
+
+def test_bracket_inputs_are_tick_steppers_without_unit_label(modal):
+    """TP/SL/TS value inputs use the shared TickPriceInput (rounded box,
+    wheel/arrow stepping, no '$ price' label, no trailing zeros)."""
+    from src.ui.widgets.order_entry_panel import TickPriceInput
+    for w in (modal._tp_widgets, modal._sl_widgets, modal._tr_widgets):
+        assert isinstance(w["val"], TickPriceInput)
+        assert "unit_lbl" not in w
+        assert w["val"].text() == "80"          # not "80.0"
+
+
+def test_bracket_tick_follows_target_symbol(modal):
+    # Unknown / DEFAULT-mode symbol → whole-dollar steps.
+    assert modal._bracket_tick() == 1.0
+    # Picked future with captured min_tick → its tick.
+    modal._draft["symbol"] = "MNQ"
+    modal._draft["contract"] = {"conid": "1", "sec_type": "FUT",
+                                "min_tick": 0.25}
+    assert modal._bracket_tick() == 0.25
+    # Known futures root without metadata → canonical table.
+    modal._draft["contract"] = {}
+    modal._draft["symbol"] = "PL"
+    assert modal._bracket_tick() == 0.10
+    # Stock metadata → cent steps.
+    modal._draft["symbol"] = "NVDA"
+    modal._draft["contract"] = {"conid": "2", "sec_type": "STK"}
+    assert modal._bracket_tick() == 0.01
