@@ -41,8 +41,9 @@ log = logging.getLogger(__name__)
 # Debounce between the last keystroke and the reqMatchingSymbols call.
 # IB rate-limits matching-symbol requests to ~1 per second.
 _SEARCH_DEBOUNCE_MS = 500
-_POPUP_WIDTH = 420
-_LIST_MAX_HEIGHT = 320
+_POPUP_WIDTH = 560
+_LIST_MAX_HEIGHT = 420
+_AVATAR_PX = 36          # circular ticker monogram diameter
 
 
 def connected_workers_by_priority(active_threads: dict) -> list:
@@ -393,24 +394,24 @@ class SymbolSearchPopup(QDialog):
         self.setFixedWidth(_POPUP_WIDTH)
         self.setStyleSheet(
             f"QDialog{{background:{Theme.BG_PANEL};"
-            f"border:1px solid {Theme.BORDER};border-radius:8px}}")
+            f"border:1px solid {Theme.BORDER};border-radius:14px}}")
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(10, 10, 10, 10)
-        lay.setSpacing(6)
+        lay.setContentsMargins(16, 16, 16, 12)
+        lay.setSpacing(10)
 
         self._search = QLineEdit()
         self._search.setPlaceholderText("Search symbol…")
         self._search.setStyleSheet(
             f"QLineEdit{{background:{Theme.BG_INPUT};color:{Theme.TEXT};"
-            f"border:1px solid {Theme.BORDER};border-radius:6px;"
-            f"padding:8px 10px;font-size:14px}}"
+            f"border:1px solid {Theme.BORDER};border-radius:10px;"
+            f"padding:11px 14px;font-size:15px}}"
             f"QLineEdit:focus{{border-color:{Theme.ACCENT}}}")
         lay.addWidget(self._search)
 
         self._hdr = QLabel("Saved contracts")
         self._hdr.setStyleSheet(
-            f"color:{Theme.TEXT_DIM};font-size:11px;padding:2px 2px 0 2px")
+            f"color:{Theme.TEXT_DIM};font-size:12px;padding:0 4px")
         lay.addWidget(self._hdr)
 
         self._lst = QListWidget()
@@ -418,10 +419,20 @@ class SymbolSearchPopup(QDialog):
         self._lst.setStyleSheet(
             f"QListWidget{{background:transparent;color:{Theme.TEXT};"
             f"border:none;outline:none}}"
-            f"QListWidget::item{{border-radius:6px;padding:0px}}"
+            f"QListWidget::item{{border-radius:10px;padding:0px;"
+            f"margin:1px 0}}"
             f"QListWidget::item:selected{{background:#334058}}"
             f"QListWidget::item:hover{{background:#232A3B}}")
         self._lst.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        # No scrollbars — the list scrolls with the mouse wheel /
+        # trackpad, and ↑/↓ step the selection (wired on the search box).
+        self._lst.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._lst.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        from PySide6.QtWidgets import QAbstractItemView
+        self._lst.setVerticalScrollMode(
+            QAbstractItemView.ScrollMode.ScrollPerPixel)
         lay.addWidget(self._lst)
 
         self._debounce = QTimer(self)
@@ -634,17 +645,35 @@ class SymbolSearchPopup(QDialog):
                 "badge": "FUT",
             })
 
+    @staticmethod
+    def _make_avatar(symbol: str) -> QLabel:
+        """Circular ticker monogram (the reference design's logo slot —
+        we have no logo assets, so the ticker itself fills the circle,
+        font-sized down for longer tickers)."""
+        text = (symbol or "?")[:4].upper()
+        size = {1: 13, 2: 13, 3: 11}.get(len(text), 9)
+        av = QLabel(text)
+        av.setFixedSize(_AVATAR_PX, _AVATAR_PX)
+        av.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        av.setStyleSheet(
+            f"background:#2A3245;color:{Theme.TEXT};"
+            f"border:none;border-radius:{_AVATAR_PX // 2}px;"
+            f"font-size:{size}px;font-weight:700")
+        return av
+
     def _add_row(self, entry: dict) -> None:
         row = QWidget()
         row.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         h = QHBoxLayout(row)
-        h.setContentsMargins(10, 7, 10, 7)
-        h.setSpacing(10)
+        h.setContentsMargins(10, 8, 10, 8)
+        h.setSpacing(12)
+
+        h.addWidget(self._make_avatar(entry["symbol"]))
 
         sym = QLabel(entry["symbol"])
         sym.setStyleSheet(
-            f"color:{Theme.TEXT};font-size:13px;font-weight:bold")
+            f"color:{Theme.TEXT};font-size:14px;font-weight:bold")
         h.addWidget(sym)
 
         # Company/fund name preferred; legacy saved rows without one fall
@@ -657,10 +686,10 @@ class SymbolSearchPopup(QDialog):
             exp = format_expiry(entry["expiry"])
             name_text = f"{exp}  ·  {name_text}" if name_text else exp
         name = QLabel()
-        name.setStyleSheet(f"color:{Theme.TEXT_DIM};font-size:12px")
+        name.setStyleSheet(f"color:{Theme.TEXT_DIM};font-size:13px")
         fm = QFontMetrics(name.font())
         name.setText(fm.elidedText(
-            name_text, Qt.TextElideMode.ElideRight, 230))
+            name_text, Qt.TextElideMode.ElideRight, 320))
         h.addWidget(name, 1)
 
         # Listing exchange preferred over the generic sec-type badge;
@@ -673,9 +702,9 @@ class SymbolSearchPopup(QDialog):
             badge_text = exch or entry.get("badge", "")
         badge = QLabel(badge_text)
         badge.setStyleSheet(
-            f"color:{Theme.TEXT_DIM};font-size:11px;"
-            f"border:1px solid {Theme.BORDER};border-radius:4px;"
-            f"padding:2px 8px")
+            f"color:{Theme.TEXT_DIM};font-size:12px;"
+            f"border:1px solid {Theme.BORDER};border-radius:12px;"
+            f"padding:4px 14px")
         h.addWidget(badge, 0, Qt.AlignmentFlag.AlignRight)
 
         item = QListWidgetItem()
