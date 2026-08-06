@@ -1806,6 +1806,7 @@ def _hot_button_default_draft() -> dict:
         "label": "",
         "tp": {"on": False, "v": 80.0, "u": "abs"},
         "sl": {"on": False, "v": 80.0, "u": "abs"},
+        "tr": {"on": False, "v": 80.0, "u": "abs"},
         "disabled": False,
     }
 
@@ -1813,7 +1814,8 @@ def _hot_button_default_draft() -> dict:
 def _auto_hot_button_label(side: str, qty: str, sym: str,
                            ord_type: str, anchor: str, offset: int,
                            tp: dict | None = None,
-                           sl: dict | None = None) -> str:
+                           sl: dict | None = None,
+                           tr: dict | None = None) -> str:
     """Generate the auto-label shown when the user leaves the label
     field blank.
 
@@ -1832,6 +1834,10 @@ def _auto_hot_button_label(side: str, qty: str, sym: str,
       * Take-profit / stop-loss values are appended only when their
         respective leg toggle is on.  When both are on they're joined
         with ``" - "`` so the label reads e.g. ``NQ @MKT 80 - 50``.
+        An armed Trailing leg appends a third value (``80 - 50 - 25``)
+        — appended ONLY when on, so pre-existing two-leg auto-labels
+        keep matching :meth:`_HotButtonModal._compute_auto_label` and
+        aren't misread as user-edited labels.
     Falls back to ``QTY`` / ``SYM`` placeholders so the preview still
     reads naturally before the user picks values.
     """
@@ -1882,6 +1888,10 @@ def _auto_hot_button_label(side: str, qty: str, sym: str,
         bracket = f"{_fmt_leg_value(tp)} - {_fmt_leg_value(sl)}"
     else:
         bracket = ""
+    if _leg_active(tr):
+        # Third value only when armed (backwards-compatible labels).
+        bracket = (f"{bracket} - {_fmt_leg_value(tr)}" if bracket
+                   else f"0 - 0 - {_fmt_leg_value(tr)}")
 
     chunks = [c for c in (qty_part, sym_part, venue, bracket) if c]
     return " ".join(chunks)
@@ -1931,6 +1941,8 @@ class _HotButtonModal(QDialog):
             "tp", {"on": False, "v": 80.0, "u": "abs"}))
         self._draft["sl"] = dict(self._draft.get(
             "sl", {"on": False, "v": 80.0, "u": "abs"}))
+        self._draft["tr"] = dict(self._draft.get(
+            "tr", {"on": False, "v": 80.0, "u": "abs"}))
         self._edit_mode = edit_mode
         # Force the SYMBOL / QTY mode segments to "specific" with empty
         # inputs even when the draft has no value — used by Add mode so
@@ -2232,8 +2244,12 @@ class _HotButtonModal(QDialog):
         self._sl_widgets = self._build_bracket_row(
             "Stop Loss", "stop · opposite side · same qty",
             Theme.CLR_SELL, "sl", card)
+        self._tr_widgets = self._build_bracket_row(
+            "Trailing", "trailing stop · opposite side · same qty",
+            Theme.CLR_CLOSE, "tr", card)
         lay.addLayout(self._tp_widgets["row"])
         lay.addLayout(self._sl_widgets["row"])
+        lay.addLayout(self._tr_widgets["row"])
         return card
 
     def _build_bracket_row(self, name: str, sublabel: str,
@@ -2430,7 +2446,8 @@ class _HotButtonModal(QDialog):
             bool(saved_label) and saved_label != auto_now)
         # Brackets — only the toggle + dollar value are user-editable
         # now (unit is fixed at "abs").
-        for key, w in (("tp", self._tp_widgets), ("sl", self._sl_widgets)):
+        for key, w in (("tp", self._tp_widgets), ("sl", self._sl_widgets),
+                       ("tr", self._tr_widgets)):
             leg = d.get(key, {})
             # Force the unit to the only supported option so any old
             # ticks / % drafts upgrade cleanly.
@@ -2468,6 +2485,7 @@ class _HotButtonModal(QDialog):
             offset=int(d.get("offset", 0) or 0),
             tp=d.get("tp"),
             sl=d.get("sl"),
+            tr=d.get("tr"),
         )
 
     def _refresh_auto_label_field(self) -> None:
@@ -2764,14 +2782,16 @@ class _HotButtonModal(QDialog):
             " font-weight:bold; font-size:10px; letter-spacing:1px; }}")
 
     def _restyle_bracket_row(self, key: str) -> None:
-        w = self._tp_widgets if key == "tp" else self._sl_widgets
+        w = {"tp": self._tp_widgets, "sl": self._sl_widgets,
+             "tr": self._tr_widgets}[key]
         on = self._draft[key]["on"]
         # QSS opacity isn't supported per-rule; use enable/disable +
         # palette swap instead.
         w["val"].setEnabled(on)
         # Dim the labels (and the static "$ price" tail) when off.
         if on:
-            colour = (Theme.CLR_BUY if key == "tp" else Theme.CLR_SELL)
+            colour = {"tp": Theme.CLR_BUY, "sl": Theme.CLR_SELL,
+                      "tr": Theme.CLR_CLOSE}[key]
             w["name"].setStyleSheet(
                 f"color:{colour}; font-size:11px; font-weight:bold;")
             w["sub"].setStyleSheet(
@@ -2817,7 +2837,7 @@ class _HotButtonModal(QDialog):
         # Auto label when blank.
         text = label or _auto_hot_button_label(
             side, qty, sym, ord_type, anchor, offset,
-            tp=d.get("tp"), sl=d.get("sl"))
+            tp=d.get("tp"), sl=d.get("sl"), tr=d.get("tr"))
         colour = _HOT_BUTTON_COLOURS.get(side, Theme.CLR_BUY)
         self._preview_btn.setText(text)
         self._preview_btn.setStyleSheet(
@@ -2851,6 +2871,8 @@ class _HotButtonModal(QDialog):
             attached.append(self._fmt_leg("TP", d["tp"]))
         if d["sl"]["on"]:
             attached.append(self._fmt_leg("SL", d["sl"]))
+        if d["tr"]["on"]:
+            attached.append(self._fmt_leg("TS", d["tr"]))
         if attached:
             summary += "\n↳ attached: " + " · ".join(attached)
         self._preview_line.setText(summary)
@@ -3347,6 +3369,7 @@ class OrderEntryPanel(QWidget):
             offset=int(entry.get("offset", 0) or 0),
             tp=entry.get("tp"),
             sl=entry.get("sl"),
+            tr=entry.get("tr"),
         )
         is_disabled = bool(entry.get("disabled", False))
         # Disabled buttons render in a neutral grey so the user sees the
@@ -3721,14 +3744,15 @@ class OrderEntryPanel(QWidget):
         # ── Attached brackets ─────────────────────────────────────────────
         payload["profit_take"] = self._bracket_payload(entry.get("tp"))
         payload["stop_loss"] = self._bracket_payload(entry.get("sl"))
-        payload["trailing"] = None  # hot buttons don't expose a trail leg
+        payload["trailing"] = self._bracket_payload(entry.get("tr"))
 
         log.info(
             "HotButton[%d]: emit order side=%s qty=%d sym=%s type=%s "
-            "limit=%s tp=%s sl=%s",
+            "limit=%s tp=%s sl=%s tr=%s",
             index, side, qty, sym, payload.get("type"),
             payload.get("limit_price"),
-            payload.get("profit_take"), payload.get("stop_loss"))
+            payload.get("profit_take"), payload.get("stop_loss"),
+            payload.get("trailing"))
         self.order_requested.emit(payload)
 
     @staticmethod

@@ -40,6 +40,7 @@ class HotButton:
     label: str                      # '' = auto-generate from other fields
     tp: BracketLeg                  # take-profit attached order
     sl: BracketLeg                  # stop-loss attached order
+    tr: BracketLeg                  # trailing-stop attached order
 
 @dataclass
 class BracketLeg:
@@ -148,12 +149,13 @@ A modal dialog (`QDialog` with custom layout). Title: `Add Hot Button` or `Edit 
 #### Attached orders block (bordered card)
 Header: `Attached Orders — sent as bracket on fill`
 
-Two rows, each: `[switch] [name + sublabel] [value input] [unit dropdown]`
+Three rows, each: `[switch] [name + sublabel] [value input] [unit dropdown]`
 
 | | Name | Sublabel | Default | Units |
 |---|---|---|---|---|
 | TP | Take Profit | `limit · opposite side · same qty` | 80 | `ticks`, `%`, `$ price` |
 | SL | Stop Loss | `stop · opposite side · same qty` | 80 | same |
+| TS | Trailing | `trailing stop · opposite side · same qty` | 80 | same (value = trail distance) |
 
 Switch off → row fades to 0.45 opacity, inputs disabled.
 
@@ -161,7 +163,7 @@ Switch off → row fades to 0.45 opacity, inputs disabled.
 - Renders an actual hot-button-styled tile reflecting current draft state.
 - Below it, summary line: `BUY 100 NQM6 · LMT @ Bid + 0t · group Live · Futures`
   > ⚠ No `· DAY` segment in the summary anymore (TIF removed).
-- If TP or SL is on, append: `· attached TP 80t · SL 80t`
+- If TP, SL or TS is on, append: `· attached TP 80t · SL 80t · TS 25t`
 
 #### Footer
 `[ Delete ]` (left, only in edit mode) ........ `[ Cancel ] [ Save ]` (right)
@@ -181,6 +183,7 @@ class HotButtonModal(QDialog):
             ord_type='LMT', anchor='BID', offset=0, label='',
             tp=BracketLeg(on=False, v=80, u='ticks'),
             sl=BracketLeg(on=False, v=80, u='ticks'),
+            tr=BracketLeg(on=False, v=80, u='ticks'),
         )
 ```
 

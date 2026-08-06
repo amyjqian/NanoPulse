@@ -657,6 +657,7 @@ def _normalise_hot_button(entry: Any) -> dict[str, Any] | None:
         "label": str(entry.get("label", "") or ""),
         "tp": _normalise_hot_button_leg(entry.get("tp")),
         "sl": _normalise_hot_button_leg(entry.get("sl")),
+        "tr": _normalise_hot_button_leg(entry.get("tr")),
         # Set when a saved contract referenced by this button is deleted
         # without a replacement.  Disabled buttons render greyed-out and
         # ignore clicks until the user re-edits them or a replacement

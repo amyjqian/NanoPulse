@@ -180,3 +180,48 @@ def test_cache_invalidates_on_config_write(cfg):
     # A write through config_manager must be visible immediately.
     cm.save_order_entry_entries([dict(_MNQ)])
     assert instruments.get_contract("MNQ")["conid"] == "793356225"
+
+
+class TestHotButtonTrailingLeg:
+    """The TS bracket leg persists like TP/SL and reaches the order
+    payload; legacy entries without it gain a default-off leg."""
+
+    def test_tr_leg_round_trips(self, cfg):
+        cm.save_hot_buttons([{
+            "side": "BUY", "symbol": "MNQ",
+            "tr": {"on": True, "v": 25.0, "u": "abs"},
+        }])
+        (btn,) = cm.load_hot_buttons()
+        assert btn["tr"] == {"on": True, "v": 25.0, "u": "abs"}
+
+    def test_legacy_entry_gains_default_off_leg(self, cfg):
+        cm.save_hot_buttons([{"side": "SELL", "symbol": "ES"}])
+        (btn,) = cm.load_hot_buttons()
+        assert btn["tr"] == {"on": False, "v": 80.0, "u": "abs"}
+
+    def test_bracket_payload_maps_tr_leg(self):
+        from src.ui.widgets.order_entry_panel import OrderEntryPanel
+        f = OrderEntryPanel._bracket_payload
+        assert f({"on": True, "v": 25, "u": "abs"}) == {
+            "value": 25.0, "unit": "price", "label": "HotButton"}
+        assert f({"on": False, "v": 25, "u": "abs"}) is None
+        assert f(None) is None
+
+    def test_auto_label_third_value_only_when_armed(self):
+        from src.ui.widgets.order_entry_panel import _auto_hot_button_label
+        base = dict(side="BUY", qty="2", sym="NQ", ord_type="MKT",
+                    anchor="MID", offset=0)
+        on = {"on": True, "v": 80, "u": "abs"}
+        sl = {"on": True, "v": 50, "u": "abs"}
+        off = {"on": False, "v": 80, "u": "abs"}
+        # Backwards compatible: tr off → identical two-value label.
+        assert _auto_hot_button_label(**base, tp=on, sl=sl, tr=off) == \
+            _auto_hot_button_label(**base, tp=on, sl=sl)
+        # Armed tr appends the third value.
+        assert _auto_hot_button_label(
+            **base, tp=on, sl=sl,
+            tr={"on": True, "v": 25, "u": "abs"}).endswith("80 - 50 - 25")
+        # tr-only still renders the full triple so the armed side shows.
+        assert _auto_hot_button_label(
+            **base, tp=off, sl=off,
+            tr={"on": True, "v": 25, "u": "abs"}).endswith("0 - 0 - 25")
