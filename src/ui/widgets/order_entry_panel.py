@@ -440,7 +440,12 @@ class TickPriceInput(QWidget):
             return max(0, -int(math.floor(math.log10(self._tick_size))))
 
     def _fmt(self, price: float) -> str:
-        return f"{price:.{self._decimals()}f}"
+        """Tick-precision format with trailing zeros stripped — the MNQ
+        distance ladder reads 0.25, 0.5, 0.75, 1, 1.25 … (never 2.00)."""
+        text = f"{price:.{self._decimals()}f}"
+        if "." in text:
+            text = text.rstrip("0").rstrip(".")
+        return text
 
     def _snap_to_tick(self) -> None:
         """If the field holds a non-tick-aligned number, round it to the nearest tick."""

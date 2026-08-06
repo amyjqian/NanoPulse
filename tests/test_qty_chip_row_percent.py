@@ -406,10 +406,10 @@ class TestTickPriceInputStepping:
         w.wheelEvent(_FakeWheel(120))
         assert w.text() == "100.25"
         w.wheelEvent(_FakeWheel(-120))
-        assert w.text() == "100.00"
+        assert w.text() == "100"       # trailing zeros stripped
         # Trackpad deltas accumulate into one step.
         w.wheelEvent(_FakeWheel(60))
-        assert w.text() == "100.00"
+        assert w.text() == "100"
         w.wheelEvent(_FakeWheel(60))
         assert w.text() == "100.25"
 
@@ -420,7 +420,7 @@ class TestTickPriceInputStepping:
         w.wheelEvent(_FakeWheel(120))
         assert w.text() == "0.25"
         w.wheelEvent(_FakeWheel(120))
-        assert w.text() == "0.50"
+        assert w.text() == "0.5"       # trailing zero stripped
         # Down floors at one tick; from empty it stays empty.
         w.wheelEvent(_FakeWheel(-120))
         w.wheelEvent(_FakeWheel(-120))
@@ -436,4 +436,4 @@ class TestTickPriceInputStepping:
         qtbot.keyClick(w._edit, _Qt.Key.Key_Up)
         assert w.text() == "100.25"
         qtbot.keyClick(w._edit, _Qt.Key.Key_Down)
-        assert w.text() == "100.00"
+        assert w.text() == "100"
