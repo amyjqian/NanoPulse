@@ -177,10 +177,37 @@ def display_exchange(code: str) -> str:
     return _EXCHANGE_DISPLAY.get(code.upper(), code)
 
 
+def _match_rank(e: dict, q: str) -> int | None:
+    """Relevance of row *e* for query *q* — lower is better:
+
+    0. exact symbol match ("ES" → ES)
+    1. symbol prefix match ("ES" → ESRX, ESLT)
+    2. name/detail substring — but only for 3+ character queries, so a
+       short query like "ES" can't drag in every "iShar**ES**" /
+       "S**ERIES**" fund by name.
+    ``None`` = no match (row is hidden).
+    """
+    sym = (e.get("symbol") or "").upper()
+    if sym == q:
+        return 0
+    if sym.startswith(q):
+        return 1
+    if len(q) >= 3:
+        hay = f"{e.get('name') or ''} {e.get('detail') or ''}".upper()
+        if q in hay:
+            return 2
+    return None
+
+
 def merge_rows(local_entries: list[dict], remote: list[dict],
                exclude: set[str], query: str
                ) -> tuple[list[dict], list[dict], list[str]]:
     """Merge saved-contract rows with live IBKR matches for display.
+
+    Rows are relevance-ranked via :func:`_match_rank` — exact symbol
+    matches first, then symbol prefixes, then name hits — and among
+    equally-ranked remote rows futures lead (this is a trading app;
+    typing "es" means the E-mini before Eversource Energy).
 
     Returns ``(locals_shown, remote_shown, already_added)``.  Remote
     rows are deduped against the shown locals by **conId** — never by
@@ -195,12 +222,13 @@ def merge_rows(local_entries: list[dict], remote: list[dict],
     caller can explain why those rows are hidden.
     """
     q = query.strip().upper()
-    locals_shown = [
-        e for e in local_entries
-        if not q or q in e["symbol"].upper()
-        or q in (e.get("name") or "").upper()
-        or q in (e.get("detail") or "").upper()
-    ]
+    if q:
+        ranked = [(_match_rank(e, q), e) for e in local_entries]
+        ranked = [(r, e) for r, e in ranked if r is not None]
+        ranked.sort(key=lambda t: t[0])          # stable — keeps saved order
+        locals_shown = [e for _r, e in ranked]
+    else:
+        locals_shown = list(local_entries)
     # Live futures roots always show their front expirations — even when
     # the root is already saved or on the chip bar — so the user can
     # switch the active expiration.  The saved per-expiry rows (and the
@@ -244,6 +272,15 @@ def merge_rows(local_entries: list[dict], remote: list[dict],
             if not e.get("primary_exchange"):
                 e["primary_exchange"] = r.get("primary_exchange", "")
         enriched.append(e)
+
+    # Relevance-order the remote rows: exact symbol > prefix > name hit
+    # (IB's fuzzy matches without any visible relation rank last), and
+    # futures before stocks within a rank.  Stable sort keeps IB's
+    # relevance order inside each group.
+    if q:
+        remote_shown.sort(key=lambda r: (
+            _match_rank(r, q) if _match_rank(r, q) is not None else 3,
+            r.get("sec_type") != "FUT"))
 
     already_added = sorted(s for s in exclude
                            if q and s.startswith(q)

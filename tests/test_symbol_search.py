@@ -109,6 +109,38 @@ class TestMergeRows:
         locals_shown, _, _ = merge_rows(local, [], set(), "amz")
         assert [e["symbol"] for e in locals_shown] == ["AMZN"]
 
+    def test_short_query_does_not_match_names(self):
+        """Searching "es" must not drag in every fund whose NAME contains
+        the letters (iShar**ES**, QQQ Trust S**ERIES** 1)."""
+        local = [
+            _local_row(symbol="IWM", name="ISHARES RUSSELL 2000 ETF"),
+            _local_row(symbol="QQQ", name="INVESCO QQQ TRUST SERIES 1"),
+            _local_row(symbol="ES", sec_type="FUT", name="E-mini S&P 500"),
+        ]
+        locals_shown, _, _ = merge_rows(local, [], set(), "es")
+        assert [e["symbol"] for e in locals_shown] == ["ES"]
+        # 3+ character queries still search names.
+        locals_shown, _, _ = merge_rows(local, [], set(), "russell")
+        assert [e["symbol"] for e in locals_shown] == ["IWM"]
+
+    def test_remote_ranked_exact_then_prefix_futures_first(self):
+        """The "es" scenario: the ES future must lead — before the ES
+        stock (Eversource), before prefix matches (ESRX/ESLT), before
+        IB fuzzy matches with no visible relation."""
+        remote = [
+            _remote_row(symbol="VGSX", conid=1),                 # fuzzy noise
+            _remote_row(symbol="ESRX", conid=2),                 # prefix
+            _remote_row(symbol="ES", conid=3),                   # exact STK
+            {**_remote_row(symbol="ES", conid=4), "sec_type": "FUT"},
+            _remote_row(symbol="ESLT", conid=5),                 # prefix
+        ]
+        _, remote_shown, _ = merge_rows([], remote, set(), "es")
+        assert [(r["symbol"], r["sec_type"]) for r in remote_shown] == [
+            ("ES", "FUT"), ("ES", "STK"),
+            ("ESRX", "STK"), ("ESLT", "STK"),
+            ("VGSX", "STK"),
+        ]
+
     def test_live_fut_root_supersedes_saved_chain_rows(self):
         """A live FUT root always shows (it expands into pickable
         expirations) — the saved per-expiry rows step aside."""
