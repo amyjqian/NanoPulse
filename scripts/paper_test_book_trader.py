@@ -40,10 +40,11 @@ def _log(m: str) -> None:
 
 def main() -> int:
     # Reference data must have MNQ so subscribe_depth can resolve the contract.
-    _rd().reload_contracts()
-    rows = _rd().contracts_by_symbol.get(TEST_SYMBOL, [])
+    from src.core import instruments
+    c = instruments.get_contract(TEST_SYMBOL)
+    rows = [c] if c else []
     if not rows:
-        _log(f"no MNQ contract in local DB — add one via Contracts tab first")
+        _log(f"no MNQ contract on any chip — add one via the symbol search first")
         return 1
     _log(f"cache hit: MNQ conid={rows[0].get('conid')} "
          f"exchange={rows[0].get('exchange')} "

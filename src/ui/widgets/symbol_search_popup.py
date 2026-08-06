@@ -3,15 +3,13 @@
 Shared by Book Trader's ticker "+" button and OrderEntryPanel's chip-bar
 "+" button.  Two result sources merge into one list:
 
-  * **Saved contracts** (ReferenceData) — shown instantly, works with no
-    TWS connection.  This keeps futures/options chips addable exactly as
-    before.
+  * **Known instruments** (chip / hot-button entries) — shown instantly,
+    works with no TWS connection.
   * **Live IBKR matches** (``reqMatchingSymbols``) — as the user types,
     a debounced search runs on the highest-priority connected worker and
-    STK matches stream in below the saved ones.  Picking one auto-saves
-    the contract to the Contracts universe (SQLite) so the ladder /
-    order paths can resolve it — the user never has to visit the
-    Contracts tab first.
+    STK matches stream in below the saved ones.  Picking one hands its
+    qualified contract metadata to the host, which stores it on the new
+    chip entry — the chip owns its contract identity.
 
 Keyboard: Up/Down navigate, Enter adds the highlighted row, Esc closes
 (Popup window flag also closes on outside click).
@@ -156,40 +154,6 @@ def pick_front_expiries(chain: list[dict], count: int = 2,
     return [r for _d, r in dated[:count]]
 
 
-def save_future_chain(results: list[dict], root_name: str = "") -> str:
-    """Persist a reqContractDetails month chain for a futures root.
-
-    Keeps USD FUT rows only, dedupes by conId against the stored
-    universe, and saves the whole chain — ``pick_active_contract``
-    then resolves the root to the front month exactly like a chain
-    added from the Contracts tab.  Returns the root symbol ("" when
-    the chain had no usable rows).
-    """
-    rows = [r for r in results
-            if r.get("sec_type") == "FUT"
-            and (r.get("currency") or "").upper() == "USD"]
-    if not rows:
-        return ""
-    sym = (rows[0].get("symbol") or "").strip().upper()
-    existing = config_manager.load_contracts()
-    have = {str(c.get("conid", "")) for c in existing if c.get("conid")}
-    added = 0
-    for r in rows:
-        cid = str(r.get("conid", "") or "")
-        if not cid or cid in have:
-            continue
-        have.add(cid)
-        existing.append({**r, "name": root_name})
-        added += 1
-    if added:
-        config_manager.save_contracts(existing)
-        from src.core.reference_data import get_instance as _rd
-        _rd().reload_contracts()
-        log.info("SymbolSearch: saved %d %s futures contract(s) from "
-                 "IBKR chain", added, sym)
-    return sym
-
-
 def display_exchange(code: str) -> str:
     """User-facing name for an IB exchange code ("" stays "")."""
     code = (code or "").strip()
@@ -270,57 +234,31 @@ def merge_rows(local_entries: list[dict], remote: list[dict],
     return enriched, remote_shown, already_added
 
 
-def replace_future_contract(entry: dict, root_name: str = "") -> str:
-    """Swap the saved futures contract(s) for *entry*'s root with just
-    *entry* — every stored FUT row for the root is dropped, so chips,
-    hot buttons and subscriptions (all root-symbol-keyed, resolved via
-    ReferenceData) re-point to the new expiration.  Returns the root
-    symbol."""
-    sym = (entry.get("symbol") or "").strip().upper()
-    if not sym:
-        return ""
-    existing = config_manager.load_contracts()
-    kept = [c for c in existing
-            if c.get("sec_type") != "FUT"
-            or c.get("symbol", "").upper() != sym]
-    kept.append({**entry, "name": root_name})
-    config_manager.save_contracts(kept)
-    from src.core.reference_data import get_instance as _rd
-    _rd().reload_contracts()
-    log.info("SymbolSearch: replaced %s futures contract(s) with expiry "
-             "%s", sym, entry.get("expiry", "?"))
-    return sym
-
-
 def apply_future_pick(parent, entry: dict) -> tuple[str, bool]:
-    """Persist a futures-expiration pick from the search popup.
+    """Apply a futures-expiration pick from the search popup.
 
     Returns ``(root_symbol, replaced)``:
 
-    * root not saved yet             → save the picked contract
-    * picked contract already saved  → no change
-    * root saved with a *different*
+    * root not stored yet            → write the pick's metadata onto
+      any existing references (the new chip gets it via ``_add_symbol``)
+    * picked contract already stored → heal-only, no change
+    * root stored with a *different*
       expiration                     → ask (modal, parented to the host
-      view) and replace on Yes; ``("", False)`` when the user declines.
+      view) and re-point every chip / hot button on Yes; ``("", False)``
+      when the user declines.
     """
+    from src.core import instruments
     sym = (entry.get("symbol") or "").strip().upper()
     if not sym:
         return "", False
-    root_name = entry.get("name", "")
-    existing = [c for c in config_manager.load_contracts()
-                if c.get("sec_type") == "FUT"
-                and c.get("symbol", "").upper() == sym]
-    if not existing:
-        save_future_chain([entry], root_name=root_name)
-        _upsert_entry_meta(sym, entry)
+    stored = instruments.get_contract(sym)
+    stored_conid = str(stored.get("conid", "") or "") if stored else ""
+    if not stored_conid or stored_conid == str(entry.get("conid", "")):
+        _upsert_entry_meta(sym, entry)   # first pick / heal — no prompt
         return sym, False
-    if str(entry.get("conid", "")) in {str(c.get("conid", ""))
-                                       for c in existing}:
-        _upsert_entry_meta(sym, entry)   # heal chips missing metadata
-        return sym, False  # same contract — nothing to do
 
-    old_labels = [format_expiry(c.get("expiry", "")) for c in existing]
-    old_desc = ", ".join(x for x in old_labels if x) or "another expiration"
+    old_desc = (format_expiry(stored.get("expiry", ""))
+                or "another expiration")
     new_desc = format_expiry(entry.get("expiry", ""))
     from PySide6.QtWidgets import QMessageBox
     resp = QMessageBox.question(
@@ -333,8 +271,9 @@ def apply_future_pick(parent, entry: dict) -> tuple[str, bool]:
         QMessageBox.StandardButton.No)
     if resp != QMessageBox.StandardButton.Yes:
         return "", False
-    replace_future_contract(entry, root_name=root_name)
     _upsert_entry_meta(sym, entry)   # re-point existing chips/hot buttons
+    log.info("SymbolSearch: replaced %s futures contract with expiry %s",
+             sym, entry.get("expiry", "?"))
     return sym, True
 
 
@@ -348,55 +287,19 @@ def _upsert_entry_meta(sym: str, entry: dict) -> None:
         config_manager.upsert_instrument(sym, meta)
 
 
-def ensure_contract_saved(result: dict) -> str:
-    """Persist an IBKR search pick into the contracts universe.
+def ensure_contract_saved(result: dict) -> tuple[str, dict | None]:
+    """Resolve a search pick into chip metadata.
 
     Returns ``(symbol, meta)`` — *meta* is the normalised contract
     metadata for the picked row (the host stores it on the new chip via
-    ``_add_symbol``), or ``None`` when the row carries no conid.  The
-    legacy contracts-DB write still runs for IBKR STK picks so the
-    Contracts tab stays coherent during the transition (dropped in the
-    final stage); futures are handled by ``apply_future_pick``.
+    ``_add_symbol``), or ``None`` when the row carries no conid.
+    Nothing is persisted here: the chip entry IS the store.
     """
     from src.core import instruments
     sym = (result.get("symbol") or "").strip().upper()
     if not sym:
         return "", None
-    meta = instruments.contract_meta_from_result(result)
-    if (result.get("source") != "ibkr"
-            or result.get("sec_type", "STK") != "STK"):
-        return sym, meta
-
-    existing = config_manager.load_contracts()
-    conid = str(result.get("conid") or "")
-    known = any(
-        (conid and str(c.get("conid", "")) == conid)
-        or (c.get("symbol", "").upper() == sym
-            and c.get("sec_type") == result.get("sec_type", "STK"))
-        for c in existing)
-    if known:
-        return sym, meta
-
-    existing.append({
-        "conid": result.get("conid", ""),
-        "symbol": sym,
-        "sec_type": result.get("sec_type", "STK"),
-        "exchange": "SMART",
-        "currency": result.get("currency", "USD") or "USD",
-        "expiry": "",
-        "strike": "",
-        "right": "",
-        "local_symbol": sym,
-        "multiplier": "",
-        "primary_exchange": result.get("primary_exchange", ""),
-        "name": result.get("name", ""),
-    })
-    config_manager.save_contracts(existing)
-    from src.core.reference_data import get_instance as _rd
-    _rd().reload_contracts()
-    log.info("SymbolSearch: saved %s (%s) from IBKR lookup",
-             sym, result.get("primary_exchange", ""))
-    return sym, meta
+    return sym, instruments.contract_meta_from_result(result)
 
 
 class SymbolSearchPopup(QDialog):

@@ -2590,7 +2590,7 @@ class _HotButtonModal(QDialog):
 
     def _install_symbol_completer(self, line: QLineEdit) -> None:
         """Wire a case-insensitive ``contains``-match QCompleter against
-        :attr:`ReferenceData.contracts_by_symbol`.  The completer's
+        the chip / hot-button instrument entries.  The completer's
         popup picks up the modal's dark QSS so it doesn't render
         light-on-light, and selecting a row fires
         :meth:`_on_symbol_changed` via the line-edit's ``textChanged``.
@@ -2981,9 +2981,9 @@ class OrderEntryPanel(QWidget):
         self._sl_section.set_market_price(self._last_price, _init_ts)
         self._tr_section.set_market_price(self._last_price, _init_ts)
 
-        # Auto-refresh when reference data changes (contract added/removed or
-        # strategy tiers saved from the StrategyEditor tab).
-        _rd().contracts_changed.connect(self._refresh_combo_items)
+        # Auto-refresh when strategy tiers are saved from the
+        # StrategyEditor tab.  (Chip additions refresh the combo through
+        # _add_symbol; Enter-to-add matches against live entries anyway.)
         _rd().strategy_tiers_changed.connect(self._reload_tier_sections)
 
     # ── UI construction ───────────────────────────────────────────────────────
@@ -3369,9 +3369,8 @@ class OrderEntryPanel(QWidget):
         return cell
 
     def reload_hot_buttons(self) -> None:
-        """Reload the hot-button list from disk and rebuild the grid.
-        Used by ContractsView after a contract deletion that updated
-        related hot-button symbols (auto-rolled or disabled)."""
+        """Reload the hot-button list from disk and rebuild the grid
+        (e.g. after an external write updated hot-button entries)."""
         try:
             self._hot_buttons = config_manager.load_hot_buttons()
         except Exception:

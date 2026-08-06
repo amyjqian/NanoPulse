@@ -23,7 +23,6 @@ from .widgets.top_tab_bar import TopTabBar
 from .widgets.statusbar import StatusBar
 from .widgets.accounts_model import AccountsTableModel
 from .widgets.connections_view import ConnectionsView
-from .widgets.contracts_view import ContractsView
 from .widgets.flash_trade_view import FlashTradeView
 from .widgets.strategy_editor import StrategyEditorView
 from .widgets.preferences_dialog import PreferencesDialog
@@ -37,9 +36,8 @@ _C_WINDOW_BG = QColor("#262E3F")
 # Tab label → stacked-widget index
 _PAGE_INDEX: dict[str, int] = {
     "Connect":        0,
-    "Contracts":      1,
-    "Nano":           2,
-    "StrategyEditor": 3,
+    "Nano":           1,
+    "StrategyEditor": 2,
 }
 
 
@@ -72,10 +70,11 @@ class MainWindow(QWidget):
         self._accounts_model = AccountsTableModel(self)
         self.active_threads: dict[str, IBWorkerThread] = {}
 
-        # Pre-warm the reference data cache so contracts and strategy tiers
-        # are available when the first widgets are constructed below.
+        # Pre-warm the strategy-tier cache so tier chips are available
+        # when the first widgets are constructed below.  Contract
+        # identity lives on the chip/hot-button entries themselves
+        # (src/core/instruments.py) — nothing to pre-warm.
         from src.core.reference_data import get_instance as _rd
-        _rd().reload_contracts()
         _rd().reload_strategy_tiers()
 
         # Enrich bare chip / hot-button entries with contract metadata
@@ -186,31 +185,15 @@ class MainWindow(QWidget):
             active_threads=self.active_threads,
             parent=self,
         )                                                  # index 0 – Connect
-        self._contracts_view = ContractsView(
-            active_threads=self.active_threads,
-            parent=self,
-        )                                                  # index 1 – Contracts
         self._flash_trade = FlashTradeView(
             active_threads=self.active_threads,
             accounts_model=self._accounts_model,
             parent=self,
             open_preferences=self._open_trades_preferences,
-        )                                                  # index 2 – FlashTrade
+        )                                                  # index 1 – FlashTrade
         self._strategy_editor = StrategyEditorView(
             parent=self,
-        )                                                  # index 3 – StrategyEditor
-
-        # When contracts are added/removed, refresh the order entry dropdown
-        self._contracts_view.contracts_changed.connect(
-            self._flash_trade._order_entry._refresh_combo_items
-        )
-        # Contract deletion that disabled or rolled hot-button symbols
-        # writes the new list to disk via config_manager.save_hot_buttons.
-        # Reload here so the OrderEntry grid greys out / re-points the
-        # affected cells without requiring an app restart.
-        self._contracts_view.hot_buttons_changed.connect(
-            self._flash_trade._order_entry.reload_hot_buttons
-        )
+        )                                                  # index 2 – StrategyEditor
 
         # ── Account pill toggles the Account Management panel ───────────────
         # The pill is always visible.  Click toggles the panel; when
@@ -224,7 +207,6 @@ class MainWindow(QWidget):
             self._current_user is not None and self._auth_service is not None)
 
         self._pages.addWidget(self._connections_view)
-        self._pages.addWidget(self._contracts_view)
         self._pages.addWidget(self._flash_trade)
         self._pages.addWidget(self._strategy_editor)
         self._pages.setCurrentIndex(0)

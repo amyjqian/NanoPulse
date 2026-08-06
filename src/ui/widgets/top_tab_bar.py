@@ -41,7 +41,6 @@ _FONT_NORMAL.setWeight(QFont.Weight.Normal)
 # Unicode icons (lightweight, no image files needed)
 _ICONS: dict[str, str] = {
     "Connect":        "⚡",
-    "Contracts":      "🔍",
     "Nano":           "⚡",
     "StrategyEditor": "📐",
     "Settings":       "⚙",
@@ -130,7 +129,7 @@ class TopTabBar(QWidget):
     # User clicked the padlock — host should lock the session.
     lockRequested = Signal()
 
-    _TABS = ["Connect", "Contracts", "Nano", "StrategyEditor", "Settings"]
+    _TABS = ["Connect", "Nano", "StrategyEditor", "Settings"]
 
     def __init__(self, parent=None):
         super().__init__(parent)

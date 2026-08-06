@@ -31,8 +31,8 @@ NanoPulse is a PySide6 (Qt) desktop trading front-end for Interactive Brokers, u
 
 ### Entry point and navigation
 - `main.py` installs a global `sys.excepthook`, calls `setup_logging()`, then shows `MainWindow`.
-- `src/ui/main_window.py` is a plain `QWidget` (not `QMainWindow`, deliberately — avoids hidden menu/status/central chrome). It owns a `QStackedWidget` with 5 pages: Connect, Contracts, Trade (FlashTrade), StrategyEditor, Executions. The "Settings" tab opens `PreferencesDialog` as a modeless window instead of switching pages.
-- `MainWindow` pre-warms `ReferenceData` (contracts + strategy tiers) before constructing child widgets — order matters because `OrderEntryPanel`, `StrategyEditorView`, etc. read from that cache at construction.
+- `src/ui/main_window.py` is a plain `QWidget` (not `QMainWindow`, deliberately — avoids hidden menu/status/central chrome). It owns a `QStackedWidget` with pages: Connect, Trade (FlashTrade), StrategyEditor. The "Settings" tab opens `PreferencesDialog` as a modeless window instead of switching pages.
+- `MainWindow` pre-warms `ReferenceData` (strategy tiers) before constructing child widgets — order matters because tier sections read the cache at construction. It also runs `instruments.migrate_active_config_from_db()` (idempotent legacy-DB enrichment) and owns the `InstrumentQualifier` (see below).
 
 ### IB connection model (`src/core/ib_worker.py`)
 - `IBWorkerThread(QThread)` = one TWS connection. `MainWindow.active_threads: dict[str, IBWorkerThread]` is keyed by connection label.
@@ -51,18 +51,20 @@ NanoPulse is a PySide6 (Qt) desktop trading front-end for Interactive Brokers, u
 - User Management lives inside `PreferencesDialog`: pass `auth_context={"user","service","on_sign_out"}`; admins get a "Users" sidebar page (`src/ui/auth/users_page.py`) and everyone gets a user chip + Change-password + Sign-out footer. `PreferencesDialog._check_should_close` skips its focus-loss auto-close while any modal (`QApplication.activeModalWidget()`) is up.
 
 ### Backup & Restore (`src/backup/` + `src/ui/widgets/backup_page.py`)
-- `src/backup/service.py` — `ConfigBackup` writes/reads a `.npbak` file, which is a **ZIP archive** (so it can carry the binary SQLite DBs): `manifest.json` + `config.json` (the signed-in user's `app_config-<username>.json`) + `db/users.db` + `db/contracts.db` + `db/strategy_tiers.db`. Passwords travel only as the `pw_hash` already in `users.db` — never plaintext.
+- `src/backup/service.py` — `ConfigBackup` writes/reads a `.npbak` file, which is a **ZIP archive** (so it can carry the binary SQLite DBs): `manifest.json` + `config.json` (the signed-in user's `app_config-<username>.json`, which carries the chip/hot-button contract metadata) + `db/users.db` + `db/strategy_tiers.db`. Legacy archives may also carry `db/contracts.db`; restore still writes it and re-runs the instrument migration. Passwords travel only as the `pw_hash` already in `users.db` — never plaintext.
 - `export()` writes atomically (`*.tmp` → `os.replace`). `restore()` validates → snapshots the current config+DBs to a temp dir → replaces files → **rolls back from the snapshot on any error**. After a successful restore the Settings dialog emits `reload_requested`, which the host treats exactly like a sign-out (returns to Login so the new accounts/config/DBs reload cleanly).
 - **Automatic backups**: `maybe_auto_backup()` is called on login and hourly (`AppController._start_auto_backup` + a `QTimer`). It's a schedule *check* (catch-up-on-launch), backs up to `QStandardPaths.AppDataLocation/backups/` when the last auto-backup is ≥24 h old, and prunes to the last 5. The on/off flag + timestamps live in the user's config under `preferences.backup`.
 - **UI** is a "Backup & Restore" page in `PreferencesDialog`, available to all signed-in users (both Create backup and Restore). The archived `config.json` carries everything in the per-user config — including **connections** (and `next_client_id`, aliases, layout, hot buttons, account groups). Manual backups go to a user-chosen path via `QFileDialog`.
 
 ### Shared in-memory caches
-- `src/core/reference_data.py` — `ReferenceData` singleton accessed via `get_instance()`. Caches contracts (SQLite-backed) and strategy tiers. Tier lookup falls back in this order: exact symbol → asset-class catch-all (`"FUT"` for futures, `"STK"` for stocks/options) → `None` (caller uses preferences). Emits `contracts_changed` / `strategy_tiers_changed` on reload.
+- `src/core/instruments.py` — the contract resolver. **There is no contract database**: each symbol chip (`order_entry_symbols` / `book_trader_symbols`) and hot button carries its own contract metadata inline in the per-user config (`conid`, `sec_type`, `exchange`, `expiry`, `local_symbol`, `multiplier`, `min_tick`, …), captured at add-time from the live symbol search. `instruments` is the single read path (Qt-free + lock/mtime-cached, so the worker thread may call it); `config_manager.upsert_instrument` is the single fan-out writer. Deleting a chip deletes its metadata — there is no cleanup step.
+- `src/core/instrument_qualifier.py` — on every worker connect, entries missing a conid (or holding an expired FUT) are re-qualified via `request_browse` and healed through `upsert_instrument` (serialized browses; paused while the symbol-search popup is open).
+- `src/core/reference_data.py` — `ReferenceData` singleton accessed via `get_instance()`. Caches strategy tiers only. Tier lookup falls back in this order: exact symbol → asset-class catch-all (`"FUT"` for futures, `"STK"` for stocks/options) → `None` (caller uses preferences). Emits `strategy_tiers_changed` on reload.
 - `src/core/trading_prefs.py` — `trading_prefs` module-level singleton for Futures/Stocks preferences. Thread-safe (internal `threading.Lock`) because IBWorkerThread coroutines read prefs while the UI thread writes them from `PreferencesDialog`.
 
 ### Persistence layout (split across JSON + two SQLite DBs)
 - `app_config.json` at project root (gitignored) — connections, next client id, account aliases, hidden/unchecked accounts, layout (window geometry + splitter sizes), order-entry symbols, active symbol, and the `preferences` dict. Written atomically via tempfile + `os.replace`. Every save helper merges into existing data — never write the full file from scratch.
-- `data/contracts.db` — the contract universe. `config_manager.load_contracts`/`save_contracts` delegate to `src/core/contracts_db.py`. On first load, any legacy `"contracts"` key still present in `app_config.json` is migrated into SQLite; after migration the JSON file is left intact but `_read_json` strips the `"contracts"` key on every read so it can never be re-persisted there.
+- `data/contracts.db` — **legacy, read-only**. Kept on disk solely so `instruments.migrate_active_config_from_db()` can enrich bare (string) chip entries from it on first login per user. Never written; new installs work without it.
 - `data/strategy_tiers.db` — per-symbol strategy tier offsets/values (take_profit, stop_loss, stop, trailing). Read by `ReferenceData`; written by `StrategyEditorView`.
 
 ### Logging (`src/utils/logger.py`)
@@ -78,11 +80,11 @@ Both dedicated loggers set `propagate = False` so their output stays out of the 
 
 ### UI composition notes
 - The FlashTrade page (`src/ui/widgets/flash_trade_view.py`) wires the `OrderEntryPanel` + `OrderStatusPanel` + `AccountListPanel` + `AccountPositionPanel` around nested `QSplitter`s. Splitter sizes persist under three distinct keys (`flash_main_splitter`, `flash_right_v_splitter`, `flash_top_right_splitter`) via `config_manager.load_layout/save_layout`.
-- `ContractsView.contracts_changed` is wired in `MainWindow._setup_ui` to `OrderEntryPanel._refresh_combo_items` — when adding new contract-dependent widgets, connect to that signal rather than polling `ReferenceData`.
+- New instruments are added ONLY through the symbol-search popup (`symbol_search_popup.py`, the "+" buttons / "/" shortcut); a pick returns qualified contract metadata that the host stores on the new chip entry via `_add_symbol(sym, meta)`.
 - Status bar counts (connections / accounts / selected) update on a 1 s `QTimer` in `MainWindow._update_status`; "selected" = checked accounts in `AccountListPanel`.
 
 ## Conventions worth knowing
 - `from __future__ import annotations` is used across the codebase — annotations are strings at runtime, so forward references in type hints are fine.
 - `ib_async` is imported under a `try/except ImportError` guard in `ib_worker.py` so UI-only development works without TWS/ib_async installed.
 - All times shown to the user are US/Eastern (`_ET = ZoneInfo("America/New_York")`). TWS timestamps are parsed via `_parse_ib_time` — they arrive in several separator styles, so reuse that helper rather than calling `strptime` directly.
-- Do not store contracts back into `app_config.json`; contracts live in SQLite only (see `_read_json` in `config_manager.py`).
+- Chip-list entries in the config may be bare strings (legacy) or dicts with contract metadata — always read/write them through `config_manager`'s entry helpers (`load_*_entries`, `save_*_symbols` merge shims, `upsert_instrument`), never raw JSON, or metadata will be silently dropped.

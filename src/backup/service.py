@@ -6,9 +6,12 @@ alongside the JSON config:
 
     manifest.json          {format, version, exported_at, app_version, username}
     config.json            the user's app_config-<username>.json contents
+                           (includes chip / hot-button contract metadata)
     db/users.db            accounts (pw_hash only — never plaintext)
-    db/contracts.db        the contract universe
     db/strategy_tiers.db   per-symbol strategy tiers
+
+Legacy archives may also carry ``db/contracts.db``; restore still writes
+it so the post-restore migration can enrich string chip lists from it.
 
 Restore snapshots the current files first and rolls back on any failure, so a
 bad archive can never leave the app half-restored.
@@ -31,11 +34,20 @@ log = logging.getLogger(__name__)
 _ROOT = Path(__file__).resolve().parents[2]
 _DATA = _ROOT / "data"
 
-# name in archive → path on disk (shared, per-app databases)
+# name in archive → path on disk (shared, per-app databases).
+# Contract identity lives on the per-user config's chip / hot-button
+# entries, so new archives carry no contracts.db.
 _DB_FILES: dict[str, Path] = {
     "users.db": _DATA / "users.db",
-    "contracts.db": _DATA / "contracts.db",
     "strategy_tiers.db": _DATA / "strategy_tiers.db",
+}
+
+# Restore-side compatibility: archives exported before the contract DB
+# was retired still ship db/contracts.db — write it back so the
+# post-restore migration (instruments.migrate_active_config_from_db)
+# can enrich the restored config's string chip lists from it.
+_RESTORE_ONLY_DB_FILES: dict[str, Path] = {
+    "contracts.db": _DATA / "contracts.db",
 }
 
 APP_VERSION = "3.2.1"
@@ -159,7 +171,10 @@ class ConfigBackup:
                     target_config,
                     json.dumps(config, indent=2, ensure_ascii=False).encode("utf-8"),
                 )
-                for name, db_path in _DB_FILES.items():
+                # Explicit _DB_FILES wins on a key collision (tests patch
+                # it wholesale).
+                for name, db_path in {**_RESTORE_ONLY_DB_FILES,
+                                      **_DB_FILES}.items():
                     member = f"db/{name}"
                     if member in members:
                         self._atomic_write_bytes(db_path, z.read(member))
@@ -169,6 +184,14 @@ class ConfigBackup:
             raise
         finally:
             self._cleanup_snapshot(snapshot)
+        # Legacy archives carry string chip lists + contracts.db — pull
+        # the metadata across so the restored config is self-contained.
+        try:
+            from src.core import instruments
+            instruments.invalidate_cache()
+            instruments.migrate_active_config_from_db()
+        except Exception:
+            log.exception("Post-restore instrument migration failed")
         log.warning("Restore applied from %s", path)
 
     # ── automatic backups ────────────────────────────────────────────────────
@@ -251,7 +274,10 @@ class ConfigBackup:
         """Copy current config + DBs into a temp dir; return {name: temp_path}."""
         snap_dir = Path(tempfile.mkdtemp(prefix="npbak_snap_"))
         snap: dict[str, Path] = {"__dir__": snap_dir}
-        pairs = {"config": config_path, **_DB_FILES}
+        # Restore-only files (legacy contracts.db) are snapshotted too —
+        # an old archive may overwrite them and the rollback must cover it.
+        pairs = {"config": config_path, **_RESTORE_ONLY_DB_FILES,
+                 **_DB_FILES}
         for name, src in pairs.items():
             if src.exists():
                 dst = snap_dir / f"{name}"
@@ -261,7 +287,8 @@ class ConfigBackup:
 
     def _rollback(self, snapshot: dict[str, Path]) -> None:
         config_path = self._config_path()
-        targets = {"config": config_path, **_DB_FILES}
+        targets = {"config": config_path, **_RESTORE_ONLY_DB_FILES,
+                   **_DB_FILES}
         for name, dst in targets.items():
             saved = snapshot.get(name)
             try:

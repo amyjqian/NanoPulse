@@ -307,9 +307,10 @@ async def run() -> int:
     # which is populated by the main app on startup.  This standalone
     # test process has to load it explicitly so close_tier can resolve
     # MNQ's exchange without making a TWS round-trip.
-    _rd().reload_contracts()
-    mnq_rows = _rd().contracts_by_symbol.get("MNQ", [])
-    _log(f"loaded {len(mnq_rows)} MNQ contract row(s) from local cache "
+    from src.core import instruments
+    c = instruments.get_contract("MNQ")
+    mnq_rows = [c] if c else []
+    _log(f"loaded {len(mnq_rows)} MNQ contract row(s) from chip entries "
          f"(exchange={mnq_rows[0].get('exchange', '?') if mnq_rows else 'n/a'})")
 
     ib = IB()

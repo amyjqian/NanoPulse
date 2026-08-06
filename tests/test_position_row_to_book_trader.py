@@ -165,77 +165,63 @@ class TestAddSymbolInsertPosition:
 # ── OPT contract save helper ──────────────────────────────────────────────────
 
 @pytest.fixture
-def contracts_env(monkeypatch):
-    state = {"contracts": [], "saved": None, "reloaded": 0}
-    monkeypatch.setattr(btv.config_manager, "load_contracts",
-                        lambda path=None: list(state["contracts"]))
+def entry_env(monkeypatch):
+    """Fake entry store for the OPT chip-metadata flow: get_contract
+    resolves from it, upsert_instrument records into it."""
+    import src.core.instruments as instruments
+    state = {"entries": {}, "upserts": []}
 
-    def _save(contracts, path=None):
-        state["saved"] = contracts
-        state["contracts"] = list(contracts)
-    monkeypatch.setattr(btv.config_manager, "save_contracts", _save)
+    def _get_contract(q):
+        e = state["entries"].get((q or "").upper())
+        return dict(e) if e else None
+    monkeypatch.setattr(instruments, "get_contract", _get_contract)
 
-    import src.core.reference_data as rd
-
-    def _reload():
-        state["reloaded"] += 1
-    monkeypatch.setattr(
-        rd, "get_instance",
-        lambda: SimpleNamespace(reload_contracts=_reload))
-    # Unresolvable until a row is saved.
-    monkeypatch.setattr(
-        btv, "_sec_type_for",
-        lambda sym: "OPT" if any(
-            c.get("symbol") == sym for c in state["contracts"]) else "?")
+    def _upsert(sym, meta, path=None):
+        state["upserts"].append((sym, dict(meta)))
+        cur = state["entries"].setdefault(sym.upper(), {"symbol": sym})
+        cur.update(meta)
+        return True
+    monkeypatch.setattr(btv.config_manager, "upsert_instrument", _upsert)
     return state
 
 
 class TestEnsurePositionContractSaved:
-    def test_saves_row_with_occ_symbol_key(self, contracts_env):
-        btv._ensure_position_contract_saved(_pos())
-        row = contracts_env["saved"][0]
-        assert row["symbol"] == _OCC.upper()
-        assert row["local_symbol"] == _OCC
-        assert row["sec_type"] == "OPT"
-        assert row["conid"] == "111"
-        assert row["multiplier"] == "100"
-        assert row["exchange"] == "SMART"
-        assert contracts_env["reloaded"] == 1
+    def test_stores_meta_under_occ_symbol_key(self, entry_env):
+        meta = btv._ensure_position_contract_saved(_pos())
+        assert meta["conid"] == "111"
+        assert meta["sec_type"] == "OPT"
+        assert meta["local_symbol"] == _OCC
+        assert meta["multiplier"] == "100"
+        assert meta["exchange"] == "SMART"
+        assert entry_env["upserts"][0][0] == _OCC.upper()
 
-    def test_second_call_is_noop(self, contracts_env):
+    def test_second_call_is_noop(self, entry_env):
         btv._ensure_position_contract_saved(_pos())
         btv._ensure_position_contract_saved(_pos())
-        assert contracts_env["reloaded"] == 1
+        assert len(entry_env["upserts"]) == 1   # already resolvable
 
-    def test_dedupes_on_conid(self, contracts_env):
-        contracts_env["contracts"] = [
-            {"conid": "111", "symbol": "SOMETHING", "sec_type": "OPT"}]
-        btv._ensure_position_contract_saved(_pos())
-        assert contracts_env["saved"] is None
+    def test_ignores_non_opt(self, entry_env):
+        assert btv._ensure_position_contract_saved(
+            _pos(sec_type="STK")) is None
+        assert entry_env["upserts"] == []
 
-    def test_ignores_non_opt(self, contracts_env):
-        btv._ensure_position_contract_saved(_pos(sec_type="STK"))
-        assert contracts_env["saved"] is None
+    def test_missing_conid_does_not_store(self, entry_env):
+        """A conid-less entry could never subscribe market data — the
+        chip stays bare so the retry that has the conid completes it."""
+        assert btv._ensure_position_contract_saved(_pos(con_id=None)) is None
+        assert entry_env["upserts"] == []
+        # A later call WITH the conid must still be able to store.
+        meta = btv._ensure_position_contract_saved(_pos())
+        assert meta["conid"] == "111"
 
-    def test_missing_conid_does_not_save(self, contracts_env):
-        """A conid-less row could never subscribe market data, and saving
-        it would permanently block the retry that has the conid."""
-        btv._ensure_position_contract_saved(_pos(con_id=None))
-        assert contracts_env["saved"] is None
-        # A later call WITH the conid must still be able to save.
+    def test_heals_entry_stored_without_conid(self, entry_env):
+        """Chip entries persisted without a conid get healed in place
+        instead of blocking on 'already resolvable'."""
+        entry_env["entries"][_OCC.upper()] = {
+            "symbol": _OCC.upper(), "sec_type": "OPT",
+            "local_symbol": _OCC, "multiplier": "100"}
         btv._ensure_position_contract_saved(_pos())
-        assert contracts_env["saved"][0]["conid"] == "111"
-
-    def test_heals_row_saved_without_conid(self, contracts_env):
-        """Rows saved by older builds with conid='' get their conid
-        filled in instead of blocking on 'already resolvable'."""
-        contracts_env["contracts"] = [
-            {"conid": "", "symbol": _OCC.upper(), "sec_type": "OPT",
-             "local_symbol": _OCC, "multiplier": "100"}]
-        btv._ensure_position_contract_saved(_pos())
-        assert len(contracts_env["saved"]) == 1
-        assert contracts_env["saved"][0]["conid"] == "111"
-        assert contracts_env["reloaded"] == 1
+        assert entry_env["entries"][_OCC.upper()]["conid"] == "111"
 
 
 # ── Panel signal filtering ────────────────────────────────────────────────────

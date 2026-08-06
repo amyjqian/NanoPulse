@@ -260,73 +260,20 @@ class TestFormatExpiry:
         assert ssp.format_expiry("") == ""
 
 
-class TestSaveFutureChain:
-    @pytest.fixture
-    def store(self, monkeypatch):
-        state = {"contracts": [], "saved": None, "reloaded": False}
-        monkeypatch.setattr(ssp.config_manager, "load_contracts",
-                            lambda: list(state["contracts"]))
-
-        def _save(contracts):
-            state["saved"] = contracts
-        monkeypatch.setattr(ssp.config_manager, "save_contracts", _save)
-
-        import src.core.reference_data as rd
-
-        def _reload():
-            state["reloaded"] = True
-        monkeypatch.setattr(
-            rd, "get_instance",
-            lambda: SimpleNamespace(reload_contracts=_reload))
-        return state
-
-    def test_saves_whole_usd_chain(self, store):
-        sym = ssp.save_future_chain(
-            [_chain_row(1, "20260918"), _chain_row(2, "20261218")],
-            root_name="E-mini Nasdaq 100")
-        assert sym == "NQ"
-        assert store["reloaded"]
-        assert [c["conid"] for c in store["saved"]] == [1, 2]
-        assert all(c["name"] == "E-mini Nasdaq 100"
-                   for c in store["saved"])
-
-    def test_dedupes_against_existing_conids(self, store):
-        store["contracts"] = [_chain_row(1, "20260918")]
-        ssp.save_future_chain(
-            [_chain_row(1, "20260918"), _chain_row(2, "20261218")])
-        assert [c["conid"] for c in store["saved"]] == [1, 2]
-
-    def test_fully_saved_chain_writes_nothing(self, store):
-        store["contracts"] = [_chain_row(1, "20260918")]
-        assert ssp.save_future_chain([_chain_row(1, "20260918")]) == "NQ"
-        assert store["saved"] is None
-
-    def test_non_usd_and_non_fut_rows_ignored(self, store):
-        assert ssp.save_future_chain(
-            [_chain_row(1, "20260918", currency="EUR"),
-             {"conid": 9, "symbol": "NQ", "sec_type": "STK",
-              "currency": "USD"}]) == ""
-        assert store["saved"] is None
-
-
 class TestApplyFuturePick:
     @pytest.fixture
     def store(self, monkeypatch):
-        state = {"contracts": [], "saved": None, "reloaded": False}
-        monkeypatch.setattr(ssp.config_manager, "load_contracts",
-                            lambda: [dict(c) for c in state["contracts"]])
-
-        def _save(contracts):
-            state["saved"] = contracts
-        monkeypatch.setattr(ssp.config_manager, "save_contracts", _save)
-
-        import src.core.reference_data as rd
-
-        def _reload():
-            state["reloaded"] = True
+        """Patch the resolver + upsert: apply_future_pick now re-points
+        chip/hot-button metadata instead of rewriting a contracts DB."""
+        import src.core.instruments as instruments
+        state = {"stored": None, "upserts": []}
         monkeypatch.setattr(
-            rd, "get_instance",
-            lambda: SimpleNamespace(reload_contracts=_reload))
+            instruments, "get_contract",
+            lambda q: dict(state["stored"]) if state["stored"] else None)
+        monkeypatch.setattr(
+            ssp.config_manager, "upsert_instrument",
+            lambda sym, meta, path=None:
+                state["upserts"].append((sym, meta)) or True)
         return state
 
     @staticmethod
@@ -348,41 +295,40 @@ class TestApplyFuturePick:
         sym, replaced = ssp.apply_future_pick(None, self._entry())
         assert (sym, replaced) == ("NQ", False)
         assert calls == []  # no confirmation needed
-        assert [c["conid"] for c in store["saved"]] == [2]
+        assert store["upserts"][0][0] == "NQ"
+        assert store["upserts"][0][1]["conid"] == "2"
 
-    def test_same_contract_is_noop(self, store, monkeypatch):
-        store["contracts"] = [_chain_row(2, "20261218")]
+    def test_same_contract_heals_without_prompt(self, store, monkeypatch):
+        store["stored"] = {"symbol": "NQ", "conid": "2",
+                           "sec_type": "FUT", "expiry": "20261218"}
         calls = self._answer(monkeypatch, None)
         sym, replaced = ssp.apply_future_pick(None, self._entry(conid=2))
         assert (sym, replaced) == ("NQ", False)
-        assert calls == [] and store["saved"] is None
+        assert calls == []
+        assert len(store["upserts"]) == 1   # heal writes metadata through
 
     def test_different_expiry_yes_replaces_everywhere(self, store,
                                                       monkeypatch):
         from PySide6.QtWidgets import QMessageBox
-        store["contracts"] = [
-            _chain_row(1, "20260918"),
-            {"conid": "9", "symbol": "MSFT", "sec_type": "STK"},
-        ]
-        self._answer(monkeypatch, QMessageBox.StandardButton.Yes)
+        store["stored"] = {"symbol": "NQ", "conid": "1",
+                           "sec_type": "FUT", "expiry": "20260918"}
+        calls = self._answer(monkeypatch, QMessageBox.StandardButton.Yes)
         sym, replaced = ssp.apply_future_pick(
             None, self._entry(conid=2, expiry="20261218"))
         assert (sym, replaced) == ("NQ", True)
-        assert store["reloaded"]
-        saved = store["saved"]
-        # old NQ expiry gone, new one in, unrelated contracts untouched
-        assert [c["conid"] for c in saved
-                if c.get("sec_type") == "FUT"] == [2]
-        assert any(c.get("symbol") == "MSFT" for c in saved)
+        assert len(calls) == 1              # user was asked
+        # upsert fans the new expiry out to every chip / hot button.
+        assert store["upserts"][0][1]["expiry"] == "20261218"
 
     def test_different_expiry_no_cancels(self, store, monkeypatch):
         from PySide6.QtWidgets import QMessageBox
-        store["contracts"] = [_chain_row(1, "20260918")]
+        store["stored"] = {"symbol": "NQ", "conid": "1",
+                           "sec_type": "FUT", "expiry": "20260918"}
         self._answer(monkeypatch, QMessageBox.StandardButton.No)
         sym, replaced = ssp.apply_future_pick(
             None, self._entry(conid=2, expiry="20261218"))
         assert (sym, replaced) == ("", False)
-        assert store["saved"] is None
+        assert store["upserts"] == []
 
 
 class TestDisplayExchange:
@@ -397,44 +343,24 @@ class TestDisplayExchange:
 
 
 class TestEnsureContractSaved:
-    @pytest.fixture
-    def store(self, monkeypatch):
-        """Patch config_manager + ReferenceData; returns the fake DB state."""
-        state = {"contracts": [], "saved": False, "reloaded": False}
-        monkeypatch.setattr(ssp.config_manager, "load_contracts",
-                            lambda: list(state["contracts"]))
+    """ensure_contract_saved no longer persists anything — it resolves a
+    popup pick into (symbol, chip metadata) for the host's _add_symbol."""
 
-        def _save(contracts):
-            state["contracts"] = contracts
-            state["saved"] = True
-        monkeypatch.setattr(ssp.config_manager, "save_contracts", _save)
-
-        import src.core.reference_data as rd
-
-        def _reload():
-            state["reloaded"] = True
-        monkeypatch.setattr(
-            rd, "get_instance",
-            lambda: SimpleNamespace(reload_contracts=_reload))
-        return state
-
-    def test_local_source_is_noop(self, store):
-        sym, _meta = ssp.ensure_contract_saved(
-            {"symbol": "nq", "sec_type": "FUT", "source": "local"})
+    def test_local_row_resolves_meta(self):
+        sym, meta = ssp.ensure_contract_saved(
+            {"symbol": "nq", "sec_type": "FUT", "conid": "11",
+             "source": "local"})
         assert sym == "NQ"
-        assert not store["saved"]
+        assert meta["conid"] == "11" and meta["sec_type"] == "FUT"
 
-    def test_ibkr_future_is_noop(self, store):
-        """FUT picks are chain-saved by the popup — never as a single
-        SMART pseudo-contract here."""
+    def test_ibkr_future_returns_meta(self):
         sym, meta = ssp.ensure_contract_saved(
             {"symbol": "es", "sec_type": "FUT", "conid": 11004968,
              "currency": "USD", "source": "ibkr"})
         assert sym == "ES"
-        assert not store["saved"]
-        assert meta["conid"] == "11004968"   # caller still gets chip meta
+        assert meta["conid"] == "11004968"
 
-    def test_ibkr_pick_saves_contract(self, store):
+    def test_ibkr_stk_pick_defaults_smart_and_local(self):
         sym, meta = ssp.ensure_contract_saved({
             "symbol": "googl", "sec_type": "STK", "conid": 208813720,
             "currency": "USD", "primary_exchange": "NASDAQ",
@@ -442,38 +368,16 @@ class TestEnsureContractSaved:
             "source": "ibkr",
         })
         assert sym == "GOOGL"
-        assert store["saved"] and store["reloaded"]
-        assert meta["conid"] == "208813720"
-        assert meta["exchange"] == "SMART"       # chip metadata for the host
+        assert meta["exchange"] == "SMART"
         assert meta["local_symbol"] == "GOOGL"
-        (c,) = store["contracts"]
-        assert c["symbol"] == "GOOGL"
-        assert c["sec_type"] == "STK"
-        assert c["exchange"] == "SMART"
-        assert c["currency"] == "USD"
-        assert c["local_symbol"] == "GOOGL"
-        assert c["primary_exchange"] == "NASDAQ"
-        assert c["name"] == "Alphabet Inc (Class A)"
+        assert meta["primary_exchange"] == "NASDAQ"
+        assert meta["name"] == "Alphabet Inc (Class A)"
 
-    def test_duplicate_conid_not_resaved(self, store):
-        store["contracts"] = [
-            {"conid": "208813720", "symbol": "GOOGL", "sec_type": "STK"}]
-        sym, _meta = ssp.ensure_contract_saved({
-            "symbol": "GOOGL", "sec_type": "STK", "conid": 208813720,
-            "source": "ibkr",
-        })
-        assert sym == "GOOGL"
-        assert not store["saved"]
+    def test_conidless_row_returns_no_meta(self):
+        sym, meta = ssp.ensure_contract_saved(
+            {"symbol": "nq", "sec_type": "FUT", "source": "local"})
+        assert sym == "NQ"
+        assert meta is None or "conid" not in meta
 
-    def test_duplicate_symbol_sectype_not_resaved(self, store):
-        store["contracts"] = [
-            {"conid": "", "symbol": "GOOGL", "sec_type": "STK"}]
-        ssp.ensure_contract_saved({
-            "symbol": "googl", "sec_type": "STK", "conid": 1,
-            "source": "ibkr",
-        })
-        assert not store["saved"]
-
-    def test_empty_symbol_returns_empty(self, store):
+    def test_empty_symbol_returns_empty(self):
         assert ssp.ensure_contract_saved({"source": "ibkr"}) == ("", None)
-        assert not store["saved"]

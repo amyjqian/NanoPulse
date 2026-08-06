@@ -135,7 +135,7 @@ def _position_like_from_order(order: dict) -> dict | None:
     The blotter's ``symbol`` is a display symbol — a bare root ("AAPL"),
     a futures localSymbol ("MNQU6"), or a raw OCC option symbol — so it
     is first matched against the saved-contracts cache (localSymbol
-    match wins over root match, mirroring ``pick_active_contract``).
+    match wins over root match, mirroring ``instruments.get_contract``).
     Unsaved symbols fall back to the order dict itself: OCC-shaped ones
     become OPT payloads (``con_id``/``sec_type`` travel on the order
     dict, so ``_ensure_position_contract_saved`` can still register
@@ -224,10 +224,8 @@ def _ensure_position_contract_saved(pos: dict) -> dict | None:
 
     Returns the metadata dict for the chip key, or ``None`` when the
     position carries no conid.  Existing chip / hot-button references
-    are healed in place via ``upsert_instrument``; the legacy contracts
-    DB row is still written too so the Contracts tab stays coherent
-    during the transition (dropped in the final stage).  Idempotent:
-    no-op when the key already resolves with a conid.
+    are healed in place via ``upsert_instrument``.  Idempotent: no-op
+    when the key already resolves with a conid.
     """
     from src.core import instruments
     key, sec = _chip_key_for_position(pos)
@@ -239,32 +237,9 @@ def _ensure_position_contract_saved(pos: dict) -> dict | None:
     meta = _contract_meta_from_position(pos)
     if meta is None:
         return None
-    config_manager.upsert_instrument(key, meta)   # heal existing refs
-
-    # Legacy dual-write (Contracts tab coherence during the transition).
-    con_id = meta["conid"]
-    existing = config_manager.load_contracts()
-    row = next((c for c in existing
-                if (c.get("symbol") or "").strip().upper() == key), None)
-    if row is not None and not str(row.get("conid") or ""):
-        row["conid"] = con_id
-    elif row is None and not any(
-            str(c.get("conid", "")) == con_id for c in existing):
-        existing.append({
-            "conid": con_id, "symbol": key, "sec_type": "OPT",
-            "exchange": meta["exchange"], "currency": meta["currency"],
-            "expiry": "", "strike": "", "right": "",
-            "local_symbol": meta["local_symbol"],
-            "multiplier": meta["multiplier"],
-            "primary_exchange": "", "name": "",
-        })
-    else:
-        return meta
-    config_manager.save_contracts(existing)
-    from src.core.reference_data import get_instance as _rd
-    _rd().reload_contracts()
-    log.info("BookTrader: saved OPT contract %s (conid %s) from position",
-             key, con_id)
+    if config_manager.upsert_instrument(key, meta):   # heal existing refs
+        log.info("BookTrader: stored OPT metadata %s (conid %s) from "
+                 "position", key, meta["conid"])
     return meta
 
 
@@ -290,7 +265,7 @@ def _tick_size_for_contract(cached: dict | None) -> float:
 
     Lookup order:
       1. ``tick_size`` / ``min_tick`` / ``minTick`` field on the cached
-         row (populated by ContractsView since the Tick column landed).
+         entry (min_tick, captured from TWS contract details).
       2. Per-symbol :data:`_FUT_TICK` table — covers contracts saved
          before the Tick column existed, and ensures GC / MGC default
          to 0.1 and CL / MCL to 0.01 instead of the generic 0.25 FUT
