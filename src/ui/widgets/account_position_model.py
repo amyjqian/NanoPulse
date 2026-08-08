@@ -170,6 +170,32 @@ class AccountPositionModel(QAbstractTableModel):
         #         Account List panel has pushed a selection).
         # set() = user has explicitly deselected everything → show nothing.
         self._selected_accounts: set[str] | None = None
+        # Lowercased search text from the control-bar search field.
+        # Matches account id / alias / symbol / localSymbol.
+        self._search_text: str = ""
+
+    def set_search_text(self, text: str) -> None:
+        """Filter rows by account id/alias or symbol (case-insensitive
+        substring), then rebuild.  Empty text clears the filter."""
+        text = (text or "").strip().lower()
+        if self._search_text != text:
+            self._search_text = text
+            self.rebuild()
+
+    def _account_matches_search(self, account: str) -> bool:
+        if self._search_text in account.lower():
+            return True
+        alias = (self._get_alias(account) if self._get_alias else "") or ""
+        return self._search_text in alias.lower()
+
+    def _position_matches_search(self, account: str, pos: dict) -> bool:
+        if not self._search_text:
+            return True
+        if self._account_matches_search(account):
+            return True
+        return any(
+            self._search_text in (pos.get(f) or "").lower()
+            for f in ("symbol", "local_symbol"))
 
     def set_show_zero(self, show: bool) -> None:
         """Show or hide rows where position qty == 0, then rebuild."""
@@ -372,7 +398,8 @@ class AccountPositionModel(QAbstractTableModel):
             self._positions[key] = pos
 
             in_view        = key in self._row_map
-            should_be_visible = self._show_zero or new_qty != 0
+            should_be_visible = (self._show_zero or new_qty != 0) \
+                and self._position_matches_search(account, pos)
 
             if in_view:
                 if new_qty != old_qty:
@@ -550,6 +577,8 @@ class AccountPositionModel(QAbstractTableModel):
                 continue
             if not self._show_zero and pos.get("position", 0) == 0:
                 continue
+            if not self._position_matches_search(account, pos):
+                continue
             acct_pos.setdefault(account, []).append((key, pos))
 
         # Accounts to render a summary header for: those with qualifying
@@ -563,6 +592,10 @@ class AccountPositionModel(QAbstractTableModel):
         header_accounts = set(acct_pos.keys())
         for acct in scope:
             if acct in self._acct_data:
+                # While searching, a position-less account only keeps its
+                # header row when its own id/alias matches the query.
+                if self._search_text and not self._account_matches_search(acct):
+                    continue
                 header_accounts.add(acct)
 
         for account in sorted(header_accounts, key=self._name_sort_key):

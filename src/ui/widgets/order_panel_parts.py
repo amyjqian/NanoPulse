@@ -569,19 +569,25 @@ class SymbolChipBar(QWidget):
         self.symbol_selected.emit(sym, sec)
 
     def _on_drop(self, src_sym: str, dst_sym: str) -> None:
-        """Move *src_sym* immediately before *dst_sym* in the entry list
-        and emit ``symbols_reordered`` with the new order.  Same-group
-        enforcement is already handled by DraggableChip — we trust the
-        callback payload here."""
+        """The dragged chip takes the drop target's position (same
+        semantics as the account-group pills): dragging forward lands
+        *after* the target, dragging backward lands *before* it — so a
+        chip can reach any slot in its group, in any direction.
+        Same-group enforcement is already handled by DraggableChip —
+        we trust the callback payload here."""
         entries = list(self._entries)
         src_entry = next((e for e in entries if e[0] == src_sym), None)
         if src_entry is None:
             return
-        entries.remove(src_entry)
         try:
-            dst_idx = next(i for i, (s, _) in enumerate(entries) if s == dst_sym)
+            # Target's index BEFORE removal: inserting there after the
+            # pop lands after the target on forward drags (everything
+            # shifted left by one) and before it on backward drags.
+            dst_idx = next(i for i, (s, _) in enumerate(entries)
+                           if s == dst_sym)
         except StopIteration:
             return
+        entries.remove(src_entry)
         entries.insert(dst_idx, src_entry)
         self._entries = entries
         self._rebuild_grid()
@@ -712,6 +718,11 @@ class QtyChipRow(QWidget):
             # Refresh readouts/chip enables against the new symbol's
             # accounts + (not-yet-ticked) price immediately.
             self._emit_state()
+        else:
+            # Landed in share mode: re-emit so the header shows the
+            # new symbol's SH total (default qty × accounts) instead
+            # of the previous symbol's stale % readout.
+            self._emit_preview()
 
     def set_percent_context(self, accounts_provider) -> None:
         """*accounts_provider(symbol) -> [(account, nlv, bp, held)]*."""
@@ -749,10 +760,13 @@ class QtyChipRow(QWidget):
                 else self._pct_ctx.preview_total(self._active_pct))
 
     def refresh_percent_preview(self) -> None:
-        """Re-resolve percent mode against fresh price/account data
-        (no-op in share mode).  Host calls this on price ticks, account
-        selection changes and summary updates."""
+        """Re-resolve the B/S readout against fresh price/account data.
+        Host calls this on price ticks, account selection changes and
+        summary updates.  Share mode only re-emits the preview (its
+        total tracks the checked-account count) — no restyle, no
+        qty_changed."""
         if self._unit != UNIT_PCT:
+            self._emit_preview()
             return
         self._restyle(self._current_chip())
         self._emit_state()
@@ -792,6 +806,9 @@ class QtyChipRow(QWidget):
             self._custom.blockSignals(False)
             self._custom_by_unit[self._unit] = str(qty)
             self._restyle(None)  # no chip is "current" while custom is active
+        # No qty_changed (re-entrancy guard) — but the B/S readout must
+        # track the new qty; preview_changed carries no order logic.
+        self._emit_preview()
 
     def current_qty(self) -> int:
         """Resolved shares.  Percent mode resolves live via the context
@@ -840,6 +857,14 @@ class QtyChipRow(QWidget):
 
     def _emit_state(self) -> None:
         self.qty_changed.emit(self.current_qty())
+        self._emit_preview()
+
+    def _emit_preview(self) -> None:
+        """Push the header B/S readout.  % mode: per-side resolved
+        totals across the checked accounts.  Share mode: the TOTAL a
+        click would transmit — active qty × checked-account count (the
+        fan-out places one order per account), same number both sides.
+        Empty strings (labels hidden) when nothing is resolvable."""
         if self._unit == UNIT_PCT:
             buy = self._pct_ctx.preview_total(self._active_pct)
             sell = self._pct_ctx.sell_preview_total(self._active_pct)
@@ -847,7 +872,11 @@ class QtyChipRow(QWidget):
                 f"B {buy:,}" if buy > 0 else "",
                 f"S {sell:,}" if sell > 0 else "")
         else:
-            self.preview_changed.emit("", "")
+            total = self.current_qty() * len(self._pct_ctx.accounts())
+            text = f"{total:,}" if total > 0 else ""
+            self.preview_changed.emit(
+                f"B {text}" if text else "",
+                f"S {text}" if text else "")
 
     def _on_unit_toggled(self) -> None:
         # Snapshot the outgoing unit's custom text, flip, restore the

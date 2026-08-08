@@ -144,9 +144,10 @@ def _parse_expiry_date(expiry: str) -> date | None:
 # ── Cached read of the active config's instrument entries ────────────────────
 
 _lock = threading.Lock()
-# (path, mtime_ns) → (oe_entries, bt_entries, hot_metas)
+# (path, mtime_ns) → (oe_entries, bt_entries, hot_metas, sweep_entries)
 _cache_key: tuple[str, int] | None = None
-_cache_val: tuple[list[dict], list[dict], list[dict]] = ([], [], [])
+_cache_val: tuple[list[dict], list[dict], list[dict], list[dict]] = \
+    ([], [], [], [])
 
 
 def invalidate_cache() -> None:
@@ -156,9 +157,10 @@ def invalidate_cache() -> None:
         _cache_key = None
 
 
-def _load_state() -> tuple[list[dict], list[dict], list[dict]]:
-    """(order-entry entries, book-trader entries, hot-button metas) for
-    the active config, mtime-cached.  Never raises."""
+def _load_state() -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+    """(order-entry entries, book-trader entries, hot-button metas,
+    sweep-symbol metas) for the active config, mtime-cached.  Never
+    raises."""
     global _cache_key, _cache_val
     from src.core import config_manager as _cm
     p: Path = _cm._default_path()
@@ -175,6 +177,7 @@ def _load_state() -> tuple[list[dict], list[dict], list[dict]]:
     oe: list[dict] = []
     bt: list[dict] = []
     hot: list[dict] = []
+    sweep: list[dict] = []
     try:
         with open(p, "r", encoding="utf-8") as fh:
             data = json.load(fh)
@@ -197,9 +200,21 @@ def _load_state() -> tuple[list[dict], list[dict], list[dict]]:
         sym = str(b.get("symbol", "") or "").strip()
         if sym:
             hot.append({"symbol": sym, **meta})
+    # Cash-sweep symbols carry their picked contract metadata under
+    # preferences.cash_management.sweep_contracts ({SYM: meta}) — a
+    # sweep symbol is resolvable/subscribable WITHOUT being a chip.
+    cm_prefs = (data.get("preferences", {}) or {}).get(
+        "cash_management", {}) or {}
+    contracts = cm_prefs.get("sweep_contracts", {})
+    if isinstance(contracts, dict):
+        for sym, raw in contracts.items():
+            meta = normalise_contract_meta(raw)
+            s = str(sym or "").strip().upper()
+            if s and meta is not None:
+                sweep.append({"symbol": s, **meta})
     with _lock:
         _cache_key = key
-        _cache_val = (oe, bt, hot)
+        _cache_val = (oe, bt, hot, sweep)
     return _cache_val
 
 
@@ -208,14 +223,15 @@ def _load_state() -> tuple[list[dict], list[dict], list[dict]]:
 
 def all_contracts() -> list[dict[str, Any]]:
     """Every known instrument entry (order-entry chips, book-trader
-    chips, hot buttons), deduped by symbol — a chip symbol maps to ONE
-    instrument in this design (OPT chips are keyed by their OCC local
-    symbol, so roots never collide across sec types) — with entries
-    that carry a conid winning over bare ones.  Sorted STK < FUT < OPT
-    then symbol, the presentation order the contracts DB used."""
-    oe, bt, hot = _load_state()
+    chips, hot buttons, cash-sweep symbols), deduped by symbol — a chip
+    symbol maps to ONE instrument in this design (OPT chips are keyed
+    by their OCC local symbol, so roots never collide across sec types)
+    — with entries that carry a conid winning over bare ones.  Sorted
+    STK < FUT < OPT then symbol, the presentation order the contracts
+    DB used."""
+    oe, bt, hot, sweep = _load_state()
     merged: dict[str, dict] = {}
-    for e in [*oe, *bt, *hot]:
+    for e in [*oe, *bt, *hot, *sweep]:
         k = e["symbol"].upper()
         cur = merged.get(k)
         if cur is None or (not entry_has_meta(cur) and entry_has_meta(e)):
@@ -233,8 +249,8 @@ def get_contract(query: str) -> dict[str, Any] | None:
     OCC key — or a bare local symbol) to one entry.
 
     The entry's SYMBOL key is the identity and wins first (in order
-    order-entry → book-trader → hot buttons, preferring entries that
-    carry a conid) — this keeps a pinned ``NQZ6`` chip resolvable even
+    order-entry → book-trader → hot buttons → sweep symbols, preferring
+    entries that carry a conid) — this keeps a pinned ``NQZ6`` chip resolvable even
     when the root ``NQ`` entry rolls onto the same local symbol.  An
     exact ``local_symbol`` match is the fallback so a root contract can
     still be looked up by its local symbol (e.g. ``"NQU6"`` → the NQ
@@ -242,8 +258,8 @@ def get_contract(query: str) -> dict[str, Any] | None:
     if not query:
         return None
     q = query.upper().strip()
-    oe, bt, hot = _load_state()
-    ordered = [*oe, *bt, *hot]
+    oe, bt, hot, sweep = _load_state()
+    ordered = [*oe, *bt, *hot, *sweep]
     fallback: dict | None = None
     for e in ordered:
         if e["symbol"].upper() != q:

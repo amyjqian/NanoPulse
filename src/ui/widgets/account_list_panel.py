@@ -237,6 +237,25 @@ class _CheckmarkBox(QWidget):
 
 # ── Account Row (Card) ────────────────────────────────────────────────────────
 
+class _SweepMenu(QMenu):
+    """Cash-sweep context menu that reports a right-click landing outside
+    it.  A popup QMenu grabs the mouse, so that click would otherwise only
+    dismiss the menu and the user would have to right-click the other
+    account row a second time — the panel listens to this signal and
+    reopens the menu on the row under the cursor in one step."""
+
+    right_pressed_outside = Signal(object)   # global QPoint
+
+    def mousePressEvent(self, ev):
+        if (ev.button() == Qt.MouseButton.RightButton
+                and not self.rect().contains(ev.position().toPoint())):
+            global_pos = ev.globalPosition().toPoint()
+            self.close()
+            self.right_pressed_outside.emit(global_pos)
+            return
+        super().mousePressEvent(ev)
+
+
 class _AccountRow(QFrame):
     """A single account card: checkbox | name | balance | × button."""
 
@@ -930,24 +949,26 @@ class AccountListPanel(QWidget):
             self._group_pills[name] = pill
 
     def _on_group_drop(self, src_name: str, dst_name: str) -> None:
-        """Pill ``src_name`` was dropped onto ``dst_name`` — reorder
-        ``self._groups`` so ``src_name`` lands immediately before
-        ``dst_name``, persist, and rebuild the grid.  Mirrors
-        ``SymbolChipBar._on_drop``.
+        """Pill ``src_name`` was dropped onto ``dst_name`` — the dragged
+        pill takes the drop target's position, so a drag works in every
+        direction (the pill grid is row-major, so left/right/up/down are
+        all just list indices): dragging forward lands *after* the
+        target, dragging backward lands *before* it.  Persist + rebuild.
         """
         names = [g["name"] for g in self._groups]
         if src_name not in names or dst_name not in names:
             return
         src_idx = names.index(src_name)
+        # The target's index BEFORE the pop: inserting there after
+        # removing src puts the pill exactly where the target was —
+        # after it when dragging forward (everything shifted left by
+        # one), before it when dragging backward (nothing shifted).
+        dst_idx = names.index(dst_name)
         moved = self._groups.pop(src_idx)
-        # Destination index must be computed AFTER the pop so the insert
-        # lands immediately before the drop target in the new list.
-        dst_idx = next(
-            i for i, g in enumerate(self._groups) if g["name"] == dst_name)
         self._groups.insert(dst_idx, moved)
         config_manager.save_account_groups(self._groups)
         self._rebuild_pills()
-        log.info("AccountList: reordered group %r before %r",
+        log.info("AccountList: moved group %r to %r's position",
                  src_name, dst_name)
 
     def _set_active_group(self, name: str | None) -> None:
@@ -1371,9 +1392,9 @@ class AccountListPanel(QWidget):
         """Scoped delete: drop *account* from the currently-active group
         only, leaving every other saved group untouched.  The row is
         removed from the list because the active-group view shows only
-        group members.  If the group becomes empty, delete it (matching
-        prior behavior) and clear the active indicator so ``_sync_rows``
-        falls back to the all-accounts view."""
+        group members.  An emptied group is KEPT — its pill stays and
+        the view just shows no rows.  Deleting a group is an explicit
+        act only: right-click the pill → Delete."""
         name = self._active_group
         g = self._find_group(name) if name else None
         if g is None:
@@ -1385,20 +1406,10 @@ class AccountListPanel(QWidget):
         if "selected" in g:
             g["selected"] = [a for a in g["selected"] if a != account]
 
-        pills_need_rebuild = False
-        if not g["accounts"]:
-            # Empty group — drop it entirely.
-            self._groups = [x for x in self._groups if x is not g]
-            self._set_active_group(None)
-            pills_need_rebuild = True
-
         config_manager.save_account_groups(self._groups)
-        if pills_need_rebuild:
-            self._rebuild_pills()
 
-        # Re-sync rows: when the group still exists the deleted account
-        # is no longer a member and its row is dropped; when the group
-        # was deleted we fall back to the all-accounts view.
+        # Re-sync rows: the deleted account is no longer a member so
+        # its row is dropped (an emptied group shows an empty list).
         self._sync_rows()
         self._emit_selection_changed()
         log.info("AccountList: removed %s from group %r (scoped delete)",
@@ -1494,8 +1505,24 @@ class AccountListPanel(QWidget):
         used to price + size the sweep order shown in the right-click menu."""
         self._sweep_quote_provider = provider
 
-    def compute_sweep(self, account: str) -> dict:
-        """Pure computation for the sweep menu (kept separate so it's testable).
+    def compute_sweeps(self, account: str) -> list[dict]:
+        """One sweep entry per configured sweep symbol (max 4) for the
+        right-click menu.  With nothing configured, a single disabled
+        pointer-to-Settings entry."""
+        from src.core.cash_management import cash_prefs
+
+        symbols = cash_prefs.sweep_symbols
+        if not symbols:
+            return [{"enabled": False, "symbol": "", "direction": None,
+                     "qty": 0, "limit_price": 0.0,
+                     "label": "Set a sweep symbol in Settings → "
+                              "Cash Management"}]
+        return [self.compute_sweep(account, s) for s in symbols]
+
+    def compute_sweep(self, account: str, symbol: str | None = None) -> dict:
+        """Pure computation for one sweep-menu entry (kept separate so
+        it's testable).  *symbol* defaults to the first configured sweep
+        symbol.
 
         Returns ``{enabled, label, direction, qty, symbol, limit_price}``:
 
@@ -1514,10 +1541,14 @@ class AccountListPanel(QWidget):
 
         ``enabled`` is False (with an explanatory ``label``) when there's no
         sweep symbol configured, no live price, a flat balance, or the quantity
-        rounds to zero."""
+        rounds to zero.  A sweep-out with no shares held additionally sets
+        ``hidden`` True — the menu drops the entry instead of showing it
+        disabled."""
         from src.core.cash_management import cash_prefs
 
-        symbol = (cash_prefs.sweep_symbol or "").strip().upper()
+        if symbol is None:
+            symbol = cash_prefs.sweep_symbol
+        symbol = (symbol or "").strip().upper()
         if not symbol:
             return {"enabled": False, "symbol": "", "direction": None, "qty": 0,
                     "limit_price": 0.0,
@@ -1555,10 +1586,11 @@ class AccountListPanel(QWidget):
         else:
             limit_price = 0.0
             # Sweep out only makes sense if the account actually holds the
-            # sweep symbol — nothing to sell otherwise, so don't offer it.
+            # sweep symbol — nothing to sell otherwise.  ``hidden`` keeps
+            # the entry out of the menu entirely (not just disabled).
             if held <= 0:
-                return {"enabled": False, "symbol": symbol, "direction": "out",
-                        "qty": 0, "limit_price": 0.0,
+                return {"enabled": False, "hidden": True, "symbol": symbol,
+                        "direction": "out", "qty": 0, "limit_price": 0.0,
                         "label": f"No {symbol} shares to sweep out"}
             needed = _ceil_to_5(abs(usd) / size_price)
             # Cover the whole deficit if we hold enough (rounded up to a
@@ -1576,15 +1608,38 @@ class AccountListPanel(QWidget):
                 "label": f"{verb} {qty:,} {symbol}"}
 
     def _show_sweep_menu(self, account: str, global_pos) -> None:
-        """Build + show the account's cash-sweep right-click menu."""
-        info = self.compute_sweep(account)
-        menu = QMenu(self)
-        act = menu.addAction(info["label"])
-        act.setEnabled(info["enabled"])
-        if menu.exec(global_pos) is act and info["enabled"]:
-            self.sweep_requested.emit(
-                account, info["direction"], info["qty"], info["symbol"],
-                float(info.get("limit_price", 0.0)))
+        """Build + show the account's cash-sweep right-click menu — one
+        action per configured sweep symbol (max 4).  Entries flagged
+        ``hidden`` (e.g. sweep-out with no shares held) are omitted;
+        with nothing left to show, no menu opens at all."""
+        menu = _SweepMenu(self)
+        menu.right_pressed_outside.connect(self._reopen_sweep_menu_at)
+        actions: list[tuple[object, dict]] = []
+        for info in self.compute_sweeps(account):
+            if info.get("hidden"):
+                continue
+            act = menu.addAction(info["label"])
+            act.setEnabled(info["enabled"])
+            actions.append((act, info))
+        if not actions:
+            return
+        chosen = menu.exec(global_pos)
+        for act, info in actions:
+            if chosen is act and info["enabled"]:
+                self.sweep_requested.emit(
+                    account, info["direction"], info["qty"], info["symbol"],
+                    float(info.get("limit_price", 0.0)))
+                break
+
+    def _reopen_sweep_menu_at(self, global_pos) -> None:
+        """A right-click closed the open sweep menu — if it landed on an
+        account row, open that row's menu without a second click.  Deferred
+        with a 0-ms timer so the closing menu's ``exec`` unwinds first."""
+        for acct, row in self._account_rows.items():
+            if row.rect().contains(row.mapFromGlobal(global_pos)):
+                QTimer.singleShot(
+                    0, lambda a=acct, p=global_pos: self._show_sweep_menu(a, p))
+                return
 
     def active_group(self) -> str | None:
         """Currently-active group name, or None when the selection

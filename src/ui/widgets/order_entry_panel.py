@@ -1870,6 +1870,11 @@ class _HotButtonModal(QDialog):
         self._inp_symbol.setStyleSheet(self._INPUT_QSS)
         self._inp_symbol.setFixedHeight(30)
         self._inp_symbol.textChanged.connect(self._on_symbol_changed)
+        # Dropdown trigger rides textEdited, which fires ONLY for user
+        # keystrokes — textChanged + hasFocus() misfired when the Tool
+        # dropdown had briefly stolen activation and hasFocus() went
+        # stale, leaving the user typing with no search popup.
+        self._inp_symbol.textEdited.connect(self._on_symbol_edited)
         # Clicking the field opens the live IBKR symbol search (same
         # popup as the chip bars) — picks store qualified contract
         # metadata on the hot button itself.
@@ -2048,7 +2053,6 @@ class _HotButtonModal(QDialog):
         " border:1px solid #232A3B; border-radius:5px;"
         " padding:4px 8px; font-size:11px;"
         "}"
-        "QLineEdit:focus, QComboBox:focus{ border-color:#539BF5; }"
         "QLineEdit:disabled, QComboBox:disabled{ color:#6A7690; }"
         "QComboBox::drop-down{ border:none; width:20px; }"
         # Style the popup list — without this Qt falls back to the
@@ -2258,10 +2262,9 @@ class _HotButtonModal(QDialog):
         if (self._draft.get("contract")
                 and self._draft["symbol"].upper() != self._picked_symbol):
             self._draft.pop("contract", None)
-        # Typing in the focused field surfaces the live-search dropdown
-        # (programmatic setText — draft load, pick adoption — doesn't).
-        if self._inp_symbol.hasFocus() and not self._suppress_dropdown:
-            self._show_symbol_dropdown()
+        # Dropdown opening moved to _on_symbol_edited (textEdited):
+        # user keystrokes only, no hasFocus() dependence — programmatic
+        # setText (draft load, pick adoption) never lands there.
         # Bracket inputs step by the new target symbol's tick.
         self._update_bracket_ticks()
         if self._draft["symbol"]:
@@ -2273,6 +2276,13 @@ class _HotButtonModal(QDialog):
         self._auto_fill_qty_from_prefs()
         self._update_symbol_status()
         self._update_preview()
+
+    def _on_symbol_edited(self, _text: str) -> None:
+        """User keystroke in the SPECIFIC symbol field → surface the
+        live-search dropdown.  textEdited never fires on programmatic
+        setText, so draft loads and pick adoption stay silent."""
+        if not self._suppress_dropdown:
+            self._show_symbol_dropdown()
 
     def _auto_fill_qty_from_prefs(self) -> None:
         """Populate ``_inp_qty`` with the trading-prefs default size for
@@ -4690,7 +4700,8 @@ class OrderEntryPanel(QWidget):
         Called from FlashTradeView.showEvent and _wire_all_workers to ensure
         background market data is always flowing.
         """
-        if not self._symbols:
+        from src.core.cash_management import cash_prefs
+        if not self._symbols and not cash_prefs.sweep_symbols:
             return
         pw = self._bg_worker
         if pw is not None and pw.isRunning() and pw.is_ib_connected:
@@ -4755,10 +4766,15 @@ class OrderEntryPanel(QWidget):
         self._subscribe_all_background()
 
     def _build_bg_params(self) -> list[dict]:
-        """Build market data params for all symbol chips."""
+        """Build market data params for all symbol chips PLUS the
+        configured cash-sweep symbols — sweep menus price from this
+        panel's cache, and a sweep symbol needn't be a chip (its
+        contract metadata is stored with the preference and resolved
+        through ``instruments`` like any chip's)."""
+        from src.core.cash_management import cash_prefs
         params_list = []
         seen: set[str] = set()
-        for sym in self._symbols:
+        for sym in [*self._symbols, *cash_prefs.sweep_symbols]:
             q = sym.upper()
             if q in seen:
                 continue

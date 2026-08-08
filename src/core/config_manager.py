@@ -518,9 +518,10 @@ def load_account_groups(
     list[str], "selected": list[str] | None}`` dicts.  ``selected`` is
     the per-group checked subset (absent in legacy configs — the UI
     migrates those to ``selected = accounts``).  Invalid entries
-    (non-string names, empty account lists, duplicate names) are
-    dropped silently — the UI rebuilds persistence on every mutation
-    so a corrupt entry won't round-trip."""
+    (non-string names, duplicate names) are dropped silently — the UI
+    rebuilds persistence on every mutation so a corrupt entry won't
+    round-trip.  An EMPTY account list is valid: a group the user
+    emptied keeps its pill until they explicitly delete it."""
     p = Path(path) if path else _default_path()
     data = _read_json(p)
     raw = data.get("account_groups", [])
@@ -540,8 +541,6 @@ def load_account_groups(
         if not isinstance(accounts, list):
             continue
         acct_list = [str(a) for a in accounts if isinstance(a, str) and a]
-        if not acct_list:
-            continue
         out: dict[str, Any] = {"name": name, "accounts": acct_list}
         sel = entry.get("selected")
         if isinstance(sel, list):

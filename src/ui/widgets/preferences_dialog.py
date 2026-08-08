@@ -79,6 +79,7 @@ _DEFAULTS: dict = {
         "sell_ask_unit": "ticks",
     },
     "cash_management": {
+        "sweep_symbols": [],
         "sweep_symbol": "",
     },
 }
@@ -414,13 +415,25 @@ class _DisplayPage(QWidget):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class _CashManagementPage(QWidget):
-    """Cash-management settings — currently the sweep stock symbol."""
+    """Cash-management settings — up to 4 sweep stock symbols.  Each
+    configured symbol becomes its own Sweep in / Sweep out action on
+    the account right-click menu.  The fields behave exactly like the
+    Hot Button modal's SPECIFIC symbol field: typing searches directly
+    from the field and an inline results-only dropdown (no second
+    search box) opens under it, filtered to stocks; ↑/↓/Enter pick,
+    Esc dismisses.  All four fields share one reusable dropdown."""
 
     changed = Signal()
 
-    def __init__(self, prefs: dict, parent=None):
+    _MAX_SYMBOLS = 4
+
+    def __init__(self, prefs: dict, parent=None, *, workers=None):
         super().__init__(parent)
         self._prefs = prefs
+        self._workers = list(workers or [])
+        self._popup = None          # shared dropdown, reused across fields
+        self._active_edit = None    # field the dropdown is attached to
+        self._suppress_dropdown = False
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -440,39 +453,166 @@ class _CashManagementPage(QWidget):
         root.addWidget(sep)
         root.addSpacing(6)
 
-        lbl = QLabel("Sweep symbol")
+        lbl = QLabel("Sweep symbols")
         lbl.setFont(_FONT_SECTION)
         lbl.setStyleSheet(f"color: {_TEXT_DIM}; border: none;")
         root.addWidget(lbl)
 
-        desc = QLabel("The stock symbol used for cash-sweep operations.")
+        desc = QLabel(
+            "Up to 4 stock symbols for cash-sweep operations — each gets "
+            "its own action on the account right-click menu.")
         desc.setStyleSheet(
             f"color: {_TEXT_DIM}; border: none; font-size: 11px;")
         root.addWidget(desc)
 
         cm = self._prefs.get("cash_management", {})
-        self._symbol = QLineEdit()
-        self._symbol.setText(str(cm.get("sweep_symbol", "") or ""))
-        self._symbol.setPlaceholderText("e.g. AAPL")
-        self._symbol.setFixedWidth(180)
-        self._symbol.setStyleSheet(_INPUT_QSS)
-        # Persist on Enter or when focus leaves the field.
-        self._symbol.editingFinished.connect(self._on_edit)
-        row = QHBoxLayout()
-        row.addWidget(self._symbol)
-        row.addStretch()
-        root.addLayout(row)
+        raw = cm.get("sweep_symbols")
+        if not isinstance(raw, list):
+            legacy = str(cm.get("sweep_symbol", "") or "")
+            raw = [legacy] if legacy else []
+        symbols = [str(s or "").strip().upper() for s in raw]
+        # Pick-time contract metadata per symbol ({SYM: meta}) — this is
+        # what lets sweep symbols price + trade without being chips.
+        contracts = cm.get("sweep_contracts", {})
+        self._contracts: dict[str, dict] = {
+            str(k or "").strip().upper(): dict(v)
+            for k, v in contracts.items()
+            if isinstance(v, dict) and str(k or "").strip()
+        } if isinstance(contracts, dict) else {}
+
+        # Reuse the Hot Button modal's input style verbatim so these
+        # fields look identical to its symbol field (same border,
+        # radius, font size and height).
+        from src.ui.widgets.order_entry_panel import _HotButtonModal
+
+        self._symbol_edits: list[QLineEdit] = []
+        for i in range(self._MAX_SYMBOLS):
+            edit = QLineEdit()
+            edit.setText(symbols[i] if i < len(symbols) else "")
+            edit.setPlaceholderText("Search symbol…")
+            edit.setFixedWidth(380)
+            edit.setFixedHeight(30)
+            edit.setStyleSheet(_HotButtonModal._INPUT_QSS)
+            # textEdited fires ONLY for user keystrokes (never on
+            # programmatic setText), so a pick adopting its symbol
+            # can't re-open the dropdown it just closed.
+            edit.textEdited.connect(
+                lambda _t, e=edit: self._on_symbol_edited(e))
+            edit.installEventFilter(self)
+            row = QHBoxLayout()
+            row.addWidget(edit)
+            row.addStretch()
+            root.addLayout(row)
+            self._symbol_edits.append(edit)
         root.addStretch()
 
+    # ── Inline symbol-search dropdown (Hot Button modal pattern) ─────────────
+
+    def _on_symbol_edited(self, edit: QLineEdit) -> None:
+        if not self._suppress_dropdown:
+            self._show_dropdown(edit)
+
+    def _show_dropdown(self, edit: QLineEdit) -> None:
+        """Inline live search under *edit* — the popup in dropdown mode
+        (no internal search box) querying the field directly, stocks
+        only.  One instance is shared by all four fields; attach_input
+        re-points it when a different field opens it."""
+        from src.ui.widgets.symbol_search_popup import SymbolSearchPopup
+        if self._popup is None:
+            self._popup = SymbolSearchPopup(
+                self, workers=self._workers, exclude=set(),
+                external_input=edit, stocks_only=True)
+            self._popup.symbol_selected.connect(self._on_symbol_picked)
+        else:
+            self._popup.attach_input(edit)
+        self._active_edit = edit
+        self._popup.open_below(edit)
+
+    def _on_symbol_picked(self, entry: dict) -> None:
+        """Adopt a dropdown pick into the field it is attached to.
+        The pick's contract metadata is kept alongside the symbol —
+        that's what lets the sweep menu price (and the order path
+        route) the symbol without it being a chip."""
+        from src.core import instruments
+        edit = self._active_edit
+        sym = str(entry.get("symbol", "") or "").strip().upper()
+        if edit is None or not sym:
+            return
+        meta = instruments.contract_meta_from_result(entry)
+        if meta and meta.get("conid"):
+            self._contracts[sym] = meta
+        self._suppress_dropdown = True
+        try:
+            edit.setText(sym)
+        finally:
+            self._suppress_dropdown = False
+        self._on_edit()
+        if self._popup is not None:
+            self._popup.close()
+
+    def eventFilter(self, obj, event):  # noqa: N802 – Qt override
+        # Same wiring as the Hot Button modal's symbol field: typing
+        # searches from the field itself, ↑/↓/Enter/Esc are forwarded
+        # to the dropdown while it's visible, clicking (re)opens it,
+        # and losing focus dismisses it and commits the text.
+        if obj in self._symbol_edits:
+            t = event.type()
+            if t == QEvent.Type.KeyPress:
+                dd = self._popup
+                if (dd is not None and dd.isVisible()
+                        and dd.handle_key(event)):
+                    return True
+            elif t == QEvent.Type.MouseButtonPress:
+                self._show_dropdown(obj)
+            elif t == QEvent.Type.FocusOut:
+                # Clicking the dropdown itself briefly activates its
+                # window (ActiveWindowFocusReason) — that must not
+                # dismiss it before the row click lands.
+                if (self._popup is not None
+                        and event.reason()
+                        != Qt.FocusReason.ActiveWindowFocusReason):
+                    self._popup.close()
+                self._on_edit()
+        return super().eventFilter(obj, event)
+
+    def close_dropdown(self) -> None:
+        """Host hook: close the search dropdown when the Settings
+        dialog closes.  In dropdown mode the popup is a floating Tool
+        window — it doesn't dismiss with its host on its own."""
+        if self._popup is not None:
+            try:
+                self._popup.close()
+            except RuntimeError:
+                pass  # already deleted
+
+    def _symbols(self) -> list[str]:
+        """Cleaned symbol list from the inputs: upper-cased, blanks
+        skipped, duplicates dropped (first occurrence wins)."""
+        out: list[str] = []
+        for edit in self._symbol_edits:
+            sym = edit.text().strip().upper()
+            if sym and sym not in out:
+                out.append(sym)
+        return out
+
     def _on_edit(self) -> None:
-        sym = self._symbol.text().strip().upper()
-        if sym != self._symbol.text():
-            self._symbol.setText(sym)
-        self._prefs.setdefault("cash_management", {})["sweep_symbol"] = sym
+        for edit in self._symbol_edits:
+            sym = edit.text().strip().upper()
+            if sym != edit.text():
+                edit.setText(sym)
+        self._prefs["cash_management"] = self.collect()
         self.changed.emit()
 
     def collect(self) -> dict:
-        return {"sweep_symbol": self._symbol.text().strip().upper()}
+        symbols = self._symbols()
+        # Legacy key kept in sync so older builds restoring this
+        # config still find their (first) sweep symbol.  Pick-time
+        # contract metadata rides along, pruned to the kept symbols.
+        return {"sweep_symbols": symbols,
+                "sweep_symbol": symbols[0] if symbols else "",
+                "sweep_contracts": {s: dict(m)
+                                    for s, m in self._contracts.items()
+                                    if s in symbols}}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -851,12 +991,21 @@ class PreferencesDialog(QDialog):
     """Preferences dialog that auto-closes on focus loss and persists
     all settings to ``app_config.json``."""
 
-    def __init__(self, parent=None, *, columns_provider=None, auth_context=None):
+    # Emitted after every successful _save() — hosts use it to refresh
+    # anything derived from preferences (e.g. background market-data
+    # subscriptions for the cash-sweep symbols).
+    preferences_saved = Signal()
+
+    def __init__(self, parent=None, *, columns_provider=None,
+                 auth_context=None, workers=None):
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.resize(920, 540)
         self.setMinimumSize(800, 420)
         self._columns_provider = columns_provider
+        # Connected IB workers (priority-ordered) for pages that need a
+        # live TWS symbol search — currently the sweep-symbol pickers.
+        self._workers = list(workers or [])
         # auth_context (optional): {"user": User, "service": AuthService,
         # "on_sign_out": callable}.  When present the sidebar grows a user
         # chip + Sign out, and admins additionally get a "Users" page.
@@ -941,7 +1090,8 @@ class PreferencesDialog(QDialog):
         self._display_page = _DisplayPage(self._prefs)
         self._trading_page = _TradingPage(self._prefs)
         self._columns_page = ColumnsPage(self._columns_provider, self)
-        self._cash_page = _CashManagementPage(self._prefs)
+        self._cash_page = _CashManagementPage(self._prefs,
+                                              workers=self._workers)
 
         self._stack.addWidget(self._display_page)
         self._stack.addWidget(self._trading_page)
@@ -1124,6 +1274,14 @@ class PreferencesDialog(QDialog):
         if QApplication.activeModalWidget() is not None:
             return
 
+        # The sweep-symbol search popup (Qt.Popup) also deactivates the
+        # dialog while it's up — closing Settings underneath it would
+        # yank the popup's anchor away mid-search.
+        from src.ui.widgets.symbol_search_popup import SymbolSearchPopup
+        for w in QApplication.topLevelWidgets():
+            if isinstance(w, SymbolSearchPopup) and w.isVisible():
+                return
+
         parent = self.parent()
         if parent is None:
             self.close()
@@ -1170,8 +1328,14 @@ class PreferencesDialog(QDialog):
     # ── Save on close ─────────────────────────────────────────────────────────
 
     def closeEvent(self, event) -> None:
+        # The sweep-symbol search dropdown is a floating tool window —
+        # it doesn't close with the dialog on its own.
+        cash = getattr(self, "_cash_page", None)
+        if cash is not None:
+            cash.close_dropdown()
         self._save()
         super().closeEvent(event)
+
 
     def _save(self) -> None:
         self._prefs["display"] = self._display_page.collect()
@@ -1188,3 +1352,4 @@ class PreferencesDialog(QDialog):
         cash_prefs.reload()
 
         log.info("Preferences saved")
+        self.preferences_saved.emit()

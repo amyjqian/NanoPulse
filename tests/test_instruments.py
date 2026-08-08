@@ -266,3 +266,39 @@ class TestPinnedFutures:
         assert instruments.is_expired_fut("NQZ6") is True
         assert instruments.is_expired_fut("NQ") is False    # future expiry
         assert instruments.is_expired_fut("ZZZ") is False   # unknown
+
+
+class TestSweepContracts:
+    """Cash-sweep symbols resolve through the same resolver as chips —
+    their pick-time metadata lives under
+    preferences.cash_management.sweep_contracts, so a sweep symbol can
+    price + trade without being a chip."""
+
+    _SGOV = {"conid": "563439551", "sec_type": "STK", "exchange": "SMART",
+             "currency": "USD", "local_symbol": "SGOV",
+             "primary_exchange": "ARCA"}
+
+    def test_sweep_symbol_resolves_without_chip(self, cfg):
+        _write(cfg, {"preferences": {"cash_management": {
+            "sweep_symbols": ["SGOV"],
+            "sweep_contracts": {"SGOV": self._SGOV}}}})
+        e = instruments.get_contract("SGOV")
+        assert e is not None and e["conid"] == "563439551"
+        p = instruments.build_md_params("SGOV")
+        assert p is not None and p["conid"] == 563439551
+        assert p["sec_type"] == "STK" and p["exchange"] == "SMART"
+
+    def test_chip_entry_wins_over_sweep_entry(self, cfg):
+        chip = dict(_AAPL)
+        _write(cfg, {"order_entry_symbols": [chip],
+                     "preferences": {"cash_management": {
+                         "sweep_contracts": {
+                             "AAPL": dict(self._SGOV, conid="1")}}}})
+        assert instruments.get_contract("AAPL")["conid"] == "265598"
+
+    def test_junk_sweep_contracts_ignored(self, cfg):
+        _write(cfg, {"preferences": {"cash_management": {
+            "sweep_contracts": {"": self._SGOV, "X": "junk", "Y": {}}}}})
+        assert instruments.get_contract("X") is None
+        assert instruments.get_contract("Y") is None
+        assert instruments.build_md_params("X") is None

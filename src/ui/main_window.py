@@ -443,8 +443,14 @@ class MainWindow(QWidget):
                 "on_sign_out": self._request_sign_out,
                 "on_lock": self.lock_session,
             }
-        dlg = PreferencesDialog(self, columns_provider=provider,
-                                auth_context=auth_context)
+        from src.ui.widgets.symbol_search_popup import (
+            connected_workers_by_priority,
+        )
+        dlg = PreferencesDialog(
+            self, columns_provider=provider, auth_context=auth_context,
+            workers=connected_workers_by_priority(self.active_threads))
+        dlg.preferences_saved.connect(
+            self._flash_trade.refresh_market_data_subscriptions)
         if section is not None:
             dlg.navigate_to(section, subview)
         if modeless:

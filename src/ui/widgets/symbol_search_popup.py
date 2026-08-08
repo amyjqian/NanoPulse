@@ -20,7 +20,7 @@ import calendar
 import logging
 from datetime import date, datetime
 
-from PySide6.QtCore import QTimer, Qt, Signal
+from PySide6.QtCore import QPoint, QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QFontMetrics
 from PySide6.QtWidgets import (
     QDialog,
@@ -398,17 +398,22 @@ class SymbolSearchPopup(QDialog):
 
     def __init__(self, parent: QWidget, workers: list,
                  exclude: set[str] | None = None,
-                 external_input=None) -> None:
+                 external_input=None,
+                 stocks_only: bool = False) -> None:
         """*external_input* (a QLineEdit) switches the popup into
         dropdown mode: its own search box is hidden, the query is read
         live from that field, and the window never steals focus — the
         host keeps typing in its own field and forwards ↑/↓/Enter/Esc
         via :meth:`handle_key`.  The instance is reusable (``close()``
-        hides instead of deleting)."""
+        hides instead of deleting).  *stocks_only* filters both saved
+        contracts and IBKR results to STK rows (no futures roots, no
+        option chips) — used where only a plain stock/ETF makes sense,
+        e.g. the cash-sweep symbol pickers."""
         super().__init__(parent)
         self._workers = workers
         self._exclude = {s.upper() for s in (exclude or set())}
         self._ext_input = external_input
+        self._stocks_only = bool(stocks_only)
         self._wired: list = []
 
         # Remote-search state
@@ -455,11 +460,13 @@ class SymbolSearchPopup(QDialog):
 
         self._search = QLineEdit()
         self._search.setPlaceholderText("Search symbol…")
+        # No :focus accent — the green frame reads as a validation
+        # state, and the box is focused whenever the popup is open
+        # anyway, so the ring carries no information.
         self._search.setStyleSheet(
             f"QLineEdit{{background:{Theme.BG_INPUT};color:{Theme.TEXT};"
             f"border:1px solid {Theme.BORDER};border-radius:9px;"
-            f"padding:8px 12px;font-size:14px}}"
-            f"QLineEdit:focus{{border-color:{Theme.ACCENT}}}")
+            f"padding:8px 12px;font-size:14px}}")
         lay.addWidget(self._search)
 
         self._hdr = QLabel("Saved contracts")
@@ -472,7 +479,12 @@ class SymbolSearchPopup(QDialog):
             f"QListWidget{{background:transparent;color:{Theme.TEXT};"
             f"border:none;outline:none}}"
             f"QListWidget::item{{border-radius:10px;padding:0px}}"
-            f"QListWidget::item:selected{{background:#334058}}"
+            # No ::item:selected rule: the keyboard-cursor highlight is
+            # painted on the row widget (_update_row_highlight), which
+            # renders identically in every context — ::item:selected
+            # paints nothing when an ancestor (the Settings dialog)
+            # carries a stylesheet.
+            f"QListWidget::item:selected{{background:transparent}}"
             f"QListWidget::item:hover{{background:#232A3B}}")
         self._lst.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         # No scrollbars — the list scrolls with the mouse wheel /
@@ -498,6 +510,8 @@ class SymbolSearchPopup(QDialog):
             self._search.hide()
             self._ext_input.textChanged.connect(self._on_text_changed)
         self._lst.itemClicked.connect(lambda _it: self._commit_current())
+        self._lst.currentRowChanged.connect(
+            lambda _r: self._update_row_highlight())
 
         def _key(event) -> None:
             if event.key() == Qt.Key.Key_Down:
@@ -512,6 +526,12 @@ class SymbolSearchPopup(QDialog):
         self._search.keyPressEvent = _key  # type: ignore[method-assign]
 
         self._rebuild()
+        # Dropdown mode is usually constructed lazily on the FIRST
+        # typed character — that keystroke predates the textChanged
+        # wiring above, so kick the search for it explicitly or the
+        # list sits empty until the second character.
+        if self._ext_input is not None and self._query():
+            self._on_text_changed(self._query())
 
     def paintEvent(self, event) -> None:  # noqa: N802
         """Rounded card on a transparent window (see __init__)."""
@@ -527,12 +547,41 @@ class SymbolSearchPopup(QDialog):
 
     # ── Public ────────────────────────────────────────────────────────────────
 
+    def attach_input(self, edit) -> None:
+        """Dropdown mode: (re)point the live query at *edit*.  Used by
+        hosts where several fields share one dropdown (the sweep-symbol
+        pickers) — rewires the textChanged feed and kicks a fresh
+        search for the new field's current text, so the results never
+        belong to the previously-attached field."""
+        if self._ext_input is edit:
+            return
+        if self._ext_input is not None:
+            try:
+                self._ext_input.textChanged.disconnect(self._on_text_changed)
+            except (RuntimeError, TypeError):
+                pass
+        self._ext_input = edit
+        edit.textChanged.connect(self._on_text_changed)
+        self._on_text_changed(edit.text())
+
     def open_below(self, anchor: QWidget) -> None:
         """Show the popup anchored under *anchor*; standalone mode also
         focuses the internal search box (dropdown mode leaves focus in
-        the host's field)."""
-        self.move(anchor.mapToGlobal(anchor.rect().bottomLeft()))
+        the host's field).  Dropdown mode matches the anchor's width
+        (with a floor so rows stay legible) and tucks in flush under
+        it, so field + list read as ONE combobox-style control."""
+        if self._ext_input is not None:
+            self.setFixedWidth(max(anchor.width(), 240))
+        pos = anchor.mapToGlobal(anchor.rect().bottomLeft())
+        if self._ext_input is not None:
+            # Tuck 1px UNDER the field's bottom edge — any downward
+            # offset reads as a detached second component.
+            pos += QPoint(0, -1)
+        self.move(pos)
         self.show()
+        # A reused (hidden) Tool window can re-show BELOW its modal
+        # host on macOS — force it back to the top of the stack.
+        self.raise_()
         if self._ext_input is None:
             self._search.setFocus()
 
@@ -677,8 +726,14 @@ class SymbolSearchPopup(QDialog):
         self._lst.clear()
         q = self._query().upper()
 
+        local_pool, remote_pool = self._local, self._remote
+        if self._stocks_only:
+            local_pool = [e for e in local_pool
+                          if e.get("sec_type", "STK") == "STK"]
+            remote_pool = [r for r in remote_pool
+                           if r.get("sec_type", "STK") == "STK"]
         locals_shown, remote_shown, already_added = merge_rows(
-            self._local, self._remote, self._exclude, q)
+            local_pool, remote_pool, self._exclude, q)
 
         self._hdr.setText("Results" if q else "Saved contracts")
 
@@ -709,6 +764,10 @@ class SymbolSearchPopup(QDialog):
             if self._lst.item(i).data(Qt.ItemDataRole.UserRole) is not None:
                 self._lst.setCurrentRow(i)
                 break
+        # Explicit call: setCurrentRow won't fire currentRowChanged
+        # when the index is unchanged across a rebuild, but the row
+        # widgets are new and start unhighlighted.
+        self._update_row_highlight()
 
         # Size the list to at most _VISIBLE_ROWS rows, using the rows'
         # real heights so a partial row never pokes out at the bottom;
@@ -759,8 +818,27 @@ class SymbolSearchPopup(QDialog):
             f"font-size:{size}px;font-weight:700")
         return av
 
+    _ROW_SS_SELECTED = "QWidget#srow{background:#2D4F80;border-radius:10px}"
+
+    def _update_row_highlight(self) -> None:
+        """Paint the keyboard-cursor row's background on the row widget
+        itself.  ``::item:selected`` renders fine when the popup lives
+        under a stylesheet-free ancestor (Book Trader) but paints
+        NOTHING when an ancestor carries a stylesheet (the Settings
+        dialog) — the row-widget background works in both contexts.
+        Every child label pins ``background:transparent`` so styling
+        the container can't surface opaque palette fills behind the
+        text/pill (the nested-boxes artifact)."""
+        cur = self._lst.currentRow()
+        for i in range(self._lst.count()):
+            w = self._lst.itemWidget(self._lst.item(i))
+            if w is None:
+                continue
+            w.setStyleSheet(self._ROW_SS_SELECTED if i == cur else "")
+
     def _add_row(self, entry: dict) -> None:
         row = QWidget()
+        row.setObjectName("srow")
         row.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         h = QHBoxLayout(row)
@@ -771,6 +849,7 @@ class SymbolSearchPopup(QDialog):
 
         sym = QLabel(entry["symbol"])
         sym.setStyleSheet(
+            f"background:transparent;"
             f"color:{Theme.TEXT};font-size:13px;font-weight:bold")
         h.addWidget(sym)
 
@@ -784,10 +863,15 @@ class SymbolSearchPopup(QDialog):
             exp = format_expiry(entry["expiry"])
             name_text = f"{exp}  ·  {name_text}" if name_text else exp
         name = QLabel()
-        name.setStyleSheet(f"color:{Theme.TEXT_DIM};font-size:12px")
+        name.setStyleSheet(
+            f"background:transparent;color:{Theme.TEXT_DIM};font-size:12px")
         fm = QFontMetrics(name.font())
+        # Elide to the space actually left beside the avatar, symbol
+        # and exchange pill at the CURRENT popup width — a fixed elide
+        # width pushes the pill off the edge in narrow dropdown mode.
+        avail = max(60, self.width() - 240)
         name.setText(fm.elidedText(
-            name_text, Qt.TextElideMode.ElideRight, 300))
+            name_text, Qt.TextElideMode.ElideRight, avail))
         h.addWidget(name, 1)
 
         # Listing exchange preferred over the generic sec-type badge;
@@ -800,6 +884,7 @@ class SymbolSearchPopup(QDialog):
             badge_text = exch or entry.get("badge", "")
         badge = QLabel(badge_text)
         badge.setStyleSheet(
+            f"background:transparent;"
             f"color:{Theme.TEXT_DIM};font-size:11px;"
             f"border:1px solid {Theme.BORDER};border-radius:10px;"
             f"padding:3px 11px")

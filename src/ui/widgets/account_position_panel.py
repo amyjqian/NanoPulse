@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
     QHeaderView,
+    QLineEdit,
     QMenu,
     QPushButton,
     QStackedWidget,
@@ -587,7 +588,8 @@ class AccountPositionPanel(QWidget):
         self._open_preferences_callback = open_preferences
         self._model = AccountPositionModel(
             get_alias=self._get_alias, parent=self)
-        self._summary_model = PositionsSummaryModel(self)
+        self._summary_model = PositionsSummaryModel(
+            self, get_alias=self._get_alias)
         self._setup_ui()
         # Both pills start unchecked every launch (no persistence):
         # flat account-grouped view, zero positions hidden.
@@ -934,6 +936,33 @@ class AccountPositionPanel(QWidget):
         self._zero_pos_toggle.toggled.connect(self._on_zero_pos_toggled)
         lay.addWidget(self._zero_pos_toggle)
 
+        # Search field — filters both position views by account alias /
+        # account id / symbol.  Styled to match the Trades tab's search box.
+        self._search_field = QLineEdit()
+        self._search_field.setObjectName("posSearch")
+        self._search_field.setPlaceholderText("Search")
+        self._search_field.setFixedHeight(24)
+        self._search_field.setStyleSheet(f"""
+            QLineEdit#posSearch {{
+                background: {BG_PANEL};
+                color: {TEXT};
+                border: 1px solid {BORDER};
+                border-radius: 4px;
+                padding: 2px 8px;
+                font-family: Inter, "Helvetica Neue", Arial, sans-serif;
+                font-size: 11px;
+                min-width: 90px;
+                max-width: 90px;
+            }}
+            QLineEdit#posSearch:focus {{
+                border-color: {CLR_OPEN};
+            }}
+        """)
+        self._search_field.textChanged.connect(self._on_search_text_changed)
+        # Esc clears the filter (event filter — QLineEdit ignores Esc).
+        self._search_field.installEventFilter(self)
+        lay.addWidget(self._search_field)
+
         btn = QPushButton("⟳")
         btn.setToolTip("Refresh positions")
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -996,6 +1025,19 @@ class AccountPositionPanel(QWidget):
     def _on_zero_pos_toggled(self, checked: bool) -> None:
         self._model.set_show_zero(checked)
         self._summary_model.set_show_zero(checked)
+
+    def _on_search_text_changed(self, text: str) -> None:
+        self._model.set_search_text(text)
+        self._summary_model.set_search_text(text)
+
+    def eventFilter(self, obj, event) -> bool:
+        if (obj is self._search_field
+                and event.type() == QEvent.Type.KeyPress
+                and event.key() == Qt.Key.Key_Escape
+                and self._search_field.text()):
+            self._search_field.clear()
+            return True
+        return super().eventFilter(obj, event)
 
     def _on_summary_toggled(self, on: bool) -> None:
         self._stack.setCurrentIndex(1 if on else 0)

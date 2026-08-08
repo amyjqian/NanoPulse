@@ -89,11 +89,12 @@ def test_sweep_out_sells_all_non_multiple_of_5(panel):
 
 
 def test_sweep_out_hidden_when_no_holdings(panel):
-    # Negative USD but the account holds none of the sweep symbol → disabled.
+    # Negative USD but the account holds none of the sweep symbol →
+    # dropped from the menu entirely (hidden, not just disabled).
     panel.set_sweep_quote_provider(lambda acct, sym: (100.0, 100.0, 0.0))
     info = panel.compute_sweep("neg")
     assert info["enabled"] is False
-    assert "No SGOV shares" in info["label"]
+    assert info.get("hidden") is True
 
 
 def test_sweep_in_still_shown_without_holdings(panel):
@@ -168,3 +169,160 @@ def test_legacy_two_tuple_provider_disables_gracefully(panel):
     panel.set_sweep_quote_provider(lambda acct, sym: (100.0, 2000.0))
     info = panel.compute_sweep("pos")
     assert info["enabled"] is False
+
+
+# ── multiple sweep symbols (max 4) ────────────────────────────────────────────
+
+@pytest.fixture
+def multi_panel(qtbot, tmp_path, monkeypatch):
+    monkeypatch.setattr(config_manager, "_active_path", tmp_path / "cfg.json")
+    (tmp_path / "cfg.json").write_text(json.dumps(
+        {"preferences": {"cash_management": {
+            "sweep_symbols": ["SGOV", "BIL"]}}}))
+    from src.core.cash_management import cash_prefs
+    cash_prefs.reload()
+
+    am = AccountsTableModel()
+    am.update_batch([("L", "pos", "NetLiquidation", "1", "USD"),
+                     ("L", "pos", "CashBalance", "91170", "USD")])
+    am.update_batch([("L", "neg", "NetLiquidation", "1", "USD"),
+                     ("L", "neg", "CashBalance", "-91170", "USD")])
+    p = AccountListPanel(am)
+    # SGOV $100, 2000 held; BIL $50, nothing held.
+    p.set_sweep_quote_provider(
+        lambda acct, sym: (100.0, 100.0, 2000.0) if sym == "SGOV"
+        else (50.0, 50.0, 0.0))
+    return p
+
+
+def test_multi_symbol_sweep_in_entry_per_symbol(multi_panel):
+    infos = multi_panel.compute_sweeps("pos")
+    assert [(i["symbol"], i["enabled"], i["qty"]) for i in infos] == [
+        ("SGOV", True, 910),      # 91170 / 100 → floor5
+        ("BIL", True, 1820),      # 91170 / 50 → floor5
+    ]
+    assert infos[0]["label"] == "Sweep in 910 SGOV"
+    assert infos[1]["label"] == "Sweep in 1,820 BIL"
+
+
+def test_multi_symbol_sweep_out_only_where_held(multi_panel):
+    infos = multi_panel.compute_sweeps("neg")
+    sgov, bil = infos
+    assert sgov["enabled"] is True and sgov["direction"] == "out"
+    assert bil["enabled"] is False
+    assert bil.get("hidden") is True   # menu drops it, not just disables
+
+
+class _FakeMenu:
+    """Stands in for _SweepMenu so ``_show_sweep_menu`` can run headless —
+    records what would have been shown instead of exec'ing a popup."""
+
+    shown: list[list[str]] = []
+
+    class _Act:
+        def __init__(self, label):
+            self._label = label
+
+        def text(self):
+            return self._label
+
+        def setEnabled(self, _b):
+            pass
+
+    class _Sig:
+        def connect(self, _slot):
+            pass
+
+    def __init__(self, parent=None):
+        self._acts = []
+        self.right_pressed_outside = self._Sig()
+
+    def addAction(self, label):
+        act = self._Act(label)
+        self._acts.append(act)
+        return act
+
+    def exec(self, _pos):
+        _FakeMenu.shown.append([a.text() for a in self._acts])
+        return None
+
+
+def test_menu_omits_hidden_entries(multi_panel, monkeypatch):
+    # neg account: SGOV held (sweep out shown), BIL not held (dropped).
+    import src.ui.widgets.account_list_panel as alp
+
+    _FakeMenu.shown = []
+    monkeypatch.setattr(alp, "_SweepMenu", _FakeMenu)
+    multi_panel._show_sweep_menu("neg", None)
+    assert _FakeMenu.shown == [["Sweep out 915 SGOV"]]
+
+
+def test_menu_not_opened_when_all_entries_hidden(multi_panel, monkeypatch):
+    # Nothing held in either symbol → every sweep-out entry is hidden and
+    # the menu never opens.
+    import src.ui.widgets.account_list_panel as alp
+
+    multi_panel.set_sweep_quote_provider(
+        lambda acct, sym: (100.0, 100.0, 0.0))
+    _FakeMenu.shown = []
+    monkeypatch.setattr(alp, "_SweepMenu", _FakeMenu)
+    multi_panel._show_sweep_menu("neg", None)
+    assert _FakeMenu.shown == []
+
+
+def test_legacy_single_symbol_config_still_works(panel):
+    # The original fixture writes only the legacy "sweep_symbol" key —
+    # compute_sweeps must surface it as the one configured symbol.
+    infos = panel.compute_sweeps("pos")
+    assert len(infos) == 1
+    assert infos[0]["symbol"] == "SGOV" and infos[0]["enabled"] is True
+
+
+def test_sweep_symbols_capped_at_four(tmp_path, monkeypatch):
+    monkeypatch.setattr(config_manager, "_active_path", tmp_path / "cfg.json")
+    (tmp_path / "cfg.json").write_text(json.dumps(
+        {"preferences": {"cash_management": {
+            "sweep_symbols": ["A", "B", "C", "D", "E", "A"]}}}))
+    from src.core.cash_management import cash_prefs
+    cash_prefs.reload()
+    assert cash_prefs.sweep_symbols == ["A", "B", "C", "D"]
+    assert cash_prefs.sweep_symbol == "A"      # legacy view = first
+
+
+def test_no_symbols_configured_single_settings_pointer(tmp_path, monkeypatch,
+                                                       qtbot):
+    monkeypatch.setattr(config_manager, "_active_path", tmp_path / "cfg.json")
+    (tmp_path / "cfg.json").write_text(json.dumps(
+        {"preferences": {"cash_management": {"sweep_symbols": []}}}))
+    from src.core.cash_management import cash_prefs
+    cash_prefs.reload()
+    am = AccountsTableModel()
+    p = AccountListPanel(am)
+    infos = p.compute_sweeps("pos")
+    assert len(infos) == 1
+    assert infos[0]["enabled"] is False
+    assert "Settings" in infos[0]["label"]
+
+
+# ── sweep contract metadata (chips not required) ─────────────────────────────
+
+def test_sweep_contracts_load_and_prune(tmp_path, monkeypatch):
+    """cash_prefs carries the pick-time contract metadata; setting a new
+    symbol list prunes metadata for dropped symbols."""
+    monkeypatch.setattr(config_manager, "_active_path", tmp_path / "cfg.json")
+    meta = {"conid": "563439551", "sec_type": "STK", "exchange": "SMART"}
+    (tmp_path / "cfg.json").write_text(json.dumps(
+        {"preferences": {"cash_management": {
+            "sweep_symbols": ["SGOV", "BIL"],
+            "sweep_contracts": {"SGOV": meta, "BIL": dict(meta, conid="2")},
+        }}}))
+    from src.core.cash_management import cash_prefs
+    cash_prefs.reload()
+    assert cash_prefs.sweep_contracts["SGOV"]["conid"] == "563439551"
+
+    cash_prefs.set_sweep_symbols(["BIL"])
+    assert list(cash_prefs.sweep_contracts) == ["BIL"]
+    saved = json.loads((tmp_path / "cfg.json").read_text())
+    cm = saved["preferences"]["cash_management"]
+    assert list(cm["sweep_contracts"]) == ["BIL"]
+    cash_prefs.reload()

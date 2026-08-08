@@ -88,8 +88,9 @@ class PositionsSummaryModel(QAbstractTableModel):
     per con_id, plus a synthetic TOTAL footer row when any aggregates
     are visible."""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, get_alias=None):
         super().__init__(parent)
+        self._get_alias = get_alias
         # Full position state keyed by (account, con_id) — mirrors the
         # flat model's local cache so a toggle/filter change rebuilds
         # without waiting for the next worker tick.
@@ -119,6 +120,12 @@ class PositionsSummaryModel(QAbstractTableModel):
         # None means "all accounts"; an empty set also means the same
         # (matches the flat model's semantics so they stay in sync).
         self._selected_accounts: set[str] | None = None
+
+        # Lowercased search text (control-bar search field).  A position
+        # contributes to the aggregates only when its account id/alias
+        # or symbol matches — so typing an alias shows that account's
+        # aggregates, typing a symbol shows that contract's row.
+        self._search_text: str = ""
 
         self._symbol_font = QFont("Inter, Helvetica Neue, Arial", 11)
         self._symbol_font.setWeight(QFont.Weight.DemiBold)
@@ -340,6 +347,15 @@ class PositionsSummaryModel(QAbstractTableModel):
         self._show_zero = show
         self._rebuild()
 
+    def set_search_text(self, text: str) -> None:
+        """Filter by account id/alias or symbol (case-insensitive
+        substring), then rebuild.  Empty text clears the filter."""
+        text = (text or "").strip().lower()
+        if text == self._search_text:
+            return
+        self._search_text = text
+        self._rebuild()
+
     def set_selected_accounts(self, accounts) -> None:
         """Filter aggregates to only the given accounts.  ``None`` or
         an empty set means "all accounts" (matches the flat model's
@@ -417,6 +433,8 @@ class PositionsSummaryModel(QAbstractTableModel):
         for (account, con_id), pos in self._positions.items():
             if not self._passes_account_filter(account):
                 continue
+            if not self._matches_search(account, pos):
+                continue
             agg = self._agg.get(con_id)
             if agg is None:
                 agg = self._empty_agg(con_id, pos)
@@ -442,6 +460,18 @@ class PositionsSummaryModel(QAbstractTableModel):
         if not sel:
             return True
         return account in sel
+
+    def _matches_search(self, account: str, pos: dict) -> bool:
+        if not self._search_text:
+            return True
+        if self._search_text in account.lower():
+            return True
+        alias = (self._get_alias(account) if self._get_alias else "") or ""
+        if self._search_text in alias.lower():
+            return True
+        return any(
+            self._search_text in (pos.get(f) or "").lower()
+            for f in ("symbol", "local_symbol"))
 
     @staticmethod
     def _empty_agg(con_id: int, seed: dict) -> dict:
