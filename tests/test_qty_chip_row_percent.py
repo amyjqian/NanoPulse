@@ -383,29 +383,45 @@ def test_wheel_steps_ladder_both_units(qtbot):
     assert box.text() == "99"
 
 
-def test_symbol_switch_to_shares_clears_preview(qtbot):
+def test_symbol_switch_to_shares_replaces_stale_pct_preview(qtbot):
     # % readout on a stock, then switch to a symbol that forces share
-    # mode (FUT) — the stale B/S totals must be cleared, not left on
-    # the Book Trader header (they only update via preview_changed).
+    # mode (FUT) — the header must show the new symbol's SH transmit
+    # total (default qty x accounts), not the stale % totals.
     row = _make(qtbot)
     previews = []
     row.preview_changed.connect(lambda b, s: previews.append((b, s)))
     row._btn_unit.click()
     _chip(row, 25).click()
-    assert previews[-1][0].startswith("B ")
+    assert previews[-1] == ("B 1,945", "")
     row.set_presets(*_STK, allow_percent=False)   # e.g. NVDA → MNQ
-    assert previews[-1] == ("", "")
+    # Default qty 100 × 1 checked account, both sides.
+    assert previews[-1] == ("B 100", "S 100")
 
 
-def test_symbol_switch_in_share_mode_keeps_preview_clear(qtbot):
-    # SH-mode stock→stock switch after earlier % usage: still clears.
-    row = _make(qtbot)
+def test_share_mode_preview_is_qty_times_accounts(qtbot):
+    row = _make(qtbot, accounts=[("A", 1.0, 0.0, 0.0),
+                                 ("B", 1.0, 0.0, 0.0),
+                                 ("C", 1.0, 0.0, 0.0)])
     previews = []
     row.preview_changed.connect(lambda b, s: previews.append((b, s)))
-    row._btn_unit.click()          # %
     _chip(row, 25).click()
-    row._btn_unit.click()          # back to SH (clears)
-    row.set_presets(*_STK, allow_percent=True)    # symbol switch in SH
+    assert previews[-1] == ("B 75", "S 75")       # 25 × 3 accounts
+    _chip(row, 500).click()
+    assert previews[-1] == ("B 1,500", "S 1,500")
+    # Programmatic set_qty (position-row click) refreshes the readout
+    # even though qty_changed stays silent.
+    row.set_qty(7)
+    assert previews[-1] == ("B 21", "S 21")
+    # Selection change → host refresh call re-resolves the total.
+    row.refresh_percent_preview()
+    assert previews[-1] == ("B 21", "S 21")
+
+
+def test_share_mode_preview_hidden_without_accounts(qtbot):
+    row = _make(qtbot, accounts=[])
+    previews = []
+    row.preview_changed.connect(lambda b, s: previews.append((b, s)))
+    _chip(row, 25).click()
     assert previews[-1] == ("", "")
 
 

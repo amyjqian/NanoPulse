@@ -565,8 +565,9 @@ class BookTraderView(QWidget):
         # button side-by-side under a single stretch slot; outer cells
         # hold the BID SZ / ASK SZ labels.
         # Percent-mode safety readouts (spec §5): each side's resolved
-        # share count must be on screen BEFORE any rung click.  Hidden
-        # in share mode so the header stays pixel-identical to today.
+        # share count must be on screen BEFORE any rung click.  Share
+        # mode shows the transmit total too: qty × checked accounts,
+        # same number on both sides.
         # Header = 5 slots: Bid Size · B:… · [lock+interval] · S:… ·
         # Ask Size, with the interval group staying dead-centre (three
         # equal-stretch thirds).
