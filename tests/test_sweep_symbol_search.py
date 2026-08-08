@@ -95,3 +95,54 @@ class TestCashPageDropdown:
         # Blanks skipped, dupes dropped, upper-cased.
         assert out["sweep_symbols"] == ["SGOV", "BIL"]
         assert out["sweep_symbol"] == "SGOV"
+
+
+class TestOneControlFeel:
+    def test_first_keystroke_kicks_search(self, qtbot):
+        # Dropdown is constructed lazily on the first typed character —
+        # that keystroke predates the textChanged wiring, so the ctor
+        # must kick the search itself (empty "Results" box otherwise).
+        host = QLineEdit()
+        qtbot.addWidget(host)
+        host.setText("S")
+        p = SymbolSearchPopup(host, workers=[object()], exclude=set(),
+                              external_input=host)
+        host._popup_pin = p
+        assert p._searching is True
+        p._debounce.stop()   # fake worker can't take the real search
+
+    def test_attach_input_rewires_query_feed(self, qtbot):
+        e0, e1 = QLineEdit(), QLineEdit()
+        qtbot.addWidget(e0)
+        qtbot.addWidget(e1)
+        p = SymbolSearchPopup(e0, workers=[object()], exclude=set(),
+                              external_input=e0)
+        e0._popup_pin = p
+        e1.setText("BI")
+        p.attach_input(e1)
+        assert p._query() == "BI"
+        assert p._searching is True
+        # The old field no longer feeds the query.
+        p._searching = False
+        e0.setText("XYZ")
+        assert p._query() == "BI"
+        assert p._searching is False
+        # The new field does.
+        e1.setText("BIL")
+        assert p._searching is True
+        p._debounce.stop()   # fake worker can't take the real search
+
+    def test_dropdown_matches_anchor_width(self, qtbot):
+        host = QLineEdit()
+        qtbot.addWidget(host)
+        host.setFixedWidth(300)
+        host.show()
+        p = SymbolSearchPopup(host, workers=[], exclude=set(),
+                              external_input=host)
+        host._popup_pin = p
+        p.open_below(host)
+        assert p.width() == 300
+        # Floor keeps rows legible under very narrow anchors.
+        host.setFixedWidth(120)
+        p.open_below(host)
+        assert p.width() == 240

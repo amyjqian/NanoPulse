@@ -20,7 +20,7 @@ import calendar
 import logging
 from datetime import date, datetime
 
-from PySide6.QtCore import QTimer, Qt, Signal
+from PySide6.QtCore import QPoint, QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QFontMetrics
 from PySide6.QtWidgets import (
     QDialog,
@@ -477,7 +477,10 @@ class SymbolSearchPopup(QDialog):
             f"QListWidget{{background:transparent;color:{Theme.TEXT};"
             f"border:none;outline:none}}"
             f"QListWidget::item{{border-radius:10px;padding:0px}}"
-            f"QListWidget::item:selected{{background:#334058}}"
+            # The keyboard cursor must read clearly against both the
+            # panel background and the mouse-hover tint — an
+            # accent-leaning blue, not another grey.
+            f"QListWidget::item:selected{{background:#2D4F80}}"
             f"QListWidget::item:hover{{background:#232A3B}}")
         self._lst.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         # No scrollbars — the list scrolls with the mouse wheel /
@@ -517,6 +520,12 @@ class SymbolSearchPopup(QDialog):
         self._search.keyPressEvent = _key  # type: ignore[method-assign]
 
         self._rebuild()
+        # Dropdown mode is usually constructed lazily on the FIRST
+        # typed character — that keystroke predates the textChanged
+        # wiring above, so kick the search for it explicitly or the
+        # list sits empty until the second character.
+        if self._ext_input is not None and self._query():
+            self._on_text_changed(self._query())
 
     def paintEvent(self, event) -> None:  # noqa: N802
         """Rounded card on a transparent window (see __init__)."""
@@ -532,11 +541,35 @@ class SymbolSearchPopup(QDialog):
 
     # ── Public ────────────────────────────────────────────────────────────────
 
+    def attach_input(self, edit) -> None:
+        """Dropdown mode: (re)point the live query at *edit*.  Used by
+        hosts where several fields share one dropdown (the sweep-symbol
+        pickers) — rewires the textChanged feed and kicks a fresh
+        search for the new field's current text, so the results never
+        belong to the previously-attached field."""
+        if self._ext_input is edit:
+            return
+        if self._ext_input is not None:
+            try:
+                self._ext_input.textChanged.disconnect(self._on_text_changed)
+            except (RuntimeError, TypeError):
+                pass
+        self._ext_input = edit
+        edit.textChanged.connect(self._on_text_changed)
+        self._on_text_changed(edit.text())
+
     def open_below(self, anchor: QWidget) -> None:
         """Show the popup anchored under *anchor*; standalone mode also
         focuses the internal search box (dropdown mode leaves focus in
-        the host's field)."""
-        self.move(anchor.mapToGlobal(anchor.rect().bottomLeft()))
+        the host's field).  Dropdown mode matches the anchor's width
+        (with a floor so rows stay legible) and tucks in flush under
+        it, so field + list read as ONE combobox-style control."""
+        if self._ext_input is not None:
+            self.setFixedWidth(max(anchor.width(), 240))
+        pos = anchor.mapToGlobal(anchor.rect().bottomLeft())
+        if self._ext_input is not None:
+            pos += QPoint(0, 2)
+        self.move(pos)
         self.show()
         if self._ext_input is None:
             self._search.setFocus()

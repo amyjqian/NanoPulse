@@ -476,7 +476,9 @@ class _CashManagementPage(QWidget):
             edit = QLineEdit()
             edit.setText(symbols[i] if i < len(symbols) else "")
             edit.setPlaceholderText("e.g. SGOV")
-            edit.setFixedWidth(180)
+            # Wide enough for the dropdown (which matches this width)
+            # to render its avatar + name + exchange rows legibly.
+            edit.setFixedWidth(300)
             edit.setStyleSheet(_INPUT_QSS)
             # Persist on Enter or when focus leaves the field.
             edit.editingFinished.connect(self._on_edit)
@@ -505,8 +507,11 @@ class _CashManagementPage(QWidget):
                 self, workers=self._workers, exclude=set(),
                 external_input=edit, stocks_only=True)
             self._dropdown.symbol_selected.connect(self._on_symbol_picked)
-        elif self._dropdown_edit is not edit:
-            self._dropdown._ext_input = edit
+        else:
+            # Rewires textChanged and kicks a fresh search — a raw
+            # _ext_input swap would leave the old field feeding the
+            # query and the list showing its results.
+            self._dropdown.attach_input(edit)
         self._dropdown_edit = edit
         self._dropdown.open_below(edit)
 
