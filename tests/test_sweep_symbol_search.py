@@ -157,12 +157,13 @@ class TestOneControlFeel:
 
 
 class TestCursorHighlight:
-    """The keyboard cursor is rendered by the list's ::item:selected
-    style (one flat blue row — the add-symbol dropdown look).  An
-    earlier explicit per-row-widget painting nested ugly borders inside
-    the row and is gone."""
+    """The keyboard cursor paints on the row widget itself — the ONLY
+    mechanism that renders in every context (::item:selected paints
+    nothing under the Settings dialog's ancestor stylesheet).  Child
+    labels pin background:transparent so the container's blue can't
+    surface opaque boxes behind the text/pill."""
 
-    def test_stepping_moves_the_selected_item(self, qtbot):
+    def _popup(self, qtbot):
         host = QLineEdit()
         qtbot.addWidget(host)
         p = SymbolSearchPopup(host, workers=[], exclude=set(),
@@ -171,24 +172,36 @@ class TestCursorHighlight:
         p._local = [_entry("NVDA", "STK"), _entry("SGOV", "STK"),
                     _entry("BIL", "STK")]
         p._rebuild()
-        # First data row selected after rebuild; ↑/↓ move it (wrapping).
-        assert p._lst.currentRow() == 0
+        return p
+
+    def test_stepped_row_gets_distinct_background(self, qtbot):
+        p = self._popup(qtbot)
+
+        def _bg(i):
+            return p._lst.itemWidget(p._lst.item(i)).styleSheet()
+
+        # First data row highlighted after rebuild, others clear.
+        assert "background" in _bg(0)
+        assert _bg(1) == "" and _bg(2) == ""
         p._step(+1)
         assert p._lst.currentRow() == 1
+        assert _bg(0) == "" and "background" in _bg(1)
         p._step(-1)
-        assert p._lst.currentRow() == 0
-        p._step(-1)
-        assert p._lst.currentRow() == 2
-        # The highlight itself comes from the item:selected style; no
-        # per-row stylesheet painting remains to fight it.
-        assert "item:selected" in p._lst.styleSheet()
-        for i in range(p._lst.count()):
-            assert p._lst.itemWidget(p._lst.item(i)).styleSheet() == ""
+        assert "background" in _bg(0) and _bg(1) == ""
+
+    def test_child_labels_pin_transparent_backgrounds(self, qtbot):
+        # Guards against the nested-boxes artifact: styling the row
+        # container must never surface opaque fills behind children.
+        p = self._popup(qtbot)
+        row = p._lst.itemWidget(p._lst.item(0))
+        from PySide6.QtWidgets import QLabel
+        labels = row.findChildren(QLabel)
+        assert labels
+        transparent = [lb for lb in labels
+                       if "background:transparent" in lb.styleSheet()]
+        # All but the circular avatar (which owns an opaque fill).
+        assert len(transparent) == len(labels) - 1
 
     def test_search_box_has_no_focus_accent_frame(self, qtbot):
-        host = QLineEdit()
-        qtbot.addWidget(host)
-        p = SymbolSearchPopup(host, workers=[], exclude=set(),
-                              external_input=host)
-        host._popup_pin = p
+        p = self._popup(qtbot)
         assert ":focus" not in p._search.styleSheet()

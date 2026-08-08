@@ -479,10 +479,12 @@ class SymbolSearchPopup(QDialog):
             f"QListWidget{{background:transparent;color:{Theme.TEXT};"
             f"border:none;outline:none}}"
             f"QListWidget::item{{border-radius:10px;padding:0px}}"
-            # The keyboard cursor must read clearly against both the
-            # panel background and the mouse-hover tint — an
-            # accent-leaning blue, not another grey.
-            f"QListWidget::item:selected{{background:#2D4F80}}"
+            # No ::item:selected rule: the keyboard-cursor highlight is
+            # painted on the row widget (_update_row_highlight), which
+            # renders identically in every context — ::item:selected
+            # paints nothing when an ancestor (the Settings dialog)
+            # carries a stylesheet.
+            f"QListWidget::item:selected{{background:transparent}}"
             f"QListWidget::item:hover{{background:#232A3B}}")
         self._lst.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         # No scrollbars — the list scrolls with the mouse wheel /
@@ -508,6 +510,8 @@ class SymbolSearchPopup(QDialog):
             self._search.hide()
             self._ext_input.textChanged.connect(self._on_text_changed)
         self._lst.itemClicked.connect(lambda _it: self._commit_current())
+        self._lst.currentRowChanged.connect(
+            lambda _r: self._update_row_highlight())
 
         def _key(event) -> None:
             if event.key() == Qt.Key.Key_Down:
@@ -757,6 +761,10 @@ class SymbolSearchPopup(QDialog):
             if self._lst.item(i).data(Qt.ItemDataRole.UserRole) is not None:
                 self._lst.setCurrentRow(i)
                 break
+        # Explicit call: setCurrentRow won't fire currentRowChanged
+        # when the index is unchanged across a rebuild, but the row
+        # widgets are new and start unhighlighted.
+        self._update_row_highlight()
 
         # Size the list to at most _VISIBLE_ROWS rows, using the rows'
         # real heights so a partial row never pokes out at the bottom;
@@ -807,8 +815,27 @@ class SymbolSearchPopup(QDialog):
             f"font-size:{size}px;font-weight:700")
         return av
 
+    _ROW_SS_SELECTED = "QWidget#srow{background:#2D4F80;border-radius:10px}"
+
+    def _update_row_highlight(self) -> None:
+        """Paint the keyboard-cursor row's background on the row widget
+        itself.  ``::item:selected`` renders fine when the popup lives
+        under a stylesheet-free ancestor (Book Trader) but paints
+        NOTHING when an ancestor carries a stylesheet (the Settings
+        dialog) — the row-widget background works in both contexts.
+        Every child label pins ``background:transparent`` so styling
+        the container can't surface opaque palette fills behind the
+        text/pill (the nested-boxes artifact)."""
+        cur = self._lst.currentRow()
+        for i in range(self._lst.count()):
+            w = self._lst.itemWidget(self._lst.item(i))
+            if w is None:
+                continue
+            w.setStyleSheet(self._ROW_SS_SELECTED if i == cur else "")
+
     def _add_row(self, entry: dict) -> None:
         row = QWidget()
+        row.setObjectName("srow")
         row.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         h = QHBoxLayout(row)
@@ -819,6 +846,7 @@ class SymbolSearchPopup(QDialog):
 
         sym = QLabel(entry["symbol"])
         sym.setStyleSheet(
+            f"background:transparent;"
             f"color:{Theme.TEXT};font-size:13px;font-weight:bold")
         h.addWidget(sym)
 
@@ -832,7 +860,8 @@ class SymbolSearchPopup(QDialog):
             exp = format_expiry(entry["expiry"])
             name_text = f"{exp}  ·  {name_text}" if name_text else exp
         name = QLabel()
-        name.setStyleSheet(f"color:{Theme.TEXT_DIM};font-size:12px")
+        name.setStyleSheet(
+            f"background:transparent;color:{Theme.TEXT_DIM};font-size:12px")
         fm = QFontMetrics(name.font())
         # Elide to the space actually left beside the avatar, symbol
         # and exchange pill at the CURRENT popup width — a fixed elide
@@ -852,6 +881,7 @@ class SymbolSearchPopup(QDialog):
             badge_text = exch or entry.get("badge", "")
         badge = QLabel(badge_text)
         badge.setStyleSheet(
+            f"background:transparent;"
             f"color:{Theme.TEXT_DIM};font-size:11px;"
             f"border:1px solid {Theme.BORDER};border-radius:10px;"
             f"padding:3px 11px")
