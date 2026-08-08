@@ -112,6 +112,25 @@ class TestCashPageDropdown:
         assert edit.text() == ""
         assert page._prefs["cash_management"]["sweep_symbols"] == []
 
+    def test_typing_letter_opens_popup_preseeded(self, page, qtbot):
+        # Keyboard-only: a letter on the focused field opens the search
+        # popup with that character already in its search box.
+        from PySide6.QtCore import Qt as _Qt
+        edit = page._symbol_edits[0]
+        qtbot.keyClick(edit, _Qt.Key.Key_B)
+        assert page._popup is not None
+        assert page._popup._search.text() == "b"
+        assert edit.text() == ""            # read-only field untouched
+        page._popup.close()
+
+    def test_enter_opens_popup_for_keyboard_users(self, page, qtbot):
+        from PySide6.QtCore import Qt as _Qt
+        edit = page._symbol_edits[1]
+        qtbot.keyClick(edit, _Qt.Key.Key_Return)
+        assert page._popup is not None
+        assert page._popup._search.text() == ""
+        page._popup.close()
+
     def test_collect_reports_all_fields(self, page):
         for i, sym in enumerate(["SGOV", "BIL", "", "sgov"]):
             page._symbol_edits[i].setText(sym)

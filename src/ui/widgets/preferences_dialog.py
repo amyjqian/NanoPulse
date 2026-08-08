@@ -553,6 +553,20 @@ class _CashManagementPage(QWidget):
                                    Qt.Key.Key_Space, Qt.Key.Key_Down):
                     self._open_search(obj)
                     return True
+                # Keyboard-only type-to-search: a letter/digit on the
+                # focused (read-only) field opens the popup with that
+                # character already in its search box, so Tab → type →
+                # ↑/↓ → Enter needs no mouse at all.
+                txt = event.text()
+                if (txt and txt.isalnum()
+                        and not event.modifiers() & (
+                            Qt.KeyboardModifier.ControlModifier
+                            | Qt.KeyboardModifier.MetaModifier
+                            | Qt.KeyboardModifier.AltModifier)):
+                    self._open_search(obj)
+                    if self._popup is not None:
+                        self._popup._search.setText(txt)
+                    return True
         return super().eventFilter(obj, event)
 
     def close_dropdown(self) -> None:
