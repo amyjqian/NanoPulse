@@ -8,6 +8,7 @@ appear in a cash-sweep picker.
 from __future__ import annotations
 
 import pytest
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QLineEdit
 
 from src.ui.widgets.symbol_search_popup import SymbolSearchPopup
@@ -74,9 +75,35 @@ class TestCashPageDropdown:
         assert page._popup._stocks_only is True
         assert page._popup._ext_input is None
 
-    def test_fields_are_readonly_pick_only(self, page):
+    def test_fields_are_pick_only_but_show_caret(self, page):
+        # Editable (Qt hides the blinking caret in read-only mode — the
+        # focused field must look like Book Trader's search box) yet
+        # every mutating path is guarded: typing is intercepted, the
+        # context menu and drops are off, and the hint matches.
         for edit in page._symbol_edits:
-            assert edit.isReadOnly()
+            assert not edit.isReadOnly()
+            assert edit.placeholderText() == "Search symbol…"
+            assert (edit.contextMenuPolicy()
+                    == Qt.ContextMenuPolicy.NoContextMenu)
+            assert not edit.acceptDrops()
+
+    def test_paste_cannot_inject_text(self, page, qtbot):
+        from PySide6.QtWidgets import QApplication
+        QApplication.clipboard().setText("EVIL")
+        edit = page._symbol_edits[0]
+        qtbot.keyClick(edit, Qt.Key.Key_V,
+                       Qt.KeyboardModifier.ControlModifier)
+        assert edit.text() == ""
+
+    def test_dot_key_does_not_slip_into_field(self, page, qtbot):
+        # "." is printable but not alnum — it must open the popup, not
+        # land in the field (BRK.B-style queries happen in the popup).
+        edit = page._symbol_edits[0]
+        qtbot.keyClick(edit, Qt.Key.Key_Period)
+        assert edit.text() == ""
+        assert page._popup is not None
+        assert page._popup._search.text() == "."
+        page._popup.close()
 
     def test_pick_fills_field_and_persists(self, page):
         edit = page._symbol_edits[0]

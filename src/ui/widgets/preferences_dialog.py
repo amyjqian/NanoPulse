@@ -474,14 +474,19 @@ class _CashManagementPage(QWidget):
         for i in range(self._MAX_SYMBOLS):
             edit = QLineEdit()
             edit.setText(symbols[i] if i < len(symbols) else "")
-            edit.setPlaceholderText("Click to search…")
+            edit.setPlaceholderText("Search symbol…")
             edit.setFixedWidth(380)
             edit.setStyleSheet(_INPUT_QSS)
-            # Selection happens exclusively through the search popup —
-            # read-only guarantees every saved symbol came from a real
-            # IBKR result, never a typo.
-            edit.setReadOnly(True)
-            edit.setCursor(Qt.CursorShape.PointingHandCursor)
+            # Selection happens exclusively through the search popup.
+            # The field is technically editable — Qt never shows the
+            # blinking caret in read-only mode, and the focused field
+            # should look like Book Trader's search box — but every
+            # text-mutating path is intercepted (typing opens the
+            # popup, paste/cut/undo are swallowed, context menu and
+            # drops disabled), so a symbol can only enter via a real
+            # IBKR pick.
+            edit.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+            edit.setAcceptDrops(False)
             edit.installEventFilter(self)
             # One-click removal: an inline "×" while the slot holds a
             # symbol.  The icon button is a child widget, so clicking
@@ -553,12 +558,22 @@ class _CashManagementPage(QWidget):
                                    Qt.Key.Key_Space, Qt.Key.Key_Down):
                     self._open_search(obj)
                     return True
-                # Keyboard-only type-to-search: a letter/digit on the
-                # focused (read-only) field opens the popup with that
+                # Editing shortcuts must not mutate the pick-only
+                # field: swallow paste/cut/undo/redo (copy stays).
+                from PySide6.QtGui import QKeySequence
+                for seq in (QKeySequence.StandardKey.Paste,
+                            QKeySequence.StandardKey.Cut,
+                            QKeySequence.StandardKey.Undo,
+                            QKeySequence.StandardKey.Redo):
+                    if event.matches(seq):
+                        return True
+                # Keyboard-only type-to-search: any printable character
+                # on the focused field opens the popup with that
                 # character already in its search box, so Tab → type →
-                # ↑/↓ → Enter needs no mouse at all.
+                # ↑/↓ → Enter needs no mouse at all.  (isprintable, not
+                # isalnum — "." must not slip into the field either.)
                 txt = event.text()
-                if (txt and txt.isalnum()
+                if (txt and txt.isprintable()
                         and not event.modifiers() & (
                             Qt.KeyboardModifier.ControlModifier
                             | Qt.KeyboardModifier.MetaModifier
