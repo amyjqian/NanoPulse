@@ -398,17 +398,22 @@ class SymbolSearchPopup(QDialog):
 
     def __init__(self, parent: QWidget, workers: list,
                  exclude: set[str] | None = None,
-                 external_input=None) -> None:
+                 external_input=None,
+                 stocks_only: bool = False) -> None:
         """*external_input* (a QLineEdit) switches the popup into
         dropdown mode: its own search box is hidden, the query is read
         live from that field, and the window never steals focus — the
         host keeps typing in its own field and forwards ↑/↓/Enter/Esc
         via :meth:`handle_key`.  The instance is reusable (``close()``
-        hides instead of deleting)."""
+        hides instead of deleting).  *stocks_only* filters both saved
+        contracts and IBKR results to STK rows (no futures roots, no
+        option chips) — used where only a plain stock/ETF makes sense,
+        e.g. the cash-sweep symbol pickers."""
         super().__init__(parent)
         self._workers = workers
         self._exclude = {s.upper() for s in (exclude or set())}
         self._ext_input = external_input
+        self._stocks_only = bool(stocks_only)
         self._wired: list = []
 
         # Remote-search state
@@ -677,8 +682,14 @@ class SymbolSearchPopup(QDialog):
         self._lst.clear()
         q = self._query().upper()
 
+        local_pool, remote_pool = self._local, self._remote
+        if self._stocks_only:
+            local_pool = [e for e in local_pool
+                          if e.get("sec_type", "STK") == "STK"]
+            remote_pool = [r for r in remote_pool
+                           if r.get("sec_type", "STK") == "STK"]
         locals_shown, remote_shown, already_added = merge_rows(
-            self._local, self._remote, self._exclude, q)
+            local_pool, remote_pool, self._exclude, q)
 
         self._hdr.setText("Results" if q else "Saved contracts")
 

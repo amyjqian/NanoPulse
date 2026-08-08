@@ -417,15 +417,22 @@ class _DisplayPage(QWidget):
 class _CashManagementPage(QWidget):
     """Cash-management settings — up to 4 sweep stock symbols.  Each
     configured symbol becomes its own Sweep in / Sweep out action on
-    the account right-click menu."""
+    the account right-click menu.  Each field is a type-ahead live
+    search against IBKR (same inline-dropdown engine as the hot-button
+    modal, filtered to stocks) — one shared dropdown follows whichever
+    field is being typed in."""
 
     changed = Signal()
 
     _MAX_SYMBOLS = 4
 
-    def __init__(self, prefs: dict, parent=None):
+    def __init__(self, prefs: dict, parent=None, *, workers=None):
         super().__init__(parent)
         self._prefs = prefs
+        self._workers = list(workers or [])
+        self._dropdown = None
+        self._dropdown_edit: QLineEdit | None = None
+        self._suppress_dropdown = False
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -473,12 +480,80 @@ class _CashManagementPage(QWidget):
             edit.setStyleSheet(_INPUT_QSS)
             # Persist on Enter or when focus leaves the field.
             edit.editingFinished.connect(self._on_edit)
+            # Typing opens the live IBKR search dropdown under the field.
+            edit.textEdited.connect(
+                lambda _t, e=edit: self._show_dropdown(e))
+            edit.installEventFilter(self)
             row = QHBoxLayout()
             row.addWidget(edit)
             row.addStretch()
             root.addLayout(row)
             self._symbol_edits.append(edit)
         root.addStretch()
+
+    # ── Live-search dropdown (mirrors the hot-button modal) ──────────────────
+
+    def _show_dropdown(self, edit: QLineEdit) -> None:
+        """Anchor the shared stocks-only search dropdown under *edit*.
+        The popup reads its query live from the attached field, so
+        switching fields means re-pointing ``_ext_input``."""
+        if self._suppress_dropdown:
+            return
+        from src.ui.widgets.symbol_search_popup import SymbolSearchPopup
+        if self._dropdown is None:
+            self._dropdown = SymbolSearchPopup(
+                self, workers=self._workers, exclude=set(),
+                external_input=edit, stocks_only=True)
+            self._dropdown.symbol_selected.connect(self._on_symbol_picked)
+        elif self._dropdown_edit is not edit:
+            self._dropdown._ext_input = edit
+        self._dropdown_edit = edit
+        self._dropdown.open_below(edit)
+
+    def _on_symbol_picked(self, entry: dict) -> None:
+        """Adopt a dropdown pick into the field it was opened for.
+        Only the ticker string matters here — sweep orders resolve
+        their contract through the normal order path."""
+        sym = str(entry.get("symbol", "") or "").strip().upper()
+        edit = self._dropdown_edit
+        if not sym or edit is None:
+            return
+        self._suppress_dropdown = True
+        try:
+            edit.setText(sym)
+        finally:
+            self._suppress_dropdown = False
+        if self._dropdown is not None:
+            self._dropdown.close()
+        self._on_edit()
+
+    def eventFilter(self, obj, event):  # noqa: N802 – Qt override
+        if obj in self._symbol_edits:
+            t = event.type()
+            if t == QEvent.Type.KeyPress:
+                dd = self._dropdown
+                if (dd is not None and dd.isVisible()
+                        and self._dropdown_edit is obj
+                        and dd.handle_key(event)):
+                    return True
+            elif t == QEvent.Type.MouseButtonPress:
+                self._show_dropdown(obj)
+            elif t == QEvent.Type.FocusOut:
+                # Clicking the dropdown itself briefly activates its
+                # window (ActiveWindowFocusReason) — that must not
+                # dismiss it before the row click lands.
+                if (self._dropdown is not None
+                        and event.reason()
+                        != Qt.FocusReason.ActiveWindowFocusReason):
+                    self._dropdown.close()
+        return super().eventFilter(obj, event)
+
+    def close_dropdown(self) -> None:
+        """Host hook: the dropdown is a floating tool window — it must
+        be closed explicitly when the Settings dialog closes or the
+        page is left."""
+        if self._dropdown is not None:
+            self._dropdown.close()
 
     def _symbols(self) -> list[str]:
         """Cleaned symbol list from the inputs: upper-cased, blanks
@@ -885,12 +960,16 @@ class PreferencesDialog(QDialog):
     """Preferences dialog that auto-closes on focus loss and persists
     all settings to ``app_config.json``."""
 
-    def __init__(self, parent=None, *, columns_provider=None, auth_context=None):
+    def __init__(self, parent=None, *, columns_provider=None,
+                 auth_context=None, workers=None):
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.resize(920, 540)
         self.setMinimumSize(800, 420)
         self._columns_provider = columns_provider
+        # Connected IB workers (priority-ordered) for pages that need a
+        # live TWS symbol search — currently the sweep-symbol pickers.
+        self._workers = list(workers or [])
         # auth_context (optional): {"user": User, "service": AuthService,
         # "on_sign_out": callable}.  When present the sidebar grows a user
         # chip + Sign out, and admins additionally get a "Users" page.
@@ -975,7 +1054,8 @@ class PreferencesDialog(QDialog):
         self._display_page = _DisplayPage(self._prefs)
         self._trading_page = _TradingPage(self._prefs)
         self._columns_page = ColumnsPage(self._columns_provider, self)
-        self._cash_page = _CashManagementPage(self._prefs)
+        self._cash_page = _CashManagementPage(self._prefs,
+                                              workers=self._workers)
 
         self._stack.addWidget(self._display_page)
         self._stack.addWidget(self._trading_page)
@@ -1204,8 +1284,23 @@ class PreferencesDialog(QDialog):
     # ── Save on close ─────────────────────────────────────────────────────────
 
     def closeEvent(self, event) -> None:
+        # The sweep-symbol search dropdown is a floating tool window —
+        # it doesn't close with the dialog on its own.
+        cash = getattr(self, "_cash_page", None)
+        if cash is not None:
+            cash.close_dropdown()
         self._save()
         super().closeEvent(event)
+
+    def moveEvent(self, event) -> None:  # noqa: N802 – Qt override
+        # Dragging the dialog re-anchors a visible sweep-symbol
+        # dropdown under its field instead of leaving it floating.
+        cash = getattr(self, "_cash_page", None)
+        dd = getattr(cash, "_dropdown", None) if cash is not None else None
+        if (dd is not None and dd.isVisible()
+                and cash._dropdown_edit is not None):
+            dd.open_below(cash._dropdown_edit)
+        super().moveEvent(event)
 
     def _save(self) -> None:
         self._prefs["display"] = self._display_page.collect()
