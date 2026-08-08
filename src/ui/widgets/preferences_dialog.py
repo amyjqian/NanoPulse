@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QStackedWidget,
+    QStyle,
     QVBoxLayout,
     QWidget,
 )
@@ -482,6 +483,20 @@ class _CashManagementPage(QWidget):
             edit.setReadOnly(True)
             edit.setCursor(Qt.CursorShape.PointingHandCursor)
             edit.installEventFilter(self)
+            # One-click removal: an inline "×" while the slot holds a
+            # symbol.  The icon button is a child widget, so clicking
+            # it does NOT hit the edit's event filter — the popup
+            # stays closed.
+            clear_act = edit.addAction(
+                self.style().standardIcon(
+                    QStyle.StandardPixmap.SP_LineEditClearButton),
+                QLineEdit.ActionPosition.TrailingPosition)
+            clear_act.setToolTip("Remove symbol")
+            clear_act.triggered.connect(
+                lambda _c=False, e=edit: self._clear_slot(e))
+            clear_act.setVisible(bool(edit.text()))
+            edit.textChanged.connect(
+                lambda t, a=clear_act: a.setVisible(bool(t)))
             row = QHBoxLayout()
             row.addWidget(edit)
             row.addStretch()
@@ -514,10 +529,18 @@ class _CashManagementPage(QWidget):
         edit.setText(sym)
         self._on_edit()
 
+    def _clear_slot(self, edit: QLineEdit) -> None:
+        edit.clear()
+        self._on_edit()
+
     def eventFilter(self, obj, event):  # noqa: N802 – Qt override
         if obj in self._symbol_edits:
             t = event.type()
             if t == QEvent.Type.MouseButtonPress:
+                # Focus first so Backspace/Delete work right after the
+                # popup dismisses (the consumed press would otherwise
+                # never focus the field).
+                obj.setFocus(Qt.FocusReason.MouseFocusReason)
                 self._open_search(obj)
                 return True
             if t == QEvent.Type.KeyPress:
