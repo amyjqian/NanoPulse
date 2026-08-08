@@ -114,21 +114,11 @@ class TestCashPageDropdown:
         assert cm["sweep_symbols"] == ["BIL"]
         assert cm["sweep_symbol"] == "BIL"
 
-    def test_inline_clear_button_removes_symbol(self, page):
-        # One click on the trailing "x" clears the slot — no popup, no
-        # keyboard needed.  Hidden while the slot is empty.
-        edit = page._symbol_edits[0]
-        acts = edit.actions()
-        assert acts, "trailing clear action missing"
-        clear_act = acts[-1]
-        assert clear_act.isVisible() is False
-        page._on_symbol_picked(edit, {"symbol": "BIL", "sec_type": "STK",
-                                      "conid": "9", "source": "ibkr"})
-        assert clear_act.isVisible() is True
-        clear_act.trigger()
-        assert edit.text() == ""
-        assert page._prefs["cash_management"]["sweep_symbols"] == []
-        assert clear_act.isVisible() is False
+    def test_no_inline_clear_button(self, page):
+        # Backspace/Delete are the only clear paths — the inline "x"
+        # was removed to keep the minimal search-box look.
+        for edit in page._symbol_edits:
+            assert edit.actions() == []
 
     def test_backspace_clears_slot(self, page, qtbot):
         from PySide6.QtCore import Qt as _Qt

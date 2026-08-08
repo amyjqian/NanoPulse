@@ -26,7 +26,6 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QStackedWidget,
-    QStyle,
     QVBoxLayout,
     QWidget,
 )
@@ -488,20 +487,6 @@ class _CashManagementPage(QWidget):
             edit.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
             edit.setAcceptDrops(False)
             edit.installEventFilter(self)
-            # One-click removal: an inline "×" while the slot holds a
-            # symbol.  The icon button is a child widget, so clicking
-            # it does NOT hit the edit's event filter — the popup
-            # stays closed.
-            clear_act = edit.addAction(
-                self.style().standardIcon(
-                    QStyle.StandardPixmap.SP_LineEditClearButton),
-                QLineEdit.ActionPosition.TrailingPosition)
-            clear_act.setToolTip("Remove symbol")
-            clear_act.triggered.connect(
-                lambda _c=False, e=edit: self._clear_slot(e))
-            clear_act.setVisible(bool(edit.text()))
-            edit.textChanged.connect(
-                lambda t, a=clear_act: a.setVisible(bool(t)))
             row = QHBoxLayout()
             row.addWidget(edit)
             row.addStretch()
@@ -532,10 +517,6 @@ class _CashManagementPage(QWidget):
         if not sym:
             return
         edit.setText(sym)
-        self._on_edit()
-
-    def _clear_slot(self, edit: QLineEdit) -> None:
-        edit.clear()
         self._on_edit()
 
     def eventFilter(self, obj, event):  # noqa: N802 – Qt override
