@@ -134,3 +134,32 @@ def test_bracket_tick_follows_target_symbol(modal):
     modal._draft["symbol"] = "NVDA"
     modal._draft["contract"] = {"conid": "2", "sec_type": "STK"}
     assert modal._bracket_tick() == 0.01
+
+
+def test_typing_reopens_dropdown_without_focus_dependence(modal, qtbot):
+    """Regression: the dropdown trigger rides textEdited (user
+    keystrokes), NOT textChanged + hasFocus() — hasFocus() went stale
+    after the Tool dropdown stole activation, leaving the user typing
+    with no search popup."""
+    from PySide6.QtCore import Qt
+
+    modal.show()
+    qtbot.waitExposed(modal)
+    qtbot.mouseClick(modal._inp_symbol, Qt.MouseButton.LeftButton)
+    dd = modal._symbol_dropdown
+    qtbot.keyClick(modal._inp_symbol, Qt.Key.Key_Escape)   # dismiss
+    assert not dd.isVisible()
+    # Simulate the stale state: field reports no focus, user types.
+    modal._inp_symbol.clearFocus()
+    qtbot.keyClick(modal._inp_symbol, "b")
+    assert modal._symbol_dropdown.isVisible()
+    assert modal._symbol_dropdown._query() == "b"
+    modal._symbol_dropdown.close()
+
+
+def test_programmatic_settext_never_opens_dropdown(modal):
+    # Draft loads / pick adoption use setText — textEdited stays
+    # silent for those, so no popup flashes during dialog setup.
+    modal._inp_symbol.setText("NVDA")
+    assert (modal._symbol_dropdown is None
+            or not modal._symbol_dropdown.isVisible())

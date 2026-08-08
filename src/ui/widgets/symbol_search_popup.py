@@ -579,6 +579,9 @@ class SymbolSearchPopup(QDialog):
             pos += QPoint(0, -1)
         self.move(pos)
         self.show()
+        # A reused (hidden) Tool window can re-show BELOW its modal
+        # host on macOS — force it back to the top of the stack.
+        self.raise_()
         if self._ext_input is None:
             self._search.setFocus()
 
