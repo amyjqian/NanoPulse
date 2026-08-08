@@ -168,3 +168,79 @@ def test_legacy_two_tuple_provider_disables_gracefully(panel):
     panel.set_sweep_quote_provider(lambda acct, sym: (100.0, 2000.0))
     info = panel.compute_sweep("pos")
     assert info["enabled"] is False
+
+
+# ── multiple sweep symbols (max 4) ────────────────────────────────────────────
+
+@pytest.fixture
+def multi_panel(qtbot, tmp_path, monkeypatch):
+    monkeypatch.setattr(config_manager, "_active_path", tmp_path / "cfg.json")
+    (tmp_path / "cfg.json").write_text(json.dumps(
+        {"preferences": {"cash_management": {
+            "sweep_symbols": ["SGOV", "BIL"]}}}))
+    from src.core.cash_management import cash_prefs
+    cash_prefs.reload()
+
+    am = AccountsTableModel()
+    am.update_batch([("L", "pos", "NetLiquidation", "1", "USD"),
+                     ("L", "pos", "CashBalance", "91170", "USD")])
+    am.update_batch([("L", "neg", "NetLiquidation", "1", "USD"),
+                     ("L", "neg", "CashBalance", "-91170", "USD")])
+    p = AccountListPanel(am)
+    # SGOV $100, 2000 held; BIL $50, nothing held.
+    p.set_sweep_quote_provider(
+        lambda acct, sym: (100.0, 100.0, 2000.0) if sym == "SGOV"
+        else (50.0, 50.0, 0.0))
+    return p
+
+
+def test_multi_symbol_sweep_in_entry_per_symbol(multi_panel):
+    infos = multi_panel.compute_sweeps("pos")
+    assert [(i["symbol"], i["enabled"], i["qty"]) for i in infos] == [
+        ("SGOV", True, 910),      # 91170 / 100 → floor5
+        ("BIL", True, 1820),      # 91170 / 50 → floor5
+    ]
+    assert infos[0]["label"] == "Sweep in 910 SGOV"
+    assert infos[1]["label"] == "Sweep in 1,820 BIL"
+
+
+def test_multi_symbol_sweep_out_only_where_held(multi_panel):
+    infos = multi_panel.compute_sweeps("neg")
+    sgov, bil = infos
+    assert sgov["enabled"] is True and sgov["direction"] == "out"
+    assert bil["enabled"] is False
+    assert "No BIL shares" in bil["label"]
+
+
+def test_legacy_single_symbol_config_still_works(panel):
+    # The original fixture writes only the legacy "sweep_symbol" key —
+    # compute_sweeps must surface it as the one configured symbol.
+    infos = panel.compute_sweeps("pos")
+    assert len(infos) == 1
+    assert infos[0]["symbol"] == "SGOV" and infos[0]["enabled"] is True
+
+
+def test_sweep_symbols_capped_at_four(tmp_path, monkeypatch):
+    monkeypatch.setattr(config_manager, "_active_path", tmp_path / "cfg.json")
+    (tmp_path / "cfg.json").write_text(json.dumps(
+        {"preferences": {"cash_management": {
+            "sweep_symbols": ["A", "B", "C", "D", "E", "A"]}}}))
+    from src.core.cash_management import cash_prefs
+    cash_prefs.reload()
+    assert cash_prefs.sweep_symbols == ["A", "B", "C", "D"]
+    assert cash_prefs.sweep_symbol == "A"      # legacy view = first
+
+
+def test_no_symbols_configured_single_settings_pointer(tmp_path, monkeypatch,
+                                                       qtbot):
+    monkeypatch.setattr(config_manager, "_active_path", tmp_path / "cfg.json")
+    (tmp_path / "cfg.json").write_text(json.dumps(
+        {"preferences": {"cash_management": {"sweep_symbols": []}}}))
+    from src.core.cash_management import cash_prefs
+    cash_prefs.reload()
+    am = AccountsTableModel()
+    p = AccountListPanel(am)
+    infos = p.compute_sweeps("pos")
+    assert len(infos) == 1
+    assert infos[0]["enabled"] is False
+    assert "Settings" in infos[0]["label"]

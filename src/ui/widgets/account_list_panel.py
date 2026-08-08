@@ -1486,8 +1486,24 @@ class AccountListPanel(QWidget):
         used to price + size the sweep order shown in the right-click menu."""
         self._sweep_quote_provider = provider
 
-    def compute_sweep(self, account: str) -> dict:
-        """Pure computation for the sweep menu (kept separate so it's testable).
+    def compute_sweeps(self, account: str) -> list[dict]:
+        """One sweep entry per configured sweep symbol (max 4) for the
+        right-click menu.  With nothing configured, a single disabled
+        pointer-to-Settings entry."""
+        from src.core.cash_management import cash_prefs
+
+        symbols = cash_prefs.sweep_symbols
+        if not symbols:
+            return [{"enabled": False, "symbol": "", "direction": None,
+                     "qty": 0, "limit_price": 0.0,
+                     "label": "Set a sweep symbol in Settings → "
+                              "Cash Management"}]
+        return [self.compute_sweep(account, s) for s in symbols]
+
+    def compute_sweep(self, account: str, symbol: str | None = None) -> dict:
+        """Pure computation for one sweep-menu entry (kept separate so
+        it's testable).  *symbol* defaults to the first configured sweep
+        symbol.
 
         Returns ``{enabled, label, direction, qty, symbol, limit_price}``:
 
@@ -1509,7 +1525,9 @@ class AccountListPanel(QWidget):
         rounds to zero."""
         from src.core.cash_management import cash_prefs
 
-        symbol = (cash_prefs.sweep_symbol or "").strip().upper()
+        if symbol is None:
+            symbol = cash_prefs.sweep_symbol
+        symbol = (symbol or "").strip().upper()
         if not symbol:
             return {"enabled": False, "symbol": "", "direction": None, "qty": 0,
                     "limit_price": 0.0,
@@ -1568,15 +1586,21 @@ class AccountListPanel(QWidget):
                 "label": f"{verb} {qty:,} {symbol}"}
 
     def _show_sweep_menu(self, account: str, global_pos) -> None:
-        """Build + show the account's cash-sweep right-click menu."""
-        info = self.compute_sweep(account)
+        """Build + show the account's cash-sweep right-click menu — one
+        action per configured sweep symbol (max 4)."""
         menu = QMenu(self)
-        act = menu.addAction(info["label"])
-        act.setEnabled(info["enabled"])
-        if menu.exec(global_pos) is act and info["enabled"]:
-            self.sweep_requested.emit(
-                account, info["direction"], info["qty"], info["symbol"],
-                float(info.get("limit_price", 0.0)))
+        actions: list[tuple[object, dict]] = []
+        for info in self.compute_sweeps(account):
+            act = menu.addAction(info["label"])
+            act.setEnabled(info["enabled"])
+            actions.append((act, info))
+        chosen = menu.exec(global_pos)
+        for act, info in actions:
+            if chosen is act and info["enabled"]:
+                self.sweep_requested.emit(
+                    account, info["direction"], info["qty"], info["symbol"],
+                    float(info.get("limit_price", 0.0)))
+                break
 
     def active_group(self) -> str | None:
         """Currently-active group name, or None when the selection

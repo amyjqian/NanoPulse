@@ -79,6 +79,7 @@ _DEFAULTS: dict = {
         "sell_ask_unit": "ticks",
     },
     "cash_management": {
+        "sweep_symbols": [],
         "sweep_symbol": "",
     },
 }
@@ -414,9 +415,13 @@ class _DisplayPage(QWidget):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class _CashManagementPage(QWidget):
-    """Cash-management settings — currently the sweep stock symbol."""
+    """Cash-management settings — up to 4 sweep stock symbols.  Each
+    configured symbol becomes its own Sweep in / Sweep out action on
+    the account right-click menu."""
 
     changed = Signal()
+
+    _MAX_SYMBOLS = 4
 
     def __init__(self, prefs: dict, parent=None):
         super().__init__(parent)
@@ -440,39 +445,68 @@ class _CashManagementPage(QWidget):
         root.addWidget(sep)
         root.addSpacing(6)
 
-        lbl = QLabel("Sweep symbol")
+        lbl = QLabel("Sweep symbols")
         lbl.setFont(_FONT_SECTION)
         lbl.setStyleSheet(f"color: {_TEXT_DIM}; border: none;")
         root.addWidget(lbl)
 
-        desc = QLabel("The stock symbol used for cash-sweep operations.")
+        desc = QLabel(
+            "Up to 4 stock symbols for cash-sweep operations — each gets "
+            "its own action on the account right-click menu.")
         desc.setStyleSheet(
             f"color: {_TEXT_DIM}; border: none; font-size: 11px;")
         root.addWidget(desc)
 
         cm = self._prefs.get("cash_management", {})
-        self._symbol = QLineEdit()
-        self._symbol.setText(str(cm.get("sweep_symbol", "") or ""))
-        self._symbol.setPlaceholderText("e.g. AAPL")
-        self._symbol.setFixedWidth(180)
-        self._symbol.setStyleSheet(_INPUT_QSS)
-        # Persist on Enter or when focus leaves the field.
-        self._symbol.editingFinished.connect(self._on_edit)
-        row = QHBoxLayout()
-        row.addWidget(self._symbol)
-        row.addStretch()
-        root.addLayout(row)
+        raw = cm.get("sweep_symbols")
+        if not isinstance(raw, list):
+            legacy = str(cm.get("sweep_symbol", "") or "")
+            raw = [legacy] if legacy else []
+        symbols = [str(s or "").strip().upper() for s in raw]
+
+        self._symbol_edits: list[QLineEdit] = []
+        for i in range(self._MAX_SYMBOLS):
+            edit = QLineEdit()
+            edit.setText(symbols[i] if i < len(symbols) else "")
+            edit.setPlaceholderText("e.g. SGOV")
+            edit.setFixedWidth(180)
+            edit.setStyleSheet(_INPUT_QSS)
+            # Persist on Enter or when focus leaves the field.
+            edit.editingFinished.connect(self._on_edit)
+            row = QHBoxLayout()
+            row.addWidget(edit)
+            row.addStretch()
+            root.addLayout(row)
+            self._symbol_edits.append(edit)
         root.addStretch()
 
+    def _symbols(self) -> list[str]:
+        """Cleaned symbol list from the inputs: upper-cased, blanks
+        skipped, duplicates dropped (first occurrence wins)."""
+        out: list[str] = []
+        for edit in self._symbol_edits:
+            sym = edit.text().strip().upper()
+            if sym and sym not in out:
+                out.append(sym)
+        return out
+
     def _on_edit(self) -> None:
-        sym = self._symbol.text().strip().upper()
-        if sym != self._symbol.text():
-            self._symbol.setText(sym)
-        self._prefs.setdefault("cash_management", {})["sweep_symbol"] = sym
+        for edit in self._symbol_edits:
+            sym = edit.text().strip().upper()
+            if sym != edit.text():
+                edit.setText(sym)
+        cm = self._prefs.setdefault("cash_management", {})
+        cm["sweep_symbols"] = self._symbols()
+        cm["sweep_symbol"] = cm["sweep_symbols"][0] \
+            if cm["sweep_symbols"] else ""
         self.changed.emit()
 
     def collect(self) -> dict:
-        return {"sweep_symbol": self._symbol.text().strip().upper()}
+        symbols = self._symbols()
+        # Legacy key kept in sync so older builds restoring this
+        # config still find their (first) sweep symbol.
+        return {"sweep_symbols": symbols,
+                "sweep_symbol": symbols[0] if symbols else ""}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

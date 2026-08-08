@@ -1,9 +1,12 @@
 """Cash-management preferences (in-memory singleton).
 
-Currently holds the **sweep symbol** — the stock used for cash-sweep
-operations.  Loaded from the active user's ``app_config`` (``preferences.
-cash_management``) on first access / on login, cached in memory so trade
-paths can read it without hitting disk, and persisted on edit.
+Holds the **sweep symbols** — up to four stock symbols usable for
+cash-sweep operations (the account right-click menu offers one sweep
+action per configured symbol).  Loaded from the active user's
+``app_config`` (``preferences.cash_management``) on first access / on
+login, cached in memory so trade paths can read it without hitting
+disk, and persisted on edit.  Legacy configs carry a single
+``sweep_symbol`` string — read as a one-entry list.
 
 Mirrors the ``trading_prefs`` pattern (thread-safe, ``reload()`` after the
 active config changes).
@@ -17,13 +20,23 @@ from src.core import config_manager
 
 log = logging.getLogger(__name__)
 
-_DEFAULT_SWEEP_SYMBOL = ""
+MAX_SWEEP_SYMBOLS = 4
+
+
+def _clean_symbols(symbols) -> list[str]:
+    """Upper-cased, deduped (order-preserving), capped at the max."""
+    out: list[str] = []
+    for s in symbols or []:
+        sym = str(s or "").strip().upper()
+        if sym and sym not in out:
+            out.append(sym)
+    return out[:MAX_SWEEP_SYMBOLS]
 
 
 class CashManagementPreferences:
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._sweep_symbol = _DEFAULT_SWEEP_SYMBOL
+        self._sweep_symbols: list[str] = []
         self._loaded = False
 
     # ── bootstrap ─────────────────────────────────────────────────────────────
@@ -32,33 +45,53 @@ class CashManagementPreferences:
         if self._loaded:
             return
         cm = config_manager.load_preferences().get("cash_management", {})
-        self._sweep_symbol = str(cm.get("sweep_symbol", _DEFAULT_SWEEP_SYMBOL) or "")
+        raw = cm.get("sweep_symbols")
+        if isinstance(raw, list):
+            self._sweep_symbols = _clean_symbols(raw)
+        else:
+            # Legacy single-symbol config.
+            legacy = str(cm.get("sweep_symbol", "") or "").strip().upper()
+            self._sweep_symbols = [legacy] if legacy else []
         self._loaded = True
-        log.info("CashManagementPreferences loaded (sweep_symbol=%r)",
-                 self._sweep_symbol)
+        log.info("CashManagementPreferences loaded (sweep_symbols=%r)",
+                 self._sweep_symbols)
 
     # ── read ──────────────────────────────────────────────────────────────────
 
     @property
-    def sweep_symbol(self) -> str:
+    def sweep_symbols(self) -> list[str]:
         with self._lock:
             self._ensure_loaded()
-            return self._sweep_symbol
+            return list(self._sweep_symbols)
+
+    @property
+    def sweep_symbol(self) -> str:
+        """Legacy single-symbol view: the first configured symbol."""
+        with self._lock:
+            self._ensure_loaded()
+            return self._sweep_symbols[0] if self._sweep_symbols else ""
 
     # ── write ─────────────────────────────────────────────────────────────────
 
-    def set_sweep_symbol(self, symbol: str) -> None:
-        """Update the in-memory value AND persist it to the active config."""
-        symbol = (symbol or "").strip().upper()
+    def set_sweep_symbols(self, symbols) -> None:
+        """Update the in-memory list AND persist it to the active config.
+        The legacy ``sweep_symbol`` key is kept in sync (first entry) so
+        older builds restoring this config still find their symbol."""
+        cleaned = _clean_symbols(symbols)
         with self._lock:
-            self._sweep_symbol = symbol
+            self._sweep_symbols = cleaned
             self._loaded = True
         prefs = config_manager.load_preferences()
         cm = dict(prefs.get("cash_management", {}))
-        cm["sweep_symbol"] = symbol
+        cm["sweep_symbols"] = cleaned
+        cm["sweep_symbol"] = cleaned[0] if cleaned else ""
         prefs["cash_management"] = cm
         config_manager.save_preferences(prefs)
-        log.info("CashManagement: sweep symbol set to %r", symbol)
+        log.info("CashManagement: sweep symbols set to %r", cleaned)
+
+    def set_sweep_symbol(self, symbol: str) -> None:
+        """Legacy setter — replaces the list with a single symbol."""
+        self.set_sweep_symbols([symbol] if symbol else [])
 
     # ── convenience ───────────────────────────────────────────────────────────
 
