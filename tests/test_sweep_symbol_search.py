@@ -65,28 +65,36 @@ class TestCashPageDropdown:
         qtbot.addWidget(pg)
         return pg
 
-    def test_dropdown_created_stocks_only_and_follows_field(self, page):
-        e0, e1 = page._symbol_edits[0], page._symbol_edits[1]
-        page._show_dropdown(e0)
-        assert page._dropdown is not None
-        assert page._dropdown._stocks_only is True
-        assert page._dropdown_edit is e0
-        # Same dropdown re-anchors to another field.
-        dd = page._dropdown
-        page._show_dropdown(e1)
-        assert page._dropdown is dd
-        assert page._dropdown._ext_input is e1
+    def test_popup_is_standalone_stocks_only(self, page):
+        # The exact Book Trader chip-bar component: its own search box
+        # (no external input), stocks-only filtering.
+        edit = page._symbol_edits[0]
+        page._open_search(edit)
+        assert page._popup is not None
+        assert page._popup._stocks_only is True
+        assert page._popup._ext_input is None
+
+    def test_fields_are_readonly_pick_only(self, page):
+        for edit in page._symbol_edits:
+            assert edit.isReadOnly()
 
     def test_pick_fills_field_and_persists(self, page):
         edit = page._symbol_edits[0]
-        page._show_dropdown(edit)
-        page._on_symbol_picked({"symbol": "bil", "sec_type": "STK",
-                                "conid": "9", "source": "ibkr"})
+        page._on_symbol_picked(edit, {"symbol": "bil", "sec_type": "STK",
+                                      "conid": "9", "source": "ibkr"})
         assert edit.text() == "BIL"
         cm = page._prefs["cash_management"]
         assert cm["sweep_symbols"] == ["BIL"]
         assert cm["sweep_symbol"] == "BIL"
-        assert not page._dropdown.isVisible()
+
+    def test_backspace_clears_slot(self, page, qtbot):
+        from PySide6.QtCore import Qt as _Qt
+        edit = page._symbol_edits[0]
+        page._on_symbol_picked(edit, {"symbol": "BIL", "sec_type": "STK",
+                                      "conid": "9", "source": "ibkr"})
+        qtbot.keyClick(edit, _Qt.Key.Key_Backspace)
+        assert edit.text() == ""
+        assert page._prefs["cash_management"]["sweep_symbols"] == []
 
     def test_collect_reports_all_fields(self, page):
         for i, sym in enumerate(["SGOV", "BIL", "", "sgov"]):
