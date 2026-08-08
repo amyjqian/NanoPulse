@@ -569,19 +569,25 @@ class SymbolChipBar(QWidget):
         self.symbol_selected.emit(sym, sec)
 
     def _on_drop(self, src_sym: str, dst_sym: str) -> None:
-        """Move *src_sym* immediately before *dst_sym* in the entry list
-        and emit ``symbols_reordered`` with the new order.  Same-group
-        enforcement is already handled by DraggableChip — we trust the
-        callback payload here."""
+        """The dragged chip takes the drop target's position (same
+        semantics as the account-group pills): dragging forward lands
+        *after* the target, dragging backward lands *before* it — so a
+        chip can reach any slot in its group, in any direction.
+        Same-group enforcement is already handled by DraggableChip —
+        we trust the callback payload here."""
         entries = list(self._entries)
         src_entry = next((e for e in entries if e[0] == src_sym), None)
         if src_entry is None:
             return
-        entries.remove(src_entry)
         try:
-            dst_idx = next(i for i, (s, _) in enumerate(entries) if s == dst_sym)
+            # Target's index BEFORE removal: inserting there after the
+            # pop lands after the target on forward drags (everything
+            # shifted left by one) and before it on backward drags.
+            dst_idx = next(i for i, (s, _) in enumerate(entries)
+                           if s == dst_sym)
         except StopIteration:
             return
+        entries.remove(src_entry)
         entries.insert(dst_idx, src_entry)
         self._entries = entries
         self._rebuild_grid()

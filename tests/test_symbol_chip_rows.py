@@ -97,3 +97,51 @@ class TestChipMetadataLifecycle:
 
         v._on_symbol_remove("NVDA")
         assert instruments.get_contract("NVDA") is None   # gone with the chip
+
+
+class TestChipDragReorder:
+    """Drag-reorder takes the drop target's position — any direction,
+    any slot (same semantics as the account-group pills)."""
+
+    def _bar(self, qtbot, entries):
+        bar = SymbolChipBar(columns=5, max_rows_per_group=2)
+        qtbot.addWidget(bar)
+        bar.set_symbols(entries)
+        orders = []
+        bar.symbols_reordered.connect(orders.append)
+        return bar, orders
+
+    def test_forward_drag_lands_after_target(self, qtbot):
+        bar, orders = self._bar(qtbot, _stk(4))
+        bar._on_drop("S00", "S02")
+        assert orders[-1] == ["S01", "S02", "S00", "S03"]
+
+    def test_drag_to_last_slot_reachable(self, qtbot):
+        bar, orders = self._bar(qtbot, _stk(4))
+        bar._on_drop("S00", "S03")
+        assert orders[-1] == ["S01", "S02", "S03", "S00"]
+
+    def test_adjacent_forward_swap_not_a_noop(self, qtbot):
+        bar, orders = self._bar(qtbot, _stk(3))
+        bar._on_drop("S00", "S01")
+        assert orders[-1] == ["S01", "S00", "S02"]
+
+    def test_backward_drag_lands_before_target(self, qtbot):
+        bar, orders = self._bar(qtbot, _stk(4))
+        bar._on_drop("S03", "S00")
+        assert orders[-1] == ["S03", "S00", "S01", "S02"]
+
+    def test_reorder_within_group_across_mixed_list(self, qtbot):
+        # STK chips separated by FUT entries in the flat list still get
+        # take-position semantics within their displayed group.
+        bar, orders = self._bar(
+            qtbot, [("S00", "STK"), ("F00", "FUT"), ("S01", "STK"),
+                    ("S02", "STK")])
+        bar._on_drop("S00", "S02")
+        assert orders[-1] == ["F00", "S01", "S02", "S00"]
+
+    def test_unknown_symbols_ignored(self, qtbot):
+        bar, orders = self._bar(qtbot, _stk(3))
+        bar._on_drop("NOPE", "S01")
+        bar._on_drop("S01", "NOPE")
+        assert orders == []
