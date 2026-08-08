@@ -1022,33 +1022,54 @@ class FlashTradeView(QWidget):
         cached = self._order_entry._price_cache.get((symbol or "").upper())
         return cached[0] if cached else 0.0
 
-    def _sweep_quote(self, account: str, symbol: str) -> tuple[float, float]:
-        """(price, held_shares) for the account's cash-sweep menu."""
-        price = self._sweep_symbol_price(symbol)
+    def _sweep_quote(self, account: str,
+                     symbol: str) -> tuple[float, float, float]:
+        """(last, ask, held_shares) for the account's cash-sweep menu."""
+        cached = self._order_entry._price_cache.get((symbol or "").upper())
+        last, ask = (cached[0], cached[2]) if cached else (0.0, 0.0)
         held = self._account_position.held_shares(account, symbol)
-        return price, held
+        return last, ask, held
 
     def _on_sweep_requested(self, account: str, direction: str,
-                            qty: int, symbol: str) -> None:
-        """Cash-sweep menu action → place a MKT order for *symbol* on *account*.
-        Sweep in → BUY (park positive USD cash); Sweep out → SELL (cover
-        negative USD cash).  Routed through the normal order path (limit-cap /
-        RTH / prefs / admin-gate all apply)."""
+                            qty: int, symbol: str,
+                            limit_price: float = 0.0) -> None:
+        """Cash-sweep menu action → place an order for *symbol* on *account*.
+
+        Sweep in → BUY as a passthrough **limit** at *limit_price* (the ask,
+        or last + 2¢ — computed in ``compute_sweep``).  A MKT buy would make
+        IB reserve ~5% over the order value, rejecting full-balance sweeps
+        in no-margin (TFSA/RSP) accounts; the exact limit avoids that and
+        still fills immediately on a stable money-market ETF.
+        Sweep out → SELL @MKT (no cash check to trip).  Both route through
+        the normal order path (RTH / prefs / admin-gate all apply)."""
         if qty <= 0 or not symbol or not account:
             log.warning("FlashTrade: sweep %s ignored — qty=%s symbol=%r acct=%r",
                         direction, qty, symbol, account)
             return
-        action = "BUY" if direction == "in" else "SELL"
-        payload = {
-            "action": action,
-            "type": "MKT",
-            "symbol": symbol,
-            "qty": int(qty),
-            "last_price": self._sweep_symbol_price(symbol),
-            "_target_accounts": [account],
-        }
-        log.info("FlashTrade: sweep %s → %s %d %s @MKT account=%s",
-                 direction, action, qty, symbol, account)
+        if direction == "in" and limit_price > 0:
+            payload = {
+                "action": "BUY",
+                "type": "LMT",
+                "symbol": symbol,
+                "qty": int(qty),
+                "limit_price": float(limit_price),
+                "last_price": self._sweep_symbol_price(symbol),
+                "_target_accounts": [account],
+            }
+            log.info("FlashTrade: sweep in → BUY %d %s LMT @ %.2f account=%s",
+                     qty, symbol, limit_price, account)
+        else:
+            action = "BUY" if direction == "in" else "SELL"
+            payload = {
+                "action": action,
+                "type": "MKT",
+                "symbol": symbol,
+                "qty": int(qty),
+                "last_price": self._sweep_symbol_price(symbol),
+                "_target_accounts": [account],
+            }
+            log.info("FlashTrade: sweep %s → %s %d %s @MKT account=%s",
+                     direction, action, qty, symbol, account)
         self._on_order_requested(payload)
 
     def _on_pnl_single_updated(self, account: str, con_id: int,
