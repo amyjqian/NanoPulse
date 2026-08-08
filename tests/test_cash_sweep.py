@@ -48,7 +48,8 @@ def panel(qtbot, tmp_path, monkeypatch):
     am.update_batch([("L", "flat", "NetLiquidation", "1", "USD"),
                      ("L", "flat", "CashBalance", "0", "USD")])
     p = AccountListPanel(am)
-    p.set_sweep_quote_provider(lambda acct, sym: (100.0, 2000.0))  # $100, 2000 held
+    p.set_sweep_quote_provider(
+    lambda acct, sym: (100.0, 100.0, 2000.0))  # last, ask, held
     return p
 
 
@@ -80,7 +81,7 @@ def test_sweep_out_sells_all_when_insufficient(panel):
 def test_sweep_out_sells_all_non_multiple_of_5(panel):
     # Insufficient holding that isn't a multiple of 5 → sell all of it (1998),
     # not rounded.
-    panel.set_sweep_quote_provider(lambda acct, sym: (100.0, 1998.0))
+    panel.set_sweep_quote_provider(lambda acct, sym: (100.0, 100.0, 1998.0))
     panel._model.update_batch([("L", "negbig", "NetLiquidation", "1", "USD"),
                                ("L", "negbig", "CashBalance", "-500000", "USD")])
     info = panel.compute_sweep("negbig")
@@ -89,7 +90,7 @@ def test_sweep_out_sells_all_non_multiple_of_5(panel):
 
 def test_sweep_out_hidden_when_no_holdings(panel):
     # Negative USD but the account holds none of the sweep symbol → disabled.
-    panel.set_sweep_quote_provider(lambda acct, sym: (100.0, 0.0))
+    panel.set_sweep_quote_provider(lambda acct, sym: (100.0, 100.0, 0.0))
     info = panel.compute_sweep("neg")
     assert info["enabled"] is False
     assert "No SGOV shares" in info["label"]
@@ -97,7 +98,7 @@ def test_sweep_out_hidden_when_no_holdings(panel):
 
 def test_sweep_in_still_shown_without_holdings(panel):
     # Sweep IN doesn't require holding the symbol.
-    panel.set_sweep_quote_provider(lambda acct, sym: (100.0, 0.0))
+    panel.set_sweep_quote_provider(lambda acct, sym: (100.0, 100.0, 0.0))
     info = panel.compute_sweep("pos")
     assert info["enabled"] is True
     assert info["qty"] == 910
@@ -124,3 +125,46 @@ def test_no_symbol_disabled(panel, tmp_path):
     info = panel.compute_sweep("pos")
     assert info["enabled"] is False
     assert "Settings" in info["label"]
+
+
+# ── sweep-in limit pricing ────────────────────────────────────────────────────
+# The buy goes out as a marketable LIMIT (no MKT ~5% cash cushion — that
+# cushion rejects full-balance sweeps in no-margin TFSA/RSP accounts).
+
+def test_sweep_in_limit_is_the_ask(panel):
+    panel.set_sweep_quote_provider(lambda acct, sym: (100.43, 100.45, 0.0))
+    info = panel.compute_sweep("pos")
+    assert info["limit_price"] == 100.45
+    # Sized by the limit price, not last: floor5(91170 / 100.45) = 905.
+    assert info["qty"] == 905
+
+
+def test_sweep_in_no_ask_uses_last_plus_two_cents(panel):
+    panel.set_sweep_quote_provider(lambda acct, sym: (100.43, 0.0, 0.0))
+    info = panel.compute_sweep("pos")
+    assert info["limit_price"] == 100.45
+    assert info["qty"] == 905
+
+
+def test_sweep_in_no_price_at_all_disabled(panel):
+    panel.set_sweep_quote_provider(lambda acct, sym: (0.0, 0.0, 0.0))
+    info = panel.compute_sweep("pos")
+    assert info["enabled"] is False
+    assert "no live price" in info["label"]
+
+
+def test_sweep_out_stays_market(panel):
+    # Sells have no cash check to trip — limit_price stays 0 (MKT), and
+    # sizing uses last so the deficit estimate matches the tape.
+    panel.set_sweep_quote_provider(lambda acct, sym: (100.0, 100.45, 2000.0))
+    info = panel.compute_sweep("neg")
+    assert info["enabled"] is True
+    assert info["limit_price"] == 0.0
+    assert info["qty"] == 915  # ceil5(91170 / 100.0)
+
+
+def test_legacy_two_tuple_provider_disables_gracefully(panel):
+    # A provider still returning (price, held) must not crash the menu.
+    panel.set_sweep_quote_provider(lambda acct, sym: (100.0, 2000.0))
+    info = panel.compute_sweep("pos")
+    assert info["enabled"] is False
