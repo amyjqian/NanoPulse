@@ -930,24 +930,26 @@ class AccountListPanel(QWidget):
             self._group_pills[name] = pill
 
     def _on_group_drop(self, src_name: str, dst_name: str) -> None:
-        """Pill ``src_name`` was dropped onto ``dst_name`` — reorder
-        ``self._groups`` so ``src_name`` lands immediately before
-        ``dst_name``, persist, and rebuild the grid.  Mirrors
-        ``SymbolChipBar._on_drop``.
+        """Pill ``src_name`` was dropped onto ``dst_name`` — the dragged
+        pill takes the drop target's position, so a drag works in every
+        direction (the pill grid is row-major, so left/right/up/down are
+        all just list indices): dragging forward lands *after* the
+        target, dragging backward lands *before* it.  Persist + rebuild.
         """
         names = [g["name"] for g in self._groups]
         if src_name not in names or dst_name not in names:
             return
         src_idx = names.index(src_name)
+        # The target's index BEFORE the pop: inserting there after
+        # removing src puts the pill exactly where the target was —
+        # after it when dragging forward (everything shifted left by
+        # one), before it when dragging backward (nothing shifted).
+        dst_idx = names.index(dst_name)
         moved = self._groups.pop(src_idx)
-        # Destination index must be computed AFTER the pop so the insert
-        # lands immediately before the drop target in the new list.
-        dst_idx = next(
-            i for i, g in enumerate(self._groups) if g["name"] == dst_name)
         self._groups.insert(dst_idx, moved)
         config_manager.save_account_groups(self._groups)
         self._rebuild_pills()
-        log.info("AccountList: reordered group %r before %r",
+        log.info("AccountList: moved group %r to %r's position",
                  src_name, dst_name)
 
     def _set_active_group(self, name: str | None) -> None:
