@@ -66,87 +66,101 @@ class TestCashPageDropdown:
         qtbot.addWidget(pg)
         return pg
 
-    def test_popup_is_standalone_stocks_only(self, page):
-        # The exact Book Trader chip-bar component: its own search box
-        # (no external input), stocks-only filtering.
+    def test_dropdown_mode_stocks_only(self, page):
+        # The hot-button modal pattern: the FIELD is the search box —
+        # the popup opens in external-input mode (its own box hidden),
+        # filtered to stocks.
         edit = page._symbol_edits[0]
-        page._open_search(edit)
+        page._show_dropdown(edit)
         assert page._popup is not None
         assert page._popup._stocks_only is True
-        assert page._popup._ext_input is None
+        assert page._popup._ext_input is edit
+        assert page._popup._search.isHidden()
+        page._popup.close()
 
-    def test_fields_are_pick_only_but_show_caret(self, page):
-        # Editable (Qt hides the blinking caret in read-only mode — the
-        # focused field must look like Book Trader's search box) yet
-        # every mutating path is guarded: typing is intercepted, the
-        # context menu and drops are off, and the hint matches.
-        for edit in page._symbol_edits:
-            assert not edit.isReadOnly()
-            assert edit.placeholderText() == "Search symbol…"
-            assert (edit.contextMenuPolicy()
-                    == Qt.ContextMenuPolicy.NoContextMenu)
-            assert not edit.acceptDrops()
-
-    def test_paste_cannot_inject_text(self, page, qtbot):
-        from PySide6.QtWidgets import QApplication
-        QApplication.clipboard().setText("EVIL")
+    def test_typing_lands_in_field_and_opens_dropdown(self, page, qtbot):
         edit = page._symbol_edits[0]
-        qtbot.keyClick(edit, Qt.Key.Key_V,
-                       Qt.KeyboardModifier.ControlModifier)
-        assert edit.text() == ""
-
-    def test_dot_key_does_not_slip_into_field(self, page, qtbot):
-        # "." is printable but not alnum — it must open the popup, not
-        # land in the field (BRK.B-style queries happen in the popup).
-        edit = page._symbol_edits[0]
-        qtbot.keyClick(edit, Qt.Key.Key_Period)
-        assert edit.text() == ""
+        qtbot.keyClick(edit, Qt.Key.Key_B)
+        assert edit.text() == "b"
         assert page._popup is not None
-        assert page._popup._search.text() == "."
+        assert page._popup._ext_input is edit
+        page._popup.close()
+
+    def test_dropdown_is_shared_and_reattached(self, page):
+        # One reusable instance serves all four fields; opening it from
+        # another field re-points the live query at that field.
+        e0, e1 = page._symbol_edits[0], page._symbol_edits[1]
+        page._show_dropdown(e0)
+        first = page._popup
+        page._show_dropdown(e1)
+        assert page._popup is first
+        assert page._popup._ext_input is e1
         page._popup.close()
 
     def test_pick_fills_field_and_persists(self, page):
         edit = page._symbol_edits[0]
-        page._on_symbol_picked(edit, {"symbol": "bil", "sec_type": "STK",
-                                      "conid": "9", "source": "ibkr"})
+        page._show_dropdown(edit)
+        page._on_symbol_picked({"symbol": "bil", "sec_type": "STK",
+                                "conid": "9", "source": "ibkr"})
         assert edit.text() == "BIL"
         cm = page._prefs["cash_management"]
         assert cm["sweep_symbols"] == ["BIL"]
         assert cm["sweep_symbol"] == "BIL"
+        assert not page._popup.isVisible()   # pick dismisses the list
 
     def test_no_inline_clear_button(self, page):
-        # Backspace/Delete are the only clear paths — the inline "x"
-        # was removed to keep the minimal search-box look.
+        # The field edits like a normal line edit — no inline "x",
+        # keeping the minimal search-box look.
         for edit in page._symbol_edits:
             assert edit.actions() == []
 
-    def test_backspace_clears_slot(self, page, qtbot):
+    def test_backspace_edits_text_normally(self, page, qtbot):
         from PySide6.QtCore import Qt as _Qt
         edit = page._symbol_edits[0]
-        page._on_symbol_picked(edit, {"symbol": "BIL", "sec_type": "STK",
-                                      "conid": "9", "source": "ibkr"})
+        edit.setText("BIL")
         qtbot.keyClick(edit, _Qt.Key.Key_Backspace)
-        assert edit.text() == ""
-        assert page._prefs["cash_management"]["sweep_symbols"] == []
+        assert edit.text() == "BI"
+        page._popup.close()
 
-    def test_typing_letter_opens_popup_preseeded(self, page, qtbot):
-        # Keyboard-only: a letter on the focused field opens the search
-        # popup with that character already in its search box.
+    def test_escape_dismisses_dropdown(self, page, qtbot):
         from PySide6.QtCore import Qt as _Qt
         edit = page._symbol_edits[0]
-        qtbot.keyClick(edit, _Qt.Key.Key_B)
-        assert page._popup is not None
-        assert page._popup._search.text() == "b"
-        assert edit.text() == ""            # read-only field untouched
-        page._popup.close()
+        page._show_dropdown(edit)
+        assert page._popup.isVisible()
+        qtbot.keyClick(edit, _Qt.Key.Key_Escape)
+        assert not page._popup.isVisible()
 
-    def test_enter_opens_popup_for_keyboard_users(self, page, qtbot):
-        from PySide6.QtCore import Qt as _Qt
-        edit = page._symbol_edits[1]
-        qtbot.keyClick(edit, _Qt.Key.Key_Return)
-        assert page._popup is not None
-        assert page._popup._search.text() == ""
-        page._popup.close()
+    def test_pick_stores_contract_meta(self, page):
+        # The pick's metadata is kept under sweep_contracts — that's
+        # what lets the symbol price/trade without being a chip.
+        edit = page._symbol_edits[0]
+        page._show_dropdown(edit)
+        page._on_symbol_picked({"symbol": "SGOV", "sec_type": "STK",
+                                "conid": "563439551", "source": "ibkr",
+                                "primary_exchange": "ARCA"})
+        meta = page._prefs["cash_management"]["sweep_contracts"]["SGOV"]
+        assert meta["conid"] == "563439551"
+        assert meta["exchange"] == "SMART"   # STK default
+
+    def test_cleared_symbol_prunes_its_contract(self, page):
+        edit = page._symbol_edits[0]
+        page._show_dropdown(edit)
+        page._on_symbol_picked({"symbol": "SGOV", "sec_type": "STK",
+                                "conid": "563439551", "source": "ibkr"})
+        edit.clear()
+        page._on_edit()
+        assert page._prefs["cash_management"]["sweep_contracts"] == {}
+
+    def test_focus_out_commits_text(self, page):
+        from PySide6.QtCore import QEvent
+        from PySide6.QtGui import QFocusEvent
+        edit = page._symbol_edits[0]
+        edit.setText("sgov")
+        page.eventFilter(edit, QFocusEvent(QEvent.Type.FocusOut,
+                                           Qt.FocusReason.TabFocusReason))
+        assert edit.text() == "SGOV"
+        assert (page._prefs["cash_management"]["sweep_symbols"]
+                == ["SGOV"])
 
     def test_collect_reports_all_fields(self, page):
         for i, sym in enumerate(["SGOV", "BIL", "", "sgov"]):

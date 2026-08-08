@@ -1016,6 +1016,13 @@ class FlashTradeView(QWidget):
 
     # ── Cash sweep ────────────────────────────────────────────────────────────
 
+    def refresh_market_data_subscriptions(self) -> None:
+        """Re-submit background L1 subscriptions (chips + sweep
+        symbols).  Called by the host after Settings saves so a newly
+        configured sweep symbol starts pricing immediately instead of
+        on the next reconnect/tab-show."""
+        self._order_entry.refresh_price_subscription()
+
     def _sweep_symbol_price(self, symbol: str) -> float:
         """Last price for *symbol* from the order-entry price cache (0 if the
         symbol isn't subscribed / priced yet)."""

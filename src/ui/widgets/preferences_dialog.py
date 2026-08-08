@@ -417,10 +417,11 @@ class _DisplayPage(QWidget):
 class _CashManagementPage(QWidget):
     """Cash-management settings — up to 4 sweep stock symbols.  Each
     configured symbol becomes its own Sweep in / Sweep out action on
-    the account right-click menu.  Clicking a field opens the SAME
-    standalone symbol-search popup Book Trader's chip bar uses (own
-    search box, live IBKR results, filtered to stocks) — a pick fills
-    the field; Backspace / Delete clears it."""
+    the account right-click menu.  The fields behave exactly like the
+    Hot Button modal's SPECIFIC symbol field: typing searches directly
+    from the field and an inline results-only dropdown (no second
+    search box) opens under it, filtered to stocks; ↑/↓/Enter pick,
+    Esc dismisses.  All four fields share one reusable dropdown."""
 
     changed = Signal()
 
@@ -430,7 +431,9 @@ class _CashManagementPage(QWidget):
         super().__init__(parent)
         self._prefs = prefs
         self._workers = list(workers or [])
-        self._popup = None
+        self._popup = None          # shared dropdown, reused across fields
+        self._active_edit = None    # field the dropdown is attached to
+        self._suppress_dropdown = False
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -468,6 +471,19 @@ class _CashManagementPage(QWidget):
             legacy = str(cm.get("sweep_symbol", "") or "")
             raw = [legacy] if legacy else []
         symbols = [str(s or "").strip().upper() for s in raw]
+        # Pick-time contract metadata per symbol ({SYM: meta}) — this is
+        # what lets sweep symbols price + trade without being chips.
+        contracts = cm.get("sweep_contracts", {})
+        self._contracts: dict[str, dict] = {
+            str(k or "").strip().upper(): dict(v)
+            for k, v in contracts.items()
+            if isinstance(v, dict) and str(k or "").strip()
+        } if isinstance(contracts, dict) else {}
+
+        # Reuse the Hot Button modal's input style verbatim so these
+        # fields look identical to its symbol field (same border,
+        # radius, font size and height).
+        from src.ui.widgets.order_entry_panel import _HotButtonModal
 
         self._symbol_edits: list[QLineEdit] = []
         for i in range(self._MAX_SYMBOLS):
@@ -475,17 +491,13 @@ class _CashManagementPage(QWidget):
             edit.setText(symbols[i] if i < len(symbols) else "")
             edit.setPlaceholderText("Search symbol…")
             edit.setFixedWidth(380)
-            edit.setStyleSheet(_INPUT_QSS)
-            # Selection happens exclusively through the search popup.
-            # The field is technically editable — Qt never shows the
-            # blinking caret in read-only mode, and the focused field
-            # should look like Book Trader's search box — but every
-            # text-mutating path is intercepted (typing opens the
-            # popup, paste/cut/undo are swallowed, context menu and
-            # drops disabled), so a symbol can only enter via a real
-            # IBKR pick.
-            edit.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
-            edit.setAcceptDrops(False)
+            edit.setFixedHeight(30)
+            edit.setStyleSheet(_HotButtonModal._INPUT_QSS)
+            # textEdited fires ONLY for user keystrokes (never on
+            # programmatic setText), so a pick adopting its symbol
+            # can't re-open the dropdown it just closed.
+            edit.textEdited.connect(
+                lambda _t, e=edit: self._on_symbol_edited(e))
             edit.installEventFilter(self)
             row = QHBoxLayout()
             row.addWidget(edit)
@@ -494,88 +506,84 @@ class _CashManagementPage(QWidget):
             self._symbol_edits.append(edit)
         root.addStretch()
 
-    # ── Symbol search (the Book Trader chip-bar popup, stocks only) ──────────
+    # ── Inline symbol-search dropdown (Hot Button modal pattern) ─────────────
 
-    def _open_search(self, edit: QLineEdit) -> None:
-        """Open the standalone symbol-search popup under *edit* — the
-        exact component Book Trader's "+" chip uses: its own search
-        box, live IBKR results, Qt.Popup semantics (outside click
-        dismisses, deletes itself on close)."""
+    def _on_symbol_edited(self, edit: QLineEdit) -> None:
+        if not self._suppress_dropdown:
+            self._show_dropdown(edit)
+
+    def _show_dropdown(self, edit: QLineEdit) -> None:
+        """Inline live search under *edit* — the popup in dropdown mode
+        (no internal search box) querying the field directly, stocks
+        only.  One instance is shared by all four fields; attach_input
+        re-points it when a different field opens it."""
         from src.ui.widgets.symbol_search_popup import SymbolSearchPopup
-        popup = SymbolSearchPopup(self, workers=self._workers,
-                                  exclude=set(), stocks_only=True)
-        popup.symbol_selected.connect(
-            lambda entry, e=edit: self._on_symbol_picked(e, entry))
-        self._popup = popup
-        popup.open_below(edit)
+        if self._popup is None:
+            self._popup = SymbolSearchPopup(
+                self, workers=self._workers, exclude=set(),
+                external_input=edit, stocks_only=True)
+            self._popup.symbol_selected.connect(self._on_symbol_picked)
+        else:
+            self._popup.attach_input(edit)
+        self._active_edit = edit
+        self._popup.open_below(edit)
 
-    def _on_symbol_picked(self, edit: QLineEdit, entry: dict) -> None:
-        """Adopt a popup pick into the field it was opened for.  Only
-        the ticker string matters here — sweep orders resolve their
-        contract through the normal order path."""
+    def _on_symbol_picked(self, entry: dict) -> None:
+        """Adopt a dropdown pick into the field it is attached to.
+        The pick's contract metadata is kept alongside the symbol —
+        that's what lets the sweep menu price (and the order path
+        route) the symbol without it being a chip."""
+        from src.core import instruments
+        edit = self._active_edit
         sym = str(entry.get("symbol", "") or "").strip().upper()
-        if not sym:
+        if edit is None or not sym:
             return
-        edit.setText(sym)
+        meta = instruments.contract_meta_from_result(entry)
+        if meta and meta.get("conid"):
+            self._contracts[sym] = meta
+        self._suppress_dropdown = True
+        try:
+            edit.setText(sym)
+        finally:
+            self._suppress_dropdown = False
         self._on_edit()
+        if self._popup is not None:
+            self._popup.close()
 
     def eventFilter(self, obj, event):  # noqa: N802 – Qt override
+        # Same wiring as the Hot Button modal's symbol field: typing
+        # searches from the field itself, ↑/↓/Enter/Esc are forwarded
+        # to the dropdown while it's visible, clicking (re)opens it,
+        # and losing focus dismisses it and commits the text.
         if obj in self._symbol_edits:
             t = event.type()
-            if t == QEvent.Type.MouseButtonPress:
-                # Focus first so Backspace/Delete work right after the
-                # popup dismisses (the consumed press would otherwise
-                # never focus the field).
-                obj.setFocus(Qt.FocusReason.MouseFocusReason)
-                self._open_search(obj)
-                return True
             if t == QEvent.Type.KeyPress:
-                if event.key() in (Qt.Key.Key_Backspace,
-                                   Qt.Key.Key_Delete):
-                    obj.clear()
-                    self._on_edit()
+                dd = self._popup
+                if (dd is not None and dd.isVisible()
+                        and dd.handle_key(event)):
                     return True
-                if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter,
-                                   Qt.Key.Key_Space, Qt.Key.Key_Down):
-                    self._open_search(obj)
-                    return True
-                # Editing shortcuts must not mutate the pick-only
-                # field: swallow paste/cut/undo/redo (copy stays).
-                from PySide6.QtGui import QKeySequence
-                for seq in (QKeySequence.StandardKey.Paste,
-                            QKeySequence.StandardKey.Cut,
-                            QKeySequence.StandardKey.Undo,
-                            QKeySequence.StandardKey.Redo):
-                    if event.matches(seq):
-                        return True
-                # Keyboard-only type-to-search: any printable character
-                # on the focused field opens the popup with that
-                # character already in its search box, so Tab → type →
-                # ↑/↓ → Enter needs no mouse at all.  (isprintable, not
-                # isalnum — "." must not slip into the field either.)
-                txt = event.text()
-                if (txt and txt.isprintable()
-                        and not event.modifiers() & (
-                            Qt.KeyboardModifier.ControlModifier
-                            | Qt.KeyboardModifier.MetaModifier
-                            | Qt.KeyboardModifier.AltModifier)):
-                    self._open_search(obj)
-                    if self._popup is not None:
-                        self._popup._search.setText(txt)
-                    return True
+            elif t == QEvent.Type.MouseButtonPress:
+                self._show_dropdown(obj)
+            elif t == QEvent.Type.FocusOut:
+                # Clicking the dropdown itself briefly activates its
+                # window (ActiveWindowFocusReason) — that must not
+                # dismiss it before the row click lands.
+                if (self._popup is not None
+                        and event.reason()
+                        != Qt.FocusReason.ActiveWindowFocusReason):
+                    self._popup.close()
+                self._on_edit()
         return super().eventFilter(obj, event)
 
     def close_dropdown(self) -> None:
-        """Host hook: close any open search popup when the Settings
-        dialog closes.  Qt.Popup usually self-dismisses, but the
-        dialog can also be closed programmatically underneath it."""
-        popup = self._popup
-        self._popup = None
-        if popup is not None:
+        """Host hook: close the search dropdown when the Settings
+        dialog closes.  In dropdown mode the popup is a floating Tool
+        window — it doesn't dismiss with its host on its own."""
+        if self._popup is not None:
             try:
-                popup.close()
+                self._popup.close()
             except RuntimeError:
-                pass  # already deleted (WA_DeleteOnClose)
+                pass  # already deleted
 
     def _symbols(self) -> list[str]:
         """Cleaned symbol list from the inputs: upper-cased, blanks
@@ -592,18 +600,19 @@ class _CashManagementPage(QWidget):
             sym = edit.text().strip().upper()
             if sym != edit.text():
                 edit.setText(sym)
-        cm = self._prefs.setdefault("cash_management", {})
-        cm["sweep_symbols"] = self._symbols()
-        cm["sweep_symbol"] = cm["sweep_symbols"][0] \
-            if cm["sweep_symbols"] else ""
+        self._prefs["cash_management"] = self.collect()
         self.changed.emit()
 
     def collect(self) -> dict:
         symbols = self._symbols()
         # Legacy key kept in sync so older builds restoring this
-        # config still find their (first) sweep symbol.
+        # config still find their (first) sweep symbol.  Pick-time
+        # contract metadata rides along, pruned to the kept symbols.
         return {"sweep_symbols": symbols,
-                "sweep_symbol": symbols[0] if symbols else ""}
+                "sweep_symbol": symbols[0] if symbols else "",
+                "sweep_contracts": {s: dict(m)
+                                    for s, m in self._contracts.items()
+                                    if s in symbols}}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -982,6 +991,11 @@ class PreferencesDialog(QDialog):
     """Preferences dialog that auto-closes on focus loss and persists
     all settings to ``app_config.json``."""
 
+    # Emitted after every successful _save() — hosts use it to refresh
+    # anything derived from preferences (e.g. background market-data
+    # subscriptions for the cash-sweep symbols).
+    preferences_saved = Signal()
+
     def __init__(self, parent=None, *, columns_provider=None,
                  auth_context=None, workers=None):
         super().__init__(parent)
@@ -1338,3 +1352,4 @@ class PreferencesDialog(QDialog):
         cash_prefs.reload()
 
         log.info("Preferences saved")
+        self.preferences_saved.emit()

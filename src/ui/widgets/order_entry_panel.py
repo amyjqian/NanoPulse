@@ -2053,7 +2053,6 @@ class _HotButtonModal(QDialog):
         " border:1px solid #232A3B; border-radius:5px;"
         " padding:4px 8px; font-size:11px;"
         "}"
-        "QLineEdit:focus, QComboBox:focus{ border-color:#539BF5; }"
         "QLineEdit:disabled, QComboBox:disabled{ color:#6A7690; }"
         "QComboBox::drop-down{ border:none; width:20px; }"
         # Style the popup list — without this Qt falls back to the
@@ -4701,7 +4700,8 @@ class OrderEntryPanel(QWidget):
         Called from FlashTradeView.showEvent and _wire_all_workers to ensure
         background market data is always flowing.
         """
-        if not self._symbols:
+        from src.core.cash_management import cash_prefs
+        if not self._symbols and not cash_prefs.sweep_symbols:
             return
         pw = self._bg_worker
         if pw is not None and pw.isRunning() and pw.is_ib_connected:
@@ -4766,10 +4766,15 @@ class OrderEntryPanel(QWidget):
         self._subscribe_all_background()
 
     def _build_bg_params(self) -> list[dict]:
-        """Build market data params for all symbol chips."""
+        """Build market data params for all symbol chips PLUS the
+        configured cash-sweep symbols — sweep menus price from this
+        panel's cache, and a sweep symbol needn't be a chip (its
+        contract metadata is stored with the preference and resolved
+        through ``instruments`` like any chip's)."""
+        from src.core.cash_management import cash_prefs
         params_list = []
         seen: set[str] = set()
-        for sym in self._symbols:
+        for sym in [*self._symbols, *cash_prefs.sweep_symbols]:
             q = sym.upper()
             if q in seen:
                 continue
