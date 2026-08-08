@@ -383,6 +383,32 @@ def test_wheel_steps_ladder_both_units(qtbot):
     assert box.text() == "99"
 
 
+def test_symbol_switch_to_shares_clears_preview(qtbot):
+    # % readout on a stock, then switch to a symbol that forces share
+    # mode (FUT) — the stale B/S totals must be cleared, not left on
+    # the Book Trader header (they only update via preview_changed).
+    row = _make(qtbot)
+    previews = []
+    row.preview_changed.connect(lambda b, s: previews.append((b, s)))
+    row._btn_unit.click()
+    _chip(row, 25).click()
+    assert previews[-1][0].startswith("B ")
+    row.set_presets(*_STK, allow_percent=False)   # e.g. NVDA → MNQ
+    assert previews[-1] == ("", "")
+
+
+def test_symbol_switch_in_share_mode_keeps_preview_clear(qtbot):
+    # SH-mode stock→stock switch after earlier % usage: still clears.
+    row = _make(qtbot)
+    previews = []
+    row.preview_changed.connect(lambda b, s: previews.append((b, s)))
+    row._btn_unit.click()          # %
+    _chip(row, 25).click()
+    row._btn_unit.click()          # back to SH (clears)
+    row.set_presets(*_STK, allow_percent=True)    # symbol switch in SH
+    assert previews[-1] == ("", "")
+
+
 class TestTickPriceInputStepping:
     """The Dist price input matches the qty field's minimal style: no
     arrows, no ladder popup — wheel and ↑/↓ step by one tick."""

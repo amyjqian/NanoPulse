@@ -712,6 +712,12 @@ class QtyChipRow(QWidget):
             # Refresh readouts/chip enables against the new symbol's
             # accounts + (not-yet-ticked) price immediately.
             self._emit_state()
+        else:
+            # Landed in share mode: clear any % B/S readout left over
+            # from the previous symbol — the host's header labels only
+            # update on preview_changed, so without this they keep
+            # showing the old symbol's resolved totals forever.
+            self.preview_changed.emit("", "")
 
     def set_percent_context(self, accounts_provider) -> None:
         """*accounts_provider(symbol) -> [(account, nlv, bp, held)]*."""
