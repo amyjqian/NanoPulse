@@ -64,21 +64,26 @@ def test_bp_zero_means_unknown_not_broke():
     assert resolve_percent_qty(100, 10_000, 10, buying_power=0) == 1000
 
 
-def test_sell_percent_of_position_ceils():
-    # SELL sizes against the position and rounds UP (mirrors the
-    # close-pct flow): 3 shares × 10% → 1, never 0.
-    assert sell_shares_from_position(10, 3) == 1
+def test_sell_percent_of_position_ceils_then_floors_to_5():
+    # SELL sizes against the position: ceil (mirrors close-pct), then a
+    # partial sell floors to a multiple of 5.
     assert sell_shares_from_position(25, 600) == 150
-    assert sell_shares_from_position(33, 100) == 33
-    assert sell_shares_from_position(34, 100) == 34
-    # ceil in action: 25% of 601 = 150.25 → 151
-    assert sell_shares_from_position(25, 601) == 151
+    assert sell_shares_from_position(33, 100) == 30   # ceil 33 → floor5
+    assert sell_shares_from_position(34, 100) == 30
+    # 25% of 601 = 150.25 → ceil 151 → floor5 150
+    assert sell_shares_from_position(25, 601) == 150
+    # Sub-5 partial slices round to 0 (account skipped by the fan-out).
+    assert sell_shares_from_position(10, 3) == 0
+    assert sell_shares_from_position(10, 42) == 5     # ceil 4.2 → 5
 
 
 def test_sell_percent_caps_at_holding():
     assert sell_shares_from_position(100, 600) == 600
     assert sell_shares_from_position(250, 600) == 600     # >100% clamps
     assert sell_shares_from_position(100, 1) == 1
+    # Full close keeps the odd lot — 100% never strands 1–4 shares.
+    assert sell_shares_from_position(100, 1998) == 1998
+    assert sell_shares_from_position(100, 7) == 7
 
 
 def test_sell_percent_never_shorts():
@@ -107,10 +112,11 @@ def test_resolve_scales_when_bp_below_nlv():
     # must resolve to a DIFFERENT count — under the old NLV base every
     # chip smashed into the BP clamp and read identically.
     kw = dict(net_liq=249_359, price=Decimal("825.82"), buying_power=22_299)
-    assert resolve_percent_qty(10, **kw) == 2
-    assert resolve_percent_qty(25, **kw) == 6
-    assert resolve_percent_qty(50, **kw) == 13
-    assert resolve_percent_qty(100, **kw) == 27
+    # Raw counts 2 / 6 / 13 / 27, floored to multiples of 5.
+    assert resolve_percent_qty(10, **kw) == 0
+    assert resolve_percent_qty(25, **kw) == 5
+    assert resolve_percent_qty(50, **kw) == 10
+    assert resolve_percent_qty(100, **kw) == 25
 
 
 def test_resolve_margin_account_keeps_nlv_base():
@@ -118,3 +124,12 @@ def test_resolve_margin_account_keeps_nlv_base():
     # never a levered position behind a single click.
     assert resolve_percent_qty(100, 100_000, 100,
                                buying_power=400_000) == 1000
+
+
+def test_resolve_floors_to_multiple_of_5():
+    # 25% of $1.42M @ 182.40 = 1,946.27 → floor 1,946 → floor5 1,945.
+    assert resolve_percent_qty(25, 1_420_000, Decimal("182.40")) == 1945
+    # Already a multiple of 5 → unchanged.
+    assert resolve_percent_qty(50, 200_000, 50) == 2000
+    # Sub-5 results round to 0 (fan-out skips the account).
+    assert resolve_percent_qty(10, 4_000, 100) == 0

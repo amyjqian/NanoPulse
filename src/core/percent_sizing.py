@@ -18,6 +18,14 @@ from __future__ import annotations
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_DOWN
 
 
+def _floor_to_5(shares: int) -> int:
+    """Round *shares* down to a multiple of 5 — lot-style sizing, the
+    same rule the cash-sweep quantities use.  Percent-resolved sizes
+    under 5 shares therefore round to 0 (the fan-out skips those
+    accounts with a warning)."""
+    return (int(shares) // 5) * 5
+
+
 def _dec(v) -> Decimal:
     """Decimal from float/int/str/Decimal; 0 on garbage."""
     if isinstance(v, Decimal):
@@ -59,9 +67,10 @@ def sell_shares_from_position(pct, position) -> int:
     """Whole shares for a SELL sized as *pct*% of the *position* held.
 
     Percent-sell reduces an existing long — it must never open a short,
-    so flat/short positions resolve to 0.  Rounds UP (``ceil``) and caps
-    at the held amount, mirroring ``ib_worker._do_close_pct``: when
-    reducing risk, take the larger slice (3 shares × 10% → 1, not 0).
+    so flat/short positions resolve to 0.  Rounds UP (``ceil``), caps
+    at the held amount, then floors the partial-sell result to a
+    multiple of 5.  A sell that reaches the whole position keeps the
+    odd lot — 100% must always close flat, never strand 1–4 shares.
     """
     p = _dec(pct)
     if p <= 0:
@@ -76,13 +85,15 @@ def sell_shares_from_position(pct, position) -> int:
         return 0
     qty = int((Decimal(held) * p / Decimal(100))
               .to_integral_value(rounding=ROUND_CEILING))
-    return min(qty, held)
+    if qty >= held:
+        return held
+    return _floor_to_5(qty)
 
 
 def resolve_percent_qty(pct, net_liq, price, buying_power=0.0) -> int:
     """Full resolution: pct of the deployable value — ``min(NLV, BP)``
     when buying power is known, NLV alone otherwise — floored at price,
-    BP-clamped, >= 0.
+    BP-clamped, then floored to a multiple of 5, >= 0.
 
     *pct* is clamped into (0, 100] first — the UI validator already
     enforces this, but the payload path must not trust the caller.
@@ -95,4 +106,5 @@ def resolve_percent_qty(pct, net_liq, price, buying_power=0.0) -> int:
     nlv, bp = _dec(net_liq), _dec(buying_power)
     base = min(nlv, bp) if bp > 0 else nlv
     shares = shares_from_percent(p, base, price)
-    return max(0, clamp_to_buying_power(shares, price, buying_power))
+    return max(0, _floor_to_5(clamp_to_buying_power(shares, price,
+                                                    buying_power)))

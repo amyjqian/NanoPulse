@@ -102,10 +102,10 @@ def _seed_positions(v):
 def test_percent_resolves_per_account(view):
     v, workers = view
     v._on_order_requested(_payload(qty_pct=25))
-    # A1: 25% × $1.42M / 182.40 → 1,946 (BP unknown → NLV base).
-    assert workers["A1"].orders[0]["qty"] == 1946
-    # A2: deployable base min($1.0M, $100k BP) → 25% × $100k / 182.40 → 137.
-    assert workers["A2"].orders[0]["qty"] == 137
+    # A1: 25% × $1.42M / 182.40 → 1,946 → floor5 1,945 (NLV base).
+    assert workers["A1"].orders[0]["qty"] == 1945
+    # A2: min($1.0M, $100k BP) → 25% × $100k / 182.40 → 137 → floor5 135.
+    assert workers["A2"].orders[0]["qty"] == 135
     # A3 has no NLV → skipped entirely, never a guessed size.
     assert workers["A3"].orders == []
 
@@ -121,16 +121,17 @@ def test_percent_falls_back_to_limit_price(view):
     v, workers = view
     v._on_order_requested(_payload(qty_pct=25, last_price=0.0,
                                    limit_price=182.40))
-    assert workers["A1"].orders[0]["qty"] == 1946
+    assert workers["A1"].orders[0]["qty"] == 1945
 
 
 def test_percent_sell_resolves_per_account_position(view):
     v, workers = view
     _seed_positions(v)
     v._on_order_requested(_payload(qty_pct=25, action="SELL"))
-    # A1: 25% of 600 held → 150.  A2: 25% of 3 → ceil(0.75) = 1.
+    # A1: 25% of 600 held → 150.  A2: 25% of 3 → ceil(0.75) = 1 →
+    # floor5 0, so the sub-5 slice is skipped like a flat account.
     assert workers["A1"].orders[0]["qty"] == 150
-    assert workers["A2"].orders[0]["qty"] == 1
+    assert workers["A2"].orders == []
     # A3 is flat → skipped, never shorted.
     assert workers["A3"].orders == []
 

@@ -57,10 +57,10 @@ def test_percent_mode_resolves_and_stamps_payload(panel, qtbot):
     panel._btn_qty_unit.click()                     # → %
     assert panel._qty_unit == UNIT_PCT
     assert panel._active_pct == 25
-    assert panel._active_qty == 1946                # 25% of $1.42M @ 182.40
+    assert panel._active_qty == 1945                # 25% of $1.42M @ 182.40
 
     panel._emit_order("BUY", "MKT")
-    assert payloads[-1]["qty"] == 1946              # NLV basis (buy)
+    assert payloads[-1]["qty"] == 1945              # NLV basis (buy)
     assert payloads[-1]["qty_pct"] == 25
 
     # SELL resolves from the POSITION: 25% of 600 held → 150.
@@ -99,7 +99,7 @@ def test_percent_sell_blocked_when_flat(panel):
     panel._emit_order("SELL", "MKT")
     assert payloads == []                           # nothing to sell
     panel._emit_order("BUY", "MKT")
-    assert payloads[-1]["qty"] == 1946
+    assert payloads[-1]["qty"] == 1945
 
 
 def test_action_labels_show_resolved_shares(panel):
@@ -107,7 +107,7 @@ def test_action_labels_show_resolved_shares(panel):
     panel._refresh_action_labels()
     # The §5 safety readout — resolved count visible before any click,
     # per side: Buy from net liq, Sell from the held position.
-    assert panel._btn_buy_mkt._primary == "Buy 1,946 @MKT"
+    assert panel._btn_buy_mkt._primary == "Buy 1,945 @MKT"
     assert panel._btn_sell_mkt._primary == "Sell 150 @MKT"
     # Toggling back restores today's plain label.
     panel._btn_qty_unit.click()
@@ -122,10 +122,10 @@ def test_preset_and_reset_use_property_values(panel):
                 if b.property("qty_value") == 50)
     chip.click()
     assert panel._active_pct == 50
-    assert panel._active_qty == 3892                # 50% → 2×1946
+    assert panel._active_qty == 3890                # 50% → 2×1945
     panel._reset_qty_to_default()
     assert panel._active_pct == 25
-    assert panel._active_qty == 1946
+    assert panel._active_qty == 1945
     # Back in shares, reset restores the share default.
     panel._btn_qty_unit.click()
     panel._reset_qty_to_default()
@@ -169,7 +169,7 @@ def test_symbol_switch_keeps_percent_mode(panel):
 
 def test_price_tick_recomputes_percent(panel):
     panel._btn_qty_unit.click()
-    assert panel._active_qty == 1946
-    # Price doubles → half the shares.
+    assert panel._active_qty == 1945
+    # Price doubles → half the shares (973 → floor5 970).
     panel._on_bg_price_update("NVDA", 364.80, 364.70, 364.90)
-    assert panel._active_qty == 973
+    assert panel._active_qty == 970
