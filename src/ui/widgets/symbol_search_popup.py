@@ -506,6 +506,8 @@ class SymbolSearchPopup(QDialog):
             self._search.hide()
             self._ext_input.textChanged.connect(self._on_text_changed)
         self._lst.itemClicked.connect(lambda _it: self._commit_current())
+        self._lst.currentRowChanged.connect(
+            lambda _r: self._update_row_highlight())
 
         def _key(event) -> None:
             if event.key() == Qt.Key.Key_Down:
@@ -568,7 +570,9 @@ class SymbolSearchPopup(QDialog):
             self.setFixedWidth(max(anchor.width(), 240))
         pos = anchor.mapToGlobal(anchor.rect().bottomLeft())
         if self._ext_input is not None:
-            pos += QPoint(0, 2)
+            # Tuck 1px UNDER the field's bottom edge — any downward
+            # offset reads as a detached second component.
+            pos += QPoint(0, -1)
         self.move(pos)
         self.show()
         if self._ext_input is None:
@@ -753,6 +757,10 @@ class SymbolSearchPopup(QDialog):
             if self._lst.item(i).data(Qt.ItemDataRole.UserRole) is not None:
                 self._lst.setCurrentRow(i)
                 break
+        # Explicit call: setCurrentRow won't fire currentRowChanged
+        # when the index is unchanged across a rebuild, but the row
+        # widgets are new and start unhighlighted.
+        self._update_row_highlight()
 
         # Size the list to at most _VISIBLE_ROWS rows, using the rows'
         # real heights so a partial row never pokes out at the bottom;
@@ -803,8 +811,23 @@ class SymbolSearchPopup(QDialog):
             f"font-size:{size}px;font-weight:700")
         return av
 
+    _ROW_SS_SELECTED = "QWidget#srow{background:#2D4F80;border-radius:10px}"
+
+    def _update_row_highlight(self) -> None:
+        """Paint the keyboard-cursor row's background explicitly on the
+        row widget.  The ``::item:selected`` stylesheet alone is
+        unreliable under custom item widgets, and the user must always
+        be able to see which row ↑/↓ landed on."""
+        cur = self._lst.currentRow()
+        for i in range(self._lst.count()):
+            w = self._lst.itemWidget(self._lst.item(i))
+            if w is None:
+                continue
+            w.setStyleSheet(self._ROW_SS_SELECTED if i == cur else "")
+
     def _add_row(self, entry: dict) -> None:
         row = QWidget()
+        row.setObjectName("srow")
         row.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         h = QHBoxLayout(row)
@@ -830,8 +853,12 @@ class SymbolSearchPopup(QDialog):
         name = QLabel()
         name.setStyleSheet(f"color:{Theme.TEXT_DIM};font-size:12px")
         fm = QFontMetrics(name.font())
+        # Elide to the space actually left beside the avatar, symbol
+        # and exchange pill at the CURRENT popup width — a fixed elide
+        # width pushes the pill off the edge in narrow dropdown mode.
+        avail = max(60, self.width() - 240)
         name.setText(fm.elidedText(
-            name_text, Qt.TextElideMode.ElideRight, 300))
+            name_text, Qt.TextElideMode.ElideRight, avail))
         h.addWidget(name, 1)
 
         # Listing exchange preferred over the generic sec-type badge;

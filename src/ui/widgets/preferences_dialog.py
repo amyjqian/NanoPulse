@@ -477,8 +477,9 @@ class _CashManagementPage(QWidget):
             edit.setText(symbols[i] if i < len(symbols) else "")
             edit.setPlaceholderText("e.g. SGOV")
             # Wide enough for the dropdown (which matches this width)
-            # to render its avatar + name + exchange rows legibly.
-            edit.setFixedWidth(300)
+            # to render avatar + symbol + name + exchange pill without
+            # clipping the pill.
+            edit.setFixedWidth(380)
             edit.setStyleSheet(_INPUT_QSS)
             # Persist on Enter or when focus leaves the field.
             edit.editingFinished.connect(self._on_edit)

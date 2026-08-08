@@ -146,3 +146,26 @@ class TestOneControlFeel:
         host.setFixedWidth(120)
         p.open_below(host)
         assert p.width() == 240
+
+
+class TestCursorHighlight:
+    def test_stepped_row_gets_distinct_background(self, qtbot):
+        host = QLineEdit()
+        qtbot.addWidget(host)
+        p = SymbolSearchPopup(host, workers=[], exclude=set(),
+                              external_input=host)
+        host._popup_pin = p
+        p._local = [_entry("NVDA", "STK"), _entry("SGOV", "STK"),
+                    _entry("BIL", "STK")]
+        p._rebuild()
+
+        def _bg(i):
+            return p._lst.itemWidget(p._lst.item(i)).styleSheet()
+
+        # First data row highlighted after rebuild, others clear.
+        assert "background" in _bg(0)
+        assert _bg(1) == "" and _bg(2) == ""
+        p._step(+1)
+        assert _bg(0) == "" and "background" in _bg(1)
+        p._step(-1)
+        assert "background" in _bg(0) and _bg(1) == ""
