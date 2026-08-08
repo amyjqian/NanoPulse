@@ -237,6 +237,25 @@ class _CheckmarkBox(QWidget):
 
 # ── Account Row (Card) ────────────────────────────────────────────────────────
 
+class _SweepMenu(QMenu):
+    """Cash-sweep context menu that reports a right-click landing outside
+    it.  A popup QMenu grabs the mouse, so that click would otherwise only
+    dismiss the menu and the user would have to right-click the other
+    account row a second time — the panel listens to this signal and
+    reopens the menu on the row under the cursor in one step."""
+
+    right_pressed_outside = Signal(object)   # global QPoint
+
+    def mousePressEvent(self, ev):
+        if (ev.button() == Qt.MouseButton.RightButton
+                and not self.rect().contains(ev.position().toPoint())):
+            global_pos = ev.globalPosition().toPoint()
+            self.close()
+            self.right_pressed_outside.emit(global_pos)
+            return
+        super().mousePressEvent(ev)
+
+
 class _AccountRow(QFrame):
     """A single account card: checkbox | name | balance | × button."""
 
@@ -1522,7 +1541,9 @@ class AccountListPanel(QWidget):
 
         ``enabled`` is False (with an explanatory ``label``) when there's no
         sweep symbol configured, no live price, a flat balance, or the quantity
-        rounds to zero."""
+        rounds to zero.  A sweep-out with no shares held additionally sets
+        ``hidden`` True — the menu drops the entry instead of showing it
+        disabled."""
         from src.core.cash_management import cash_prefs
 
         if symbol is None:
@@ -1565,10 +1586,11 @@ class AccountListPanel(QWidget):
         else:
             limit_price = 0.0
             # Sweep out only makes sense if the account actually holds the
-            # sweep symbol — nothing to sell otherwise, so don't offer it.
+            # sweep symbol — nothing to sell otherwise.  ``hidden`` keeps
+            # the entry out of the menu entirely (not just disabled).
             if held <= 0:
-                return {"enabled": False, "symbol": symbol, "direction": "out",
-                        "qty": 0, "limit_price": 0.0,
+                return {"enabled": False, "hidden": True, "symbol": symbol,
+                        "direction": "out", "qty": 0, "limit_price": 0.0,
                         "label": f"No {symbol} shares to sweep out"}
             needed = _ceil_to_5(abs(usd) / size_price)
             # Cover the whole deficit if we hold enough (rounded up to a
@@ -1587,13 +1609,20 @@ class AccountListPanel(QWidget):
 
     def _show_sweep_menu(self, account: str, global_pos) -> None:
         """Build + show the account's cash-sweep right-click menu — one
-        action per configured sweep symbol (max 4)."""
-        menu = QMenu(self)
+        action per configured sweep symbol (max 4).  Entries flagged
+        ``hidden`` (e.g. sweep-out with no shares held) are omitted;
+        with nothing left to show, no menu opens at all."""
+        menu = _SweepMenu(self)
+        menu.right_pressed_outside.connect(self._reopen_sweep_menu_at)
         actions: list[tuple[object, dict]] = []
         for info in self.compute_sweeps(account):
+            if info.get("hidden"):
+                continue
             act = menu.addAction(info["label"])
             act.setEnabled(info["enabled"])
             actions.append((act, info))
+        if not actions:
+            return
         chosen = menu.exec(global_pos)
         for act, info in actions:
             if chosen is act and info["enabled"]:
@@ -1601,6 +1630,16 @@ class AccountListPanel(QWidget):
                     account, info["direction"], info["qty"], info["symbol"],
                     float(info.get("limit_price", 0.0)))
                 break
+
+    def _reopen_sweep_menu_at(self, global_pos) -> None:
+        """A right-click closed the open sweep menu — if it landed on an
+        account row, open that row's menu without a second click.  Deferred
+        with a 0-ms timer so the closing menu's ``exec`` unwinds first."""
+        for acct, row in self._account_rows.items():
+            if row.rect().contains(row.mapFromGlobal(global_pos)):
+                QTimer.singleShot(
+                    0, lambda a=acct, p=global_pos: self._show_sweep_menu(a, p))
+                return
 
     def active_group(self) -> str | None:
         """Currently-active group name, or None when the selection
