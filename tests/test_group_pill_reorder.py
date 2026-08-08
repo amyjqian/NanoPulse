@@ -9,8 +9,6 @@ from src.ui.widgets.accounts_model import AccountsTableModel
 
 
 def _make_panel(qtbot):
-    # Groups need at least one member — load_account_groups drops
-    # empty-account entries as invalid.
     groups = [{"name": n, "accounts": [f"DU{i}"], "selected": [f"DU{i}"]}
               for i, n in enumerate(("Alpha", "Beta", "Gamma", "Core"))]
     config_manager.save_account_groups(groups)

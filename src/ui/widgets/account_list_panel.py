@@ -1373,9 +1373,9 @@ class AccountListPanel(QWidget):
         """Scoped delete: drop *account* from the currently-active group
         only, leaving every other saved group untouched.  The row is
         removed from the list because the active-group view shows only
-        group members.  If the group becomes empty, delete it (matching
-        prior behavior) and clear the active indicator so ``_sync_rows``
-        falls back to the all-accounts view."""
+        group members.  An emptied group is KEPT — its pill stays and
+        the view just shows no rows.  Deleting a group is an explicit
+        act only: right-click the pill → Delete."""
         name = self._active_group
         g = self._find_group(name) if name else None
         if g is None:
@@ -1387,20 +1387,10 @@ class AccountListPanel(QWidget):
         if "selected" in g:
             g["selected"] = [a for a in g["selected"] if a != account]
 
-        pills_need_rebuild = False
-        if not g["accounts"]:
-            # Empty group — drop it entirely.
-            self._groups = [x for x in self._groups if x is not g]
-            self._set_active_group(None)
-            pills_need_rebuild = True
-
         config_manager.save_account_groups(self._groups)
-        if pills_need_rebuild:
-            self._rebuild_pills()
 
-        # Re-sync rows: when the group still exists the deleted account
-        # is no longer a member and its row is dropped; when the group
-        # was deleted we fall back to the all-accounts view.
+        # Re-sync rows: the deleted account is no longer a member so
+        # its row is dropped (an emptied group shows an empty list).
         self._sync_rows()
         self._emit_selection_changed()
         log.info("AccountList: removed %s from group %r (scoped delete)",
