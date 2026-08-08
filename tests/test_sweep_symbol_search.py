@@ -157,7 +157,12 @@ class TestOneControlFeel:
 
 
 class TestCursorHighlight:
-    def test_stepped_row_gets_distinct_background(self, qtbot):
+    """The keyboard cursor is rendered by the list's ::item:selected
+    style (one flat blue row — the add-symbol dropdown look).  An
+    earlier explicit per-row-widget painting nested ugly borders inside
+    the row and is gone."""
+
+    def test_stepping_moves_the_selected_item(self, qtbot):
         host = QLineEdit()
         qtbot.addWidget(host)
         p = SymbolSearchPopup(host, workers=[], exclude=set(),
@@ -166,14 +171,24 @@ class TestCursorHighlight:
         p._local = [_entry("NVDA", "STK"), _entry("SGOV", "STK"),
                     _entry("BIL", "STK")]
         p._rebuild()
-
-        def _bg(i):
-            return p._lst.itemWidget(p._lst.item(i)).styleSheet()
-
-        # First data row highlighted after rebuild, others clear.
-        assert "background" in _bg(0)
-        assert _bg(1) == "" and _bg(2) == ""
+        # First data row selected after rebuild; ↑/↓ move it (wrapping).
+        assert p._lst.currentRow() == 0
         p._step(+1)
-        assert _bg(0) == "" and "background" in _bg(1)
+        assert p._lst.currentRow() == 1
         p._step(-1)
-        assert "background" in _bg(0) and _bg(1) == ""
+        assert p._lst.currentRow() == 0
+        p._step(-1)
+        assert p._lst.currentRow() == 2
+        # The highlight itself comes from the item:selected style; no
+        # per-row stylesheet painting remains to fight it.
+        assert "item:selected" in p._lst.styleSheet()
+        for i in range(p._lst.count()):
+            assert p._lst.itemWidget(p._lst.item(i)).styleSheet() == ""
+
+    def test_search_box_has_no_focus_accent_frame(self, qtbot):
+        host = QLineEdit()
+        qtbot.addWidget(host)
+        p = SymbolSearchPopup(host, workers=[], exclude=set(),
+                              external_input=host)
+        host._popup_pin = p
+        assert ":focus" not in p._search.styleSheet()
