@@ -1874,3 +1874,24 @@ class AccountListPanel(QWidget):
     def get_selected_accounts(self) -> list[str]:
         """Return list of currently checked account IDs."""
         return [a for a, r in self._account_rows.items() if r.is_checked]
+
+    def is_full_fanout_selection(self) -> bool:
+        """True when the selection is "every account the user can see"
+        in a default view — i.e. exactly what the built-in All pill
+        produces.  FlashTradeView uses this for the *Orders on "All"
+        accounts* guard.
+
+        A user-defined group returns False: ``_sync_rows`` filters the
+        visible rows to that group's members, so a fully-checked group
+        would otherwise look like "everything selected" (the same trap
+        ``get_all_accounts`` documents).  Fanning out to a group is a
+        deliberate act, and the group hot buttons aren't guarded either.
+
+        Single-account setups return False too — there is no "all vs
+        some" distinction to protect.
+        """
+        if (self._active_group is not None
+                and self._active_group not in _DEFAULT_GROUPS):
+            return False
+        visible = set(self._account_rows)
+        return len(visible) > 1 and self.get_checked_accounts() == visible

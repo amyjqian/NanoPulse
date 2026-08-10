@@ -1,9 +1,10 @@
 """
 TradingPreferencesManager — in-memory singleton for active trading preferences.
 
-Loads ``preferences`` from ``app_config.json`` at first access and keeps both
-the *Futures* and *Stocks* sections in memory.  The PreferencesDialog calls
-:meth:`update` on every save so the very next trade always uses fresh values.
+Loads ``preferences`` from ``app_config.json`` at first access and keeps the
+*Futures*, *Stocks* and *Order guards* sections in memory.  The
+PreferencesDialog calls :meth:`update` on every save so the very next trade
+always uses fresh values.
 
 Usage
 -----
@@ -12,9 +13,11 @@ Usage
     # Read (never hits disk after first load)
     fut = trading_prefs.futures          # dict
     stk = trading_prefs.stocks           # dict
+    grd = trading_prefs.guards           # dict
+    ok = trading_prefs.allow_all_accounts_orders()   # bool
 
     # Write (called by PreferencesDialog._save)
-    trading_prefs.update(futures_dict, stocks_dict)
+    trading_prefs.update(futures_dict, stocks_dict, guards_dict)
 
 All public access is through the module-level ``trading_prefs`` singleton.
 """
@@ -52,9 +55,17 @@ _STOCKS_DEFAULTS: dict[str, Any] = {
     "sell_ask_unit": "ticks",
 }
 
+# Order-safety switches that aren't tied to an asset class.
+_GUARDS_DEFAULTS: dict[str, Any] = {
+    # False blocks a Buy/Sell whose account fan-out covers every visible
+    # account (the built-in "All" pill).  Defaults to True = the classic
+    # behaviour, so an existing config sees no change.
+    "allow_all_group_orders": True,
+}
+
 
 class TradingPreferencesManager:
-    """Singleton-style in-memory cache for Futures & Stocks trading prefs.
+    """Singleton-style in-memory cache for Futures, Stocks & guard prefs.
 
     Thread-safe: a lock guards every read / write so IBWorkerThread
     coroutines can safely call :meth:`get` while the UI thread calls
@@ -65,6 +76,7 @@ class TradingPreferencesManager:
         self._lock = threading.Lock()
         self._futures: dict[str, Any] = {}
         self._stocks: dict[str, Any] = {}
+        self._guards: dict[str, Any] = {}
         self._loaded = False
 
     # ── Bootstrap ─────────────────────────────────────────────────────────────
@@ -77,6 +89,7 @@ class TradingPreferencesManager:
         self._futures = {**_FUTURES_DEFAULTS,
                          **prefs.get("trading_futures", {})}
         self._stocks = {**_STOCKS_DEFAULTS, **prefs.get("trading_stocks", {})}
+        self._guards = {**_GUARDS_DEFAULTS, **prefs.get("trading_guards", {})}
         self._loaded = True
         log.info(
             "TradingPreferencesManager loaded  "
@@ -106,6 +119,21 @@ class TradingPreferencesManager:
             self._ensure_loaded()
             return dict(self._stocks)
 
+    @property
+    def guards(self) -> dict[str, Any]:
+        """Return a *snapshot copy* of the order-guard prefs dict."""
+        with self._lock:
+            self._ensure_loaded()
+            return dict(self._guards)
+
+    def allow_all_accounts_orders(self) -> bool:
+        """False when the user disabled orders that hit every account.
+
+        Coerced to bool so a hand-edited / ``null`` value in the config
+        can't read as "blocked" while the Settings toggle shows On.
+        """
+        return bool(self.guards.get("allow_all_group_orders", True))
+
     def get(self, symbol_type: str) -> dict[str, Any]:
         """Return prefs for *symbol_type* (``"FUT"`` → futures, ``"STK"`` → stocks).
 
@@ -121,17 +149,25 @@ class TradingPreferencesManager:
         self,
         futures: dict[str, Any] | None = None,
         stocks: dict[str, Any] | None = None,
+        guards: dict[str, Any] | None = None,
     ) -> None:
-        """Replace one or both in-memory pref dicts.
+        """Replace one or more in-memory pref dicts.
 
         Called by :meth:`PreferencesDialog._save` right after it writes to
         disk, so the in-memory state is always in sync.
+
+        Loads first: a partial update (say ``update(guards=...)`` alone)
+        must not leave the untouched sections empty forever — ``_loaded``
+        is flipped below, so ``_ensure_loaded`` would never repair them.
         """
         with self._lock:
+            self._ensure_loaded()
             if futures is not None:
                 self._futures = {**_FUTURES_DEFAULTS, **futures}
             if stocks is not None:
                 self._stocks = {**_STOCKS_DEFAULTS, **stocks}
+            if guards is not None:
+                self._guards = {**_GUARDS_DEFAULTS, **guards}
             self._loaded = True
         log.debug("TradingPreferencesManager updated in memory")
 

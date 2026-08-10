@@ -78,6 +78,9 @@ _DEFAULTS: dict = {
         "sell_ask_offset": 0,
         "sell_ask_unit": "ticks",
     },
+    "trading_guards": {
+        "allow_all_group_orders": True,
+    },
     "cash_management": {
         "sweep_symbols": [],
         "sweep_symbol": "",
@@ -922,6 +925,71 @@ class _AssetSettingsGroup(QWidget):
 #  Trading settings page  (Futures + Stocks stacked in a scroll area)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+class _OrderGuardsGroup(QWidget):
+    """Order-safety switches that aren't tied to an asset class.
+
+    Currently one toggle: whether a Buy/Sell may fan out to *every*
+    account in the Accounts panel (what the built-in "All" pill
+    selects).  Off makes FlashTradeView refuse such an order — see
+    ``FlashTradeView._on_order_requested``.
+    """
+
+    changed = Signal()
+
+    def __init__(self, prefs: dict, parent=None):
+        super().__init__(parent)
+        self._prefs = prefs
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(24, 16, 24, 16)
+        root.setSpacing(14)
+
+        g = self._prefs.get("trading_guards", {})
+
+        title_lbl = QLabel("Order Guards")
+        title_lbl.setFont(_FONT_TITLE)
+        title_lbl.setStyleSheet(f"color: {_TEXT}; border: none;")
+        root.addWidget(title_lbl)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"color: {_BORDER};")
+        sep.setFixedHeight(1)
+        root.addWidget(sep)
+        root.addSpacing(4)
+
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        lbl = QLabel('Orders on "All" accounts')
+        lbl.setStyleSheet(f"color: {_TEXT}; border: none; font-size: 12px;")
+        lbl.setFixedWidth(160)
+        allowed = bool(g.get("allow_all_group_orders", True))
+        self._all_toggle = _ToggleGroup(["Off", "On"],
+                                        "On" if allowed else "Off")
+        self._all_toggle.setFixedWidth(140)
+        row.addWidget(lbl)
+        row.addWidget(self._all_toggle)
+        row.addStretch()
+        root.addLayout(row)
+
+        desc = QLabel(
+            "Off blocks any Buy/Sell that would fan out to every account "
+            "in the Accounts panel.  Trading groups and group hot buttons "
+            "are unaffected.")
+        desc.setWordWrap(True)
+        desc.setStyleSheet(
+            f"color: {_TEXT_DIM}; border: none; font-size: 11px;")
+        root.addWidget(desc)
+
+        self._all_toggle.value_changed.connect(self.changed)
+
+    def collect(self) -> dict:
+        """Return the guards dict for direct config storage."""
+        return {"allow_all_group_orders": self._all_toggle.value() == "On"}
+
+
 class _TradingPage(QWidget):
     """Thin host widget: stacks a Futures and a Stocks _AssetSettingsGroup."""
 
@@ -950,6 +1018,16 @@ class _TradingPage(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
 
+        # ── Order guards block ────────────────────────────────────────────────
+        self._guards_group = _OrderGuardsGroup(self._prefs)
+        lay.addWidget(self._guards_group)
+
+        guards_div = QFrame()
+        guards_div.setFrameShape(QFrame.Shape.HLine)
+        guards_div.setStyleSheet(f"color: {_BORDER};")
+        guards_div.setFixedHeight(1)
+        lay.addWidget(guards_div)
+
         # ── Futures block ─────────────────────────────────────────────────────
         self._futures_group = _AssetSettingsGroup(
             "Futures", "Contracts", "ticks", "trading_futures", self._prefs,
@@ -974,13 +1052,16 @@ class _TradingPage(QWidget):
         scroll.setWidget(container)
         outer.addWidget(scroll)
 
-        # Bubble both groups' changes up to this page's changed signal
+        # Bubble every group's changes up to this page's changed signal
+        self._guards_group.changed.connect(self.changed)
         self._futures_group.changed.connect(self.changed)
         self._stocks_group.changed.connect(self.changed)
 
-    def collect(self) -> tuple[dict, dict]:
-        """Return ``(futures_dict, stocks_dict)`` for direct config storage."""
-        return self._futures_group.collect(), self._stocks_group.collect()
+    def collect(self) -> tuple[dict, dict, dict]:
+        """Return ``(futures, stocks, guards)`` for direct config storage."""
+        return (self._futures_group.collect(),
+                self._stocks_group.collect(),
+                self._guards_group.collect())
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1339,15 +1420,17 @@ class PreferencesDialog(QDialog):
 
     def _save(self) -> None:
         self._prefs["display"] = self._display_page.collect()
-        futures_data, stocks_data = self._trading_page.collect()
+        futures_data, stocks_data, guards_data = self._trading_page.collect()
         self._prefs["trading_futures"] = futures_data
         self._prefs["trading_stocks"] = stocks_data
+        self._prefs["trading_guards"] = guards_data
         self._prefs["cash_management"] = self._cash_page.collect()
         config_manager.save_preferences(self._prefs)
 
         # Push into the in-memory singletons so the next trade uses fresh values
         from src.core.trading_prefs import trading_prefs
-        trading_prefs.update(futures=futures_data, stocks=stocks_data)
+        trading_prefs.update(futures=futures_data, stocks=stocks_data,
+                             guards=guards_data)
         from src.core.cash_management import cash_prefs
         cash_prefs.reload()
 

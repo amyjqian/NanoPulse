@@ -376,6 +376,11 @@ class FlashTradeView(QWidget):
         #      configured group regardless of AccountListPanel state.
         #   3. AccountListPanel.get_selected_accounts() — default for
         #      every other Buy/Sell click.
+        # Only path 3 is subject to the "Orders on All accounts" guard:
+        # paths 1 and 2 name their accounts explicitly (a single flatten
+        # leg, a group hot button, a sweep, an options ticket), so they
+        # are never the accidental whole-book fan-out the guard exists
+        # to stop.
         flatten_account = payload.get("_flatten_account")
         target_accounts = payload.get("_target_accounts")
         if flatten_account:
@@ -395,6 +400,19 @@ class FlashTradeView(QWidget):
             accounts = self._account_list.get_selected_accounts()
             if not accounts:
                 log.warning("FlashTrade: no accounts checked – aborting order")
+                return
+
+            # User guard: refuse a fan-out that covers every visible
+            # account (Settings → Trading → Order Guards).
+            from src.core.trading_prefs import trading_prefs
+            if (not trading_prefs.allow_all_accounts_orders()
+                    and self._account_list.is_full_fanout_selection()):
+                log.warning(
+                    "FlashTrade: order blocked – orders on all %d accounts "
+                    "are disabled in preferences", len(accounts))
+                self.transient_status_message.emit(
+                    "Orders on all accounts are disabled "
+                    "(Settings → Trading).", 5000)
                 return
 
         # Skip offline workers up front so the UI can tell the user what

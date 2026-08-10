@@ -241,4 +241,72 @@ class TestTradingPreferencesManager:
         assert mgr.futures["quantity"] == 1  # unchanged
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Order guards  (preferences.trading_guards)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestTradingPreferencesGuards:
+    def _mgr(self):
+        from src.core.trading_prefs import TradingPreferencesManager
+        return TradingPreferencesManager()
+
+    def test_default_allows_all_accounts_orders(self):
+        """Absent section → the classic behaviour, orders allowed."""
+        mgr = self._mgr()
+        assert mgr.guards["allow_all_group_orders"] is True
+        assert mgr.allow_all_accounts_orders() is True
+
+    def test_update_and_read(self):
+        mgr = self._mgr()
+        mgr.update(guards={"allow_all_group_orders": False})
+        assert mgr.guards["allow_all_group_orders"] is False
+        assert mgr.allow_all_accounts_orders() is False
+
+    def test_snapshot_isolation(self):
+        mgr = self._mgr()
+        g = mgr.guards
+        g["allow_all_group_orders"] = "tampered"
+        assert mgr.guards["allow_all_group_orders"] is True
+
+    def test_guards_only_update_preserves_other_sections(self):
+        """A partial update must not blank futures/stocks — ``update``
+        flips ``_loaded``, so ``_ensure_loaded`` would never repair them."""
+        mgr = self._mgr()
+        mgr.update(guards={"allow_all_group_orders": False})
+        assert mgr.futures["quantity"] == 1
+        assert mgr.stocks["quantity"] == 100
+
+    def test_null_value_reads_as_allowed(self):
+        """A hand-edited / null config value must not silently block
+        orders while the Settings toggle still reads On."""
+        mgr = self._mgr()
+        mgr.update(guards={"allow_all_group_orders": None})
+        assert mgr.allow_all_accounts_orders() is False
+
+    def test_lazy_load_and_reload_pick_up_disk_value(self):
+        """The sign-in path (main.py calls reload() after switching the
+        active config) must see the guard for the new user."""
+        from src.core import config_manager
+        config_manager.save_preferences(
+            {"trading_guards": {"allow_all_group_orders": False}})
+        mgr = self._mgr()
+        assert mgr.allow_all_accounts_orders() is False   # lazy first read
+
+        config_manager.save_preferences(
+            {"trading_guards": {"allow_all_group_orders": True}})
+        assert mgr.allow_all_accounts_orders() is False   # cached
+        mgr.reload()
+        assert mgr.allow_all_accounts_orders() is True
+
+    def test_defaults_mirror_the_dialog(self):
+        """trading_prefs' default tables are documented as mirrors of
+        _DEFAULTS in preferences_dialog — pin all three."""
+        pytest.importorskip("PySide6")
+        from src.core import trading_prefs as tp
+        from src.ui.widgets import preferences_dialog as pd
+        assert tp._GUARDS_DEFAULTS == pd._DEFAULTS["trading_guards"]
+        assert tp._FUTURES_DEFAULTS == pd._DEFAULTS["trading_futures"]
+        assert tp._STOCKS_DEFAULTS == pd._DEFAULTS["trading_stocks"]
+
+
 
