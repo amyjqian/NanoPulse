@@ -147,7 +147,7 @@ def _venue_rank(r: dict) -> tuple:
             0 if (primary and exch == primary) else 1)
 
 
-def pick_front_expiries(chain: list[dict], count: int = 2,
+def pick_front_expiries(chain: list[dict], count: int = 4,
                         today: date | None = None) -> list[dict]:
     """The *count* nearest unexpired USD futures from a browse chain,
     sorted by expiry.  Rows that aren't USD FUTs or whose expiry can't
@@ -155,9 +155,9 @@ def pick_front_expiries(chain: list[dict], count: int = 2,
 
     One row per expiration DATE: reqContractDetails lists the same
     expiry on several venues (e.g. ES on CME *and* QBALGO), and without
-    dedup the two front slots would both be the same month — the user
-    would see Sep twice and never Dec.  Within an expiry the primary
-    venue wins (see :func:`_venue_rank`)."""
+    dedup the front slots would repeat the same month — the user would
+    see Sep twice and never Dec.  Within an expiry the primary venue
+    wins (see :func:`_venue_rank`)."""
     today = today or date.today()
     best: dict[date, dict] = {}
     for r in chain:
@@ -432,7 +432,7 @@ class SymbolSearchPopup(QDialog):
         # Futures chain state.  When a FUT root appears in the results
         # its month chain is fetched automatically (one reqContractDetails
         # at a time — browse signals carry no request token) and the root
-        # expands into the two nearest expirations for the user to pick.
+        # expands into the four nearest expirations for the user to pick.
         self._fut_chains: dict[str, list[dict] | None] = {}  # None = failed
         self._chain_queue: list[str] = []
         self._chain_active: str | None = None
@@ -837,7 +837,7 @@ class SymbolSearchPopup(QDialog):
         self.adjustSize()
 
     def _add_fut_rows(self, root: dict) -> None:
-        """Render a live futures root: its two nearest expirations as
+        """Render a live futures root: its four nearest expirations as
         pickable rows once the chain has loaded, a status note before
         (loading) or when the chain came back unusable."""
         sym = root["symbol"].upper()
