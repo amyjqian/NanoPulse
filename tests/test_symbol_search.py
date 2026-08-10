@@ -255,11 +255,18 @@ def _chain_row(conid, expiry, symbol="NQ", currency="USD"):
 class TestPickFrontExpiries:
     _TODAY = date(2026, 7, 26)
 
-    def test_nearest_two_unexpired_sorted(self):
+    def test_nearest_unexpired_sorted(self):
         chain = [_chain_row(3, "20261218"), _chain_row(1, "20250620"),
                  _chain_row(2, "20260918"), _chain_row(4, "20270319")]
         out = ssp.pick_front_expiries(chain, today=self._TODAY)
-        assert [r["conid"] for r in out] == [2, 3]
+        assert [r["conid"] for r in out] == [2, 3, 4]
+
+    def test_default_shows_four_expiries(self):
+        chain = [_chain_row(i, f"2026{m:02d}18") for i, m in
+                 enumerate((9, 10, 11, 12), start=1)] + [
+            _chain_row(5, "20270319")]
+        out = ssp.pick_front_expiries(chain, today=self._TODAY)
+        assert [r["conid"] for r in out] == [1, 2, 3, 4]
 
     def test_month_only_expiry_selectable_through_its_month(self):
         chain = [_chain_row(1, "202607")]

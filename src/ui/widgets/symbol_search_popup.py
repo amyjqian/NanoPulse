@@ -20,9 +20,10 @@ import calendar
 import logging
 from datetime import date, datetime
 
-from PySide6.QtCore import QPoint, QTimer, Qt, Signal
+from PySide6.QtCore import QEvent, QPoint, QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QFontMetrics
 from PySide6.QtWidgets import (
+    QApplication,
     QDialog,
     QHBoxLayout,
     QLabel,
@@ -146,7 +147,7 @@ def _venue_rank(r: dict) -> tuple:
             0 if (primary and exch == primary) else 1)
 
 
-def pick_front_expiries(chain: list[dict], count: int = 2,
+def pick_front_expiries(chain: list[dict], count: int = 4,
                         today: date | None = None) -> list[dict]:
     """The *count* nearest unexpired USD futures from a browse chain,
     sorted by expiry.  Rows that aren't USD FUTs or whose expiry can't
@@ -154,9 +155,9 @@ def pick_front_expiries(chain: list[dict], count: int = 2,
 
     One row per expiration DATE: reqContractDetails lists the same
     expiry on several venues (e.g. ES on CME *and* QBALGO), and without
-    dedup the two front slots would both be the same month — the user
-    would see Sep twice and never Dec.  Within an expiry the primary
-    venue wins (see :func:`_venue_rank`)."""
+    dedup the front slots would repeat the same month — the user would
+    see Sep twice and never Dec.  Within an expiry the primary venue
+    wins (see :func:`_venue_rank`)."""
     today = today or date.today()
     best: dict[date, dict] = {}
     for r in chain:
@@ -415,6 +416,10 @@ class SymbolSearchPopup(QDialog):
         self._ext_input = external_input
         self._stocks_only = bool(stocks_only)
         self._wired: list = []
+        # Dropdown mode only: app-wide mouse-press watch (see
+        # _install_outside_click_filter).  Tracked so install/remove
+        # stay balanced across the popup's show → hide → show reuse.
+        self._outside_filter_on = False
 
         # Remote-search state
         self._token = 0           # bumps on every debounce fire
@@ -427,7 +432,7 @@ class SymbolSearchPopup(QDialog):
         # Futures chain state.  When a FUT root appears in the results
         # its month chain is fetched automatically (one reqContractDetails
         # at a time — browse signals carry no request token) and the root
-        # expands into the two nearest expirations for the user to pick.
+        # expands into the four nearest expirations for the user to pick.
         self._fut_chains: dict[str, list[dict] | None] = {}  # None = failed
         self._chain_queue: list[str] = []
         self._chain_active: str | None = None
@@ -584,6 +589,59 @@ class SymbolSearchPopup(QDialog):
         self.raise_()
         if self._ext_input is None:
             self._search.setFocus()
+        else:
+            self._install_outside_click_filter()
+
+    # ── Dropdown mode: dismiss on a click anywhere else ───────────────────────
+
+    def _install_outside_click_filter(self) -> None:
+        """Watch application-wide mouse presses while the dropdown is up.
+
+        A ``Qt.Popup`` window grabs the mouse and self-dismisses on an
+        outside click, but dropdown mode is a non-activating ``Qt.Tool``
+        window (so typing stays in the host's field) and gets no such
+        grab.  The host's FocusOut hook only fires when the click lands
+        on another focusable widget — clicking blank dialog background,
+        a label, or the page header left the list hanging open."""
+        app = QApplication.instance()
+        if app is not None and not self._outside_filter_on:
+            app.installEventFilter(self)
+            self._outside_filter_on = True
+
+    def _remove_outside_click_filter(self) -> None:
+        app = QApplication.instance()
+        if app is not None and self._outside_filter_on:
+            app.removeEventFilter(self)
+        self._outside_filter_on = False
+
+    def eventFilter(self, obj, event):  # noqa: N802 – Qt override
+        if (self._outside_filter_on
+                and event.type() == QEvent.Type.MouseButtonPress
+                and self.isVisible()):
+            try:
+                gp = event.globalPosition().toPoint()
+            except AttributeError:      # non-mouse event on this type
+                gp = None
+            if gp is not None and not self._contains_global(gp):
+                self.close()
+        return super().eventFilter(obj, event)
+
+    def _contains_global(self, gp) -> bool:
+        """True when *gp* (screen coords) is over the dropdown itself or
+        over the field it is attached to.  The attached field is exempt
+        because the host reopens the dropdown on its mouse press — this
+        filter runs first, so closing here would make a click on the
+        field flicker the list shut and straight back open."""
+        if self.frameGeometry().contains(gp):
+            return True
+        edit = self._ext_input
+        if edit is not None:
+            try:
+                if edit.rect().contains(edit.mapFromGlobal(gp)):
+                    return True
+            except RuntimeError:        # field deleted out from under us
+                pass
+        return False
 
     def handle_key(self, event) -> bool:
         """Dropdown mode: the host forwards key events from its own
@@ -701,6 +759,7 @@ class SymbolSearchPopup(QDialog):
         self._rebuild()
 
     def closeEvent(self, event) -> None:  # noqa: N802 – Qt override
+        self._remove_outside_click_filter()
         self._debounce.stop()
         self._chain_queue.clear()
         self._chain_active = None
@@ -778,7 +837,7 @@ class SymbolSearchPopup(QDialog):
         self.adjustSize()
 
     def _add_fut_rows(self, root: dict) -> None:
-        """Render a live futures root: its two nearest expirations as
+        """Render a live futures root: its four nearest expirations as
         pickable rows once the chain has loaded, a status note before
         (loading) or when the chain came back unusable."""
         sym = root["symbol"].upper()
