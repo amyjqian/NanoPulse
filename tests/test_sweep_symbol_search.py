@@ -130,6 +130,49 @@ class TestCashPageDropdown:
         qtbot.keyClick(edit, _Qt.Key.Key_Escape)
         assert not page._popup.isVisible()
 
+    def test_click_outside_dismisses_dropdown(self, page, qtbot):
+        # The dropdown is a non-activating Tool window (no Qt.Popup
+        # mouse grab), and the page's FocusOut hook only fires when the
+        # click lands on a focusable widget — a click on the page's own
+        # background used to leave the list hanging open.
+        from PySide6.QtCore import QPoint
+        from PySide6.QtTest import QTest
+        page.resize(600, 900)
+        page.show()
+        qtbot.waitExposed(page)
+        edit = page._symbol_edits[0]
+        page._show_dropdown(edit)
+        assert page._popup.isVisible()
+        # Bottom-right corner of the page — blank background, well
+        # clear of the dropdown's own rect.
+        spot = QPoint(page.width() - 5, page.height() - 5)
+        assert not page._popup.frameGeometry().contains(page.mapToGlobal(spot))
+        QTest.mouseClick(page, Qt.MouseButton.LeftButton, pos=spot)
+        assert not page._popup.isVisible()
+
+    def test_click_inside_dropdown_keeps_it_open(self, page, qtbot):
+        from PySide6.QtTest import QTest
+        page.show()
+        qtbot.waitExposed(page)
+        page._show_dropdown(page._symbol_edits[0])
+        pop = page._popup
+        QTest.mouseClick(pop, Qt.MouseButton.LeftButton,
+                         pos=pop.rect().center())
+        assert pop.isVisible()
+        pop.close()
+
+    def test_click_on_attached_field_keeps_it_open(self, page, qtbot):
+        # The field's own press reopens the dropdown — the outside-click
+        # watch must not shut it first, or the list flickers.
+        from PySide6.QtTest import QTest
+        page.show()
+        qtbot.waitExposed(page)
+        edit = page._symbol_edits[0]
+        page._show_dropdown(edit)
+        QTest.mouseClick(edit, Qt.MouseButton.LeftButton)
+        assert page._popup.isVisible()
+        page._popup.close()
+
     def test_pick_stores_contract_meta(self, page):
         # The pick's metadata is kept under sweep_contracts — that's
         # what lets the symbol price/trade without being a chip.
