@@ -26,6 +26,34 @@ log = logging.getLogger(__name__)
 
 _ET = ZoneInfo("America/New_York")
 
+
+def portfolio_mark_keys(pos: dict) -> tuple[str, ...]:
+    """Price-cache keys a portfolio row's ``market_price`` should refresh.
+
+    ``_last_price_for`` resolves a summary group through several keys —
+    root symbol first (written by the L1 tick feeds), then the display
+    symbol.  A mark fed under only one of them can be shadowed by a
+    stale entry under another (an L1 tick that landed once before the
+    market-data stream died leaves its root price in the cache
+    forever), so the portfolio feed refreshes every key the lookup may
+    hit:
+
+    * stocks/futures — the local symbol (``MNQU6``) **and** the root
+      (``MNQ``);
+    * options — the raw OCC local symbol and its ``format_option_symbol``
+      display form (group meta uses the formatted form, per-row
+      aggregates the raw one), but **never** the root: the root feed
+      carries the underlying's price, which must not mark a premium.
+    """
+    local = pos.get("local_symbol", "") or pos.get("symbol", "") or ""
+    if not local:
+        return ()
+    if (pos.get("sec_type") or "").upper() in ("OPT", "FOP"):
+        keys = {local, format_option_symbol(local)}
+    else:
+        keys = {local, pos.get("symbol", "") or ""}
+    return tuple(k for k in keys if k)
+
 # ── Column indices ────────────────────────────────────────────────────────────
 S_COL_SYMBOL        = 0
 S_COL_TYPE          = 1

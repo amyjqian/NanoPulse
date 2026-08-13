@@ -20,6 +20,7 @@ from .account_list_panel import AccountListPanel
 from .account_position_panel import AccountPositionPanel
 from .accounts_model import AccountsTableModel
 from .trades_panel import TradesPanel
+from .trades_summary_model import portfolio_mark_keys
 from .positions_trades_tabs import PositionsTradesTabs
 
 log = logging.getLogger(__name__)
@@ -976,15 +977,18 @@ class FlashTradeView(QWidget):
         # price cache.  Portfolio updates cover every HELD symbol without
         # a market-data subscription, so summary rows for symbols outside
         # the active/background feeds (e.g. SGOV) still mark to a real
-        # price instead of falling back to their last fill.  Keyed by
-        # local symbol so option rows match exactly (their market_price
-        # is the option's own premium, not the underlying).
+        # price instead of falling back to their last fill.  Fed under
+        # every key the summary lookup resolves (root + local; options
+        # raw + formatted, never the underlying's root) — the lookup
+        # checks the root key first, so a stale L1 tick left behind by a
+        # dead market-data stream would otherwise shadow this fresh mark
+        # and the status-bar U.P&L would silently drift.
         for pos in batch:
             mkt = float(pos.get("market_price", 0.0) or 0.0)
-            if mkt > 0:
-                sym = pos.get("local_symbol", "") or pos.get("symbol", "")
-                if sym:
-                    self._trades_panel.update_last_price(sym, mkt)
+            if not 0 < mkt < 1e12:   # 0 = no data yet; huge = DBL_MAX leak
+                continue
+            for sym in portfolio_mark_keys(pos):
+                self._trades_panel.update_last_price(sym, mkt)
 
         # Feed account balance info from accounts_model if available.
         # RC #2: use O(1) reverse-index lookup (_acct_to_label + _row_map)
