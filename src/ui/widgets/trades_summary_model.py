@@ -95,6 +95,22 @@ _FILL_SEARCH_KEYS: tuple[str, ...] = (
 
 _S_NUM_COLS = len(S_HEADERS)
 
+# Components of a FIFO walk over one contract's fills (see
+# ``TradesSummaryModel._walk_account``).  Every value is per-point —
+# the contract multiplier is applied by the callers that turn these
+# into dollars.
+_WALK_KEYS: tuple[str, ...] = (
+    "paired_qty", "paired_buys_notional", "paired_sells_notional",
+    "paired_comm", "closing_realized", "closing_comm",
+    "open_buys_qty", "open_buys_notional",
+    "open_sells_qty", "open_sells_notional",
+)
+
+
+def _empty_walk() -> dict[str, float]:
+    return {k: 0.0 for k in _WALK_KEYS}
+
+
 _S_RIGHT_ALIGN_COLS = {
     S_COL_BUYS, S_COL_SELLS, S_COL_NET,
     S_COL_AVG_BUY, S_COL_AVG_SELL, S_COL_TRANS_TOTAL,
@@ -307,14 +323,14 @@ class TradesSummaryModel(QAbstractTableModel):
         s_q = agg.get("sells_qty", 0.0)
         if b_q == s_q:
             return agg
-        paired = self._fifo_paired(key)
-        if paired is None:
+        walk = self._walk_for_key(key)
+        if walk["paired_qty"] <= 0:
             return agg
         eff = dict(agg)
-        eff["buys_qty"] = paired["buys_qty"]
-        eff["sells_qty"] = paired["sells_qty"]
-        eff["buys_notional"] = paired["buys_notional"]
-        eff["sells_notional"] = paired["sells_notional"]
+        eff["buys_qty"] = walk["paired_qty"]
+        eff["sells_qty"] = walk["paired_qty"]
+        eff["buys_notional"] = walk["paired_buys_notional"]
+        eff["sells_notional"] = walk["paired_sells_notional"]
         return eff
 
     # ── Realized-P&L row rendering (paired round-trips only) ────────────────
@@ -327,162 +343,150 @@ class TradesSummaryModel(QAbstractTableModel):
         out.sort(key=lambda f: f.get("time_sort", "") or "")
         return out
 
-    def _fifo_paired(self, key: tuple[str, str]) -> dict | None:
-        """The paired (closed round-trip) portion of *key*, matched FIFO:
-        the earliest buy fills pair with the earliest sell fills, so an
-        open remainder is always the *latest* fills on the larger leg.
-        Commission is the paired fills' own commission (partial fills
-        prorated).  Returns ``None`` when nothing is paired."""
-        return self._fifo_paired_fills(self._fills_for_key(key),
-                                       self._agg.get(key) or {})
+    def _walk_for_key(self, key: tuple[str, str]) -> dict[str, float]:
+        """``_walk_fills`` over this row's currently-counted fills."""
+        return self._walk_fills(self._fills_for_key(key))
+
+    @classmethod
+    def _walk_fills(cls, fills: list[dict]) -> dict[str, float]:
+        """Split *fills* into closed round trips, closes of positions
+        opened before the window, and the still-open remainder.
+
+        Each ACCOUNT gets its own book.  A summary row aggregates one
+        contract across every account, but P&L can't: pooling the
+        accounts lets one account's close pair against another's opening
+        fill, which both invents a round trip nobody traded and hides the
+        second account's real position from U.P&L.  Walking per account
+        keeps each book honest; the parts are summed afterwards because
+        every number here is linear in the fills — including the mark
+        (see ``_mark_open``), so a long in one account and a short in
+        another still net correctly.
+        """
+        by_account: dict[str, list[dict]] = {}
+        for f in fills:
+            by_account.setdefault(f.get("account_id", "") or "", []).append(f)
+        out = _empty_walk()
+        for account_fills in by_account.values():
+            account_fills.sort(key=lambda f: f.get("time_sort", "") or "")
+            for k, v in cls._walk_account(account_fills).items():
+                out[k] += v
+        return out
 
     @staticmethod
-    def _fifo_paired_fills(fills: list[dict], meta: dict) -> dict | None:
-        """``_fifo_paired`` over an explicit time-ordered fill list.
-        *meta* supplies symbol/multiplier (an aggregate dict, or a
-        minimal stand-in for the status-bar aggregate)."""
-        buys: list[tuple[float, float, float]] = []   # (qty, price, comm)
-        sells: list[tuple[float, float, float]] = []
+    def _walk_account(fills: list[dict]) -> dict[str, float]:
+        """Chronological FIFO walk over ONE account's fills in ONE
+        contract (*fills* time-ordered, earliest first).
+
+        Order matters: a fill can only close a lot that was already open
+        when it printed.  Matching by leg totals instead — earliest buys
+        against earliest sells, whatever their order — pairs a 10:00
+        close of an overnight long with a 10:30 opening buy into a short
+        round trip that never happened, and drops IB's real realized
+        number on the floor.
+
+        Three outcomes per fill, in that order:
+
+        * it closes in-window lots on the other side → a **paired** round
+          trip, valued gross from both legs' own fill prices,
+        * whatever is left closed a position opened *outside* the window
+          — recognised by a nonzero ``realized_pnl``, which IB's
+          commissionReport stamps on every closing execution (computed
+          against the account's average cost, a basis we can't see) →
+          **closing**, taken from IB and prorated,
+        * otherwise it opens a lot → the **open** remainder, marked to
+          the last price by ``_mark_open``.
+
+        IB's ``realized_pnl`` is already NET of both legs' commissions,
+        so ``closing_comm`` carries back the part of that deduction this
+        window can see (the closing fill's own commission).  Callers add
+        it to keep every reported P&L gross, so the Comm column can
+        subtract commission exactly once instead of twice.
+        """
+        out = _empty_walk()
+        # Open in-window lots, FIFO.  Always all on the same side: a lot
+        # only opens once nothing on the other side is left to close.
+        # Each entry is [qty, price, side, commission per unit].
+        lots: list[list] = []
         for f in fills:
+            side = f.get("side", "")
+            if side not in ("BOT", "SLD"):
+                continue
             qty = float(f.get("shares", 0.0) or 0.0)
             if qty <= 0:
                 continue
             price = float(f.get("price", 0.0) or 0.0)
             comm = float(f.get("commission") or 0.0)
-            side = f.get("side", "")
-            if side == "BOT":
-                buys.append((qty, price, comm))
-            elif side == "SLD":
-                sells.append((qty, price, comm))
-        matched = min(sum(q for q, _p, _c in buys),
-                      sum(q for q, _p, _c in sells))
-        if matched <= 0:
-            return None
-
-        def take(legs: list[tuple[float, float, float]],
-                 target: float) -> tuple[float, float]:
-            left = target
-            notional = comm = 0.0
-            for qty, price, fill_comm in legs:
-                if left <= 0:
-                    break
-                use = min(qty, left)
-                notional += use * price
-                comm += fill_comm * (use / qty)
-                left -= use
-            return notional, comm
-
-        b_notional, b_comm = take(buys, matched)
-        s_notional, s_comm = take(sells, matched)
-        return {
-            "symbol": meta.get("symbol", ""),
-            "root_symbol": meta.get("root_symbol", ""),
-            "buys_qty": matched,
-            "sells_qty": matched,
-            "buys_notional": b_notional,
-            "sells_notional": s_notional,
-            "commission": b_comm + s_comm,
-            "multiplier": meta.get("multiplier", 1.0),
-        }
-
-    # ── FIFO remainder split — closing (IB realized) vs opening (marked) ────
-
-    def _fifo_split(self, key: tuple[str, str]) -> dict:
-        """Split *key*'s in-window fills three ways:
-
-        * the FIFO-**paired** round trip (as ``_fifo_paired``),
-        * the unpaired **closing** remainder — fills that closed a
-          position opened *outside* the window.  IB's commissionReport
-          stamps ``realized_pnl`` (computed against the account's average
-          cost) on every closing execution, so their P&L is taken from
-          IB directly instead of being synthesised from a basis we can't
-          see.  Prorated when a fill is only partially unpaired,
-        * the unpaired **opening** remainder (no ``realized_pnl`` on the
-          fill) — a genuinely new position, marked to the last price by
-          ``_unrealized_total``.
-
-        A closing fill whose commissionReport hasn't arrived yet counts
-        as opening (marked) until the report lands and the re-emitted
-        fill re-folds — self-healing, never double-counted.
-        """
-        return self._fifo_split_fills(self._fills_for_key(key))
-
-    @staticmethod
-    def _fifo_split_fills(fills: list[dict]) -> dict:
-        """``_fifo_split`` over an explicit time-ordered fill list."""
-        buys: list[tuple[float, float, float | None]] = []  # (qty, price, rpnl)
-        sells: list[tuple[float, float, float | None]] = []
-        for f in fills:
-            qty = float(f.get("shares", 0.0) or 0.0)
-            if qty <= 0:
-                continue
-            price = float(f.get("price", 0.0) or 0.0)
+            comm_unit = comm / qty
             rpnl = f.get("realized_pnl", None)
-            side = f.get("side", "")
-            if side == "BOT":
-                buys.append((qty, price, rpnl))
-            elif side == "SLD":
-                sells.append((qty, price, rpnl))
-        matched = min(sum(q for q, _p, _r in buys),
-                      sum(q for q, _p, _r in sells))
 
-        out = {
-            "closing_realized": 0.0,
-            "open_buys_qty": 0.0, "open_buys_notional": 0.0,
-            "open_sells_qty": 0.0, "open_sells_notional": 0.0,
-        }
-
-        def walk(legs, side: str) -> None:
-            left = matched  # FIFO consumes the earliest fills first
-            for qty, price, rpnl in legs:
-                consumed = min(qty, left)
-                left -= consumed
-                rest = qty - consumed
-                if rest <= 0:
-                    continue
-                if rpnl:
-                    # Closing remainder — IB's number, prorated.  Only a
-                    # NONZERO realized P&L marks a closing fill: live
-                    # commissionReports stamp realizedPNL = 0.0 on
-                    # opening executions too, so `is not None` would
-                    # classify every opening leg as a $0 close and pin
-                    # U.P&L at zero.  (A genuine scratch close at
-                    # exactly $0.00 falls through to marking — same as
-                    # an opening leg, and harmlessly close to truth.)
-                    out["closing_realized"] += rpnl * (rest / qty)
-                elif side == "BOT":
-                    out["open_buys_qty"] += rest
-                    out["open_buys_notional"] += rest * price
+            left = qty
+            while left > 0 and lots and lots[0][2] != side:
+                lot = lots[0]
+                use = min(lot[0], left)
+                if side == "BOT":
+                    out["paired_buys_notional"] += use * price
+                    out["paired_sells_notional"] += use * lot[1]
                 else:
-                    out["open_sells_qty"] += rest
-                    out["open_sells_notional"] += rest * price
+                    out["paired_sells_notional"] += use * price
+                    out["paired_buys_notional"] += use * lot[1]
+                out["paired_qty"] += use
+                out["paired_comm"] += use * (comm_unit + lot[3])
+                lot[0] -= use
+                left -= use
+                if lot[0] <= 0:
+                    lots.pop(0)
 
-        walk(buys, "BOT")
-        walk(sells, "SLD")
+            if left <= 0:
+                continue
+            if rpnl:
+                # Closing remainder — IB's number, prorated over the part
+                # of the fill that found nothing to pair with.  Only a
+                # NONZERO realized P&L marks a closing fill: live
+                # commissionReports stamp realizedPNL = 0.0 on opening
+                # executions too, so `is not None` would classify every
+                # opening leg as a $0 close and pin U.P&L at zero.  (A
+                # genuine scratch close at exactly $0.00 falls through to
+                # marking — same as an opening leg, and harmlessly close
+                # to truth.)
+                frac = left / qty
+                out["closing_realized"] += float(rpnl) * frac
+                out["closing_comm"] += comm * frac
+            else:
+                # Opening leg — including a closing fill whose
+                # commissionReport hasn't landed yet.  It marks to last
+                # until the report arrives and the re-emitted fill sends
+                # the walk round again: self-healing, never
+                # double-counted.
+                lots.append([left, price, side, comm_unit])
+
+        for qty, price, side, _comm_unit in lots:
+            if side == "BOT":
+                out["open_buys_qty"] += qty
+                out["open_buys_notional"] += qty * price
+            else:
+                out["open_sells_qty"] += qty
+                out["open_sells_notional"] += qty * price
         return out
 
-    def _realized_total(self, key: tuple[str, str]) -> float:
-        """R.P&L for one row: the in-window FIFO round trip plus IB's
-        realized P&L on unpaired closing fills.  A matched row shows the
-        trimmed round trip only — that's the point of matching."""
-        paired = self._fifo_paired(key)
-        realized = self._net_total(paired) if paired else 0.0
-        if self.is_matched(key):
-            return realized
-        return realized + self._fifo_split(key)["closing_realized"]
+    # ── P&L built on the walk ───────────────────────────────────────────────
 
-    def _unrealized_total(self, key: tuple[str, str], agg: dict) -> float:
-        """U.P&L for one row: only the *opening* remainder marked to the
-        last price (a net-long remainder valued as if sold, a net-short
-        as if bought back).  Falls back to the newest fill price when no
-        live quote has been seen — without a mark, an all-buys position
-        would report its entire cost as unrealized loss."""
-        if self.is_matched(key):
-            return 0.0
-        s = self._fifo_split(key)
+    @staticmethod
+    def _paired_net(walk: dict[str, float], multiplier: float) -> float:
+        """Gross cash flow of the closed round trips, multiplier-scaled
+        so futures (NQ × 20, MNQ × 2, …) report in dollars."""
+        return ((walk["paired_sells_notional"] - walk["paired_buys_notional"])
+                * multiplier)
+
+    def _mark_open(self, walk: dict[str, float], agg: dict) -> float:
+        """The walk's open remainder marked to the last price — a
+        net-long remainder valued as if sold, a net-short as if bought
+        back.  Falls back to the newest fill price when no live quote has
+        been seen: without a mark, an all-buys position would report its
+        entire cost as unrealized loss."""
         mult = agg.get("multiplier", 1.0)
-        cash = (s["open_sells_notional"] - s["open_buys_notional"]) * mult
-        open_net = s["open_buys_qty"] - s["open_sells_qty"]
+        cash = (walk["open_sells_notional"]
+                - walk["open_buys_notional"]) * mult
+        open_net = walk["open_buys_qty"] - walk["open_sells_qty"]
         if open_net == 0:
             return cash
         last = self._last_price_for(agg)
@@ -491,6 +495,30 @@ class TradesSummaryModel(QAbstractTableModel):
         if not last:
             return cash
         return cash + open_net * last * mult
+
+    def _key_multiplier(self, key: tuple[str, str]) -> float:
+        mult = (self._agg.get(key) or {}).get("multiplier", 1.0)
+        return float(mult) if mult else 1.0
+
+    def _realized_total(self, key: tuple[str, str]) -> float:
+        """R.P&L for one row: the in-window round trips plus IB's realized
+        P&L on fills that closed a position opened before the window —
+        GROSS, with the commission IB folded into its realized number
+        added back so ``P&L − Comm`` deducts commission exactly once.  A
+        matched row shows the trimmed round trip only — that's the point
+        of matching."""
+        walk = self._walk_for_key(key)
+        realized = self._paired_net(walk, self._key_multiplier(key))
+        if self.is_matched(key):
+            return realized
+        return realized + walk["closing_realized"] + walk["closing_comm"]
+
+    def _unrealized_total(self, key: tuple[str, str], agg: dict) -> float:
+        """U.P&L for one row: only the *opening* remainder, marked to the
+        last price."""
+        if self.is_matched(key):
+            return 0.0
+        return self._mark_open(self._walk_for_key(key), agg)
 
     def _row_pnl_total(self, key: tuple[str, str], agg: dict) -> float:
         """P&L column: R.P&L + U.P&L, so the three always reconcile."""
@@ -548,9 +576,9 @@ class TradesSummaryModel(QAbstractTableModel):
         filter — this feeds the always-on status-bar aggregate.  Fills
         the user has HIDDEN are excluded, though: a hide is session-level
         ("stop counting this transaction") and drops the fill from every
-        calculation until Restore hidden.  Same math as the summary rows:
-        in-window
-        FIFO pairs, plus IB realized on unpaired closing fills, plus the
+        calculation until Restore hidden.  Same math as the summary rows
+        (``_walk_fills``): per-account round trips, plus IB's realized on
+        fills that closed a position opened before the window, plus the
         opening remainder marked to the last cached price (newest fill
         price when no quote is cached).  The commission element sums the
         in-frame fills' reported commissions (TWS only sends a
@@ -608,22 +636,14 @@ class TradesSummaryModel(QAbstractTableModel):
                 "root_symbol": (newest.get("symbol", "") or "").upper(),
                 "sec_type": newest.get("sec_type", "") or "",
                 "multiplier": self._group_multiplier(fills),
+                # No-quote mark fallback, same rule as the summary rows'
+                # aggregate: the newest fill's own price.
+                "last_fill_price": float(newest.get("price", 0.0) or 0.0),
             }
-            mult = meta["multiplier"]
-            paired = self._fifo_paired_fills(fills, meta)
-            split = self._fifo_split_fills(fills)
-            r_total += ((self._net_total(paired) if paired else 0.0)
-                        + split["closing_realized"])
-            cash = (split["open_sells_notional"]
-                    - split["open_buys_notional"]) * mult
-            open_net = split["open_buys_qty"] - split["open_sells_qty"]
-            if open_net == 0:
-                u_total += cash
-                continue
-            last = self._last_price_for(meta)
-            if not last:
-                last = float(newest.get("price", 0.0) or 0.0)
-            u_total += (cash + open_net * last * mult) if last else cash
+            walk = self._walk_fills(fills)
+            r_total += (self._paired_net(walk, meta["multiplier"])
+                        + walk["closing_realized"] + walk["closing_comm"])
+            u_total += self._mark_open(walk, meta)
         return r_total, u_total, r_total + u_total, comm_total
 
     def _total_value(self, col: int) -> float | None:
@@ -703,8 +723,8 @@ class TradesSummaryModel(QAbstractTableModel):
         return f"{sign}{a / 1_000_000:.2f}m"
 
     def _paired_pnl(self, key: tuple[str, str] | None) -> float:
-        """R.P&L for one row — the in-window FIFO round trip plus IB's
-        realized P&L on unpaired closing fills (see ``_fifo_split``)."""
+        """R.P&L for one row — the in-window round trips plus IB's
+        realized P&L on closing fills (see ``_walk_account``)."""
         if key is None:
             return 0.0
         return self._realized_total(key)
