@@ -262,11 +262,11 @@ class TradesPanel(QWidget):
         # viewport mouse tracking for the row-hover delegate.
         tt.apply_table_chrome(t)
         t.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        # Rows aren't click-selectable — hover is the only pointer cue.  The
-        # hide flows still work: the context menu targets the clicked row and
-        # the Delete shortcut falls back to the current index, which clicks
-        # still move.
-        tt.disable_click_selection(t)
+        # Click selects a row; ⌘-click toggles individual rows and ⇧-click
+        # extends a range — Qt's ExtendedSelection gives all three, and it
+        # maps ⌘ to ControlModifier on macOS.  This is also what the hide
+        # flows target: "Hide N selected trades" and the Delete shortcut.
+        t.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         t.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
 
         # Row hover, plus the 1px rule between data rows.  The flat table
