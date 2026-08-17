@@ -38,10 +38,15 @@ def _to_eastern(dt: datetime | None) -> datetime:
 
 
 def _generate_order_ref() -> str:
-    """Generate a custom orderRef: ``nano_{MMDD}_{HHMMSS}_{4 random lowercase letters}``."""
+    """Generate a custom orderRef: ``nano_{YYMMDD}_{HHMMSS}_{4 random lowercase letters}``.
+
+    The date carries the year so ``_parse_orderref_time`` doesn't have to
+    assume the current one — an order placed on Dec 31 and viewed on Jan 1
+    used to come back dated a year late.
+    """
     now = datetime.now(_ET)
     tag = "".join(random.choices(string.ascii_lowercase, k=4))
-    return f"nano_{now:%m%d}_{now:%H%M%S}_{tag}"
+    return f"nano_{now:%y%m%d}_{now:%H%M%S}_{tag}"
 
 
 def _round_to_tick(price: float, tick: float) -> float:
@@ -59,27 +64,38 @@ def _round_to_tick(price: float, tick: float) -> float:
 def _parse_orderref_time(order_ref: str) -> datetime | None:
     """Extract the submission timestamp embedded in a NanoPulse orderRef.
 
-    Format: ``nano_{MMDD}_{HHMMSS}_{4-letter tag}``
-    Example: ``nano_0401_103045_abcd`` → 10:30:45 ET on April 1st.
+    Format: ``nano_{YYMMDD}_{HHMMSS}_{4-letter tag}``
+    Example: ``nano_260401_103045_abcd`` → 10:30:45 ET on April 1st 2026.
 
-    Uses the current year (edge case: orders placed on Dec 31 viewed on
-    Jan 1 will show the wrong year, acceptable for an intraday blotter).
+    The legacy ``MMDD`` form is still accepted — refs live on in open
+    orders and in the fills snapshot IB replays after a reconnect, so a
+    build that only understood the new form would lose their submission
+    times.  Those fall back to the current year, which is what they
+    always did.
+
     Returns ``None`` if the format does not match.
     """
     try:
         parts = order_ref.split("_")
-        # Expected: ["nano", "MMDD", "HHMMSS", "xxxx"]
+        # Expected: ["nano", "YYMMDD" (or legacy "MMDD"), "HHMMSS", "xxxx"]
         if len(parts) != 4 or parts[0] != "nano":
             return None
-        mmdd, hhmmss = parts[1], parts[2]
-        if len(mmdd) != 4 or len(hhmmss) != 6:
+        date_s, hhmmss = parts[1], parts[2]
+        if len(hhmmss) != 6:
             return None
-        month = int(mmdd[:2])
-        day = int(mmdd[2:])
+        if len(date_s) == 6:
+            year = 2000 + int(date_s[:2])
+            month = int(date_s[2:4])
+            day = int(date_s[4:])
+        elif len(date_s) == 4:                     # legacy MMDD
+            year = datetime.now(_ET).year
+            month = int(date_s[:2])
+            day = int(date_s[2:])
+        else:
+            return None
         hour = int(hhmmss[:2])
         minute = int(hhmmss[2:4])
         second = int(hhmmss[4:])
-        year = datetime.now(_ET).year
         return datetime(year, month, day, hour, minute, second, tzinfo=_ET)
     except Exception:
         return None
@@ -3831,19 +3847,27 @@ class IBWorkerThread(QThread):
           reqPnLSingle subscription has already been cancelled (they will
           never receive another update).
         """
-        today_mmdd = datetime.now(_ET).strftime("%m%d")
-        today_prefix = f"nano_{today_mmdd}_"
+        # Refs generated before the YYMMDD switch carry a 4-digit MMDD, so
+        # match on both prefixes; a legacy ref simply prunes as stale on
+        # the next sweep, which is the correct outcome for a past day.
+        now_et = datetime.now(_ET)
+        today_prefix = f"nano_{now_et:%y%m%d}_"
+        legacy_prefix = f"nano_{now_et:%m%d}_"
+
+        def _is_today_ref(ref: str) -> bool:
+            return ref.startswith(today_prefix) or ref.startswith(legacy_prefix)
 
         # ── Order-ref caches ─────────────────────────────────────────────────
         stale_refs = [r for r in list(self._order_times)
-                      if not r.startswith(today_prefix)]
+                      if not _is_today_ref(r)]
         for r in stale_refs:
             self._order_times.pop(r, None)
             self._order_error_messages.pop(r, None)
             self._order_symbols.pop(r, None)
 
         stale_rejected = [oid for oid in list(self._rejected_order_cache)
-                          if today_prefix not in oid]
+                          if today_prefix not in oid
+                          and legacy_prefix not in oid]
         for oid in stale_rejected:
             self._rejected_order_cache.pop(oid, None)
 

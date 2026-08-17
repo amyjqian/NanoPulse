@@ -12,11 +12,59 @@ import logging
 from typing import Any
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QColor
 
+from src.ui.theme import Theme
 from src.utils.helpers import format_option_symbol
 
+from .table_theme import (
+    CELL_FONT, CELL_FONT_BOLD, GroupKeyRole, header_alignment)
+
 log = logging.getLogger(__name__)
+
+# ── Custom roles ──────────────────────────────────────────────────────────────
+# Re-exported: the view bands contiguous runs of equal key, so one
+# submission reads as a single block.
+__all_roles__ = (GroupKeyRole,)
+
+
+def order_group_key(row: dict) -> str:
+    """Identity of the *submission* a fill belongs to.
+
+    One click in this app places an order per selected account, so a
+    single action produces several orders — each with its own orderRef
+    and account, all stamped with the same submission second.  Grouping
+    per order would put every one of those on its own row-band, which is
+    just stripes; grouping by the submission is what makes a batch read
+    as one block.
+
+    The stamp comes from the orderRef, whose format is
+    ``nano_{YYMMDD}_{HHMMSS}_{tag}`` (``ib_worker._generate_order_ref``,
+    legacy refs carry ``MMDD``): the first two fields are the submission
+    time, the tag is per-order.  Fills with no nano ref — placed in TWS
+    or by another client — fall back to their execution second, and a
+    fill with neither becomes its own group rather than joining a bogus
+    shared one.
+
+    Instrument and side join the key because each worker stamps its own
+    ref: the second is shared by everything submitted in that second, so
+    two unrelated clicks landing together would otherwise merge.  A batch
+    is one instrument on one side across accounts, so this never splits a
+    real group — it only separates clicks that happened to coincide.
+    """
+    contract = row.get("local_symbol") or row.get("symbol") or ""
+    side = row.get("side") or ""
+    ref = row.get("order_ref") or ""
+    if ref.startswith("nano_"):
+        parts = ref.split("_")
+        if len(parts) >= 3:
+            return f"sub_{parts[1]}_{parts[2]}_{contract}_{side}"
+    ts = row.get("time_sort") or ""
+    if ts:
+        # ISO stamp truncated to the second.
+        return f"exec_{ts[:19]}_{contract}_{side}"
+    return f"fill_{row.get('exec_id', '')}"
+
 
 # ── Column indices ────────────────────────────────────────────────────────────
 COL_TIME          = 0
@@ -59,12 +107,15 @@ _RIGHT_ALIGN_COLS = {
     COL_LAST_LIQ,
 }
 
-# ── Theme tokens (match the rest of the FlashTrade panels) ───────────────────
-CLR_BUY    = "#3FB950"   # BOT – green
-CLR_SELL   = "#F85149"   # SLD – red
-TEXT       = "#E6EBF2"
-TEXT_DIM   = "#A3AFC2"
-TEXT_BOLD  = "#E6EBF2"
+# ── Theme tokens ─────────────────────────────────────────────────────────────
+# Shared with the Positions tables (src/ui/theme.py POS_*): the softer
+# green/red is deliberate for dense grids, where full-saturation colour on
+# hundreds of digits reads as alarm.
+CLR_BUY    = Theme.POS_GAIN   # BOT – green
+CLR_SELL   = Theme.POS_LOSS   # SLD – red
+TEXT       = Theme.POS_TEXT
+TEXT_DIM   = Theme.POS_TEXT_MUTED
+TEXT_BOLD  = Theme.POS_TEXT
 
 
 class TradesModel(QAbstractTableModel):
@@ -76,11 +127,10 @@ class TradesModel(QAbstractTableModel):
         # execId → row index (for dedupe + surgical commission patches)
         self._index: dict[str, int] = {}
 
-        self._side_font = QFont("Inter, Helvetica Neue, Arial", 11)
-        self._side_font.setWeight(QFont.Weight.Bold)
-
-        self._symbol_font = QFont("Inter, Helvetica Neue, Arial", 11)
-        self._symbol_font.setWeight(QFont.Weight.DemiBold)
+        # Shared cell fonts — same family, weight and size as the Positions
+        # tables (family + weight only; size comes from the stylesheet).
+        self._side_font = CELL_FONT_BOLD
+        self._symbol_font = CELL_FONT_BOLD
 
     # ── Proxy helpers ───────────────────────────────────────────────────────
 
@@ -107,10 +157,14 @@ class TradesModel(QAbstractTableModel):
 
     def headerData(self, section: int, orientation: Qt.Orientation,
                    role: int = Qt.ItemDataRole.DisplayRole) -> Any:
-        if role == Qt.ItemDataRole.DisplayRole \
-                and orientation == Qt.Orientation.Horizontal \
-                and 0 <= section < _NUM_COLS:
+        if orientation != Qt.Orientation.Horizontal \
+                or not 0 <= section < _NUM_COLS:
+            return None
+        if role == Qt.ItemDataRole.DisplayRole:
             return HEADERS[section]
+        if role == Qt.ItemDataRole.TextAlignmentRole:
+            # Captions sit over their values.
+            return header_alignment(section, _RIGHT_ALIGN_COLS)
         return None
 
     def data(self, index: QModelIndex,
@@ -123,6 +177,8 @@ class TradesModel(QAbstractTableModel):
         row = self._rows[row_idx]
         col = index.column()
 
+        if role == GroupKeyRole:
+            return order_group_key(row)
         if role == Qt.ItemDataRole.DisplayRole:
             return self._cell_text(row, col)
         if role == Qt.ItemDataRole.ForegroundRole:
@@ -134,10 +190,11 @@ class TradesModel(QAbstractTableModel):
             return int(Qt.AlignmentFlag.AlignLeft
                        | Qt.AlignmentFlag.AlignVCenter)
         if role == Qt.ItemDataRole.FontRole:
-            if col == COL_SIDE:
-                return self._side_font
-            if col == COL_SYMBOL:
-                return self._symbol_font
+            # Same emphasis as the Positions table: the instrument and the
+            # P&L are what you scan for, so those carry the weight.
+            if col in (COL_SIDE, COL_SYMBOL, COL_REAL_PNL):
+                return CELL_FONT_BOLD
+            return CELL_FONT
         return None
 
     # ── Cell rendering ──────────────────────────────────────────────────────

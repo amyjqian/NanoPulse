@@ -17,10 +17,13 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QColor
 
+from src.ui.theme import Theme
 from src.ui.widgets.trades_filter_proxy import today_et, trading_days_cutoff
 from src.utils.helpers import format_option_symbol
+
+from .table_theme import CELL_FONT_BOLD, IsFooterRowRole, header_alignment
 
 log = logging.getLogger(__name__)
 
@@ -120,14 +123,15 @@ _S_RIGHT_ALIGN_COLS = {
 }
 
 # Theme tokens (keep in sync with trades_model)
-CLR_BUY    = "#3FB950"
-CLR_SELL   = "#F85149"
-TEXT       = "#E6EBF2"
-TEXT_DIM   = "#A3AFC2"
-TEXT_BOLD  = "#E6EBF2"
+CLR_BUY    = Theme.POS_GAIN
+CLR_SELL   = Theme.POS_LOSS
+TEXT       = Theme.POS_TEXT
+TEXT_DIM   = Theme.POS_TEXT_MUTED
+TEXT_BOLD  = Theme.POS_TEXT
 # Subtle tint for the footer/total row so it reads as a separate
-# band from the per-symbol rows above without shouting.
-BG_TOTAL   = "#232A3B"
+# band from the per-symbol rows above without shouting.  Same band as
+# the Positions account headers and Summary totals.
+BG_TOTAL   = Theme.POS_BG_ACCT_BAND
 
 
 class TradesSummaryModel(QAbstractTableModel):
@@ -193,11 +197,12 @@ class TradesSummaryModel(QAbstractTableModel):
         # marks unclosed (net long/short) positions to these prices.
         self._last_prices: dict[str, float] = {}
 
-        self._symbol_font = QFont("Inter, Helvetica Neue, Arial", 11)
-        self._symbol_font.setWeight(QFont.Weight.DemiBold)
+        # Shared cell fonts — same family, weight and size as every other
+        # table in the two tabs (family + weight only; the size comes from
+        # the table's stylesheet).
+        self._symbol_font = CELL_FONT_BOLD
         # Bold font used across every cell of the totals/footer row.
-        self._total_font = QFont("Inter, Helvetica Neue, Arial", 11)
-        self._total_font.setWeight(QFont.Weight.Bold)
+        self._total_font = CELL_FONT_BOLD
 
     # ── Proxy helpers ───────────────────────────────────────────────────────
 
@@ -241,10 +246,14 @@ class TradesSummaryModel(QAbstractTableModel):
 
     def headerData(self, section: int, orientation: Qt.Orientation,
                    role: int = Qt.ItemDataRole.DisplayRole) -> Any:
-        if role == Qt.ItemDataRole.DisplayRole \
-                and orientation == Qt.Orientation.Horizontal \
-                and 0 <= section < _S_NUM_COLS:
+        if orientation != Qt.Orientation.Horizontal \
+                or not 0 <= section < _S_NUM_COLS:
+            return None
+        if role == Qt.ItemDataRole.DisplayRole:
             return S_HEADERS[section]
+        if role == Qt.ItemDataRole.TextAlignmentRole:
+            # Captions sit over their values.
+            return header_alignment(section, _S_RIGHT_ALIGN_COLS)
         return None
 
     def data(self, index: QModelIndex,
@@ -253,6 +262,11 @@ class TradesSummaryModel(QAbstractTableModel):
             return None
         row = index.row()
         col = index.column()
+
+        # Available on every row, footer included — the row delegate asks
+        # each row whether it is the totals band.
+        if role == IsFooterRowRole:
+            return self._is_total_row(row)
 
         if self._is_total_row(row):
             return self._total_row_data(col, role)

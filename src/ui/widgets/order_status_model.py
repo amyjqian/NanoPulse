@@ -27,9 +27,12 @@ from PySide6.QtCore import (
     QSortFilterProxyModel,
     Qt,
 )
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QColor
 
+from src.ui.theme import Theme
 from src.utils.helpers import format_option_symbol
+
+from .table_theme import CELL_FONT_BOLD, header_alignment
 
 log = logging.getLogger(__name__)
 
@@ -70,14 +73,18 @@ _KEY_FOR_COL: dict[int, str] = {
 }
 
 # ── Theme tokens ──────────────────────────────────────────────────────────────
-CLR_BUY = "#3FB950"
-CLR_SELL = "#F85149"
-CLR_OPEN = "#539BF5"
-CLR_FILLED = "#3FB950"
-CLR_CANCELLED = "#A3AFC2"
-CLR_EXTERNAL_BG = "#2A2420"
-TEXT = "#E6EBF2"
-TEXT_DIM = "#A3AFC2"
+# Shared with the Positions/Trades tables (src/ui/theme.py POS_*) so the
+# three blotters read as one system.
+CLR_BUY = Theme.POS_GAIN
+CLR_SELL = Theme.POS_LOSS
+CLR_OPEN = Theme.POS_ACCENT
+CLR_FILLED = Theme.POS_GAIN
+CLR_CANCELLED = Theme.POS_TEXT_MUTED
+# Row tint marking an order this app didn't place (TWS / another client).
+# Warm, to stay distinct from every cool tone in the row-state ladder.
+CLR_EXTERNAL_BG = "#2a2018"
+TEXT = Theme.POS_TEXT
+TEXT_DIM = Theme.POS_TEXT_MUTED
 
 # ── Filter categories ─────────────────────────────────────────────────────────
 FILTER_ALL = "All"
@@ -114,10 +121,15 @@ TimeSortRole = Qt.ItemDataRole.UserRole + 5
 RawStatusRole = Qt.ItemDataRole.UserRole + 6
 
 # ── Fonts (shared with the panel) ────────────────────────────────────────────
-ACTION_FONT = QFont("Inter, Helvetica Neue, Arial", 11, QFont.Weight.Bold)
-STATUS_FONT = QFont("Inter, Helvetica Neue, Arial", 11, QFont.Weight.Bold)
-SYMBOL_FONT = QFont("Inter, Helvetica Neue, Arial", 11)
-SYMBOL_FONT.setWeight(QFont.Weight.DemiBold)
+# Shared cell fonts — family and weight only; the size comes from the
+# table's stylesheet, so all the blotters render at one size.
+ACTION_FONT = CELL_FONT_BOLD
+STATUS_FONT = CELL_FONT_BOLD
+SYMBOL_FONT = CELL_FONT_BOLD
+
+# Numeric columns read right, text columns left — same rule as the other
+# blotters, so captions sit over their values.
+_RIGHT_ALIGN_COLS = {COL_QTY, COL_FILL, COL_LMT, COL_STP}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -163,8 +175,13 @@ class OrderStatusModel(QAbstractTableModel):
 
     def headerData(self, section: int, orientation: Qt.Orientation,
                    role: int = Qt.ItemDataRole.DisplayRole) -> Any:
-        if role == Qt.ItemDataRole.DisplayRole and orientation == Qt.Orientation.Horizontal:
-            return HEADERS[section] if section < _NUM_COLS else None
+        if orientation != Qt.Orientation.Horizontal \
+                or not 0 <= section < _NUM_COLS:
+            return None
+        if role == Qt.ItemDataRole.DisplayRole:
+            return HEADERS[section]
+        if role == Qt.ItemDataRole.TextAlignmentRole:
+            return header_alignment(section, _RIGHT_ALIGN_COLS)
         return None
 
     def flags(self, index: QModelIndex) -> Qt.ItemFlag:
@@ -198,6 +215,9 @@ class OrderStatusModel(QAbstractTableModel):
 
         # ── TextAlignmentRole ────────────────────────────────────────────
         if role == Qt.ItemDataRole.TextAlignmentRole:
+            if col in _RIGHT_ALIGN_COLS:
+                return int(Qt.AlignmentFlag.AlignRight
+                           | Qt.AlignmentFlag.AlignVCenter)
             return int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
         # ── ForegroundRole ───────────────────────────────────────────────

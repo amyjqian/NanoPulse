@@ -12,7 +12,6 @@ Pure view layer: emits Qt signals; holds no state beyond widget values.
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont, QFontMetrics
 from PySide6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
@@ -22,16 +21,22 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-# ── Theme tokens ──────────────────────────────────────────────────────────────
-ACCENT     = "#E08A3C"
-ACCENT_DIM = "#B8722F"
-BG_PANEL   = "#151922"
-BG_INPUT   = "#151922"
-BORDER     = "#262E3F"
-TEXT       = "#E6EBF2"
-TEXT_DIM   = "#A3AFC2"
+from src.ui.theme import Theme
+from . import table_theme as tt
 
-_BAR_HEIGHT = 32
+# ── Theme tokens ──────────────────────────────────────────────────────────────
+# Mirrors the Positions control bar (account_position_panel.CONTROL_BTN_QSS)
+# — the two toolbars sit in the same tab-bar corner and swap on tab change,
+# so any divergence reads as a glitch.
+ACCENT     = Theme.POS_ACCENT
+BG_INPUT   = "#161a24"
+BORDER     = Theme.POS_OUTLINE
+BORDER_HOV = "#4a5464"
+TEXT       = Theme.POS_TEXT
+TEXT_DIM   = Theme.POS_TEXT_2
+TEXT_CTRL  = "#b8bdc7"
+ROW_HOVER  = Theme.POS_ROW_HOVER
+
 
 _BAR_QSS = f"""
     QWidget#tradesControlBar {{
@@ -39,43 +44,47 @@ _BAR_QSS = f"""
         border: none;
     }}
     QLabel#tbTradeCount {{
-        color: {TEXT_DIM};
+        color: {Theme.POS_LABEL};
         font-family: Inter, "Helvetica Neue", Arial, sans-serif;
         font-size: 11px;
         font-weight: 500;
     }}
     QLabel#tbTradeCount[hasTrades="true"] {{
-        color: {TEXT};
+        color: {TEXT_DIM};
     }}
     QPushButton#tbSummaryPill {{
         background: transparent;
-        color: {TEXT_DIM};
+        color: {TEXT_CTRL};
         border: 1px solid {BORDER};
-        border-radius: 8px;
-        padding: 0;
+        border-radius: 6px;
+        padding: 0 10px;
         font-size: 11px;
         font-weight: 600;
     }}
     QPushButton#tbSummaryPill:hover {{
-        color: #ffffff;
-        border-color: #5D8EF0;
+        color: {TEXT};
+        border-color: {BORDER_HOV};
     }}
     QPushButton#tbSummaryPill:checked {{
-        background: #5D8EF0;
+        background: {ACCENT};
         color: #ffffff;
-        border: none;
+        border-color: {ACCENT};
     }}
     QPushButton#tbSummaryPill:checked:hover {{
-        background: #6E9AF2;
+        background: #4a91fa;
     }}
     QComboBox#tbDateCombo {{
         background: {BG_INPUT};
-        color: {TEXT};
+        color: {TEXT_CTRL};
         border: 1px solid {BORDER};
-        border-radius: 4px;
+        border-radius: 6px;
         padding: 2px 6px;
         font-family: Inter, "Helvetica Neue", Arial, sans-serif;
         font-size: 11px;
+    }}
+    QComboBox#tbDateCombo:hover {{
+        border-color: {BORDER_HOV};
+        color: {TEXT};
     }}
     QComboBox#tbDateCombo:focus {{
         border-color: {ACCENT};
@@ -84,7 +93,7 @@ _BAR_QSS = f"""
         background: {BG_INPUT};
         color: {TEXT};
         border: 1px solid {BORDER};
-        selection-background-color: {ACCENT_DIM};
+        selection-background-color: {ACCENT};
         selection-color: #FFFFFF;
         outline: none;
     }}
@@ -92,30 +101,33 @@ _BAR_QSS = f"""
         background: {BG_INPUT};
         color: {TEXT};
         border: 1px solid {BORDER};
-        border-radius: 4px;
+        border-radius: 6px;
         padding: 3px 8px;
         font-family: Inter, "Helvetica Neue", Arial, sans-serif;
         font-size: 11px;
-        min-width: 60px;
-        max-width: 60px;
+        min-width: {tt.CTRL_SEARCH_W}px;
+        max-width: {tt.CTRL_SEARCH_W}px;
+    }}
+    QLineEdit#tbSearch:hover {{
+        border-color: {BORDER_HOV};
     }}
     QLineEdit#tbSearch:focus {{
         border-color: {ACCENT};
     }}
     QPushButton#tbGear {{
         background: transparent;
-        border: 1px solid transparent;
-        border-radius: 4px;
-        padding: 2px 6px;
-        color: {TEXT_DIM};
+        border: 1px solid {BORDER};
+        border-radius: 6px;
+        padding: 0;
+        color: {TEXT_CTRL};
         font-size: 14px;
     }}
     QPushButton#tbGear:hover {{
         color: {TEXT};
-        border-color: {BORDER};
+        border-color: {BORDER_HOV};
     }}
     QPushButton#tbGear:pressed {{
-        background: {BG_INPUT};
+        background: {ROW_HOVER};
     }}
 """
 
@@ -140,14 +152,17 @@ class TradesControlBar(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("tradesControlBar")
-        self.setFixedHeight(_BAR_HEIGHT)
+        # No fixed height: the tab-bar corner is only as tall as the tab
+        # row, and a taller-than-available bar gets its rows nudged down
+        # relative to the Positions bar — a 2px vertical hop on the
+        # Summary pill when you switch tabs.
         self.setStyleSheet(_BAR_QSS)
         self._build_ui()
 
     def _build_ui(self) -> None:
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(8, 2, 8, 2)
-        lay.setSpacing(8)
+        lay.setContentsMargins(*tt.CTRL_MARGINS)
+        lay.setSpacing(tt.CTRL_SPACING)
         # Stretch first so the controls cluster on the right side of the
         # tab-bar corner (the stack can be wider than our content).
         lay.addStretch(1)
@@ -163,22 +178,21 @@ class TradesControlBar(QWidget):
         lay.addSpacing(10)
 
         # Summary pill button — same style/size as the Pos view's pills
-        # (width sized to the wider of that view's two labels so the
-        # Summary buttons line up when switching tabs).
+        # (shared width helper).  Where it *lands* is settled by
+        # ``table_theme.align_summary_pills``, which pads whichever bar
+        # carries less to its right; both bars keep their own control
+        # order.
         self._summary_toggle = QPushButton("Summary", self)
         self._summary_toggle.setObjectName("tbSummaryPill")
         self._summary_toggle.setCheckable(True)
         self._summary_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._summary_toggle.setFixedHeight(24)
-        pill_font = QFont(self._summary_toggle.font())
-        pill_font.setPixelSize(11)
-        pill_font.setWeight(QFont.Weight.DemiBold)
-        fm = QFontMetrics(pill_font)
+        self._summary_toggle.setFixedHeight(tt.CTRL_H)
         self._summary_toggle.setFixedWidth(
-            max(fm.horizontalAdvance(t)
-                for t in ("Summary", "Zero Pos")) + 22)
+            tt.pill_width(self._summary_toggle.font()))
         self._summary_toggle.toggled.connect(self.summaryToggled.emit)
         lay.addWidget(self._summary_toggle)
+        pad_summary = tt.align_pad()
+        lay.addItem(pad_summary)
 
         # Spacer
         lay.addSpacing(12)
@@ -210,12 +224,21 @@ class TradesControlBar(QWidget):
 
         lay.addSpacing(8)
 
+        # Alignment slack — see the pads in the Positions bar.
+        pad_filter = tt.align_pad()
+        lay.addItem(pad_filter)
+
         # Search field (plain text input; no leading icon).
         self._search = QLineEdit(self)
         self._search.setObjectName("tbSearch")
-        self._search.setPlaceholderText("Search")
+        self._search.setPlaceholderText("Search...")
+        self._search.setFixedHeight(tt.CTRL_H)
         self._search.textChanged.connect(self.searchTextChanged.emit)
         lay.addWidget(self._search)
+        # This one ends up carrying the Positions bar's refresh button —
+        # the searches can't line up unless this bar leaves room for it.
+        pad_search = tt.align_pad()
+        lay.addItem(pad_search)
 
         lay.addSpacing(4)
 
@@ -223,9 +246,18 @@ class TradesControlBar(QWidget):
         self._gear = QPushButton("\u2699", self)   # ⚙
         self._gear.setObjectName("tbGear")
         self._gear.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._gear.setFixedSize(tt.CTRL_ICON, tt.CTRL_ICON)
         self._gear.setToolTip("Column preferences")
         self._gear.clicked.connect(self.settingsClicked.emit)
         lay.addWidget(self._gear)
+
+        # Hand-off for the tab container's alignment pass.  The date combo
+        # takes the "filter" slot the Positions bar fills with Zero Pos.
+        self.align_anchors = [
+            ("summary", self._summary_toggle, pad_summary),
+            ("filter",  self._date_combo,     pad_filter),
+            ("search",  self._search,         pad_search),
+        ]
 
     # ── Public getters / setters ────────────────────────────────────────────
 

@@ -14,19 +14,25 @@ from __future__ import annotations
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QStackedWidget, QTabWidget, QWidget
 
-# ── Theme tokens ──────────────────────────────────────────────────────────────
-BG_PANEL  = "#151922"
-# Raised chip behind the selected tab label
-BG_CHIP   = "#2A3242"
-TEXT      = "#E6EBF2"
-TEXT_DIM  = "#A3AFC2"
+from src.ui.theme import Theme
+from . import table_theme as tt
 
+# ── Theme tokens ──────────────────────────────────────────────────────────────
+BG_PANEL  = Theme.POS_BG_PAGE
+TEXT      = "#eeeef0"
+TEXT_DIM  = "#7a8494"
+TEXT_HOVER = Theme.POS_TEXT_2
+ACCENT    = Theme.POS_ACCENT
+
+# Underline tabs: the selected tab is marked by a 2px accent rule flush
+# with the toolbar's bottom border, not by a raised chip.
 _TAB_QSS = f"""
     QTabWidget {{
         background: transparent;
     }}
     QTabWidget::pane {{
         border: none;
+        border-top: 1px solid {Theme.POS_BORDER};
         background: {BG_PANEL};
         top: -1px;
     }}
@@ -41,21 +47,20 @@ _TAB_QSS = f"""
     QTabBar::tab {{
         background: transparent;
         color: {TEXT_DIM};
-        padding: 4px 12px;
-        margin: 4px 3px;
+        padding: 6px 4px;
+        margin: 2px 18px 0 0;
         border: none;
-        border-radius: 8px;
+        border-bottom: 2px solid transparent;
         font-family: Inter, "Helvetica Neue", Arial, sans-serif;
-        font-size: 11px;
-        font-weight: 700;
-        letter-spacing: 0.02em;
+        font-size: 13px;
+        font-weight: 600;
     }}
     QTabBar::tab:hover {{
-        color: {TEXT};
+        color: {TEXT_HOVER};
     }}
     QTabBar::tab:selected {{
-        background: {BG_CHIP};
-        color: #FFFFFF;
+        color: {TEXT};
+        border-bottom: 2px solid {ACCENT};
     }}
 """
 
@@ -95,6 +100,12 @@ class PositionsTradesTabs(QTabWidget):
         trades_bar = getattr(trades_widget, "control_bar", None) or QWidget()
         self._corner_stack.addWidget(positions_bar)    # 0
         self._corner_stack.addWidget(trades_bar)       # 1
+        # The stack right-aligns both bars against the same edge, so a
+        # control only stays put across a tab switch if each bar carries
+        # the same width to the right of it.  The bars keep their own
+        # control order; this pads whichever one is short at each anchor
+        # (Summary pill, Zero Pos / date filter, search box).
+        tt.align_control_bars(positions_bar, trades_bar)
         self.setCornerWidget(self._corner_stack, Qt.Corner.TopRightCorner)
 
         self.currentChanged.connect(self._on_tab_changed)
