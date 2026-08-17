@@ -22,8 +22,8 @@ import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QFont, QFontMetrics, QKeySequence, QShortcut
+from PySide6.QtCore import QEvent, QItemSelectionModel, Qt, QTimer
+from PySide6.QtGui import QFontMetrics, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHeaderView,
@@ -37,18 +37,20 @@ from PySide6.QtWidgets import (
 from typing import Callable
 
 from src.core import config_manager
+from . import table_theme as tt
 from .trades_control_bar import TradesControlBar
 from .trades_filter_proxy import TradesFilterProxy, _try_parse_time_query
 from .trades_model import (
-    TradesModel,
+    TradesModel, HEADERS,
     COL_TIME, COL_SYMBOL, COL_SECTYPE, COL_SIDE, COL_QTY, COL_PRICE, COL_EXCH,
     COL_REF, COL_ACCOUNT, COL_EXPIRY, COL_STRIKE_RIGHT, COL_COMM, COL_REAL_PNL,
     COL_ORDER_ID, COL_SUBMITTER, COL_LIQUIDATION, COL_LAST_LIQ,
 )
 from .trades_summary_model import (
-    TradesSummaryModel,
+    TradesSummaryModel, S_HEADERS,
     S_COL_SYMBOL, S_COL_TYPE, S_COL_BUYS, S_COL_SELLS, S_COL_NET,
     S_COL_AVG_BUY, S_COL_AVG_SELL, S_COL_TRANS_TOTAL, S_COL_NET_TOTAL,
+    S_COL_PAIRED_PNL, S_COL_UNPAIRED_PNL,
     S_COL_COMMISSION, S_COL_NET_INCL_COMM, S_COL_REALIZED, S_COL_EXCHANGES,
 )
 
@@ -74,64 +76,12 @@ _FILTER_PRESETS: dict[str, tuple[int, tuple[int, int] | None]] = {
     "last_7":    (7, None),
 }
 
-# ── Theme tokens ──────────────────────────────────────────────────────────────
-BG_TABLE     = "#151922"
-BG_TABLE_ALT = "#1B2130"
-BG_HEADER    = "#151922"
-BORDER       = "#262E3F"
-TEXT         = "#E6EBF2"
-TEXT_DIM     = "#A3AFC2"
+# ── Theme ─────────────────────────────────────────────────────────────────────
+# The table look is shared with the Positions tab — both tables sit behind
+# the same tab bar, so any divergence reads as a glitch on tab change.
+_PANEL_OBJECT_NAME = "TradesPanel"
 
-_TABLE_FONT = QFont("JetBrains Mono, Menlo, Consolas, monospace", 11)
 
-_TABLE_STYLE = f"""
-    QTableView {{
-        background-color: {BG_TABLE};
-        alternate-background-color: {BG_TABLE_ALT};
-        color: {TEXT};
-        gridline-color: {BORDER};
-        border: none;
-        font-size: 11px;
-        selection-background-color: #1C2740;
-        selection-color: {TEXT};
-    }}
-    QHeaderView::section {{
-        background-color: {BG_HEADER};
-        color: {TEXT_DIM};
-        border: none;
-        border-bottom: 1px solid {BORDER};
-        border-right: 1px solid {BORDER};
-        padding: 4px 8px;
-        font-weight: 700;
-        font-size: 10px;
-        letter-spacing: 0.06em;
-    }}
-    QTableView::item {{ padding: 0px 6px; }}
-    QScrollBar:vertical {{
-        background: {BG_TABLE};
-        width: 8px;
-        margin: 0;
-    }}
-    QScrollBar::handle:vertical {{
-        background: #334058;
-        border-radius: 4px;
-        min-height: 24px;
-    }}
-    QScrollBar::handle:vertical:hover {{ background: #334058; }}
-    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
-    QScrollBar:horizontal {{
-        background: {BG_TABLE};
-        height: 10px;
-        margin: 0;
-    }}
-    QScrollBar::handle:horizontal {{
-        background: #334058;
-        border-radius: 4px;
-        min-width: 40px;
-    }}
-    QScrollBar::handle:horizontal:hover {{ background: #334058; }}
-    QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
-"""
 
 
 # Default selected columns per view (keys, in order).  Leaves advanced
@@ -219,9 +169,14 @@ class TradesPanel(QWidget):
     # ── UI construction ─────────────────────────────────────────────────────
 
     def _setup_ui(self) -> None:
+        # Same card as the Positions panel, so the two tabs don't shift
+        # when you switch between them.
+        self.setObjectName(_PANEL_OBJECT_NAME)
+        self.setStyleSheet(tt.panel_card_qss(_PANEL_OBJECT_NAME))
+
         root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
+        root.setContentsMargins(10, 8, 10, 8)
+        root.setSpacing(6)
 
         # Control bar is not added to our own layout — PositionsTradesTabs
         # reparents it into the QTabWidget's top-right corner so the
@@ -256,8 +211,10 @@ class TradesPanel(QWidget):
             self._sync_summary_hidden_fills)
 
         self._stack = QStackedWidget(self)
-        self._flat_table = self._make_table(self._flat_proxy)
-        self._summary_table = self._make_table(self._summary_proxy)
+        self._flat_table, self._flat_row_delegate = \
+            self._make_table(self._flat_proxy, tt.GroupBandDelegate)
+        self._summary_table, self._summary_row_delegate = \
+            self._make_table(self._summary_proxy)
         self._stack.addWidget(self._flat_table)      # index 0
         self._stack.addWidget(self._summary_table)   # index 1
         root.addWidget(self._stack, 1)
@@ -291,18 +248,33 @@ class TradesPanel(QWidget):
         flat_delete_sc.setContext(Qt.ShortcutContext.WidgetShortcut)
         flat_delete_sc.activated.connect(self._hide_selected_flat_rows)
 
-    def _make_table(self, proxy) -> QTableView:
+    def _make_table(self, proxy, delegate_cls=tt.FooterAwareRowDelegate
+                    ) -> tuple[QTableView, tt.FooterAwareRowDelegate]:
+        """Build one of the two trade tables.
+
+        Returns the view and its row delegate — the caller keeps a
+        reference so the delegate isn't garbage-collected and so tests can
+        drive its hover state.
+        """
         t = QTableView(self)
         t.setModel(proxy)
-        t.setAlternatingRowColors(True)
+        # Shared chrome: no zebra, no gridlines, uppercase captions, and
+        # viewport mouse tracking for the row-hover delegate.
+        tt.apply_table_chrome(t)
         t.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        t.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        # Rows aren't click-selectable — hover is the only pointer cue.  The
+        # hide flows still work: the context menu targets the clicked row and
+        # the Delete shortcut falls back to the current index, which clicks
+        # still move.
+        tt.disable_click_selection(t)
         t.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        t.verticalHeader().setVisible(False)
-        t.setShowGrid(False)
-        t.setFont(_TABLE_FONT)
-        t.setStyleSheet(_TABLE_STYLE)
-        t.verticalHeader().setDefaultSectionSize(30)
+
+        # Row hover, plus the 1px rule between data rows.  The flat table
+        # bands each order's fills (GroupBandDelegate) and puts the rule on
+        # group boundaries only; the summary model's "P&L" row answers
+        # IsFooterRowRole and is skipped either way.
+        delegate = delegate_cls(t)
+        t.setItemDelegate(delegate)
 
         hdr = t.horizontalHeader()
         hdr.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft
@@ -310,11 +282,22 @@ class TradesPanel(QWidget):
         hdr.setStretchLastSection(True)
         hdr.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         hdr.setSectionsMovable(True)
-        return t
+        return t, delegate
+
+    # ── Selection behaviour ─────────────────────────────────────────────────
+
+    def hideEvent(self, event) -> None:
+        """Drop any selection when this tab stops being the visible one.
+
+        A selection here only ever means "rows I'm about to hide", so
+        carrying it across a tab switch would leave a stale highlight
+        waiting when you come back.
+        """
+        tt.clear_selections(getattr(self, "_flat_table", None),
+                            getattr(self, "_summary_table", None))
+        super().hideEvent(event)
 
     def _apply_flat_default_widths(self) -> None:
-        fm = QFontMetrics(self._flat_table.font())
-        pad = fm.horizontalAdvance("W")
         samples = {
             COL_TIME:         "Mmm00 00:00:00",
             COL_SYMBOL:       "WWWWWW",
@@ -323,7 +306,7 @@ class TradesPanel(QWidget):
             COL_QTY:          "99999",
             COL_PRICE:        "9999.99",
             COL_EXCH:         "NASDAQW",
-            COL_REF:          "nano_0000_000000_wwww",
+            COL_REF:          "nano_000000_000000_wwww",
             COL_ACCOUNT:      "WWWWWWWWW",
             COL_EXPIRY:       "YYYYMMDD",
             COL_STRIKE_RIGHT: "99999 P",
@@ -334,12 +317,9 @@ class TradesPanel(QWidget):
             COL_LIQUIDATION:  "LIQ",
             COL_LAST_LIQ:     "LLQ",
         }
-        for col, sample in samples.items():
-            self._flat_table.setColumnWidth(col, fm.horizontalAdvance(sample) + pad)
+        self._apply_default_widths(self._flat_table, samples, HEADERS)
 
     def _apply_summary_default_widths(self) -> None:
-        fm = QFontMetrics(self._summary_table.font())
-        pad = fm.horizontalAdvance("W")
         samples = {
             S_COL_SYMBOL:        "WWWWWW",
             S_COL_TYPE:          "WWWW",
@@ -349,14 +329,26 @@ class TradesPanel(QWidget):
             S_COL_AVG_BUY:       "99,999.99",
             S_COL_AVG_SELL:      "99,999.99",
             S_COL_TRANS_TOTAL:   "999.99m",
+            S_COL_PAIRED_PNL:    "+9,999,999.99",
+            S_COL_UNPAIRED_PNL:  "+9,999,999.99",
             S_COL_NET_TOTAL:     "+9,999,999.99",
             S_COL_COMMISSION:    "9,999.99",
             S_COL_NET_INCL_COMM: "+9,999,999.99",
             S_COL_REALIZED:      "+9,999.99",
             S_COL_EXCHANGES:     "NASDAQ, ARCA",
         }
+        self._apply_default_widths(self._summary_table, samples, S_HEADERS)
+
+    @staticmethod
+    def _apply_default_widths(table: QTableView, samples: dict[int, str],
+                              headers: list[str]) -> None:
+        """Size each column to fit its widest value *and* its caption —
+        the uppercase tracked-out captions are wider than they look."""
+        fm     = QFontMetrics(table.font())
+        hdr_fm = QFontMetrics(tt.COL_HEADER_FONT)
         for col, sample in samples.items():
-            self._summary_table.setColumnWidth(col, fm.horizontalAdvance(sample) + pad)
+            table.setColumnWidth(
+                col, tt.default_column_width(fm, hdr_fm, sample, headers[col]))
 
     # ── Control-bar handlers ────────────────────────────────────────────────
 
@@ -748,6 +740,11 @@ class TradesPanel(QWidget):
 
     # ── Persistence (preferences.trades_columns) ────────────────────────────
 
+    # Bumped when a restyle changes what a column needs to be wide enough
+    # for.  v2 = the shared table look (wider cell padding, uppercase
+    # captions, tabular figures).
+    _STYLE_VERSION = 2
+
     def _load_persisted_columns(self) -> dict[str, dict]:
         """Returns ``{"flat": {"visible": [...], "widths": {...}},
         "summary": {...}}``.  Missing sections become empty dicts so
@@ -758,12 +755,23 @@ class TradesPanel(QWidget):
             log.exception("TradesPanel: load_preferences failed")
             return {"flat": {}, "summary": {}}
         tc = prefs.get("trades_columns", {})
-        flat = tc.get("flat", {}) if isinstance(tc, dict) else {}
-        summ = tc.get("summary", {}) if isinstance(tc, dict) else {}
-        return {
-            "flat": flat if isinstance(flat, dict) else {},
-            "summary": summ if isinstance(summ, dict) else {},
-        }
+        if not isinstance(tc, dict):
+            return {"flat": {}, "summary": {}}
+        flat = tc.get("flat", {})
+        summ = tc.get("summary", {})
+        flat = flat if isinstance(flat, dict) else {}
+        summ = summ if isinstance(summ, dict) else {}
+
+        if tc.get("style_v", 1) < self._STYLE_VERSION:
+            # Widths saved against the old font and padding would truncate
+            # their own values now.  Drop them so the defaults recompute;
+            # the user's column choice and order (visible) are kept.
+            flat = {k: v for k, v in flat.items() if k != "widths"}
+            summ = {k: v for k, v in summ.items() if k != "widths"}
+            log.info("TradesPanel: retired column widths saved before the "
+                     "restyle (style_v < %d)", self._STYLE_VERSION)
+
+        return {"flat": flat, "summary": summ}
 
     def _save_persisted_columns(self) -> None:
         """Atomically merge our current column state into the preferences
@@ -771,6 +779,7 @@ class TradesPanel(QWidget):
         try:
             prefs = config_manager.load_preferences()
             prefs["trades_columns"] = {
+                "style_v": self._STYLE_VERSION,
                 "flat": {
                     "visible": list(self._visible_flat),
                     "widths":  dict(self._saved_widths_flat),

@@ -29,9 +29,12 @@ import math
 from typing import Any
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QColor
 
+from src.ui.theme import Theme
 from src.utils.helpers import format_option_symbol
+
+from .table_theme import CELL_FONT_BOLD, IsFooterRowRole
 
 from .account_position_model import (
     AccountPositionModel,
@@ -40,6 +43,11 @@ from .account_position_model import (
 )
 
 log = logging.getLogger(__name__)
+
+# ── Custom roles ──────────────────────────────────────────────────────────────
+# bool: TOTAL footer row.  Shared with the Trades summary so one delegate
+# handles both tables' footer bands.
+IsTotalRowRole = IsFooterRowRole
 
 # ── Column indices ────────────────────────────────────────────────────────────
 S_COL_SYMBOL         = 0
@@ -73,10 +81,10 @@ _S_RIGHT_ALIGN_COLS = {
 }
 
 # Theme tokens (keep in sync with account_position_model / trades_summary_model).
-TEXT_BOLD = "#E6EBF2"
+TEXT_BOLD = Theme.POS_TEXT
 # Same subtle tint used by the Trades summary footer so both summary
 # views read the same way visually.
-BG_TOTAL  = "#232A3B"
+BG_TOTAL  = Theme.POS_BG_ACCT_BAND
 
 # Net-zero threshold for the Zero-Pos toggle — fractional-share
 # positions are possible so an exact `== 0` test is too strict.
@@ -127,10 +135,10 @@ class PositionsSummaryModel(QAbstractTableModel):
         # aggregates, typing a symbol shows that contract's row.
         self._search_text: str = ""
 
-        self._symbol_font = QFont("Inter, Helvetica Neue, Arial", 11)
-        self._symbol_font.setWeight(QFont.Weight.DemiBold)
-        self._total_font = QFont("Inter, Helvetica Neue, Arial", 11)
-        self._total_font.setWeight(QFont.Weight.Bold)
+        # Shared cell fonts — family + weight only, size from the table's
+        # stylesheet, so every table in both tabs renders identically.
+        self._symbol_font = CELL_FONT_BOLD
+        self._total_font = CELL_FONT_BOLD
 
     # ── Proxy / menu helpers ────────────────────────────────────────────────
 
@@ -175,6 +183,11 @@ class PositionsSummaryModel(QAbstractTableModel):
             return None
         row = index.row()
         col = index.column()
+
+        # Available on every row, TOTAL included — the row-separator
+        # delegate asks each row whether it is the footer.
+        if role == IsTotalRowRole:
+            return self._is_total_row(row)
 
         if self._is_total_row(row):
             return self._total_row_data(col, role)

@@ -260,10 +260,8 @@ class FlashTradeView(QWidget):
                 self._account_list.get_selected_accounts())
 
         # ── Wire position panel action buttons ───────────────────────────────
-        # Header-row Flatten: flatten every open position for that account
-        self._account_position.flatten_requested.connect(
-            self._on_position_account_flatten)
-        # Position-row buttons: Flatten (100%) · 25% · 50% · 75%
+        # Row close control: 25% · 50% · 75% · 100% (100 = flatten).  There is
+        # no account-level flatten here — that lives on the Account List cards.
         self._account_position.position_close_requested.connect(
             self._on_position_close_requested)
         # Context menus: Options income (account rows + STK rows) / sweeps
@@ -1607,52 +1605,6 @@ class FlashTradeView(QWidget):
                 worker.request_portfolio_refresh()
                 log.info(
                     "FlashTrade: portfolio snapshot + refresh for worker %s", label)
-
-    def _on_position_account_flatten(self, account: str) -> None:
-        """Header-row Flatten clicked → cancel ALL open orders for *account*,
-        then close every open position.
-
-        Step 1 — ``cancel_all_for_account``: sweeps every open order for the
-        account regardless of symbol, including resting limit orders that have
-        no matching position yet (which per-symbol flatten would miss).
-
-        Step 2 — ``worker.flatten(symbol, account)`` per position: reads the
-        live position size and emits ``flatten_close_needed`` so the offsetting
-        order routes through the normal limit-cap / RTH / prefs path.
-        Note: ``_do_flatten`` also runs a per-symbol cancel internally, but
-        since Step 1 already cancelled everything, the redundant cancel is a
-        no-op and does no harm.
-        """
-        worker = self._find_worker_for_account(account)
-        if not worker:
-            log.warning(
-                "FlashTrade: account flatten — no connected worker for %s", account)
-            return
-
-        self._ensure_worker_connected(worker)
-
-        # ── Step 1: cancel ALL open orders for this account (no symbol filter).
-        # This runs even for a flat account so a header-row Flatten still clears
-        # any resting orders that have no matching position yet.
-        worker.cancel_all_for_account(account)
-        log.info("FlashTrade: cancel_all_for_account sent for %s", account)
-
-        # ── Step 2: close each non-zero position via the normal flatten path
-        pos_keys = [
-            (acct, con_id)
-            for acct, con_id in self._account_position.get_position_keys()
-            if acct == account
-        ]
-        for _, con_id in pos_keys:
-            symbol = self._account_position.get_symbol_for_position(account, con_id)
-            if symbol:
-                worker.flatten(symbol, account)
-                log.info(
-                    "FlashTrade: position flatten %s for account %s", symbol, account)
-
-        log.info(
-            "FlashTrade: account flatten complete — cancelled open orders, "
-            "%d position(s) closed in %s", len(pos_keys), account)
 
     def _on_position_close_requested(self, account: str,
                                      con_id: int, pct: int) -> None:

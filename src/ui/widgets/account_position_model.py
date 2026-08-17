@@ -4,15 +4,16 @@ AccountPositionModel – grouped QAbstractTableModel for live portfolio position
 Row layout
 ──────────
 For every account group the model inserts:
-  • one HEADER row  → shows account name; columns 1-7 are spanned into one
-                       merged info cell painted by AccountHeaderInfoDelegate
-                       (Daily P&L · Net Liq · Excess Liq); column 8 = Flatten
-  • N POSITION rows → symbol, position, prices, per-position P&L
+  • one HEADER row  → the whole row is spanned into one merged band painted
+                       by AccountHeaderInfoDelegate (account name · Daily P&L ·
+                       Net · EX · BP).  No buttons.
+  • N POSITION rows → symbol, day P&L, position, prices, per-position P&L,
+                       and the 25|50|75|100% close control in the last column
 
 Columns
 ───────
-Account(0) Symbol(1) Position(2) AvgPrice(3) LastPrice(4)
-DailyP&L(5) RealizedP&L(6) UnrealizedP&L(7) Flatten(8)
+Symbol(0) DayP&L(1) Qty(2) Unrealized(3) AvgPrice(4)
+LastPrice(5) Realized(6) MktValue(7) Close(8)
 """
 from __future__ import annotations
 
@@ -25,9 +26,12 @@ from PySide6.QtCore import (
     QModelIndex,
     Qt,
 )
-from PySide6.QtGui import QBrush, QColor, QFont
+from PySide6.QtGui import QBrush, QColor
 
+from src.ui.theme import Theme
 from src.utils.helpers import format_option_symbol
+
+from .table_theme import CELL_FONT, CELL_FONT_BOLD
 
 # ── Custom roles ──────────────────────────────────────────────────────────────
 IsFirstInGroupRole      = Qt.ItemDataRole.UserRole + 100  # kept for compat (unused now)
@@ -45,36 +49,46 @@ ROW_TYPE_POSITION = "position"
 log = logging.getLogger(__name__)
 
 # ── Column indices ────────────────────────────────────────────────────────────
-COL_ACCOUNT        = 0
-COL_SYMBOL         = 1
+# COL_SYMBOL holds the account name on header rows (it is the span origin)
+# and the contract symbol on position rows.
+COL_SYMBOL         = 0
+COL_DAY_PNL        = 1
 COL_POSITION       = 2
 COL_UNREALIZED_PNL = 3
 COL_AVG_PRICE      = 4
 COL_LAST_PRICE     = 5
 COL_REALIZED_PNL   = 6
 COL_MARKET_VALUE   = 7
-COL_FLATTEN        = 8   # header rows: Flatten button; position rows: blank
+# Historical name — this column now carries the 25|50|75|100% close control.
+COL_FLATTEN        = 8
 
+# "Close %" rather than "Close": only the last segment is labelled 100%,
+# so the caption is what tells you 25/50/75 are percentages of the
+# position and not share counts.
 HEADERS = [
-    "Account", "Symbol", "Qty", "Unrealized", "Avg Price", "Last Price",
-    "Realized", "Mkt Value", "",
+    "Symbol", "Day P&L", "Qty", "Unrealized", "Avg Price", "Last Price",
+    "Realized", "Mkt Value", "Close %",
 ]
 
 NUM_COLS = len(HEADERS)
 
 # ── Theme tokens ──────────────────────────────────────────────────────────────
-TEXT     = "#E6EBF2"
-TEXT_DIM = "#A3AFC2"
-CLR_PNL_POS = "#2EA043"
-CLR_PNL_NEG = "#F85149"
-CLR_LONG    = "#2EA043"
-CLR_SHORT   = "#F85149"
-CLR_ACCT    = "#539BF5"
-BG_HEADER_ROW = "#1B2130"
+TEXT     = Theme.POS_TEXT
+TEXT_DIM = Theme.POS_TEXT_MUTED
+TEXT_MUTED  = Theme.POS_LABEL      # en-dash placeholders / zero P&L
+CLR_PNL_POS = Theme.POS_GAIN
+CLR_PNL_NEG = Theme.POS_LOSS
+CLR_LONG    = Theme.POS_GAIN
+CLR_SHORT   = Theme.POS_LOSS
+CLR_ACCT    = Theme.POS_ACCT_NAME
+BG_HEADER_ROW = Theme.POS_BG_ACCT_BAND
 
-_MONO       = QFont("JetBrains Mono, Menlo, Consolas, monospace", 11)
-_MONO_BOLD  = QFont("JetBrains Mono, Menlo, Consolas, monospace", 11, QFont.Weight.Bold)
-_ACCT_FONT  = QFont("JetBrains Mono, Menlo, Consolas, monospace", 11, QFont.Weight.Bold)
+# Shared with the Trades blotter so the two tabs render cells identically.
+# They carry family and weight only — the size comes from the table's
+# stylesheet (table_theme.CELL_FONT_PX).
+_MONO       = CELL_FONT
+_MONO_BOLD  = CELL_FONT_BOLD
+_ACCT_FONT  = CELL_FONT_BOLD
 
 _BG_HEADER_BRUSH = QBrush(QColor(BG_HEADER_ROW))
 
@@ -98,7 +112,7 @@ def _fmt_pnl(val: float) -> str:
         return "–"
     v = int(round(val))
     if v == 0:
-        return ""
+        return "–"
     return f"+{v:,}" if v > 0 else f"-{abs(v):,}"
 
 
@@ -108,19 +122,24 @@ def _fmt_qty(val: float) -> str:
 
 
 def _fmt_mktval(val: float) -> str:
-    """Format market value: rounded to integer, empty for zero, signed."""
+    """Format market value: rounded to integer, en-dash for zero, signed."""
     if not math.isfinite(val):
         return "–"
     v = int(round(val))
     if v == 0:
-        return ""
+        return "–"
     return f"{v:,}" if v > 0 else f"-{abs(v):,}"
 
 
 def _pnl_color(val: float) -> QColor:
-    if not math.isfinite(val):
-        return QColor(TEXT_DIM)
-    return QColor(CLR_PNL_POS) if val >= 0 else QColor(CLR_PNL_NEG)
+    """Green/red for a live P&L; muted grey for zero or missing.
+
+    Zero has to be muted, not green — the cell renders as an en-dash and a
+    green dash reads as a gain that isn't there.
+    """
+    if not math.isfinite(val) or int(round(val)) == 0:
+        return QColor(TEXT_MUTED)
+    return QColor(CLR_PNL_POS) if val > 0 else QColor(CLR_PNL_NEG)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -224,9 +243,17 @@ class AccountPositionModel(QAbstractTableModel):
 
     def headerData(self, section: int, orientation: Qt.Orientation,
                    role: int = Qt.ItemDataRole.DisplayRole) -> Any:
-        if (role == Qt.ItemDataRole.DisplayRole
-                and orientation == Qt.Orientation.Horizontal):
-            return HEADERS[section] if section < NUM_COLS else None
+        if orientation != Qt.Orientation.Horizontal or section >= NUM_COLS:
+            return None
+        if role == Qt.ItemDataRole.DisplayRole:
+            return HEADERS[section]
+        if role == Qt.ItemDataRole.TextAlignmentRole:
+            # Captions sit over their values: Symbol and the close control
+            # read left, numbers right.
+            align = (Qt.AlignmentFlag.AlignLeft
+                     if section in (COL_SYMBOL, COL_FLATTEN)
+                     else Qt.AlignmentFlag.AlignRight)
+            return int(align | Qt.AlignmentFlag.AlignVCenter)
         return None
 
     def flags(self, index: QModelIndex) -> Qt.ItemFlag:
@@ -257,8 +284,8 @@ class AccountPositionModel(QAbstractTableModel):
             ad = self._acct_data.get(account, {})
 
             # ── HeaderInfoRole – available on any column of a header row ──
-            # The panel uses setSpan to merge cols 1-7 into one cell, and
-            # AccountHeaderInfoDelegate reads this role to paint the summary.
+            # The panel spans the whole row into one cell at COL_SYMBOL, and
+            # AccountHeaderInfoDelegate reads this role to paint the band.
             if role == HeaderInfoRole:
                 return {
                     "daily_pnl":    ad.get("daily_pnl",    float("nan")),
@@ -268,7 +295,7 @@ class AccountPositionModel(QAbstractTableModel):
                 }
 
             if role == Qt.ItemDataRole.DisplayRole:
-                if col == COL_ACCOUNT:
+                if col == COL_SYMBOL:
                     alias = (self._get_alias(account) if self._get_alias else "")
                     return alias if alias else account
                 return None  # all other cells blank (delegate paints the info)
@@ -280,12 +307,12 @@ class AccountPositionModel(QAbstractTableModel):
                 return _BG_HEADER_BRUSH
 
             if role == Qt.ItemDataRole.ForegroundRole:
-                if col == COL_ACCOUNT:
+                if col == COL_SYMBOL:
                     return QColor(CLR_ACCT)
                 return QColor(TEXT_DIM)
 
             if role == Qt.ItemDataRole.FontRole:
-                if col == COL_ACCOUNT:
+                if col == COL_SYMBOL:
                     return _ACCT_FONT
                 return _MONO
 
@@ -311,13 +338,12 @@ class AccountPositionModel(QAbstractTableModel):
         pnl_s  = self._pnl_single.get((account, con_id), {})
 
         if role == Qt.ItemDataRole.DisplayRole:
-            if col == COL_ACCOUNT:
-                # Show daily P&L in the first column for position rows
-                v = pnl_s.get("daily_pnl", rd.get("daily_pnl", float("nan")))
-                return _fmt_pnl(v) if math.isfinite(v) else "–"
             if col == COL_SYMBOL:
                 return format_option_symbol(
                     rd.get("local_symbol") or rd.get("symbol", ""))
+            if col == COL_DAY_PNL:
+                v = pnl_s.get("daily_pnl", rd.get("daily_pnl", float("nan")))
+                return _fmt_pnl(v) if math.isfinite(v) else "–"
             if col == COL_POSITION:
                 return _fmt_qty(rd.get("position", 0))
             if col == COL_AVG_PRICE:
@@ -333,7 +359,7 @@ class AccountPositionModel(QAbstractTableModel):
                 return _fmt_pnl(v) if math.isfinite(v) else "–"
             if col == COL_MARKET_VALUE:
                 return _fmt_mktval(rd.get("market_value", float("nan")))
-            return None  # COL_NET_LIQ, COL_EXCESS_LIQ, COL_FLATTEN → blank
+            return None  # COL_FLATTEN (close control) → blank
 
         if role == Qt.ItemDataRole.TextAlignmentRole:
             if col == COL_SYMBOL:
@@ -341,7 +367,7 @@ class AccountPositionModel(QAbstractTableModel):
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         if role == Qt.ItemDataRole.ForegroundRole:
-            if col == COL_ACCOUNT:
+            if col == COL_DAY_PNL:
                 v = pnl_s.get("daily_pnl", rd.get("daily_pnl", float("nan")))
                 return _pnl_color(v)
             if col == COL_REALIZED_PNL:
@@ -361,7 +387,7 @@ class AccountPositionModel(QAbstractTableModel):
             return QColor(TEXT)
 
         if role == Qt.ItemDataRole.FontRole:
-            if col in (COL_ACCOUNT, COL_SYMBOL):
+            if col in (COL_SYMBOL, COL_DAY_PNL):
                 return _MONO_BOLD
             if col in (COL_REALIZED_PNL, COL_UNREALIZED_PNL):
                 return _MONO_BOLD
@@ -436,8 +462,10 @@ class AccountPositionModel(QAbstractTableModel):
             for field, val in pnl_data.items():
                 if math.isfinite(val):
                     rd[field] = val
-            left  = self.index(row, COL_ACCOUNT)
-            right = self.index(row, COL_UNREALIZED_PNL)
+            # Span the whole row: realized P&L sits past the P&L block and
+            # the panel watches dataChanged to auto-hide that column.
+            left  = self.index(row, COL_SYMBOL)
+            right = self.index(row, NUM_COLS - 1)
             self.dataChanged.emit(left, right, [
                 Qt.ItemDataRole.DisplayRole,
                 Qt.ItemDataRole.ForegroundRole,
@@ -501,6 +529,24 @@ class AccountPositionModel(QAbstractTableModel):
     def get_position_keys(self) -> list[tuple[str, int]]:
         return [k for k, v in self._positions.items()
                 if v.get("position", 0) != 0]
+
+    def has_realized(self) -> bool:
+        """True when any *visible* row carries a non-zero realized P&L.
+
+        The panel hides the Realized column while this is False — it is
+        empty on most days and a column of en-dashes is pure noise.
+        Resolves the value exactly the way ``data()`` does for
+        COL_REALIZED_PNL: live pnlSingle first, row snapshot second.
+        """
+        for rd in self._rows:
+            if rd.get("_row_type") != ROW_TYPE_POSITION:
+                continue
+            key = (rd.get("account", ""), rd.get("con_id", 0))
+            v = self._pnl_single.get(key, {}).get(
+                "realized_pnl", rd.get("realized_pnl", float("nan")))
+            if math.isfinite(v) and int(round(v)) != 0:
+                return True
+        return False
 
     def get_symbol_for_position(self, account: str, con_id: int) -> str:
         """Return the best display symbol (localSymbol preferred) for a position."""

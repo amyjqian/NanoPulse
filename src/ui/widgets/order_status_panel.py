@@ -40,10 +40,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from src.ui.theme import Theme
+from . import table_theme as tt
 from .order_status_model import (
     # Column constants
     COL_SYMBOL, COL_ACCOUNT, COL_ACTION, COL_TYPE, COL_QTY,
     COL_FILL, COL_STATUS, COL_CANCEL, COL_TIME, COL_LMT, COL_STP, COL_TIF,
+    HEADERS,
     # Roles
     OrderIdRole, IsInternalRole, StatusCategoryRole,
     # Filter constants
@@ -57,92 +60,29 @@ from .order_status_model import (
 
 log = logging.getLogger(__name__)
 
-# ── Theme tokens ──────────────────────────────────────────────────────────────
-BG_PANEL = "#151922"
-BG_TABLE = "#151922"
-BG_TABLE_ALT = "#1B2130"
-BG_HEADER = "#151922"
-BORDER = "#262E3F"
-TEXT = "#E6EBF2"
-TEXT_DIM = "#A3AFC2"
+# ── Theme ─────────────────────────────────────────────────────────────────────
+# The table look is shared with the Positions and Trades blotters — see
+# table_theme; only what this panel paints itself lives here.
+BG_PANEL = tt.BG_PAGE
+BG_TABLE = tt.BG_TABLE
+BORDER = tt.BORDER
+TEXT = tt.TEXT
+TEXT_DIM = tt.TEXT_MUTED
+SELECTION_BG = tt.SELECTION_BG
 
-CLR_OPEN = "#539BF5"
+CLR_OPEN = tt.ACCENT
+# Cancel button — the destructive action in this table, so it borrows the
+# close control's red rather than inventing another one.
 CLR_CANCEL_BTN = "#3A1A1A"
-CLR_CANCEL_BTN_HOVER = "#4A2424"
-CLR_CANCEL_BTN_PRESSED = "#5A2A2A"
+CLR_CANCEL_BTN_HOVER = Theme.POS_LOSS_HOVER
+CLR_CANCEL_BTN_PRESSED = "#8B2A28"
 CLR_CANCEL_BTN_BORDER = "#4A2A2A"
 
-# ── Fonts ─────────────────────────────────────────────────────────────────────
 _TITLE_FONT = QFont("Inter, Helvetica Neue, Arial", 11)
 _TITLE_FONT.setWeight(QFont.Weight.Bold)
 
-_TABLE_FONT = QFont("JetBrains Mono, Menlo, Consolas, monospace", 11)
-
-# ── Table QSS (applied to QTableView) ────────────────────────────────────────
-_TABLE_STYLE = f"""
-    QTableView {{
-        background-color: {BG_TABLE};
-        alternate-background-color: {BG_TABLE_ALT};
-        color: {TEXT};
-        gridline-color: {BORDER};
-        border: none;
-        font-size: 11px;
-        selection-background-color: #1C2740;
-        selection-color: {TEXT};
-    }}
-    QHeaderView::section {{
-        background-color: {BG_HEADER};
-        color: {TEXT_DIM};
-        border: none;
-        border-bottom: 1px solid {BORDER};
-        border-right: 1px solid {BORDER};
-        padding: 2px 2px;
-        font-weight: 600;
-        font-size: 11px;
-    }}
-    QTableView::item {{
-        padding: 0px 2px;
-    }}
-    QScrollBar:vertical {{
-        background: {BG_TABLE};
-        width: 8px;
-        margin: 0;
-    }}
-    QScrollBar::handle:vertical {{
-        background: #334058;
-        border-radius: 4px;
-        min-height: 24px;
-    }}
-    QScrollBar::handle:vertical:hover {{
-        background: #334058;
-    }}
-    QScrollBar::handle:vertical:pressed {{
-        background: #6E7380;
-    }}
-    QScrollBar:horizontal {{
-        background: {BG_TABLE};
-        height: 10px;
-        margin: 0;
-    }}
-    QScrollBar::handle:horizontal {{
-        background: #334058;
-        border-radius: 4px;
-        min-width: 40px;
-    }}
-    QScrollBar::handle:horizontal:hover {{
-        background: #334058;
-    }}
-    QScrollBar::handle:horizontal:pressed {{
-        background: #6E7380;
-    }}
-    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
-        height: 0;
-    }}
-    QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
-        width: 0;
-    }}
-"""
-
+_TABLE_FONT = tt.TABLE_FONT
+_TABLE_STYLE = tt.TABLE_QSS
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CancelButtonDelegate
@@ -161,9 +101,12 @@ class CancelButtonDelegate(QStyledItemDelegate):
     _BTN_V_PAD = 2
     _BTN_RADIUS = 3
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, hover_source=None):
         super().__init__(parent)
         self._pressed_row: int | None = None
+        # Row-hover state lives on the table's default delegate; this one
+        # reads it so the hovered row's fill runs through this column too.
+        self._hover_source = hover_source
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -187,14 +130,23 @@ class CancelButtonDelegate(QStyledItemDelegate):
               index: QModelIndex) -> None:
         painter.save()
 
-        # Fill cell background (external-order bg, selection, alternating rows)
+        # Fill the cell background ourselves — this column is painted from
+        # scratch, so it has to reproduce the row's state (selection, hover,
+        # the external-order tint) or the row would break here.
+        src = self._hover_source
+        hovered_row = src.hover_row if src else None
         bg = index.data(Qt.ItemDataRole.BackgroundRole)
-        if bg:
+        if option.state & QStyle.StateFlag.State_Selected:
+            painter.fillRect(option.rect, QColor(SELECTION_BG))
+        elif index.row() == hovered_row:
+            painter.fillRect(option.rect,
+                             src.hover_brush if src else tt.ROW_HOVER_BRUSH)
+        elif bg:
             painter.fillRect(option.rect, bg)
-        elif option.state & QStyle.StateFlag.State_Selected:
-            painter.fillRect(option.rect, QColor("#1C2740"))
-        elif option.features & QStyleOptionViewItem.ViewItemFeature.Alternate:
-            painter.fillRect(option.rect, QColor(BG_TABLE_ALT))
+        else:
+            painter.fillRect(option.rect, QColor(tt.BG_TABLE))
+
+        tt.paint_separator_line(painter, option.rect)
 
         if not self._should_show_button(index):
             painter.restore()
@@ -300,13 +252,8 @@ class OrderStatusPanel(QWidget):
 
     def _setup_ui(self) -> None:
         self.setObjectName("OrderStatusPanel")
-        self.setStyleSheet(f"""
-            QWidget#OrderStatusPanel {{
-                background: {BG_PANEL};
-                border: 1px solid {BORDER};
-                border-radius: 4px;
-            }}
-        """)
+        # Same card as the Positions and Trades panels.
+        self.setStyleSheet(tt.panel_card_qss("OrderStatusPanel"))
 
         root = QVBoxLayout(self)
         root.setContentsMargins(10, 8, 10, 8)
@@ -325,29 +272,14 @@ class OrderStatusPanel(QWidget):
         refresh_btn = QPushButton("⟳")
         refresh_btn.setToolTip("Refresh orders from TWS")
         refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        refresh_btn.setFixedSize(26, 26)
-        refresh_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: transparent;
-                color: {TEXT_DIM};
-                border: 1px solid {BORDER};
-                border-radius: 4px;
-                font-size: 14px;
-                font-weight: bold;
-            }}
-            QPushButton:hover {{
-                color: #ffffff;
-                border-color: {CLR_OPEN};
-                background: #1C2740;
-            }}
-            QPushButton:pressed {{
-                background: #1C2740;
-            }}
-        """)
+        refresh_btn.setFixedSize(28, 28)
+        refresh_btn.setStyleSheet(tt.ICON_BTN_QSS)
         refresh_btn.clicked.connect(self._on_refresh_clicked)
+        header.addSpacing(10)
         header.addWidget(refresh_btn)
 
         header.addStretch(1)
+        header.setSpacing(tt.CTRL_SPACING)
 
         # Filter buttons
         self._filter_btns: dict[str, QPushButton] = {}
@@ -367,23 +299,28 @@ class OrderStatusPanel(QWidget):
         # ── Table view ───────────────────────────────────────────────────
         self._table = QTableView()
         self._table.setModel(self._proxy)
-        self._table.setAlternatingRowColors(True)
+        # Shared chrome: no zebra, no gridlines, uppercase captions, row
+        # height, and the viewport mouse tracking the hover delegate needs.
+        tt.apply_table_chrome(self._table)
         self._table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows)
-        self._table.setSelectionMode(
-            QAbstractItemView.SelectionMode.SingleSelection)
+        # Rows aren't click-selectable — hover is the only pointer cue,
+        # matching the Positions and Trades blotters.
+        tt.disable_click_selection(self._table)
         self._table.setEditTriggers(
             QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._table.verticalHeader().setVisible(False)
-        self._table.setShowGrid(True)
-        self._table.setFont(_TABLE_FONT)
-        self._table.setStyleSheet(_TABLE_STYLE)
 
-        # Enable mouse tracking so the delegate receives hover states
-        self._table.viewport().setMouseTracking(True)
+        # Row hover + the 1px rule between rows.  No group banding here:
+        # bracket parents and their TP/SL children are deliberately
+        # opposite sides placed a moment apart, so any submission-based
+        # grouping striped this table rather than clarifying it.
+        # Also the source of truth for hover, which the Cancel column reads.
+        self._row_delegate = tt.FooterAwareRowDelegate(self._table)
+        self._table.setItemDelegate(self._row_delegate)
 
         # Cancel button delegate
-        self._cancel_delegate = CancelButtonDelegate(self._table)
+        self._cancel_delegate = CancelButtonDelegate(
+            self._table, hover_source=self._row_delegate)
         self._cancel_delegate.cancel_clicked.connect(self._on_cancel_clicked)
         self._table.setItemDelegateForColumn(COL_CANCEL, self._cancel_delegate)
 
@@ -400,12 +337,13 @@ class OrderStatusPanel(QWidget):
         # Restore saved column widths or apply defaults
         self._restore_table_state()
 
-        self._table.verticalHeader().setDefaultSectionSize(30)
         root.addWidget(self._table, stretch=1)
 
     # ── Column state persistence (QSettings) ──────────────────────────────────
 
-    _SETTINGS_KEY = "OrderStatusPanel/headerState"
+    # v2: the restyle widened cell padding and uppercased the captions, so
+    # widths saved under the old key now truncate their own values.
+    _SETTINGS_KEY = "OrderStatusPanel/headerState_v2"
 
     def _restore_table_state(self) -> None:
         settings = QSettings("NanoPulse", "Dashboard")
@@ -425,16 +363,17 @@ class OrderStatusPanel(QWidget):
 
     def _apply_font_metrics_widths(self) -> None:
         fm = QFontMetrics(self._table.font())
-        pad = fm.horizontalAdvance("W")
+        hdr_fm = QFontMetrics(tt.COL_HEADER_FONT)
 
         col_samples = {
             COL_SYMBOL:  "WWWWWW",
             COL_ACCOUNT: "WWWWWWWWW",
             COL_ACTION:  "WWWWW",
-            COL_TYPE:    "WWWWW",
+            COL_TYPE:    "STP LMT",
             COL_QTY:     "9999",
             COL_FILL:    "999999999",
-            COL_STATUS:  "WWWWWWWWWW",
+            # Longest status TWS sends, plus the ⚠ an error row appends.
+            COL_STATUS:  "PreSubmitted ⚠",
             COL_CANCEL:  "WWWWWWWW",
             COL_TIME:    "00:00:00",
             COL_LMT:     "999999999",
@@ -443,39 +382,21 @@ class OrderStatusPanel(QWidget):
         }
 
         for col, sample in col_samples.items():
-            w = fm.horizontalAdvance(sample) + pad
-            self._table.setColumnWidth(col, w)
+            self._table.setColumnWidth(
+                col,
+                tt.default_column_width(fm, hdr_fm, sample, HEADERS[col]))
 
     # ── Filter bar ────────────────────────────────────────────────────────────
 
     def _apply_filter_styles(self) -> None:
+        """Filter pills use the shared outlined-control style, so the
+        checked one fills with the accent exactly like the Summary /
+        Zero Pos toggles in the other two blotters."""
         active = self._proxy.active_filter
         for label, btn in self._filter_btns.items():
-            if label == active:
-                btn.setStyleSheet(f"""
-                    QPushButton {{
-                        background: #1C2740;
-                        color: #ffffff;
-                        border: 1px solid {CLR_OPEN};
-                        border-radius: 10px;
-                        padding: 3px 12px;
-                        font-size: 11px;
-                        font-weight: 600;
-                    }}
-                """)
-            else:
-                btn.setStyleSheet(f"""
-                    QPushButton {{
-                        background: transparent;
-                        color: {TEXT_DIM};
-                        border: none;
-                        border-radius: 10px;
-                        padding: 3px 12px;
-                        font-size: 11px;
-                        font-weight: 600;
-                    }}
-                    QPushButton:hover {{ color: #ffffff; }}
-                """)
+            btn.setFixedHeight(26)
+            btn.setChecked(label == active)
+            btn.setStyleSheet(tt.CONTROL_BTN_QSS)
 
     def _on_filter_clicked(self, label: str) -> None:
         for lbl, btn in self._filter_btns.items():
