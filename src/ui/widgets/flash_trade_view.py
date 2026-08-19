@@ -664,6 +664,11 @@ class FlashTradeView(QWidget):
                 "local_symbol": contract.get("local_symbol", ""),
                 "expiry": contract.get("expiry", ""),
                 "multiplier": contract.get("multiplier", ""),
+                # Option identity (blank for stocks/futures) — rides along
+                # so the worker's conId→metadata map can enrich fills,
+                # whose lean-contract executions arrive without them.
+                "strike": contract.get("strike") or 0.0,
+                "right": contract.get("right", "") or "",
                 "account": account,
                 "action": action,
                 "qty": acct_qty,
@@ -1159,9 +1164,10 @@ class FlashTradeView(QWidget):
         """Cancel button clicked in OrderStatusPanel → route to correct worker.
 
         order_id format: ``{account}_{orderRef}``
-        The cancel is only forwarded when the order's account has its checkbox
-        checked in the AccountListPanel.  If the AccountListPanel is not
-        available the cancel is blocked entirely (fail-safe).
+        Deliberately NOT gated on the AccountListPanel checkboxes: account
+        selection scopes where NEW orders go, but a cancel targets one
+        already-identified order and reduces risk — it must work even with
+        zero accounts checked.
         """
         parts = order_id.split("_", 1)
         if len(parts) < 2:
@@ -1170,23 +1176,6 @@ class FlashTradeView(QWidget):
             return
 
         account = parts[0]
-
-        # Always require the account checkbox to be checked.
-        # get_selected_accounts() returns only accounts where is_checked=True,
-        # so an empty set means nothing is checked — cancel is blocked.
-        if not isinstance(self._account_list, AccountListPanel):
-            log.warning("FlashTrade: cancel blocked for order %s — "
-                        "AccountListPanel not available", order_id)
-            return
-
-        checked = set(self._account_list.get_selected_accounts())
-        if account not in checked:
-            log.warning(
-                "FlashTrade: cancel blocked for order %s — account %s "
-                "is not checked (checked: %s)",
-                order_id, account, sorted(checked) or "none",
-            )
-            return
 
         label = self._accounts_model.connection_for_account(account)
         if not label:
