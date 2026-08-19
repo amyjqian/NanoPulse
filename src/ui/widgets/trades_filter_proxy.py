@@ -322,17 +322,23 @@ class TradesFilterProxy(QSortFilterProxyModel):
                                if self._preset_threshold is not None
                                else self._time_threshold)
         if effective_threshold is not None:
-            time_sort = data.get("time_sort", "")
-            if time_sort:
-                try:
-                    ts = datetime.fromisoformat(time_sort)
-                except ValueError:
-                    ts = None
-                if ts is not None:
-                    if ts.tzinfo is None:
+            # Prefer the parse-once stamp the summary model puts on the
+            # shared fill dict (see ``stamp_fill``) — re-parsing here per
+            # row per filter pass was a measurable per-tick cost.
+            if "_ts_dt" in data:
+                ts = data["_ts_dt"]
+            else:
+                ts = None
+                time_sort = data.get("time_sort", "")
+                if time_sort:
+                    try:
+                        ts = datetime.fromisoformat(time_sort)
+                    except ValueError:
+                        ts = None
+                    if ts is not None and ts.tzinfo is None:
                         ts = ts.replace(tzinfo=_ET)
-                    if ts < effective_threshold:
-                        return False
+            if ts is not None and ts < effective_threshold:
+                return False
 
         # Substring search — match across the per-view key set.  Keys
         # whose value is a set/list (e.g. summary "exchanges") are
@@ -364,9 +370,16 @@ class TradesFilterProxy(QSortFilterProxyModel):
         if (not self._is_summary
                 and self._days_back > 0
                 and effective_threshold is None):
-            time_sort = data.get("time_sort", "")
-            if time_sort and not self._within_days(time_sort, self._days_back):
-                return False
+            local = data.get("_ts_date")   # stamp_fill parse-once stamp
+            if local is not None:
+                if local < trading_days_cutoff(self._anchor_date,
+                                               self._days_back):
+                    return False
+            elif "_ts_date" not in data:
+                time_sort = data.get("time_sort", "")
+                if time_sort and not self._within_days(
+                        time_sort, self._days_back):
+                    return False
 
         return True
 

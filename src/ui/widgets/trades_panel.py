@@ -413,6 +413,12 @@ class TradesPanel(QWidget):
             count = self._summary_model.visible_fill_count()
         else:
             count = self._flat_proxy.rowCount()
+        # Price ticks fire the summary's dataChanged without changing any
+        # fill count — skip the control-bar restyle (a full QSS re-polish
+        # of the label) unless the number actually moved.
+        if count == getattr(self, "_last_trade_count", None):
+            return
+        self._last_trade_count = count
         self._control_bar.setTradeCount(count)
 
     def _refresh_summary_threshold(self) -> None:
