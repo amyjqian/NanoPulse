@@ -30,7 +30,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QColor
 
 from src.ui.theme import Theme
-from src.utils.helpers import format_option_symbol
+from src.utils.helpers import format_option_symbol_two_line
 
 from .table_theme import CELL_FONT_BOLD, header_alignment
 
@@ -209,7 +209,9 @@ class OrderStatusModel(QAbstractTableModel):
             if col == COL_STATUS and error_msg:
                 return f"{status} ⚠"
             if col == COL_SYMBOL:
-                return format_option_symbol(order.get("symbol", "–"))
+                # Options stack root+expiry over strike+right — the shared
+                # delegate paints newline'd cells as two small-font lines.
+                return format_option_symbol_two_line(order.get("symbol", "–"))
             key = _KEY_FOR_COL.get(col)
             return order.get(key, "–") if key else None
 
@@ -317,6 +319,17 @@ class OrderStatusModel(QAbstractTableModel):
         self._order_map.clear()
         self.endResetModel()
         log.debug("OrderStatusModel: cleared all orders")
+
+    def has_order(self, order_id: str) -> bool:
+        """True if a row for *order_id* already exists."""
+        return order_id in self._order_map
+
+    def order_status(self, order_id: str) -> str:
+        """Current status string for *order_id* ("" if unknown)."""
+        row = self._order_map.get(order_id)
+        if row is None:
+            return ""
+        return self._orders[row].get("status", "")
 
     def order_at(self, row: int) -> dict | None:
         """Return the raw order dict at *row*, or None."""
