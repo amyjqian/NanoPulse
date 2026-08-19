@@ -18,7 +18,7 @@ import math
 import random
 import string
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from src.core.enums import OrderAction, OrderType
@@ -662,6 +662,12 @@ class IBWorkerThread(QThread):
         zeroed = 0
         for key, cached in list(self._portfolio_cache.items()):
             if key not in current_keys:
+                # Only the flat *transition* emits (and logs): entries
+                # already at zero were announced on an earlier refresh,
+                # and re-emitting every historically-flat position made
+                # the batch (and this log) grow monotonically all day.
+                if cached.get("position", 0.0) == 0.0:
+                    continue
                 zero = dict(cached)
                 zero["position"]     = 0.0
                 zero["market_value"] = 0.0
@@ -3906,6 +3912,13 @@ class IBWorkerThread(QThread):
         * _portfolio_cache entries for zero-position instruments whose
           reqPnLSingle subscription has already been cancelled (they will
           never receive another update).
+        * _fills_cache entries older than 10 calendar days — comfortably
+          past the UI's widest preset (7 trading days), and the fills
+          snapshot is the Trades tab's source of truth after a rewire,
+          so nothing a preset can show is dropped.
+        * _order_status_cache entries for terminal orders from previous
+          days (today's stay: the blotter shows them all session).
+        * _conid_contract_meta entries no cache references any more.
         """
         # Refs generated before the YYMMDD switch carry a 4-digit MMDD, so
         # match on both prefixes; a legacy ref simply prunes as stale on
@@ -3961,13 +3974,65 @@ class IBWorkerThread(QThread):
             self._portfolio_cache.pop(key, None)
             self._pnl_single_cache.pop(key, None)
 
-        if stale_refs or stale_rejected or stale_trades or stale_pos:
+        # ── _fills_cache ─────────────────────────────────────────────────────
+        # time_sort is ISO-style, so a lexicographic date compare works.
+        fills_cutoff = (now_et - timedelta(days=10)).date().isoformat()
+        stale_fills = [
+            eid for eid, f in self._fills_cache.items()
+            if (f.get("time_sort", "") or "")[:10] < fills_cutoff
+            and f.get("time_sort")
+        ]
+        for eid in stale_fills:
+            self._fills_cache.pop(eid, None)
+
+        # ── _order_status_cache ──────────────────────────────────────────────
+        terminal = ("Filled", "Cancelled", "Canceled",
+                    "Inactive", "ApiCancelled", "Completed",
+                    "Rejected", "ValidationError")
+        today_iso = now_et.date().isoformat()
+        stale_status: list[str] = []
+        for oid, d in self._order_status_cache.items():
+            if d.get("status", "") not in terminal:
+                continue
+            if today_prefix in oid or legacy_prefix in oid:
+                continue   # today's internal order — keep
+            ts = d.get("time_sort", "") or ""
+            if ts and ts[:10] < today_iso:
+                stale_status.append(oid)
+            elif not ts and "_nano_" in oid:
+                # Internal ref from a previous day (prefix check above
+                # already excluded today's) with no timestamp.
+                stale_status.append(oid)
+        for oid in stale_status:
+            self._order_status_cache.pop(oid, None)
+
+        # ── _conid_contract_meta ─────────────────────────────────────────────
+        if self._conid_contract_meta:
+            referenced: set[int] = set()
+            for f in self._fills_cache.values():
+                cid = f.get("con_id", 0)
+                if cid:
+                    referenced.add(int(cid))
+            for trade in self._trades.values():
+                cid = getattr(getattr(trade, "contract", None), "conId", 0)
+                if cid:
+                    referenced.add(int(cid))
+            for (_acct, cid) in self._portfolio_cache:
+                referenced.add(int(cid))
+            for cid in [c for c in self._conid_contract_meta
+                        if c not in referenced]:
+                self._conid_contract_meta.pop(cid, None)
+
+        if (stale_refs or stale_rejected or stale_trades or stale_pos
+                or stale_fills or stale_status):
             log.debug(
                 "Worker %s: pruned %d order refs, %d rejected orders, "
-                "%d stale trades, %d flat positions",
+                "%d stale trades, %d flat positions, %d old fills, "
+                "%d old status entries",
                 self._label,
                 len(stale_refs), len(stale_rejected),
-                len(stale_trades), len(stale_pos))
+                len(stale_trades), len(stale_pos),
+                len(stale_fills), len(stale_status))
 
     def _on_account_summary(self, value) -> None:
         """De-duplicate rapid ticks into the buffer dict.
@@ -4215,9 +4280,17 @@ class IBWorkerThread(QThread):
     def _on_ib_error(self, reqId, errorCode, errorString, contract) -> None:
         """Handle IB error events – detect market-data failures like 10197
         and order rejections like 201."""
-        tws_log.warning("[%s] EVENT     errorEvent → reqId=%s errorCode=%s "
-                        "errorString=%s contract=%s",
-                        self._label, reqId, errorCode, errorString, contract)
+        if errorCode in (2104, 2106, 2158):
+            # Routine farm-status notices arrive constantly; skip the
+            # Contract repr (a full dataclass format) for them.
+            tws_log.warning("[%s] EVENT     errorEvent → reqId=%s "
+                            "errorCode=%s errorString=%s",
+                            self._label, reqId, errorCode, errorString)
+        else:
+            tws_log.warning("[%s] EVENT     errorEvent → reqId=%s "
+                            "errorCode=%s errorString=%s contract=%s",
+                            self._label, reqId, errorCode, errorString,
+                            contract)
 
         # Error 354 — "Requested market data is not subscribed."  The
         # options ticket first tries frozen data (type 2), which needs a
@@ -4300,6 +4373,22 @@ class IBWorkerThread(QThread):
 
     # ── Global order listener ─────────────────────────────────────────────────
 
+    @staticmethod
+    def _trade_order_key(order, order_status) -> str:
+        """Canonical order key for a Trade — the exact derivation
+        ``_build_trade_dict`` uses (see its docstring for the rules).
+        Split out so ``_on_global_order_status`` can decide to skip a
+        handled order without building the full dict."""
+        order_ref = getattr(order, "orderRef", "") or ""
+        acct = getattr(order, "account", "") or ""
+        if order_ref.startswith("nano_"):
+            return f"{acct}_{order_ref}"
+        perm_id = getattr(order, "permId", 0) or getattr(
+            order_status, "permId", 0)
+        if perm_id:
+            return f"{acct}_p{perm_id}"
+        return f"{acct}_{order.orderId}"
+
     def _build_trade_dict(self, trade, fill_map: dict | None = None) -> dict | None:
         """Build an order-status dict from an ib_async Trade object.
 
@@ -4337,13 +4426,9 @@ class IBWorkerThread(QThread):
                 trade.orderStatus, "permId", 0)
             acct = getattr(order, "account", "") or ""
 
-            if order_ref.startswith("nano_"):
-                # Internal NanoPulse order — account + orderRef is immutable.
-                order_id = f"{acct}_{order_ref}"
-            elif perm_id:
-                order_id = f"{acct}_p{perm_id}"
-            else:
-                order_id = f"{acct}_{order.orderId}"
+            # Single source of truth for the key — shared with the
+            # global handler's early skip.
+            order_id = self._trade_order_key(order, trade.orderStatus)
 
             # ── Fill price ────────────────────────────────────────────────
             # 1. orderStatus.avgFillPrice (populated for live orders)
@@ -4709,11 +4794,24 @@ class IBWorkerThread(QThread):
         restored from snapshot do NOT have closures, so we must emit for
         them here — otherwise cancel/fill updates after reconnect are lost.
         """
+        # Skip BEFORE building the full dict: this global callback fires
+        # for every status of every order, and for session-placed orders
+        # the per-trade closure already emits AND writes the same
+        # tws_log/order_log lines — paying ~200 lines of attribute
+        # walking (plus a duplicate disk write) per event just to throw
+        # the result away was measurable all day.
+        try:
+            if (self._trade_order_key(trade.order, trade.orderStatus)
+                    in self._has_status_handler):
+                return
+        except Exception:
+            pass   # fall through to the full build, which guards itself
+
         d = self._build_trade_dict(trade)
         if not d:
             return
 
-        # Log every global order status event to TWS log
+        # Log every unhandled global order status event to TWS log
         tws_log.info("[%s] EVENT     global orderStatusEvent → orderId=%s "
                      "status=%s symbol=%s action=%s filled=%s avgFill=%s "
                      "orderRef=%s permId=%s",
@@ -4727,12 +4825,7 @@ class IBWorkerThread(QThread):
                      d.get("order_ref", ""),
                      getattr(trade.order, "permId", 0))
 
-        # Only skip if a per-trade _on_status closure is handling this order.
-        # Snapshot-registered trades (in _trades but NOT _has_status_handler)
-        # must be emitted here so cancel/fill status reaches the UI.
         order_id = d["order_id"]
-        if order_id in self._has_status_handler:
-            return
 
         # Log to order log for external or snapshot-restored orders
         order_log.info("[%s] ORDER-STATUS  %s | status=%s symbol=%s "

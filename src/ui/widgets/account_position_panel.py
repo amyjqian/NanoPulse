@@ -537,6 +537,16 @@ class CloseControlDelegate(QStyledItemDelegate):
 
     # ── interaction ───────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _update_rows(view, *rows) -> None:
+        """Repaint just the given rows — a full viewport update here
+        re-ran every visible cell's data() chain per mouse move."""
+        vp = view.viewport()
+        for r in rows:
+            if r is not None and r >= 0:
+                vp.update(QRect(0, view.rowViewportPosition(r),
+                                vp.width(), view.rowHeight(r)))
+
     def eventFilter(self, obj, event) -> bool:
         """Track which segment the cursor is over, so hover is per-segment.
 
@@ -557,17 +567,19 @@ class CloseControlDelegate(QStyledItemDelegate):
                         row, seg = idx.row(), i
                         break
             if (row, seg) != (self._hover_row, self._hover_seg):
+                prev_row = self._hover_row
                 self._hover_row, self._hover_seg = row, seg
                 # Moving off an armed segment cancels it — an armed control
                 # must never be left waiting somewhere you aren't looking.
                 if self._armed is not None and (row, seg) != self._armed:
                     self._disarm()
-                view.viewport().update()
+                self._update_rows(view, prev_row, row)
         elif etype == QEvent.Type.Leave:
             self._disarm()
             if self._hover_row is not None or self._hover_seg is not None:
+                prev_row = self._hover_row
                 self._hover_row = self._hover_seg = None
-                self.parent().viewport().update()
+                self._update_rows(self.parent(), prev_row, None)
         return False
 
     def editorEvent(self, event: QEvent, model,

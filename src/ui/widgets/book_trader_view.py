@@ -36,6 +36,7 @@ handlers route Book Trader clicks to the same worker methods):
 from __future__ import annotations
 
 import logging
+import weakref
 from pathlib import Path
 
 from PySide6.QtCore import QSize, Qt, Signal
@@ -377,8 +378,11 @@ class BookTraderView(QWidget):
         self._live_orders: dict[str, dict] = {}
         # Workers whose ``order_status_updated`` signal is already
         # connected to our slot.  Tracked so we don't double-connect on
-        # repeat ``_wire_order_status`` calls.
-        self._order_status_wired: set = set()
+        # repeat ``_wire_order_status`` calls.  A WeakSet so replaced /
+        # disconnected IBWorkerThread objects aren't kept alive for the
+        # app's lifetime; a NEW worker under the same label is a
+        # different object and gets wired as before.
+        self._order_status_wired: weakref.WeakSet = weakref.WeakSet()
 
         # Ladder model/view (built first so _reload_tier_sections can call it).
         # ``rows_each_side`` defaults to 20 → 41-row ladder; the view scrolls
