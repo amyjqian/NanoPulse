@@ -51,8 +51,9 @@ class TestChipLabels:
     def test_occ_chip_gets_compact_small_label(self, qtbot):
         bar = self._bar(qtbot)
         chip = bar._buttons[_OCC.upper()]
-        # Two-line label: root on top, expiry/strike/right underneath.
-        assert chip.text() == "QQQ\nAug7 670 P"
+        # Two-line label: root + expiry on top, strike + right underneath
+        # (same split as the Positions/Trades/Orders symbol columns).
+        assert chip.text() == "QQQ Aug7\n670 P"
         assert chip.property("chip_small") is True
         assert "font-size:9px" in chip.styleSheet()
 

@@ -17,6 +17,7 @@ from PySide6.QtCore import QEvent, QItemSelectionModel, QObject, QRect, Qt
 from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QSizePolicy,
     QSpacerItem,
     QStyle,
@@ -61,6 +62,11 @@ SELECTION_BG = Theme.POS_ROW_SELECTED
 BG_FIELD     = "#161a24"
 
 ROW_H = 32
+
+# Font size for cells that stack two lines into the fixed row height
+# (option symbols: root + expiry over strike + right).  Two lines at
+# 9px fit inside ROW_H with the separator; the regular 11px would not.
+TWO_LINE_FONT_PX = 9
 
 # Horizontal room a cell loses before it can draw text: the stylesheet's
 # padding each side, the style's own item margin, and a few px of slack so
@@ -384,6 +390,56 @@ def paint_separator_line(painter: QPainter, rect: QRect) -> None:
     painter.restore()
 
 
+def paint_two_line_cell(delegate: QStyledItemDelegate, painter: QPainter,
+                        option: QStyleOptionViewItem, index) -> bool:
+    """Paint a cell whose display text carries a newline as two stacked
+    lines at ``TWO_LINE_FONT_PX`` (option symbols: root + expiry over
+    strike + right, from ``format_option_symbol_two_line``).
+
+    Background, hover, band and selection still go through *delegate*'s
+    ``initStyleOption`` + the style's item painting with the text
+    blanked, so the cell chrome matches every other cell.  Returns False
+    for ordinary single-line cells — the caller falls back to its normal
+    paint.  Any delegate may call this from ``paint`` before its default
+    text pass.
+    """
+    text = index.data(Qt.ItemDataRole.DisplayRole)
+    if not isinstance(text, str) or "\n" not in text:
+        return False
+    opt = QStyleOptionViewItem(option)
+    delegate.initStyleOption(opt, index)
+    opt.text = ""
+    widget = opt.widget
+    style = widget.style() if widget is not None else QApplication.style()
+    style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt,
+                      painter, widget)
+
+    top, _, bottom = text.partition("\n")
+    font = QFont(opt.font)
+    font.setPixelSize(TWO_LINE_FONT_PX)
+    fm = QFontMetrics(font)
+    fg = index.data(Qt.ItemDataRole.ForegroundRole)
+    if isinstance(fg, QBrush):
+        fg = fg.color()
+    color = fg if isinstance(fg, QColor) else opt.palette.text().color()
+    h_align = opt.displayAlignment & Qt.AlignmentFlag.AlignHorizontal_Mask
+    flags = int(h_align | Qt.AlignmentFlag.AlignVCenter)
+    rect = opt.rect.adjusted(CELL_PAD_H, 0, -CELL_PAD_H, 0)
+    half = rect.height() // 2
+    painter.save()
+    painter.setFont(font)
+    painter.setPen(QPen(color))
+    painter.drawText(
+        QRect(rect.left(), rect.top(), rect.width(), half), flags,
+        fm.elidedText(top, Qt.TextElideMode.ElideRight, rect.width()))
+    painter.drawText(
+        QRect(rect.left(), rect.top() + half, rect.width(),
+              rect.height() - half), flags,
+        fm.elidedText(bottom, Qt.TextElideMode.ElideRight, rect.width()))
+    painter.restore()
+    return True
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  RowHoverDelegate – shared row-hover tracking
 # ══════════════════════════════════════════════════════════════════════════════
@@ -473,7 +529,8 @@ class FooterAwareRowDelegate(RowHoverDelegate):
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem,
               index) -> None:
-        super().paint(painter, option, index)
+        if not paint_two_line_cell(self, painter, option, index):
+            super().paint(painter, option, index)
         if self._is_footer(index):
             return
         below = index.sibling(index.row() + 1, index.column())

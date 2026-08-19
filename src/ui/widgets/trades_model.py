@@ -15,7 +15,7 @@ from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
 from PySide6.QtGui import QColor
 
 from src.ui.theme import Theme
-from src.utils.helpers import format_option_symbol
+from src.utils.helpers import format_option_symbol_two_line
 
 from .table_theme import (
     CELL_FONT, CELL_FONT_BOLD, GroupKeyRole, SortValueRole, header_alignment)
@@ -255,7 +255,9 @@ class TradesModel(QAbstractTableModel):
         if col == COL_SYMBOL:
             # Prefer localSymbol ("NQM6") over root symbol ("NQ") so the
             # trades blotter matches the orders blotter and positions view.
-            return format_option_symbol(
+            # Options stack root+expiry over strike+right — the shared
+            # delegate paints newline'd cells as two small-font lines.
+            return format_option_symbol_two_line(
                 row.get("local_symbol", "") or row.get("symbol", "") or "")
         if col == COL_SECTYPE:
             return row.get("sec_type", "") or ""

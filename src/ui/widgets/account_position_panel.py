@@ -215,7 +215,10 @@ class AccountHeaderInfoDelegate(QStyledItemDelegate):
     def paint(self, painter: QPainter, option: QStyleOptionViewItem,
               index) -> None:
         if index.data(RowTypeRole) != ROW_TYPE_HEADER:
-            super().paint(painter, option, index)
+            # Option symbols stack root+expiry over strike+right at a
+            # smaller font — same treatment as the shared row delegates.
+            if not tt.paint_two_line_cell(self, painter, option, index):
+                super().paint(painter, option, index)
             _draw_row_separator(painter, option, index)
             return
 

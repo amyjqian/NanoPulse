@@ -29,7 +29,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QBrush, QColor
 
 from src.ui.theme import Theme
-from src.utils.helpers import format_option_symbol
+from src.utils.helpers import format_option_symbol_two_line
 
 from .table_theme import CELL_FONT, CELL_FONT_BOLD
 
@@ -339,7 +339,10 @@ class AccountPositionModel(QAbstractTableModel):
 
         if role == Qt.ItemDataRole.DisplayRole:
             if col == COL_SYMBOL:
-                return format_option_symbol(
+                # Options stack root+expiry over strike+right — the symbol
+                # column delegate paints newline'd cells as two small-font
+                # lines (see table_theme.paint_two_line_cell).
+                return format_option_symbol_two_line(
                     rd.get("local_symbol") or rd.get("symbol", ""))
             if col == COL_DAY_PNL:
                 v = pnl_s.get("daily_pnl", rd.get("daily_pnl", float("nan")))

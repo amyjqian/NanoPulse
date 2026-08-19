@@ -18,6 +18,24 @@ _OCC_OPTION_RE = re.compile(
     r"^([A-Z][A-Z0-9.]*)\s*(\d{2})(\d{2})(\d{2})([CP])(\d{8})$")
 
 
+def _parse_occ_option(symbol: str) -> tuple[str, str, str, str] | None:
+    """Split an OCC option localSymbol into display parts.
+
+    ``"QQQ 260807P00670000"`` → ``("QQQ", "Aug7", "670", "P")``;
+    ``None`` for anything that isn't an OCC string (stocks, futures,
+    already-formatted text).
+    """
+    m = _OCC_OPTION_RE.match((symbol or "").strip())
+    if not m:
+        return None
+    root, _yy, mm, dd, right, strike_raw = m.groups()
+    month = int(mm)
+    if not 1 <= month <= 12:
+        return None
+    strike = int(strike_raw) / 1000.0
+    return root, f"{_MONTH_ABBR[month]}{int(dd)}", f"{strike:g}", right
+
+
 def format_option_symbol(symbol: str) -> str:
     """Pretty-print an OCC option localSymbol for display.
 
@@ -28,15 +46,28 @@ def format_option_symbol(symbol: str) -> str:
     positions on the raw localSymbol, so never feed the result back
     into order routing.
     """
-    m = _OCC_OPTION_RE.match((symbol or "").strip())
-    if not m:
+    parts = _parse_occ_option(symbol)
+    if parts is None:
         return symbol
-    root, _yy, mm, dd, right, strike_raw = m.groups()
-    month = int(mm)
-    if not 1 <= month <= 12:
+    root, expiry, strike, right = parts
+    return f"{root} {expiry} {strike} {right}"
+
+
+def format_option_symbol_two_line(symbol: str) -> str:
+    """Two-line variant of :func:`format_option_symbol` for table cells.
+
+    ``"QQQ 260807P00670000"`` → ``"QQQ Aug7\\n670 P"`` — root + expiry
+    on top, strike + right below, so a symbol column can stack an option
+    into its fixed row height at a smaller font (the shared table
+    delegate renders any newline'd cell this way — see
+    ``table_theme.FooterAwareRowDelegate``).  Non-OCC strings come back
+    unchanged, single-line.  Display-only, same as the one-line form.
+    """
+    parts = _parse_occ_option(symbol)
+    if parts is None:
         return symbol
-    strike = int(strike_raw) / 1000.0
-    return f"{root} {_MONTH_ABBR[month]}{int(dd)} {strike:g} {right}"
+    root, expiry, strike, right = parts
+    return f"{root} {expiry}\n{strike} {right}"
 
 
 def round_to_tick(price: float, tick_size: float = 0.01) -> float:
