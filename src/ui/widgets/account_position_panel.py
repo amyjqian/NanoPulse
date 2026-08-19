@@ -633,6 +633,9 @@ class AccountPositionPanel(QWidget):
             get_alias=self._get_alias, parent=self)
         self._summary_model = PositionsSummaryModel(
             self, get_alias=self._get_alias)
+        # Batches parked while the summary view is hidden, deduped per
+        # (account, con_id); folded in one go when the view is shown.
+        self._pending_summary_batch: dict[tuple[str, int], dict] = {}
         self._setup_ui()
         # Both pills start unchecked every launch (no persistence):
         # flat account-grouped view, zero positions hidden.
@@ -834,7 +837,24 @@ class AccountPositionPanel(QWidget):
 
     def update_positions(self, batch: list[dict]) -> None:
         self._model.update_positions(batch)
-        self._summary_model.update_positions(batch)
+        # The summary model re-folds every position per batch (~4×/s).
+        # While the flat view is showing, park the batches in a pending
+        # dict (deduped per position) and fold them once on switch.
+        if self._stack.currentIndex() == 1:
+            self._summary_model.update_positions(batch)
+        else:
+            pend = self._pending_summary_batch
+            for pos in batch:
+                account = pos.get("account", "")
+                con_id = pos.get("con_id")
+                if account and con_id is not None:
+                    pend[(account, int(con_id))] = pos
+
+    def _flush_pending_summary(self) -> None:
+        if self._pending_summary_batch:
+            batch = list(self._pending_summary_batch.values())
+            self._pending_summary_batch.clear()
+            self._summary_model.update_positions(batch)
 
     def update_pnl_single(self, account: str, con_id: int,
                           daily_pnl: float, realized_pnl: float,
@@ -1079,6 +1099,8 @@ class AccountPositionPanel(QWidget):
 
     def _on_summary_toggled(self, on: bool) -> None:
         self._stack.setCurrentIndex(1 if on else 0)
+        if on:
+            self._flush_pending_summary()
 
     def _on_gear_clicked(self) -> None:
         if self._open_preferences_callback:
@@ -1194,9 +1216,19 @@ class AccountPositionPanel(QWidget):
 
     def _on_model_data_changed(self, top_left, bottom_right, _roles=None) -> None:
         """Realized P&L arrives via pnlSingle after the rows are built, so the
-        column's visibility has to be re-checked on data updates too."""
+        column's visibility has to be re-checked on data updates too.
+        Coalesced to one check per event-loop turn: a 250 ms pnl flush
+        lands one dataChanged per position, and ``has_realized`` scans
+        every row — running it per position was O(N²) per flush."""
         if top_left.column() <= COL_REALIZED_PNL <= bottom_right.column():
-            self._update_realized_visibility()
+            if getattr(self, "_realized_check_pending", False):
+                return
+            self._realized_check_pending = True
+            QTimer.singleShot(0, self._realized_check_now)
+
+    def _realized_check_now(self) -> None:
+        self._realized_check_pending = False
+        self._update_realized_visibility()
 
     def _apply_summary_column_visibility(self, visible_keys: list[str]) -> None:
         visible = set(visible_keys)

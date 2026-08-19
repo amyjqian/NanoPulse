@@ -280,6 +280,9 @@ class TestPanelSignal:
             panel._on_table_row_clicked(idx)
 
     def test_summary_non_symbol_column_does_not_emit(self, panel, qtbot):
+        # Batches are parked while the flat view shows; switching to the
+        # summary view folds them (same as the user toggling Summary).
+        panel._on_summary_toggled(True)
         model = panel._summary_model
         target = next(row for row in range(model.rowCount())
                       if model.row_data(row) is not None)
@@ -287,6 +290,7 @@ class TestPanelSignal:
             panel._on_summary_row_clicked(model.index(target, 1))
 
     def test_summary_row_emits_with_blank_account(self, panel, qtbot):
+        panel._on_summary_toggled(True)
         model = panel._summary_model
         target = None
         for row in range(model.rowCount()):
@@ -302,6 +306,7 @@ class TestPanelSignal:
         assert "accounts" not in payload
 
     def test_summary_total_row_does_not_emit(self, panel, qtbot):
+        panel._on_summary_toggled(True)
         model = panel._summary_model
         total_row = None
         for row in range(model.rowCount()):

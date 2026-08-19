@@ -311,6 +311,9 @@ class IBWorkerThread(QThread):
     # per-position P&L from pnlSingleEvent
     # (account, con_id, daily_pnl, realized_pnl, unrealized_pnl)
     pnl_single_updated = Signal(str, int, float, float, float)
+    # Batched form: [(account, con_id, daily, realized, unrealized), …] —
+    # one QMetaCallEvent per 250 ms flush instead of one per position.
+    pnl_single_batch_updated = Signal(list)
     # account-level P&L from pnlEvent
     # (account, daily_pnl, realized_pnl, unrealized_pnl)
     account_pnl_updated = Signal(str, float, float, float)
@@ -388,6 +391,12 @@ class IBWorkerThread(QThread):
         self._depth_tickers: dict[str, object] = {}
         self._ticker_to_depth_sym: dict[int, str] = {}
         self._depth_dirty: set[str] = set()
+        # L1 price coalescing (same 100 ms cadence as depth): raw ticks
+        # mark these dirty; ``_depth_flush_loop`` emits at most 10×/s per
+        # symbol.  Subscribe paths still emit directly for instant first
+        # paint.
+        self._active_price_dirty: bool = False
+        self._bg_price_dirty: dict[str, object] = {}
 
         # Order tracking: order_id → Trade
         self._trades: dict[str, object] = {}
@@ -1114,6 +1123,9 @@ class IBWorkerThread(QThread):
                 self._depth_tickers.clear()
                 self._ticker_to_depth_sym.clear()
                 self._depth_dirty.clear()
+                # Pending coalesced L1 emits reference dead tickers.
+                self._active_price_dirty = False
+                self._bg_price_dirty.clear()
                 # Clear pnlSingle subscriptions so they are re-established
                 # after reconnect (IB drops all subscriptions on disconnect).
                 self._pnl_single_subs.clear()
@@ -1216,16 +1228,19 @@ class IBWorkerThread(QThread):
                 self._portfolio_buffer.clear()
                 self.portfolio_updated.emit(p_batch)
 
-            # RC #1: flush pnl_single buffer — at most 4 batch emissions/second
-            # instead of one QMetaCallEvent per raw pnlSingleEvent tick.
+            # RC #1: flush pnl_single buffer — ONE list-payload signal per
+            # 250 ms window instead of one QMetaCallEvent per position.
             # The dict naturally de-duplicates: only the latest value per
-            # (account, conId) is kept, so rapid ticks collapse into one emit.
+            # (account, conId) is kept, so rapid ticks collapse into one
+            # batch entry.
             if self._pnl_single_buffer:
-                for (acct, con_id), (daily, realized, unrealized) in \
-                        list(self._pnl_single_buffer.items()):
-                    self.pnl_single_updated.emit(
-                        acct, con_id, daily, realized, unrealized)
+                pnl_batch = [
+                    (acct, con_id, daily, realized, unrealized)
+                    for (acct, con_id), (daily, realized, unrealized)
+                    in self._pnl_single_buffer.items()
+                ]
                 self._pnl_single_buffer.clear()
+                self.pnl_single_batch_updated.emit(pnl_batch)
 
             # RC #3: process deferred pnlSingle cancellations for flat positions.
             # Positions that reached zero ≥60 s ago have their reqPnLSingle
@@ -3472,11 +3487,15 @@ class IBWorkerThread(QThread):
         tickers for the multi-symbol cache.
         """
         for ticker in tickers:
-            # Single-symbol active subscription (existing behavior)
+            # Single-symbol active subscription — mark dirty; the 100 ms
+            # flush loop coalesces bursts (same treatment as depth): the
+            # unthrottled form emitted per L1 tick and every emit fanned
+            # into ladder full-grid repaints, trades-summary marks and
+            # ticker-strip restyles on the GUI thread.
             if (self._active_ticker is not None
                     and self._active_price_symbol
                     and ticker is self._active_ticker):
-                self._on_price_update(ticker)
+                self._active_price_dirty = True
 
             # Options-income ticket quote batch (O(1) reverse index)
             if self._ticker_to_opt_conid:
@@ -3490,7 +3509,7 @@ class IBWorkerThread(QThread):
             if self._ticker_to_sym:
                 sym = self._ticker_to_sym.get(id(ticker))
                 if sym:
-                    self._emit_bg_price(sym, ticker)
+                    self._bg_price_dirty[sym] = ticker
 
             # Depth-of-market hot path: mark dirty, don't emit here — the
             # 100 ms ``_depth_flush_loop`` coalesces bursts so we don't
@@ -3571,6 +3590,7 @@ class IBWorkerThread(QThread):
             finally:
                 self._active_ticker = None
                 self._active_price_symbol = ""
+                self._active_price_dirty = False
 
     # ── Background market data (multi-symbol cache) ───────────────────────────
 
@@ -3656,6 +3676,7 @@ class IBWorkerThread(QThread):
         self._bg_tickers.clear()
         self._bg_last_bid_ask.clear()    # clear stale bid/ask cache
         self._ticker_to_sym.clear()  # RC #6: clear reverse index
+        self._bg_price_dirty.clear()     # pending emits reference dead tickers
         log.debug("Worker %s: all %d bg subscriptions cleared",
                   self._label, count)
 
@@ -3769,6 +3790,22 @@ class IBWorkerThread(QThread):
         """
         while self._running:
             await asyncio.sleep(0.1)
+
+            # L1 price coalescing shares this loop's cadence: flush the
+            # active symbol and any dirty background symbols at most
+            # 10×/s each.  First paint stays instant — subscribe paths
+            # emit directly.
+            if self._active_price_dirty:
+                self._active_price_dirty = False
+                if (self._active_ticker is not None
+                        and self._active_price_symbol):
+                    self._on_price_update(self._active_ticker)
+            if self._bg_price_dirty:
+                bg_flush = self._bg_price_dirty
+                self._bg_price_dirty = {}
+                for sym, ticker in bg_flush.items():
+                    self._emit_bg_price(sym, ticker)
+
             if not self._depth_dirty:
                 continue
             for sym in list(self._depth_dirty):
