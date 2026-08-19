@@ -32,7 +32,7 @@ from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
 from PySide6.QtGui import QColor
 
 from src.ui.theme import Theme
-from src.utils.helpers import format_option_symbol
+from src.utils.helpers import format_option_symbol_two_line
 
 from .table_theme import CELL_FONT_BOLD, IsFooterRowRole
 
@@ -270,7 +270,9 @@ class PositionsSummaryModel(QAbstractTableModel):
 
     def _cell_text(self, agg: dict, col: int) -> str:
         if col == S_COL_SYMBOL:
-            return format_option_symbol(
+            # Options stack root+expiry over strike+right — the shared
+            # delegate paints newline'd cells as two small-font lines.
+            return format_option_symbol_two_line(
                 agg.get("local_symbol") or agg.get("symbol") or "")
         if col == S_COL_SEC_TYPE:
             return agg.get("sec_type", "")

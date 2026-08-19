@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.ui.theme import Theme
-from src.utils.helpers import format_option_symbol
+from src.utils.helpers import format_option_symbol_two_line
 from src.ui.widgets.size_unit_parts import (
     PCT_DEFAULT,
     PCT_POPUP,
@@ -287,11 +287,11 @@ def attach_exchange_badge(btn: QPushButton, symbol: str) -> None:
 def _apply_chip_style(btn: QPushButton, selected: bool) -> None:
     """Apply blue-selected or grey-unselected style to a symbol chip.
 
-    Duplicated verbatim from order_entry_panel._apply_chip_style so both
-    panels render chips identically.  Kept here to avoid a reverse import.
+    The single chip style for both the Order Entry and Book Trader
+    panels (order_entry_panel imports this).
 
     Chips whose ``chip_small`` property is set (option chips showing a
-    compact two-line "QQQ ⏎ Aug7 670 P" label) get a smaller font and
+    compact two-line "QQQ Aug7 ⏎ 670 P" label) get a smaller font and
     tighter padding so both lines fit the standard chip height.
     """
     if bool(btn.property("chip_small")):
@@ -533,14 +533,12 @@ class SymbolChipBar(QWidget):
 
     def _make_chip(self, sym: str, sec_type: str) -> QPushButton:
         # OCC option symbols render a compact display label in a smaller
-        # font; format_option_symbol passes every other symbol through
-        # unchanged, so STK/FUT chips are unaffected.  The label breaks
-        # after the root ("QQQ" / "Aug7 670 P") so the chip stays as
-        # narrow as a plain symbol chip.
-        disp = format_option_symbol(sym)
+        # font — root + expiry over strike + right, the same split the
+        # Positions/Trades/Orders tables use.
+        # format_option_symbol_two_line passes every other symbol through
+        # unchanged, so STK/FUT chips are unaffected.
+        disp = format_option_symbol_two_line(sym)
         is_opt = disp != sym
-        if is_opt:
-            disp = disp.replace(" ", "\n", 1)
         btn = DraggableChip(sym, sec_type, self._on_drop,
                             label=disp if is_opt else None)
         btn.setProperty("chip_small", is_opt)

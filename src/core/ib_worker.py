@@ -440,6 +440,16 @@ class IBWorkerThread(QThread):
         # after the worker has already run its initial snapshot.
         self._fills_cache: dict[str, dict] = {}
 
+        # Contract metadata per conId, captured at order-placement time.
+        # The fill-side twin of _order_symbols: ib_async attaches
+        # trade.contract to every live fill for an order it placed, and
+        # for options that contract is the lean conId-only one — so
+        # _flatten_fill would emit fills with a blank symbol/secType and
+        # a 1.0 multiplier (the Trades view then shows "—", no Type, and
+        # option notionals/P&L understated 100×).  _flatten_fill backfills
+        # blank contract fields from here instead.
+        self._conid_contract_meta: dict[int, dict] = {}
+
         # Track per-position PnL subscriptions: set of (account, conId)
         self._pnl_single_subs: set[tuple[str, int]] = set()
 
@@ -1809,6 +1819,19 @@ class IBWorkerThread(QThread):
             c.exchange = params.get("exchange") or "SMART"
             c.currency = params.get("currency", "USD")
             sec_type = params.get("sec_type", "")
+            # Remember this contract's metadata so fills can be enriched.
+            # Matters for options (lean conId-only contract below → the
+            # Trade, and therefore every live Fill, carries no
+            # symbol/secType); harmless for the rest.
+            self._conid_contract_meta[conid] = {
+                "symbol": params.get("symbol", "") or "",
+                "local_symbol": params.get("local_symbol", "") or "",
+                "sec_type": sec_type,
+                "expiry": params.get("expiry", "") or "",
+                "multiplier": params.get("multiplier", "") or "",
+                "strike": params.get("strike", 0.0) or 0.0,
+                "right": params.get("right", "") or "",
+            }
             if sec_type == "OPT":
                 # Options: conId + exchange ONLY.  TWS rejects option
                 # orders whose request carries redundant identifiers
@@ -4488,7 +4511,7 @@ class IBWorkerThread(QThread):
                 if not math.isnan(rf) and abs(rf) < _IB_DBL_MAX:
                     realized_pnl = rf
 
-        return {
+        d = {
             "exec_id":       exec_id,
             "time":          et_time.strftime("%b%d %H:%M:%S") if et_time else "",
             "time_sort":     et_time.isoformat() if et_time else "",
@@ -4518,6 +4541,28 @@ class IBWorkerThread(QThread):
             "last_liquidity": int(getattr(ex, "lastLiquidity", 0) or 0) if ex is not None else 0,
             "label":         self._label,
         }
+
+        # Option orders are placed on a lean conId-only contract (TWS
+        # error 478 workaround in _do_place_order), and ib_async hands
+        # live fills that same contract — blank symbol/secType and no
+        # multiplier.  Backfill the blanks from the metadata captured at
+        # placement time so the Trades view gets a labeled row and the
+        # OPT multiplier default (×100) can kick in.
+        if d["con_id"] and not d["symbol"] and not d["local_symbol"]:
+            meta = self._conid_contract_meta.get(d["con_id"])
+            if meta:
+                d["symbol"] = meta["symbol"]
+                d["local_symbol"] = meta["local_symbol"]
+                d["sec_type"] = d["sec_type"] or meta["sec_type"]
+                if d["multiplier"] == 1.0:
+                    d["multiplier"] = _parse_multiplier(meta["multiplier"])
+                if not d["expiry"]:
+                    d["expiry"] = meta["expiry"]
+                if not d["strike"]:
+                    d["strike"] = float(meta["strike"] or 0.0)
+                if not d["right"]:
+                    d["right"] = meta["right"]
+        return d
 
     def _on_exec_details(self, trade, fill) -> None:
         """Live execDetailsEvent → emit + cache a flattened fill dict."""

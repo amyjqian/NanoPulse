@@ -407,10 +407,20 @@ class OrderStatusPanel(QWidget):
     # ── Public data API (pass-through to model) ──────────────────────────────
 
     def add_order(self, order_id: str, data: dict[str, Any]) -> None:
+        # New rows insert at the top (newest-first sort) and fills recolour
+        # a row that may be scrolled out of view — snap back to the top so
+        # the fresh activity is visible.
+        is_new = not self._model.has_order(order_id)
+        newly_filled = (
+            not is_new
+            and data.get("status") == "Filled"
+            and self._model.order_status(order_id) != "Filled")
         self._model.add_order(order_id, data)
+        if is_new or newly_filled:
+            self._table.scrollToTop()
 
     def update_order(self, order_id: str, data: dict[str, Any]) -> None:
-        self._model.update_order(order_id, data)
+        self.add_order(order_id, data)
 
     def remove_order(self, order_id: str) -> None:
         self._model.remove_order(order_id)

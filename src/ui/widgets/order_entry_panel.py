@@ -46,7 +46,9 @@ from PySide6.QtWidgets import (
 )
 
 from src.core import config_manager
-from src.ui.widgets.order_panel_parts import DraggableChip, attach_exchange_badge
+from src.ui.widgets.order_panel_parts import (
+    DraggableChip, _apply_chip_style, attach_exchange_badge)
+from src.utils.helpers import format_option_symbol_two_line
 from src.ui.widgets.size_unit_parts import (
     PCT_DEFAULT,
     PCT_POPUP,
@@ -229,27 +231,10 @@ def _sec_type_for(sym: str) -> str:
     return instruments.get_sec_type(sym)
 
 
-def _apply_chip_style(btn: QPushButton, selected: bool) -> None:
-    """Apply blue-selected or grey-unselected style to a symbol chip button."""
-    if bool(btn.property("chip_expired")):
-        # Dead pinned future — dimmed + dashed so the user removes it.
-        btn.setStyleSheet(
-            "QPushButton{background:#1B2130;color:#5A6478;"
-            "border:1px dashed #334058;"
-            "border-radius:6px;padding:4px 12px;font-weight:500;"
-            "font-size:12px}"
-            "QPushButton:hover{background:#232A3B}")
-        return
-    if selected:
-        btn.setStyleSheet(
-            "QPushButton{background:#539BF5;color:white;border:none;"
-            "border-radius:6px;padding:4px 12px;font-weight:600;font-size:12px}"
-            "QPushButton:hover{background:#6BA8F6}")
-    else:
-        btn.setStyleSheet(
-            "QPushButton{background:#232A3B;color:#A3AFC2;border:none;"
-            "border-radius:6px;padding:4px 12px;font-weight:500;font-size:12px}"
-            "QPushButton:hover{background:#334058}")
+# _apply_chip_style lives in order_panel_parts (imported above) so the
+# Order Entry and Book Trader panels render chips identically — including
+# the small two-line option-chip variant keyed off the ``chip_small``
+# property.
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3877,7 +3862,14 @@ class OrderEntryPanel(QWidget):
 
     def _make_chip(self, sym: str, sec_type: str) -> QPushButton:
         """Create a symbol chip button (draggable within its own group)."""
-        btn = DraggableChip(sym, sec_type, self._on_chip_drop)
+        # OCC option symbols get the compact two-line label (root +
+        # expiry over strike + right) at a smaller font — same treatment
+        # as the Book Trader chip bar; STK/FUT chips are unaffected.
+        disp = format_option_symbol_two_line(sym)
+        is_opt = disp != sym
+        btn = DraggableChip(sym, sec_type, self._on_chip_drop,
+                            label=disp if is_opt else None)
+        btn.setProperty("chip_small", is_opt)
         btn.setFixedHeight(self._CHIP_HEIGHT)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         try:
