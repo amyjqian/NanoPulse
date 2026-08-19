@@ -26,6 +26,8 @@ from zoneinfo import ZoneInfo
 
 from PySide6.QtCore import QModelIndex, QSortFilterProxyModel, Qt, Signal
 
+from .table_theme import IsFooterRowRole, SortValueRole
+
 log = logging.getLogger(__name__)
 
 _ET = ZoneInfo("America/New_York")
@@ -121,6 +123,10 @@ class TradesFilterProxy(QSortFilterProxyModel):
     def __init__(self, parent=None, *, is_summary: bool = False):
         super().__init__(parent)
         self._is_summary = is_summary
+        # Header-click sorting compares raw values (floats/ints/strings)
+        # rather than the formatted display text, so 9.99 < 10.00 and
+        # "+1,234.56" doesn't sort as a string.
+        self.setSortRole(SortValueRole)
         self._search: str = ""
         # When the user types a parseable datetime, the proxy switches
         # into "time threshold" mode: flat rows are kept only if their
@@ -259,6 +265,23 @@ class TradesFilterProxy(QSortFilterProxyModel):
         Exposed so the panel can compute the preset threshold against
         the same day the Today window uses."""
         return self._anchor_date
+
+    # ── Sorting ─────────────────────────────────────────────────────────────
+
+    def lessThan(self, left: QModelIndex,
+                 right: QModelIndex) -> bool:  # noqa: N802 (Qt style)
+        """Default sort-role comparison, except the summary's totals
+        footer (the row answering ``IsFooterRowRole``) is pinned to the
+        bottom whichever column/direction is active.  Qt renders
+        descending order by inverting this comparison, so the footer's
+        answer has to flip with the current sort order to stay last."""
+        src = self.sourceModel()
+        if src is not None:
+            if src.data(left, IsFooterRowRole):
+                return self.sortOrder() == Qt.SortOrder.DescendingOrder
+            if src.data(right, IsFooterRowRole):
+                return self.sortOrder() == Qt.SortOrder.AscendingOrder
+        return super().lessThan(left, right)
 
     # ── Core filter ─────────────────────────────────────────────────────────
 

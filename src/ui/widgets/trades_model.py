@@ -18,7 +18,7 @@ from src.ui.theme import Theme
 from src.utils.helpers import format_option_symbol
 
 from .table_theme import (
-    CELL_FONT, CELL_FONT_BOLD, GroupKeyRole, header_alignment)
+    CELL_FONT, CELL_FONT_BOLD, GroupKeyRole, SortValueRole, header_alignment)
 
 log = logging.getLogger(__name__)
 
@@ -179,6 +179,8 @@ class TradesModel(QAbstractTableModel):
 
         if role == GroupKeyRole:
             return order_group_key(row)
+        if role == SortValueRole:
+            return self._sort_value(row, col)
         if role == Qt.ItemDataRole.DisplayRole:
             return self._cell_text(row, col)
         if role == Qt.ItemDataRole.ForegroundRole:
@@ -204,6 +206,48 @@ class TradesModel(QAbstractTableModel):
         if not v:
             return ""
         return f"{int(v)}" if float(v).is_integer() else f"{v:g}"
+
+    @staticmethod
+    def _sort_value(row: dict, col: int):
+        """Raw sortable value for a cell — numeric columns return numbers
+        so the sort proxy orders 9.99 < 10.00 instead of lexicographically.
+        Types are consistent per column; missing values sort as 0 / ""."""
+        if col == COL_TIME:
+            return row.get("time_sort", "") or ""
+        if col == COL_SYMBOL:
+            return (row.get("local_symbol", "")
+                    or row.get("symbol", "") or "").upper()
+        if col == COL_SECTYPE:
+            return row.get("sec_type", "") or ""
+        if col == COL_SIDE:
+            return row.get("side", "") or ""
+        if col == COL_QTY:
+            return float(row.get("shares", 0) or 0)
+        if col == COL_PRICE:
+            return float(row.get("price", 0.0) or 0.0)
+        if col == COL_EXCH:
+            return row.get("exchange", "") or ""
+        if col == COL_REF:
+            return row.get("order_ref", "") or ""
+        if col == COL_ACCOUNT:
+            return row.get("account", "") or ""
+        if col == COL_EXPIRY:
+            return row.get("expiry", "") or ""
+        if col == COL_STRIKE_RIGHT:
+            return float(row.get("strike", 0) or 0)
+        if col == COL_COMM:
+            return float(row.get("commission") or 0.0)
+        if col == COL_REAL_PNL:
+            return float(row.get("realized_pnl") or 0.0)
+        if col == COL_ORDER_ID:
+            return int(row.get("order_id", 0) or 0)
+        if col == COL_SUBMITTER:
+            return row.get("label", "") or ""
+        if col == COL_LIQUIDATION:
+            return 1 if row.get("liquidation") else 0
+        if col == COL_LAST_LIQ:
+            return int(row.get("last_liquidity", 0) or 0)
+        return ""
 
     def _cell_text(self, row: dict, col: int) -> str:
         if col == COL_TIME:
