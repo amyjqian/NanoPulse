@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import textwrap
+from bisect import bisect_right
 from typing import Any
 
 from PySide6.QtCore import (
@@ -162,8 +163,13 @@ class OrderStatusModel(QAbstractTableModel):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._orders: list[dict] = []          # row-ordered list
-        self._order_map: dict[str, int] = {}   # order_id → row index
+        # Orders oldest→newest INTERNALLY; the view presents them
+        # reversed (view row r ↔ internal position len-1-r).  New orders
+        # are the newest, so the hot path is a pure append and the map
+        # below never shifts — the previous newest-first list rewrote
+        # the whole map on every insert, O(N) per order all day.
+        self._orders: list[dict] = []
+        self._order_map: dict[str, int] = {}   # order_id → INTERNAL pos
 
     # ── Qt model interface ────────────────────────────────────────────────────
 
@@ -196,7 +202,7 @@ class OrderStatusModel(QAbstractTableModel):
         if row >= len(self._orders):
             return None
 
-        order = self._orders[row]
+        order = self._orders[len(self._orders) - 1 - row]
         order_ref = order.get("order_ref", "")
         internal = is_internal_order(order_ref)
         status = order.get("status", "")
@@ -300,15 +306,19 @@ class OrderStatusModel(QAbstractTableModel):
 
     def remove_order(self, order_id: str) -> None:
         """Remove a single order row."""
-        row = self._order_map.pop(order_id, None)
-        if row is None:
+        pos = self._order_map.pop(order_id, None)
+        if pos is None:
             return
-        self.beginRemoveRows(QModelIndex(), row, row)
-        self._orders.pop(row)
+        view_row = len(self._orders) - 1 - pos
+        self.beginRemoveRows(QModelIndex(), view_row, view_row)
+        self._orders.pop(pos)
         self.endRemoveRows()
-        # Rebuild index for rows that shifted down
-        self._rebuild_map_from(row)
-        log.debug("OrderStatusModel: removed %s (was row %d)", order_id, row)
+        # Internal positions above the removed slot shifted down by one.
+        for oid, p in self._order_map.items():
+            if p > pos:
+                self._order_map[oid] = p - 1
+        log.debug("OrderStatusModel: removed %s (was view row %d)",
+                  order_id, view_row)
 
     def clear(self) -> None:
         """Remove every row."""
@@ -326,15 +336,15 @@ class OrderStatusModel(QAbstractTableModel):
 
     def order_status(self, order_id: str) -> str:
         """Current status string for *order_id* ("" if unknown)."""
-        row = self._order_map.get(order_id)
-        if row is None:
+        pos = self._order_map.get(order_id)
+        if pos is None:
             return ""
-        return self._orders[row].get("status", "")
+        return self._orders[pos].get("status", "")
 
     def order_at(self, row: int) -> dict | None:
-        """Return the raw order dict at *row*, or None."""
+        """Return the raw order dict at VIEW *row*, or None."""
         if 0 <= row < len(self._orders):
-            return self._orders[row]
+            return self._orders[len(self._orders) - 1 - row]
         return None
 
     def order_id_at(self, row: int) -> str:
@@ -345,26 +355,34 @@ class OrderStatusModel(QAbstractTableModel):
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _insert_sorted(self, order_id: str, data: dict) -> None:
-        """Insert at the correct position to keep descending time_sort."""
+        """Insert so the VIEW stays descending by time_sort.  New orders
+        are the newest ⇒ internal append, no map maintenance."""
         data = dict(data)  # shallow copy
         data["order_id"] = order_id
         new_sort = data.get("time_sort", "")
 
-        insert_at = self._find_sorted_row(new_sort)
-        self.beginInsertRows(QModelIndex(), insert_at, insert_at)
-        self._orders.insert(insert_at, data)
+        pos = self._find_sorted_row(new_sort)
+        n = len(self._orders)
+        view_row = n - pos
+        self.beginInsertRows(QModelIndex(), view_row, view_row)
+        self._orders.insert(pos, data)
+        if pos < n:
+            # Rare non-newest insert: shift the entries above the slot.
+            for oid, p in self._order_map.items():
+                if p >= pos:
+                    self._order_map[oid] = p + 1
+        self._order_map[order_id] = pos
         self.endInsertRows()
-
-        # Rebuild map from the insertion point onward
-        self._rebuild_map_from(insert_at)
-        log.debug("OrderStatusModel: added %s at row %d", order_id, insert_at)
+        log.debug("OrderStatusModel: added %s at view row %d",
+                  order_id, view_row)
 
     def _update_existing(self, order_id: str, data: dict) -> None:
         """Surgically update an existing row — only changed columns emit
         ``dataChanged``.
         """
-        row = self._order_map[order_id]
-        order = self._orders[row]
+        pos = self._order_map[order_id]
+        order = self._orders[pos]
+        row = len(self._orders) - 1 - pos   # view row for dataChanged
 
         changed_cols: list[int] = []
         for col, key in _KEY_FOR_COL.items():
@@ -406,18 +424,14 @@ class OrderStatusModel(QAbstractTableModel):
                       order_id, row, changed_cols)
 
     def _find_sorted_row(self, new_sort: str) -> int:
-        """Return the row index to insert at so time_sort stays descending."""
-        for i, order in enumerate(self._orders):
-            if new_sort >= order.get("time_sort", ""):
-                return i
-        return len(self._orders)
-
-    def _rebuild_map_from(self, start: int) -> None:
-        """Rebuild ``_order_map`` for rows ``start`` … end."""
-        for i in range(start, len(self._orders)):
-            oid = self._orders[i].get("order_id", "")
-            if oid:
-                self._order_map[oid] = i
+        """INTERNAL position to insert at so the view stays descending.
+        ``bisect_right`` lands an equal-timestamp order after existing
+        equals internally — above them in the view, which is where the
+        old descending scan (`new_sort >= existing → insert here`) put
+        it.  A blank ``new_sort`` lands at internal 0 = the view's tail,
+        also as before."""
+        return bisect_right(self._orders, new_sort,
+                            key=lambda o: o.get("time_sort", ""))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
