@@ -622,6 +622,9 @@ class BookTraderView(QWidget):
         # sees exactly what a click would submit.
         self._ladder.set_qty_provider(self._ladder_badge_qty)
         self._ladder.set_armed_summary_provider(self._format_attached_summary)
+        # Lazily-imported OrderEntryPanel class (circular-import dodge),
+        # cached for the badge's per-mouse-move summary calls.
+        self._oep_cls = None
         # Populate tick combo for the initial contract.
         self._populate_tick_combo()
 
@@ -824,6 +827,11 @@ class BookTraderView(QWidget):
             bids.append((self._last_bid, self._last_bid_size))
         if self._last_ask > 0 and self._last_ask_size > 0:
             asks.append((self._last_ask, self._last_ask_size))
+        # feed_depth invalidates the whole grid — skip when the
+        # synthesised book is identical to the last render.
+        if (bids, asks) == getattr(self, "_l1_rendered", None):
+            return
+        self._l1_rendered = (bids, asks)
         self._model.feed_depth(bids, asks)
 
     def _on_order_status(self, data: dict) -> None:
@@ -1052,7 +1060,13 @@ class BookTraderView(QWidget):
         """
         # Reuse the helpers from OrderEntryPanel — they already do the
         # tier-section → dollar-amount math the action buttons rely on.
-        from src.ui.widgets.order_entry_panel import OrderEntryPanel as _OEP
+        # Local import dodges a circular import; cached because this
+        # runs from the ladder's mouse-move handler.
+        _OEP = self._oep_cls
+        if _OEP is None:
+            from src.ui.widgets.order_entry_panel import (
+                OrderEntryPanel as _OEP)
+            self._oep_cls = _OEP
         parts: list[str] = []
         tp = _OEP._tier_amount(self._pt_section)
         if tp is not None:

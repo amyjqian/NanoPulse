@@ -78,6 +78,18 @@ CLR_CANCEL_BTN_HOVER = Theme.POS_LOSS_HOVER
 CLR_CANCEL_BTN_PRESSED = "#8B2A28"
 CLR_CANCEL_BTN_BORDER = "#4A2A2A"
 
+# Paint-path constants, built once — the Cancel column repaints on every
+# hover move and status tick, and constructing QFont (a font-DB family
+# resolution) / QColor / QPen per cell paint showed up in profiles.
+_BTN_BG = QColor(CLR_CANCEL_BTN)
+_BTN_BG_HOVER = QColor(CLR_CANCEL_BTN_HOVER)
+_BTN_BG_PRESSED = QColor(CLR_CANCEL_BTN_PRESSED)
+_BTN_BORDER_PEN = QPen(QColor(CLR_CANCEL_BTN_BORDER), 1)
+_BTN_TEXT_COLOR = QColor(CLR_SELL)
+_BTN_FONT = QFont("Inter, Helvetica Neue, Arial", 10, QFont.Weight.Bold)
+_SELECTION_BG = QColor(SELECTION_BG)
+_TABLE_BG = QColor(tt.BG_TABLE)
+
 _TITLE_FONT = QFont("Inter, Helvetica Neue, Arial", 11)
 _TITLE_FONT.setWeight(QFont.Weight.Bold)
 
@@ -137,14 +149,14 @@ class CancelButtonDelegate(QStyledItemDelegate):
         hovered_row = src.hover_row if src else None
         bg = index.data(Qt.ItemDataRole.BackgroundRole)
         if option.state & QStyle.StateFlag.State_Selected:
-            painter.fillRect(option.rect, QColor(SELECTION_BG))
+            painter.fillRect(option.rect, _SELECTION_BG)
         elif index.row() == hovered_row:
             painter.fillRect(option.rect,
                              src.hover_brush if src else tt.ROW_HOVER_BRUSH)
         elif bg:
             painter.fillRect(option.rect, bg)
         else:
-            painter.fillRect(option.rect, QColor(tt.BG_TABLE))
+            painter.fillRect(option.rect, _TABLE_BG)
 
         tt.paint_separator_line(painter, option.rect)
 
@@ -159,19 +171,19 @@ class CancelButtonDelegate(QStyledItemDelegate):
                    and index.row() == self._pressed_row)
 
         if pressed:
-            bg_color = QColor(CLR_CANCEL_BTN_PRESSED)
+            bg_color = _BTN_BG_PRESSED
         elif hovered:
-            bg_color = QColor(CLR_CANCEL_BTN_HOVER)
+            bg_color = _BTN_BG_HOVER
         else:
-            bg_color = QColor(CLR_CANCEL_BTN)
+            bg_color = _BTN_BG
 
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QPen(QColor(CLR_CANCEL_BTN_BORDER), 1))
+        painter.setPen(_BTN_BORDER_PEN)
         painter.setBrush(bg_color)
         painter.drawRoundedRect(btn_rect, self._BTN_RADIUS, self._BTN_RADIUS)
 
-        painter.setPen(QColor(CLR_SELL))
-        painter.setFont(QFont("Inter, Helvetica Neue, Arial", 10, QFont.Weight.Bold))
+        painter.setPen(_BTN_TEXT_COLOR)
+        painter.setFont(_BTN_FONT)
         painter.drawText(btn_rect, Qt.AlignmentFlag.AlignCenter, self._BTN_TEXT)
 
         painter.restore()

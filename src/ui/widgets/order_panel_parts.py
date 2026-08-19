@@ -242,9 +242,13 @@ class TickerStrip(QWidget):
             colour = Theme.CLR_SELL
         else:
             colour = Theme.TEXT_DIM
-        ss = f"color: {colour}; border: none;"
-        self._lbl_change.setStyleSheet(ss)
-        self._lbl_change_pct.setStyleSheet(ss)
+        # Restyle only when the colour flips — setStyleSheet forces a
+        # full re-polish and this runs on every tick of the strip.
+        if colour != getattr(self, "_change_colour", None):
+            self._change_colour = colour
+            ss = f"color: {colour}; border: none;"
+            self._lbl_change.setStyleSheet(ss)
+            self._lbl_change_pct.setStyleSheet(ss)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

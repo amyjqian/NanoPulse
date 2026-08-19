@@ -105,7 +105,14 @@ def apply_sized_chip_style(btn: QPushButton, selected: bool, unit: str,
                            enabled: bool = True) -> None:
     """Chip style per unit.  SH uses the original stylesheets verbatim;
     PCT is the gold pair; a disabled chip (percent resolves to 0 or no
-    live price) greys out and stops accepting clicks (spec §4)."""
+    live price) greys out and stops accepting clicks (spec §4).
+
+    No-op when nothing changed: in percent mode every price tick
+    restyles every chip, and each setStyleSheet is a full re-polish."""
+    state = (selected, unit, enabled)
+    if state == getattr(btn, "_chip_style_state", None):
+        return
+    btn._chip_style_state = state
     if not enabled:
         btn.setStyleSheet(_CHIP_DISABLED)
         btn.setEnabled(False)

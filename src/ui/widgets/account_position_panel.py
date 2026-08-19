@@ -305,6 +305,18 @@ _SEG_FONT = QFont("Inter, Helvetica Neue, Arial")
 _SEG_FONT.setPixelSize(11)
 _SEG_FONT.setWeight(QFont.Weight.DemiBold)
 
+# The font never changes, so its metrics are computed once — lazily,
+# because QFontMetrics needs a live QGuiApplication.  Constructing it
+# per segment-rect computation / cell paint was measurable on hover.
+_SEG_FM: QFontMetrics | None = None
+
+
+def _seg_metrics() -> QFontMetrics:
+    global _SEG_FM
+    if _SEG_FM is None:
+        _SEG_FM = QFontMetrics(_SEG_FONT)
+    return _SEG_FM
+
 # ── Position column definitions (configurable via Column Management) ───────────
 _POS_COL_KEYS = [
     "symbol", "day_pnl", "qty", "unrealized_pnl",
@@ -416,7 +428,7 @@ class CloseControlDelegate(QStyledItemDelegate):
         right-aligned control drifts with the panel's width and lands a
         long way from the numbers it acts on.
         """
-        fm      = QFontMetrics(_SEG_FONT)
+        fm      = _seg_metrics()
         widths  = self._seg_widths(fm)
         h       = min(_SEG_H, cell_rect.height() - 2)
         x       = cell_rect.left() + _SEG_MARGIN_L
@@ -605,7 +617,7 @@ class CloseControlDelegate(QStyledItemDelegate):
     # ── size hint ─────────────────────────────────────────────────────────────
 
     def sizeHint(self, option: QStyleOptionViewItem, index) -> QSize:
-        fm = QFontMetrics(_SEG_FONT)
+        fm = _seg_metrics()
         return QSize(self._control_width(fm) + _SEG_MARGIN_R + 8, _SEG_H + 6)
 
 
@@ -804,7 +816,7 @@ class AccountPositionPanel(QWidget):
             self._table.setColumnWidth(
                 col, tt.default_column_width(fm, hdr_fm, sample, HEADERS[col]))
         # The close control sizes itself from its own font, not the table's.
-        seg_fm = QFontMetrics(_SEG_FONT)
+        seg_fm = _seg_metrics()
         self._table.setColumnWidth(
             COL_FLATTEN,
             CloseControlDelegate._control_width(seg_fm) + _SEG_MARGIN_R + 8)

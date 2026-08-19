@@ -26,7 +26,8 @@ from __future__ import annotations
 
 from typing import Callable, Literal
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPoint, Qt, QTimer, Signal
+from PySide6.QtCore import (
+    QAbstractTableModel, QModelIndex, QPoint, QRect, Qt, QTimer, Signal)
 from PySide6.QtGui import QColor, QFont, QPainter
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -286,6 +287,10 @@ class DOMLadderModel(QAbstractTableModel):
         """Update the last-traded price highlight and its tick direction."""
         price = float(price or 0.0)
         if price <= 0:
+            return
+        if price == self._last:
+            # Identical print: highlight, direction and above/below
+            # colouring are all unchanged — skip the grid-wide repaint.
             return
         if self._last > 0:
             if price > self._last:
@@ -572,7 +577,6 @@ class DOMLadderDelegate(QStyledItemDelegate):
             # Inner edge of ask cell = left side
             x = rect.left() + 2
         y = rect.top() + 3
-        from PySide6.QtCore import QRect
         badge = QRect(x, y, badge_w, badge_h)
 
         colour = QColor(Theme.CLR_BUY if is_bid else Theme.CLR_SELL)
@@ -749,6 +753,9 @@ class DOMLadderView(QTableView):
         self._hover_badge.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self._hover_badge.hide()
+        # (side, text) last rendered into the badge — mouse-move only
+        # repositions when unchanged.
+        self._badge_rendered: tuple[str, str] | None = None
         # Optional providers — host (BookTraderView) wires these so the
         # badge can read the current order qty + armed-tier summary.
         self._qty_provider: Callable[[str], int] | None = None
@@ -834,18 +841,24 @@ class DOMLadderView(QTableView):
             except Exception:
                 secondary = ""
         text = primary if not secondary else f"{primary}\n{secondary}"
-        self._hover_badge.setText(text)
-        self._hover_badge.setStyleSheet(
-            f"QLabel#ladderHoverBadge {{"
-            f"background:{bg};color:{fg};"
-            f"border:1px solid {fg};border-radius:3px;"
-            f"padding:2px 6px}}")
-        self._hover_badge.adjustSize()
-        # QSS padding (2px 6px) + 1px border are NOT part of a QLabel's
-        # sizeHint — without this allowance longer texts ("Buy 13,449")
-        # clip at both edges.
-        self._hover_badge.resize(self._hover_badge.width() + 16,
-                                 self._hover_badge.height() + 6)
+        # Mouse-move fires this per pixel; re-rendering the badge (a
+        # setStyleSheet is a full re-polish) when neither side nor text
+        # changed just moves work onto every hover frame — reposition
+        # only in that case.
+        if (side, text) != self._badge_rendered:
+            self._badge_rendered = (side, text)
+            self._hover_badge.setText(text)
+            self._hover_badge.setStyleSheet(
+                f"QLabel#ladderHoverBadge {{"
+                f"background:{bg};color:{fg};"
+                f"border:1px solid {fg};border-radius:3px;"
+                f"padding:2px 6px}}")
+            self._hover_badge.adjustSize()
+            # QSS padding (2px 6px) + 1px border are NOT part of a QLabel's
+            # sizeHint — without this allowance longer texts ("Buy 13,449")
+            # clip at both edges.
+            self._hover_badge.resize(self._hover_badge.width() + 16,
+                                     self._hover_badge.height() + 6)
         bw = self._hover_badge.width()
         bh = self._hover_badge.height()
         # BUY hovers sit in the left bid column → place the badge to the
