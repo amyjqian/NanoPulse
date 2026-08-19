@@ -21,7 +21,8 @@ from PySide6.QtGui import QColor
 
 from src.ui.theme import Theme
 from src.ui.widgets.trades_filter_proxy import today_et, trading_days_cutoff
-from src.utils.helpers import format_option_symbol
+from src.utils.helpers import (
+    format_option_symbol, format_option_symbol_two_line)
 
 from .table_theme import (
     CELL_FONT_BOLD, IsFooterRowRole, SortValueRole, header_alignment)
@@ -105,7 +106,7 @@ _S_NUM_COLS = len(S_HEADERS)
 # into dollars.
 _WALK_KEYS: tuple[str, ...] = (
     "paired_qty", "paired_buys_notional", "paired_sells_notional",
-    "paired_comm", "closing_realized", "closing_comm",
+    "paired_comm",
     "open_buys_qty", "open_buys_notional",
     "open_sells_qty", "open_sells_notional",
 )
@@ -366,8 +367,8 @@ class TradesSummaryModel(QAbstractTableModel):
 
     @classmethod
     def _walk_fills(cls, fills: list[dict]) -> dict[str, float]:
-        """Split *fills* into closed round trips, closes of positions
-        opened before the window, and the still-open remainder.
+        """Split *fills* into closed round trips and the still-open
+        remainder — window-relative, nothing outside the fills given.
 
         Each ACCOUNT gets its own book.  A summary row aggregates one
         contract across every account, but P&L can't: pooling the
@@ -394,30 +395,21 @@ class TradesSummaryModel(QAbstractTableModel):
         """Chronological FIFO walk over ONE account's fills in ONE
         contract (*fills* time-ordered, earliest first).
 
-        Order matters: a fill can only close a lot that was already open
-        when it printed.  Matching by leg totals instead — earliest buys
-        against earliest sells, whatever their order — pairs a 10:00
-        close of an overnight long with a 10:30 opening buy into a short
-        round trip that never happened, and drops IB's real realized
-        number on the floor.
+        WINDOW-RELATIVE by design: the walk sees nothing outside the
+        fills it is given.  Each fill either closes in-window lots on the
+        other side → a **paired** round trip, valued gross from both
+        legs' own fill prices — or opens a lot → the **open** remainder,
+        marked to the current price by ``_mark_open``.
 
-        Three outcomes per fill, in that order:
-
-        * it closes in-window lots on the other side → a **paired** round
-          trip, valued gross from both legs' own fill prices,
-        * whatever is left closed a position opened *outside* the window
-          — recognised by a nonzero ``realized_pnl``, which IB's
-          commissionReport stamps on every closing execution (computed
-          against the account's average cost, a basis we can't see) →
-          **closing**, taken from IB and prorated,
-        * otherwise it opens a lot → the **open** remainder, marked to
-          the last price by ``_mark_open``.
-
-        IB's ``realized_pnl`` is already NET of both legs' commissions,
-        so ``closing_comm`` carries back the part of that deduction this
-        window can see (the closing fill's own commission).  Callers add
-        it to keep every reported P&L gross, so the Comm column can
-        subtract commission exactly once instead of twice.
+        A fill that really closed a position opened *before* the window
+        (e.g. the morning sale of an overnight long) therefore opens a
+        window-short here: later in-window buys pair against it, and NET
+        0 always means U.P&L 0.  That is the point — R/U/P&L answer
+        "what did this window's trading make?", marking any unmatched
+        leg against the current price.  IB's own realized number (which
+        is computed against the account's average cost, a basis that
+        reaches outside the window) is deliberately NOT folded in; it
+        stays visible in the separate Rlz P&L column.
         """
         out = _empty_walk()
         # Open in-window lots, FIFO.  Always all on the same side: a lot
@@ -434,7 +426,6 @@ class TradesSummaryModel(QAbstractTableModel):
             price = float(f.get("price", 0.0) or 0.0)
             comm = float(f.get("commission") or 0.0)
             comm_unit = comm / qty
-            rpnl = f.get("realized_pnl", None)
 
             left = qty
             while left > 0 and lots and lots[0][2] != side:
@@ -453,27 +444,7 @@ class TradesSummaryModel(QAbstractTableModel):
                 if lot[0] <= 0:
                     lots.pop(0)
 
-            if left <= 0:
-                continue
-            if rpnl:
-                # Closing remainder — IB's number, prorated over the part
-                # of the fill that found nothing to pair with.  Only a
-                # NONZERO realized P&L marks a closing fill: live
-                # commissionReports stamp realizedPNL = 0.0 on opening
-                # executions too, so `is not None` would classify every
-                # opening leg as a $0 close and pin U.P&L at zero.  (A
-                # genuine scratch close at exactly $0.00 falls through to
-                # marking — same as an opening leg, and harmlessly close
-                # to truth.)
-                frac = left / qty
-                out["closing_realized"] += float(rpnl) * frac
-                out["closing_comm"] += comm * frac
-            else:
-                # Opening leg — including a closing fill whose
-                # commissionReport hasn't landed yet.  It marks to last
-                # until the report arrives and the re-emitted fill sends
-                # the walk round again: self-healing, never
-                # double-counted.
+            if left > 0:
                 lots.append([left, price, side, comm_unit])
 
         for qty, price, side, _comm_unit in lots:
@@ -518,17 +489,10 @@ class TradesSummaryModel(QAbstractTableModel):
         return float(mult) if mult else 1.0
 
     def _realized_total(self, key: tuple[str, str]) -> float:
-        """R.P&L for one row: the in-window round trips plus IB's realized
-        P&L on fills that closed a position opened before the window —
-        GROSS, with the commission IB folded into its realized number
-        added back so ``P&L − Comm`` deducts commission exactly once.  A
-        matched row shows the trimmed round trip only — that's the point
-        of matching."""
+        """R.P&L for one row: the window's closed round trips, GROSS
+        (commission is deducted once, by the Comm column)."""
         walk = self._walk_for_key(key)
-        realized = self._paired_net(walk, self._key_multiplier(key))
-        if self.is_matched(key):
-            return realized
-        return realized + walk["closing_realized"] + walk["closing_comm"]
+        return self._paired_net(walk, self._key_multiplier(key))
 
     def _unrealized_total(self, key: tuple[str, str], agg: dict) -> float:
         """U.P&L for one row: only the *opening* remainder, marked to the
@@ -594,9 +558,8 @@ class TradesSummaryModel(QAbstractTableModel):
         the user has HIDDEN are excluded, though: a hide is session-level
         ("stop counting this transaction") and drops the fill from every
         calculation until Restore hidden.  Same math as the summary rows
-        (``_walk_fills``): per-account round trips, plus IB's realized on
-        fills that closed a position opened before the window, plus the
-        opening remainder marked to the last cached price (newest fill
+        (``_walk_fills``): per-account in-frame round trips, plus the
+        unmatched remainder marked to the last cached price (newest fill
         price when no quote is cached).  The commission element sums the
         in-frame fills' reported commissions (TWS only sends a
         commissionReport for a subset of fills, so this is "commissions
@@ -658,8 +621,7 @@ class TradesSummaryModel(QAbstractTableModel):
                 "last_fill_price": float(newest.get("price", 0.0) or 0.0),
             }
             walk = self._walk_fills(fills)
-            r_total += (self._paired_net(walk, meta["multiplier"])
-                        + walk["closing_realized"] + walk["closing_comm"])
+            r_total += self._paired_net(walk, meta["multiplier"])
             u_total += self._mark_open(walk, meta)
         return r_total, u_total, r_total + u_total, comm_total
 
@@ -789,8 +751,10 @@ class TradesSummaryModel(QAbstractTableModel):
     def _cell_text(self, agg: dict, col: int, key=None) -> str:
         if col == S_COL_SYMBOL:
             # agg["symbol"] stays the raw local symbol (price-cache key);
-            # prettify OCC option symbols only at render time.
-            return format_option_symbol(agg.get("symbol", ""))
+            # prettify OCC option symbols only at render time.  Options
+            # stack root+expiry over strike+right — the shared delegate
+            # paints newline'd cells as two small-font lines.
+            return format_option_symbol_two_line(agg.get("symbol", ""))
         if col == S_COL_TYPE:
             return agg.get("sec_type", "") or ""
         if col == S_COL_BUYS:

@@ -104,10 +104,15 @@ class TestFlatProxyStrictToday:
 
 class TestSummaryPnlWindow:
     def test_pnl_totals_trading_day_lookback(self, _monday):
+        # Two open shorts marked to last: Friday's AAA is worth +100
+        # unrealized, Monday's BBB +57 — the U element shows which fills
+        # the window admits.
         m = TradesSummaryModel()
-        m.add_fill(_fill("e1", _FRI, side="SLD", realized_pnl=100.0))
+        m.add_fill(_fill("e1", _FRI, side="SLD"))
         m.add_fill(_fill("e2", _MON, side="SLD", con_id=2, symbol="BBB",
-                         local_symbol="BBB", realized_pnl=57.0))
-        assert m.pnl_totals(days_back=1)[0] == 57.0     # today only
-        assert m.pnl_totals(days_back=2)[0] == 157.0    # + Friday
-        assert m.pnl_totals(days_back=0)[0] == 157.0    # 0 = everything
+                         local_symbol="BBB"))
+        m.set_last_price("AAA", 90.0)     # (100 − 90) × 10 = +100
+        m.set_last_price("BBB", 94.3)     # (100 − 94.3) × 10 = +57
+        assert m.pnl_totals(days_back=1)[1] == pytest.approx(57.0)
+        assert m.pnl_totals(days_back=2)[1] == pytest.approx(157.0)
+        assert m.pnl_totals(days_back=0)[1] == pytest.approx(157.0)

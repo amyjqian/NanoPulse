@@ -1,18 +1,20 @@
-"""Trades summary R/U P&L split with IB realized P&L on closing fills.
+"""Trades summary R/U P&L split — window-relative by design.
 
 Fills walk their own account's book in the order they printed (see
-``TradesSummaryModel._walk_account``).  A fill that closes lots opened
-earlier in the window is a round trip, valued gross from both legs' own
-prices.  A fill that closes a position opened *outside* the window is
-recognised by its nonzero ``realized_pnl`` — stamped by the
-commissionReport on every closing execution, computed against the
-account's average cost — so it shows IB's true realized number instead
-of a fake short marked to the last price.  Anything else is an *opening*
-leg and marks to the last price.  P&L = R.P&L + U.P&L always.
+``TradesSummaryModel._walk_account``), seeing NOTHING outside the
+selected time window.  A fill that closes lots opened earlier in the
+window is a round trip → R.P&L, valued gross from both legs' own
+prices.  Anything unmatched — including a fill that really closed a
+position opened *before* the window — is an open window leg and marks
+to the current price → U.P&L.  So NET 0 always means U.P&L 0, and
+P&L = R.P&L + U.P&L always.
 
-Every P&L number the model reports is GROSS: IB's realized arrives net
-of both legs' commissions, so the closing fill's own commission is added
-back and the Comm column deducts it exactly once.
+IB's ``realized_pnl`` (computed against the account's average cost, a
+basis that reaches outside the window) is deliberately NOT folded into
+R/U — it stays visible in the separate Rlz P&L column.
+
+Every P&L number the model reports is GROSS; the Comm column deducts
+commission exactly once (Net P&L = P&L − Comm).
 """
 from __future__ import annotations
 
@@ -66,19 +68,32 @@ def _u(m, row=0):
     return m._unrealized_total(key, m._effective_agg(key))
 
 
-def test_close_of_overnight_position_uses_ib_realized():
-    """Sell 6 bought yesterday: no in-window pair, IB realized wins.
-    Nothing is open, so U.P&L is 0 even while the price keeps moving."""
+def test_net_zero_window_has_zero_upnl():
+    """The headline rule: buys == sells in the window → U.P&L is exactly
+    0 and stops moving with the price, even when the sell actually
+    closed an overnight position (its IB realized number is ignored by
+    R/U — it lives in the Rlz P&L column)."""
     m = TradesSummaryModel()
     m.add_fill(_fill("e1", "SLD", 6, 110.0, realized_pnl=57.0))
-    m.set_last_price("AAA", 95.0)  # must NOT affect either number
-    assert _r(m) == 57.0
+    m.add_fill(_fill("e2", "BOT", 6, 111.0, t="2026-05-29T11:00:00"))
+    m.set_last_price("AAA", 95.0)       # must NOT affect either number
+    assert _r(m) == (110.0 - 111.0) * 6
     assert _u(m) == 0.0
 
 
+def test_close_of_overnight_position_is_a_window_short():
+    """Sell 6 bought yesterday: the window can't see the buy, so the
+    sell is an open window-short marked against the current price."""
+    m = TradesSummaryModel()
+    m.add_fill(_fill("e1", "SLD", 6, 110.0, realized_pnl=57.0))
+    m.set_last_price("AAA", 95.0)
+    assert _r(m) == 0.0
+    assert _u(m) == (110.0 - 95.0) * 6
+
+
 def test_naked_sell_marks_to_last():
-    """Opening short (no realized_pnl on the fill): R.P&L stays 0 and
-    the leg marks to last — profit as the price falls."""
+    """Opening short: R.P&L stays 0 and the leg marks to last —
+    profit as the price falls."""
     m = TradesSummaryModel()
     m.add_fill(_fill("e1", "SLD", 5, 110.0))
     m.set_last_price("AAA", 104.0)
@@ -97,16 +112,17 @@ def test_in_window_round_trip_not_double_counted():
     assert _u(m) == 0.0
 
 
-def test_partially_paired_closing_fill_prorates_ib_realized():
-    """Buy 4 today, sell 10 (6 of which closed an overnight long):
-    4 pair in-window; the unpaired 6/10 of the sell prorates the fill's
-    IB realized_pnl."""
+def test_partial_pair_remainder_marks_to_current_price():
+    """Buy 4 today, sell 10: 4 pair in-window; the unmatched 6 stay an
+    open window-short marked to the current price — IB's realized on
+    the sell is ignored."""
     m = TradesSummaryModel()
     m.add_fill(_fill("e1", "BOT", 4, 100.0))
     m.add_fill(_fill("e2", "SLD", 10, 110.0, realized_pnl=600.0,
                      t="2026-05-29T11:00:00"))
-    assert _r(m) == (110.0 - 100.0) * 4 + 600.0 * (6 / 10)
-    assert _u(m) == 0.0
+    m.set_last_price("AAA", 105.0)
+    assert _r(m) == (110.0 - 100.0) * 4
+    assert _u(m) == (110.0 - 105.0) * 6
 
 
 def test_opening_buys_mark_to_last():
@@ -117,29 +133,18 @@ def test_opening_buys_mark_to_last():
     assert _u(m) == (105.0 - 100.0) * 10
 
 
-def test_opening_fill_with_zero_realized_still_marks():
-    """Live commissionReports stamp realized_pnl = 0.0 on OPENING fills
-    too — a zero must not classify the leg as a $0 close, or U.P&L
-    would sit at 0.00 forever."""
-    m = TradesSummaryModel()
-    m.add_fill(_fill("e1", "BOT", 10, 100.0, realized_pnl=0.0))
-    m.set_last_price("AAA", 105.0)
-    assert _r(m) == 0.0
-    assert _u(m) == (105.0 - 100.0) * 10
-
-
-def test_closing_fill_without_report_yet_falls_back_to_marking():
-    """Until the commissionReport lands, a closing sell is
-    indistinguishable from a naked short and marks to last; once the
-    re-emitted fill carries realized_pnl it flips to R.P&L."""
-    m = TradesSummaryModel()
-    m.add_fill(_fill("e1", "SLD", 6, 110.0))          # report not yet in
-    m.set_last_price("AAA", 108.0)
-    assert _r(m) == 0.0
-    assert _u(m) == (110.0 - 108.0) * 6
-    m.add_fill(_fill("e1", "SLD", 6, 110.0, realized_pnl=57.0))
-    assert _r(m) == 57.0
-    assert _u(m) == 0.0
+def test_realized_pnl_value_never_changes_window_math():
+    """``realized_pnl`` — absent, zero, or huge — must not change R/U:
+    the walk is window-relative and ignores it entirely (it still feeds
+    the separate Rlz P&L column)."""
+    with_rpnl = TradesSummaryModel()
+    without = TradesSummaryModel()
+    with_rpnl.add_fill(_fill("e1", "SLD", 6, 110.0, realized_pnl=57.0))
+    without.add_fill(_fill("e1", "SLD", 6, 110.0))
+    with_rpnl.set_last_price("AAA", 108.0)
+    without.set_last_price("AAA", 108.0)
+    assert _r(with_rpnl) == _r(without) == 0.0
+    assert _u(with_rpnl) == _u(without) == (110.0 - 108.0) * 6
 
 
 class TestPnlTotalsToday:
@@ -148,64 +153,71 @@ class TestPnlTotalsToday:
 
     def _model(self):
         m = TradesSummaryModel()
-        # U111: closed an overnight long (IB realized +57).
-        m.add_fill(_fill("e1", "SLD", 6, 110.0, realized_pnl=57.0,
+        # U111: sold 6 @110, bought 4 back @108 → R +8; the open short 2
+        # marks @104 → U +12.
+        m.add_fill(_fill("e1", "SLD", 6, 110.0,
                          con_id=1) | {"account_id": "U111"})
-        # U222: opened a long, marked to 103.
+        m.add_fill(_fill("e1b", "BOT", 4, 108.0, con_id=1,
+                         t="2026-05-29T11:00:00") | {"account_id": "U111"})
+        # U222: opened a long, marked to 103 → U +30.
         m.add_fill(_fill("e2", "BOT", 10, 100.0, con_id=2,
                          symbol="BBB") | {"account_id": "U222"})
+        m.set_last_price("AAA", 104.0)
         m.set_last_price("BBB", 103.0)
         return m
 
     def test_all_accounts(self):
         r, u, total, comm = self._model().pnl_totals_today()
-        assert r == 57.0
-        assert u == 30.0
-        assert total == 87.0
+        assert r == 8.0
+        assert u == 42.0
+        assert total == 50.0
         assert comm == 0.0            # no commission reports in-frame
 
     def test_account_subset(self):
         m = self._model()
-        assert m.pnl_totals_today({"U111"}) == (57.0, 0.0, 57.0, 0.0)
+        assert m.pnl_totals_today({"U111"}) == (8.0, 12.0, 20.0, 0.0)
         assert m.pnl_totals_today({"U222"}) == (0.0, 30.0, 30.0, 0.0)
 
     def test_prior_day_fills_excluded(self):
         m = self._model()
-        m.add_fill(_fill("e3", "SLD", 99, 500.0, realized_pnl=999.0,
-                         con_id=3, symbol="OLD",
+        m.add_fill(_fill("e3", "SLD", 99, 500.0, con_id=3, symbol="OLD",
                          t="2026-05-28T10:00:00") | {"account_id": "U111"})
-        assert m.pnl_totals_today()[0] == 57.0  # yesterday's 999 ignored
+        m.set_last_price("OLD", 480.0)
+        assert m.pnl_totals_today() == (8.0, 42.0, 50.0, 0.0)
 
     def test_independent_of_view_filters(self):
         m = self._model()
         m.set_selected_accounts({"U222"})   # view filtered to one account
         m.set_search_text("zzz-no-match")   # view shows nothing
-        assert m.pnl_totals_today() == (57.0, 30.0, 87.0, 0.0)
+        assert m.pnl_totals_today() == (8.0, 42.0, 50.0, 0.0)
 
     def test_hidden_fills_excluded_until_restored(self):
         # A hide is session-level "stop counting this transaction" — it
-        # drops out of the status-bar totals too, until restored.
+        # drops out of the status-bar totals too, until restored.  With
+        # e1 hidden, U111 is left holding the 4-lot buy-back as an open
+        # long: (104 − 108) × 4 = −16.
         m = self._model()
-        m.set_hidden_fills({"e1"})          # hide the realized +57 fill
-        assert m.pnl_totals_today() == (0.0, 30.0, 30.0, 0.0)
+        m.set_hidden_fills({"e1"})
+        assert m.pnl_totals_today() == (0.0, 14.0, 14.0, 0.0)
         m.set_hidden_fills(set())           # restore
-        assert m.pnl_totals_today() == (57.0, 30.0, 87.0, 0.0)
+        assert m.pnl_totals_today() == (8.0, 42.0, 50.0, 0.0)
 
     def test_empty_model(self):
         assert TradesSummaryModel().pnl_totals_today() == (0.0, 0.0, 0.0, 0.0)
 
     def test_days_back_widens_the_window(self):
         m = self._model()
-        m.add_fill(_fill("e3", "SLD", 1, 500.0, realized_pnl=100.0,
-                         con_id=3, symbol="OLD",
+        # Yesterday: an open short 1 @500 marked @480 → U +20.
+        m.add_fill(_fill("e3", "SLD", 1, 500.0, con_id=3, symbol="OLD",
                          t="2026-05-28T10:00:00") | {"account_id": "U111"})
-        assert m.pnl_totals(days_back=1)[0] == 57.0    # today only
-        assert m.pnl_totals(days_back=2)[0] == 157.0   # + yesterday
-        assert m.pnl_totals(days_back=0)[0] == 157.0   # 0 = everything
+        m.set_last_price("OLD", 480.0)
+        assert m.pnl_totals(days_back=1)[1] == 42.0    # today only
+        assert m.pnl_totals(days_back=2)[1] == 62.0    # + yesterday
+        assert m.pnl_totals(days_back=0)[1] == 62.0    # 0 = everything
 
     def test_commission_sums_over_same_fill_set(self):
         m = TradesSummaryModel()
-        m.add_fill(_fill("e1", "SLD", 6, 110.0, realized_pnl=57.0)
+        m.add_fill(_fill("e1", "SLD", 6, 110.0)
                    | {"account_id": "U111", "commission": 1.25})
         m.add_fill(_fill("e2", "BOT", 10, 100.0, con_id=2, symbol="BBB")
                    | {"account_id": "U222", "commission": 0.35})
@@ -213,27 +225,28 @@ class TestPnlTotalsToday:
         m.add_fill(_fill("e3", "SLD", 1, 500.0, con_id=3, symbol="OLD",
                          t="2026-05-28T10:00:00")
                    | {"account_id": "U111", "commission": 9.99})
+        m.set_last_price("AAA", 104.0)
+        m.set_last_price("BBB", 103.0)
         assert m.pnl_totals_today()[3] == pytest.approx(1.60)
         # Account filter applies to the commission element too.
         assert m.pnl_totals_today({"U111"})[3] == pytest.approx(1.25)
         # Gross P&L stays gross — commission is reported, not deducted.
-        # IB's 57.0 is already net of the 1.25 commission, so the gross
-        # figure adds it back and NET = P&L − Comm lands on IB's number.
-        r, _u, total, comm = m.pnl_totals_today()
-        assert r == pytest.approx(58.25)
-        assert total == pytest.approx(58.25)
-        assert total - comm == pytest.approx(56.65)   # 57.0 − U222's 0.35
+        r, u, total, comm = m.pnl_totals_today()
+        assert r == 0.0
+        assert u == pytest.approx(66.0)     # (110−104)×6 + (103−100)×10
+        assert total == pytest.approx(66.0)
+        assert total - comm == pytest.approx(64.40)
 
     def test_threshold_keeps_fills_at_or_after(self):
         from datetime import datetime
         from zoneinfo import ZoneInfo
-        m = self._model()   # both fills at 10:00 ET
+        m = self._model()   # fills at 10:00 / 11:00 ET
         noon = datetime(2026, 5, 29, 12, 0,
                         tzinfo=ZoneInfo("America/New_York"))
         morning = datetime(2026, 5, 29, 9, 30,
                            tzinfo=ZoneInfo("America/New_York"))
         assert m.pnl_totals(threshold=noon) == (0.0, 0.0, 0.0, 0.0)
-        assert m.pnl_totals(threshold=morning) == (57.0, 30.0, 87.0, 0.0)
+        assert m.pnl_totals(threshold=morning) == (8.0, 42.0, 50.0, 0.0)
 
 
 def test_status_bar_pnl_display(qtbot):
@@ -272,12 +285,17 @@ def test_panel_pnl_follows_date_combo(qtbot):
     from src.ui.widgets.trades_panel import TradesPanel
     panel = TradesPanel()
     qtbot.addWidget(panel)
-    panel.add_fill(_fill("e1", "SLD", 6, 110.0, realized_pnl=57.0)
-                   | {"account_id": "U111"})           # 10:00 ET
-    panel.add_fill(_fill("e2", "SLD", 1, 100.0, realized_pnl=10.0,
-                         con_id=2, symbol="BBB",
+    # Morning round trip: +50.
+    panel.add_fill(_fill("e1", "BOT", 5, 100.0)
+                   | {"account_id": "U111"})               # 10:00 ET
+    panel.add_fill(_fill("e2", "SLD", 5, 110.0,
+                         t="2026-05-29T10:30:00") | {"account_id": "U111"})
+    # Afternoon round trip: +10.
+    panel.add_fill(_fill("e3", "BOT", 2, 200.0, con_id=2, symbol="BBB",
                          t="2026-05-29T13:00:00") | {"account_id": "U111"})
-    assert panel.pnl_totals()[0] == 67.0               # Today (default)
+    panel.add_fill(_fill("e4", "SLD", 2, 205.0, con_id=2, symbol="BBB",
+                         t="2026-05-29T13:30:00") | {"account_id": "U111"})
+    assert panel.pnl_totals()[0] == 60.0               # Today (default)
     assert panel.pnl_timeframe_label() == "Today"
 
     panel._control_bar.setFilterKey("afternoon")       # Noon → 12:00 cutoff
@@ -285,7 +303,7 @@ def test_panel_pnl_follows_date_combo(qtbot):
     assert panel.pnl_timeframe_label() == "Noon"
 
     panel._control_bar.setFilterKey("morning")         # 09:30 cutoff
-    assert panel.pnl_totals()[0] == 67.0
+    assert panel.pnl_totals()[0] == 60.0
     assert panel.pnl_timeframe_label() == "Morning"
 
 
@@ -307,45 +325,42 @@ class TestPerAccountBooks:
     A summary row aggregates one contract across every account, but P&L
     can't: pooling the books lets one account's close pair against
     another's opening fill, inventing a round trip nobody traded and
-    hiding the second account's real position from U.P&L.  Chronology
-    matters for the same reason — a fill can only close a lot that was
-    already open when it printed.
+    hiding both accounts' real window legs from U.P&L.
     """
 
-    def test_close_in_one_account_ignores_an_open_in_another(self):
-        # A closes an overnight long: IB realized +198.78, already net of
-        # both legs' 0.61 commissions.  B, flat, opens a new long.
+    def test_a_sell_in_one_account_never_pairs_a_buy_in_another(self):
+        # A sold 1 (a window-short, marked), B opened a long (marked).
+        # Pooled books would pair the two into a round trip nobody
+        # traded: R −100 / U 0 instead of R 0 / U −120 + 20.
         m = TradesSummaryModel()
-        m.add_fill(_fut("a1", "SLD", 30100.0, "10:00:00", "A",
-                        realized_pnl=198.78))
+        m.add_fill(_fut("a1", "SLD", 30100.0, "10:00:00", "A"))
         m.add_fill(_fut("b1", "BOT", 30150.0, "10:30:00", "B"))
         m.set_last_price("MNQ", 30160.0)
 
-        r, u, total, comm = m.pnl_totals_today()
-        # Pooled books would pair the two into a fictitious short round
-        # trip: R −100.00, U 0.00.
-        assert r == pytest.approx(199.39)      # 198.78 + A's own 0.61
-        assert u == pytest.approx(20.0)        # B's open long, marked
-        assert total - comm == pytest.approx(218.17)
+        r, u, _total, _comm = m.pnl_totals_today()
+        assert r == 0.0
+        assert u == pytest.approx(-100.0)   # A: −120 marked, B: +20 marked
 
-    def test_close_then_reopen_the_other_way_is_not_a_round_trip(self):
-        # Same account, and the same trap: the 10:00 close of an
-        # overnight long has nothing in-window to pair with, so the
-        # 10:30 opening buy must not be conscripted as its other leg.
+    def test_close_then_reopen_pairs_as_a_window_round_trip(self):
+        # Same account: the 10:00 sale really closed an overnight long,
+        # but the window can't see that basis — window-relative by
+        # design, the sell and the 10:30 buy-back pair into a window
+        # round trip.  IB's own realized number (against average cost)
+        # stays in the Rlz P&L column.
         m = TradesSummaryModel()
         m.add_fill(_fut("c1", "SLD", 30100.0, "10:00:00", "A",
                         realized_pnl=198.78))
         m.add_fill(_fut("c2", "BOT", 30150.0, "10:30:00", "A"))
         m.set_last_price("MNQ", 30160.0)
 
-        r, u, total, comm = m.pnl_totals_today()
-        assert r == pytest.approx(199.39)
-        assert u == pytest.approx(20.0)
-        assert total - comm == pytest.approx(218.17)
+        r, u, _total, _comm = m.pnl_totals_today()
+        assert r == pytest.approx(-100.0)   # (30100 − 30150) × 2
+        assert u == 0.0                     # NET 0 → U.P&L 0
 
-    def test_in_window_round_trip_still_pairs_in_the_right_order(self):
-        # Buy then sell IS a round trip — the walk must still pair it,
-        # gross from both fill prices, and ignore IB's realized number.
+    def test_in_window_round_trip_pairs_gross_from_both_prices(self):
+        # Buy then sell: paired gross from both fill prices, IB's
+        # realized number ignored; net of the two 0.61 commissions the
+        # total lands on IB's 198.78.
         m = TradesSummaryModel()
         m.add_fill(_fut("d1", "BOT", 30000.0, "09:40:00", "A"))
         m.add_fill(_fut("d2", "SLD", 30100.0, "10:00:00", "A",
@@ -353,18 +368,17 @@ class TestPerAccountBooks:
         r, u, total, comm = m.pnl_totals_today()
         assert r == pytest.approx(200.0)       # (30100 − 30000) × 2
         assert u == 0.0
-        assert total - comm == pytest.approx(198.78)   # == IB's number
+        assert total - comm == pytest.approx(198.78)
 
     def test_summary_row_splits_per_account_too(self):
         # The row aggregates both accounts, but its R/U come from the
         # per-account walk — not just the status-bar aggregate.
         m = TradesSummaryModel()
-        m.add_fill(_fut("a1", "SLD", 30100.0, "10:00:00", "A",
-                        realized_pnl=198.78))
+        m.add_fill(_fut("a1", "SLD", 30100.0, "10:00:00", "A"))
         m.add_fill(_fut("b1", "BOT", 30150.0, "10:30:00", "B"))
         m.set_last_price("MNQ", 30160.0)
-        assert _r(m) == pytest.approx(199.39)
-        assert _u(m) == pytest.approx(20.0)
+        assert _r(m) == 0.0
+        assert _u(m) == pytest.approx(-100.0)
 
     def test_arrival_order_does_not_change_the_result(self):
         # Snapshot replay after a reconnect emits fills in worker order,
@@ -389,44 +403,26 @@ class TestPerAccountBooks:
         assert u == pytest.approx(-19.0)
 
 
-class TestCommissionNettedOnce:
-    """IB's ``realized_pnl`` arrives NET of both legs' commissions, so a
-    closing fill's own commission is added back to keep every reported
-    P&L gross.  The status bar and the Net P&L column then subtract the
-    Comm column exactly once."""
+class TestCommissionReportedNotDeducted:
+    """Every P&L the model reports is GROSS; commission is summed in its
+    own element/column and subtracted exactly once by the callers
+    (Net P&L = P&L − Comm)."""
 
     def _net(self, m):
         _r, _u, total, comm = m.pnl_totals_today()
         return total - comm
 
-    def test_net_is_the_same_whether_the_open_leg_is_in_frame(self):
-        # Identical economics: bought 30000, sold 30100, $0.61 a side.
-        both_legs = TradesSummaryModel()
-        both_legs.add_fill(_fut("d1", "BOT", 30000.0, "09:40:00", "A"))
-        both_legs.add_fill(_fut("d2", "SLD", 30100.0, "10:00:00", "A",
-                                realized_pnl=198.78))
-        # Same trade, but the buy printed before the time frame started.
-        close_only = TradesSummaryModel()
-        close_only.add_fill(_fut("d2", "SLD", 30100.0, "10:00:00", "A",
-                                 realized_pnl=198.78))
-
-        assert self._net(both_legs) == pytest.approx(198.78)
-        assert self._net(close_only) == pytest.approx(198.78)
-
-    def test_partial_close_prorates_the_commission_add_back(self):
+    def test_round_trip_nets_both_legs_commissions(self):
         m = TradesSummaryModel()
-        # 4 bought in-window, then 10 sold: 4 pair, 6 close an overnight
-        # long.  6/10 of both IB's realized and the fill's commission.
-        m.add_fill(_fut("f1", "BOT", 100.0, "10:00:00", "A", qty=4,
-                        commission=0.4))
-        m.add_fill(_fut("f2", "SLD", 110.0, "11:00:00", "A", qty=10,
-                        realized_pnl=600.0, commission=1.0))
-        r, _u, _t, _c = m.pnl_totals_today()
-        # The paired leg is priced per point (× the $2 multiplier); IB's
-        # realized already arrives in dollars, so only its 6/10 share and
-        # the matching 6/10 of the sell's commission are added on top.
-        assert r == pytest.approx((110.0 - 100.0) * 4 * 2.0
-                                  + 600.0 * 0.6 + 1.0 * 0.6)
+        m.add_fill(_fut("d1", "BOT", 30000.0, "09:40:00", "A"))
+        m.add_fill(_fut("d2", "SLD", 30100.0, "10:00:00", "A"))
+        assert self._net(m) == pytest.approx(200.0 - 2 * 0.61)
+
+    def test_unmatched_leg_marks_gross_and_nets_its_own_commission(self):
+        m = TradesSummaryModel()
+        m.add_fill(_fut("d2", "SLD", 30100.0, "10:00:00", "A"))
+        m.set_last_price("MNQ", 30160.0)
+        assert self._net(m) == pytest.approx(-120.0 - 0.61)
 
 
 def test_multi_account_session_reconciles_with_per_account_totals():
@@ -474,8 +470,9 @@ def test_multi_account_session_reconciles_with_per_account_totals():
 
 def test_footer_reconciles_r_plus_u():
     m = TradesSummaryModel()
-    m.add_fill(_fill("e1", "SLD", 6, 110.0, realized_pnl=57.0, con_id=1))
+    m.add_fill(_fill("e1", "SLD", 6, 110.0, con_id=1))
     m.add_fill(_fill("e2", "BOT", 10, 100.0, con_id=2, symbol="BBB"))
+    m.set_last_price("AAA", 104.0)
     m.set_last_price("BBB", 103.0)
     from src.ui.widgets.trades_summary_model import (
         S_COL_NET_TOTAL, S_COL_PAIRED_PNL, S_COL_UNPAIRED_PNL,
@@ -483,6 +480,6 @@ def test_footer_reconciles_r_plus_u():
     r = m._total_value(S_COL_PAIRED_PNL)
     u = m._total_value(S_COL_UNPAIRED_PNL)
     total = m._total_value(S_COL_NET_TOTAL)
-    assert r == 57.0
-    assert u == (103.0 - 100.0) * 10
+    assert r == 0.0
+    assert u == (110.0 - 104.0) * 6 + (103.0 - 100.0) * 10
     assert total == r + u
