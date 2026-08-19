@@ -153,6 +153,14 @@ class TradesPanel(QWidget):
         self._save_timer.setInterval(350)
         self._save_timer.timeout.connect(self._save_persisted_columns)
 
+        # Header-click sort state per view kind: (logical column, order).
+        # ``(-1, None)`` = unsorted (source order).  Clicking a caption
+        # cycles descending → ascending → unsorted.
+        self._sort_state: dict[str, tuple[int, Qt.SortOrder | None]] = {
+            "flat": (-1, None),
+            "summary": (-1, None),
+        }
+
         # Suppress save callbacks while we programmatically move/resize
         # sections during init and apply_columns.
         self._suspend_save = True
@@ -282,6 +290,14 @@ class TradesPanel(QWidget):
         hdr.setStretchLastSection(True)
         hdr.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         hdr.setSectionsMovable(True)
+        # Caption clicks drive the desc → asc → unsorted cycle in
+        # ``_on_header_sort_clicked``.  The view's own sortingEnabled stays
+        # off — it only knows Qt's two-state asc/desc toggle.  The header
+        # flips its indicator itself on click (that's built into
+        # QHeaderView when sections are clickable); the handler overwrites
+        # it with the cycle's actual state right after.
+        hdr.setSectionsClickable(True)
+        hdr.setSortIndicatorShown(False)
         return t, delegate
 
     # ── Selection behaviour ─────────────────────────────────────────────────
@@ -694,6 +710,40 @@ class TradesPanel(QWidget):
             lambda _logical, _old, _new, k=kind: self._on_header_changed(k))
         hdr.sectionMoved.connect(
             lambda _logical, _from, _to, k=kind: self._on_header_changed(k))
+        hdr.sectionClicked.connect(
+            lambda logical, k=kind: self._on_header_sort_clicked(k, logical))
+
+    # ── Header-click sorting (desc → asc → unsorted) ────────────────────────
+
+    def _on_header_sort_clicked(self, kind: str, logical: int) -> None:
+        """Cycle the clicked column through descending → ascending →
+        unsorted.  Clicking a different column starts its cycle fresh at
+        descending.  Unsorted restores the source model's natural order
+        (flat: newest fill first; summary: first-fill insertion order)."""
+        if kind == "flat":
+            table, proxy = self._flat_table, self._flat_proxy
+        else:
+            table, proxy = self._summary_table, self._summary_proxy
+        hdr = table.horizontalHeader()
+
+        col, order = self._sort_state.get(kind, (-1, None))
+        if col != logical:
+            col, order = logical, Qt.SortOrder.DescendingOrder
+        elif order == Qt.SortOrder.DescendingOrder:
+            order = Qt.SortOrder.AscendingOrder
+        else:
+            col, order = -1, None
+
+        self._sort_state[kind] = (col, order)
+        if order is None:
+            # sort(-1) is Qt's documented "back to source order".
+            proxy.sort(-1)
+            hdr.setSortIndicatorShown(False)
+            hdr.setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+        else:
+            proxy.sort(col, order)
+            hdr.setSortIndicatorShown(True)
+            hdr.setSortIndicator(col, order)
 
     def _on_header_changed(self, kind: str) -> None:
         if self._suspend_save:

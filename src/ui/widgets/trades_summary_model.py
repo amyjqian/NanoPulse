@@ -23,7 +23,8 @@ from src.ui.theme import Theme
 from src.ui.widgets.trades_filter_proxy import today_et, trading_days_cutoff
 from src.utils.helpers import format_option_symbol
 
-from .table_theme import CELL_FONT_BOLD, IsFooterRowRole, header_alignment
+from .table_theme import (
+    CELL_FONT_BOLD, IsFooterRowRole, SortValueRole, header_alignment)
 
 log = logging.getLogger(__name__)
 
@@ -278,6 +279,8 @@ class TradesSummaryModel(QAbstractTableModel):
         if agg is None:
             return None
 
+        if role == SortValueRole:
+            return self._sort_value(agg, col, key)
         if role == Qt.ItemDataRole.DisplayRole:
             return self._cell_text(agg, col, key)
         if role == Qt.ItemDataRole.ForegroundRole:
@@ -742,6 +745,46 @@ class TradesSummaryModel(QAbstractTableModel):
         if key is None:
             return 0.0
         return self._realized_total(key)
+
+    def _sort_value(self, agg: dict, col: int, key=None):
+        """Raw sortable value for a cell — same numbers the display
+        formats, so the sort proxy orders numerically.  The totals footer
+        never reaches here (its ``data`` path answers ``None`` and the
+        proxy pins it to the bottom regardless of sort)."""
+        if col == S_COL_SYMBOL:
+            return (agg.get("symbol", "") or "").upper()
+        if col == S_COL_TYPE:
+            return agg.get("sec_type", "") or ""
+        if col == S_COL_BUYS:
+            return agg.get("buys_qty", 0.0)
+        if col == S_COL_SELLS:
+            return agg.get("sells_qty", 0.0)
+        if col == S_COL_NET:
+            return agg.get("buys_qty", 0.0) - agg.get("sells_qty", 0.0)
+        if col == S_COL_AVG_BUY:
+            b_q = agg.get("buys_qty", 0.0)
+            return agg.get("buys_notional", 0.0) / b_q if b_q else 0.0
+        if col == S_COL_AVG_SELL:
+            s_q = agg.get("sells_qty", 0.0)
+            return agg.get("sells_notional", 0.0) / s_q if s_q else 0.0
+        if col == S_COL_TRANS_TOTAL:
+            return self._trans_total(agg)
+        if col == S_COL_PAIRED_PNL:
+            return self._paired_pnl(key)
+        if col == S_COL_UNPAIRED_PNL:
+            return self._unrealized_total(key, agg) if key else 0.0
+        if col == S_COL_NET_TOTAL:
+            return self._row_pnl_total(key, agg) if key else 0.0
+        if col == S_COL_COMMISSION:
+            return agg.get("commission", 0.0)
+        if col == S_COL_NET_INCL_COMM:
+            return ((self._row_pnl_total(key, agg) if key else 0.0)
+                    - agg.get("commission", 0.0))
+        if col == S_COL_REALIZED:
+            return agg.get("realized_pnl", 0.0)
+        if col == S_COL_EXCHANGES:
+            return ", ".join(sorted(agg.get("exchanges", set())))
+        return ""
 
     def _cell_text(self, agg: dict, col: int, key=None) -> str:
         if col == S_COL_SYMBOL:

@@ -34,6 +34,10 @@ IsFooterRowRole = Qt.ItemDataRole.UserRole + 120
 # str: identity of the group a row belongs to.  GroupBandDelegate tints
 # consecutive runs of equal key, alternating per run.
 GroupKeyRole = Qt.ItemDataRole.UserRole + 130
+# Raw sortable value for a cell (float/int/str, consistent per column).
+# Sort proxies use this as their sort role so numeric columns order
+# numerically instead of by their formatted display strings.
+SortValueRole = Qt.ItemDataRole.UserRole + 140
 
 # ── Theme tokens ──────────────────────────────────────────────────────────────
 BG_PAGE      = Theme.POS_BG_PAGE
