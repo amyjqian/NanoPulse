@@ -139,6 +139,12 @@ class MainWindow(QWidget):
         except AttributeError:
             self._status_bar.set_pnl_summary(None)
 
+        # IB's Daily P&L per account (the Connect tab's Daily P&L
+        # column), for every detected account — visible to every role,
+        # since the Connect tab itself is.
+        self._status_bar.set_daily_pnl(
+            self._accounts_model.daily_pnl_entries())
+
     # ── Window geometry persistence ───────────────────────────────────────────
 
     def _restore_geometry(self) -> None:

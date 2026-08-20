@@ -485,6 +485,27 @@ class AccountsTableModel(QAbstractTableModel):
             return "-"
         return f"{val:,.2f}"
 
+    def daily_pnl_entries(self) -> list[tuple[str, float]]:
+        """(display name, Daily P&L) for every account row that has
+        received a ``DailyPnL`` value — the same numbers the Connect
+        tab's Daily P&L column shows, in the same row order.  The name
+        is the account's alias when one is set, else the account id.
+        Rows whose tag hasn't arrived yet and IBKR "Infinity" sentinels
+        are skipped."""
+        out: list[tuple[str, float]] = []
+        for row in self._table_data:
+            raw = row[COL_DAILY_PNL]
+            if not raw:
+                continue
+            try:
+                v = float(raw)
+            except (ValueError, TypeError):
+                continue
+            if abs(v) > 1e100:
+                continue
+            out.append((row[COL_ALIAS] or row[COL_ACCOUNT], v))
+        return out
+
     def connection_for_account(self, account: str) -> str | None:
         """Return the connection_label that manages *account*, or None.
 

@@ -84,7 +84,19 @@ class StatusBar(QWidget):
         self._mono_font(self._status_lbl, bold=True)
         layout.addWidget(self._status_lbl)
 
-        # Today's transaction P&L, right of the status text.  Fed once a
+        # All-accounts Daily P&L total (IB's number, mirrors the Connect
+        # tab's Total row), right of the status text.  Fed once a second
+        # by MainWindow._update_status.
+        layout.addSpacing(10)
+        self._daily_sep = self._make_label("")
+        layout.addWidget(self._daily_sep)
+        layout.addSpacing(10)
+        self._daily_lbl = QLabel("", self)
+        self._mono_font(self._daily_lbl)
+        self._daily_lbl.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(self._daily_lbl)
+
+        # Today's transaction P&L, right of the daily total.  Fed once a
         # second by MainWindow._update_status; rich text so each number
         # carries its own gain/loss colour.
         layout.addSpacing(10)
@@ -205,6 +217,27 @@ class StatusBar(QWidget):
                     + "&nbsp;&nbsp;" + body)
         self._pnl_lbl.setText(body)
 
+    def set_daily_pnl(self, entries) -> None:
+        """Show IB's Daily P&L summed across every account — the same
+        number as the Connect tab's Daily P&L Total row.  *entries* is a
+        list of (display name, value); the bar shows only the total, and
+        the per-account breakdown lives in the tooltip.  Pass ``None``
+        or an empty list to hide the section (no accounts connected /
+        tags not arrived yet)."""
+        if not entries:
+            self._daily_sep.setText("")
+            self._daily_lbl.setText("")
+            self._daily_lbl.setToolTip("")
+            return
+        self._daily_sep.setText("|")
+        total = sum(v for _n, v in entries)
+        self._daily_lbl.setText(
+            f"{self._fmt_caption('DAY')}&nbsp;{self._fmt_pnl(total)}")
+        self._daily_lbl.setToolTip(
+            "IB Daily P&L per account (Connect tab)\n"
+            + "\n".join(f"{name}  {v:+,.2f}" for name, v in entries)
+            + f"\nTotal  {total:+,.2f}")
+
     # ── Transient messages ───────────────────────────────────────────────────
 
     def show_message(self, text: str, duration_ms: int = 6000) -> None:
@@ -233,7 +266,7 @@ class StatusBar(QWidget):
         )
         for lbl in (self._build_lbl, self._market_lbl, self._time_lbl):
             lbl.setStyleSheet(f"color: {TEXT_SECONDARY};")
-        for sep in (self._sep1, self._sep2, self._pnl_sep):
+        for sep in (self._sep1, self._sep2, self._pnl_sep, self._daily_sep):
             sep.setStyleSheet(f"color: {TEXT_DIM};")
 
     # ── Background ────────────────────────────────────────────────────────────

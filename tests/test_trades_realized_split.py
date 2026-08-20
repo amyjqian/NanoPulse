@@ -282,6 +282,46 @@ def test_status_bar_pnl_display(qtbot):
     assert bar._pnl_sep.text() == ""
 
 
+def test_status_bar_daily_pnl_display(qtbot):
+    """The "DAY" segment: IB's Daily P&L summed across every account —
+    the Connect tab's Total row.  Only the total shows on the bar; the
+    per-account breakdown lives in the tooltip."""
+    from src.ui.widgets.statusbar import StatusBar
+    bar = StatusBar()
+    qtbot.addWidget(bar)
+    bar.set_daily_pnl([("alex-01", 104.45), ("maya-02", -80.0)])
+    html = bar._daily_lbl.text()
+    assert "DAY" in html
+    assert "+24" in html                            # 104.45 − 80 → +24
+    assert "alex-01" not in html                    # no per-account on the bar
+    assert bar._daily_sep.text() == "|"
+    tip = bar._daily_lbl.toolTip()
+    assert "alex-01  +104.45" in tip and "maya-02  -80.00" in tip
+    assert "Total  +24.45" in tip
+    bar.set_daily_pnl([])                           # hidden entirely
+    assert bar._daily_lbl.text() == ""
+    assert bar._daily_sep.text() == ""
+
+
+def test_accounts_model_daily_pnl_entries(qtbot):
+    """daily_pnl_entries mirrors the Connect tab's Daily P&L column:
+    alias-or-account per row, rows without the tag skipped, IB
+    "Infinity" sentinels skipped."""
+    from src.ui.widgets.accounts_model import AccountsTableModel
+    m = AccountsTableModel()
+    m.update_batch([
+        ("c1", "U111", "NetLiquidation", "1000", "USD"),
+        ("c1", "U111", "DailyPnL", "104.45", "BASE"),
+        ("c1", "U222", "DailyPnL", "-80", "BASE"),
+        ("c1", "U333", "NetLiquidation", "500", "USD"),   # tag not arrived
+        ("c1", "U444", "DailyPnL", "1e300", "BASE"),      # IB Infinity
+    ])
+    assert m.daily_pnl_entries() == [("U111", 104.45), ("U222", -80.0)]
+    # Alias wins over the raw account id once the user sets one.
+    m.setData(m.index(0, 3), "alex-01")                   # COL_ALIAS
+    assert m.daily_pnl_entries()[0] == ("alex-01", 104.45)
+
+
 def test_panel_pnl_follows_date_combo(qtbot):
     """The status-bar aggregate follows the Trades control bar's time
     frame: Morning/Noon/Evening thresholds and Last-N-Days windows."""
