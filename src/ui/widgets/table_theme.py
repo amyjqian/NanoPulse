@@ -39,6 +39,13 @@ GroupKeyRole = Qt.ItemDataRole.UserRole + 130
 # Sort proxies use this as their sort role so numeric columns order
 # numerically instead of by their formatted display strings.
 SortValueRole = Qt.ItemDataRole.UserRole + 140
+# int: ordering band a row belongs to when a table stacks sections
+# (Trades summary: 0 = window-relative rows, 1 = "P&L" footer,
+# 2 = cost-basis rows, 3 = "Acct P&L" footer).  The sort proxy orders by
+# rank first so sections stay put whatever column/direction is active;
+# rows within a rank sort normally.  Models without sections simply
+# don't answer it (None → rank 0 for every row).
+SectionRankRole = Qt.ItemDataRole.UserRole + 150
 
 # ── Theme tokens ──────────────────────────────────────────────────────────────
 BG_PAGE      = Theme.POS_BG_PAGE

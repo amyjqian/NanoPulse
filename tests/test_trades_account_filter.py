@@ -102,22 +102,25 @@ class TestSummaryModel:
         m = TradesSummaryModel()
         m.add_fill(_fill("e1", "U111", shares=10))
         m.add_fill(_fill("e2", "U222", shares=4))
-        key = m.row_key(0)
+        # Row 0 is the "TRADE LEVEL" band; the symbol row sits below it.
+        key = m.row_key(1)
         assert m._effective_agg(key)["buys_qty"] == 14
 
         m.set_selected_accounts({"U111"})
-        assert m._effective_agg(m.row_key(0))["buys_qty"] == 10
+        assert m._effective_agg(m.row_key(1))["buys_qty"] == 10
 
         m.set_selected_accounts(set())
-        assert m._effective_agg(m.row_key(0))["buys_qty"] == 14
+        assert m._effective_agg(m.row_key(1))["buys_qty"] == 14
 
     def test_symbol_row_drops_when_no_fill_matches(self):
         m = TradesSummaryModel()
         m.add_fill(_fill("e1", "U111", symbol="AAA", con_id=1))
         m.add_fill(_fill("e2", "U222", symbol="BBB", con_id=2))
-        assert m.rowCount() == 3  # two symbol rows + totals footer
+        # Two symbol rows in each section + the four band rows (the two
+        # section headers and the two TOTAL rows).
+        assert m.rowCount() == 8
         m.set_selected_accounts({"U111"})
-        assert m.rowCount() == 2  # AAA + totals footer
+        assert m.rowCount() == 6  # AAA in each section + the bands
 
 
 def test_panel_forwards_to_both_views(qtbot):
@@ -128,6 +131,6 @@ def test_panel_forwards_to_both_views(qtbot):
     panel.set_selected_accounts({"U111"})
     assert panel._flat_proxy.rowCount() == 1
     assert panel._summary_model._effective_agg(
-        panel._summary_model.row_key(0))["buys_qty"] == 10
+        panel._summary_model.row_key(1))["buys_qty"] == 10
     panel.set_selected_accounts(set())
     assert panel._flat_proxy.rowCount() == 2

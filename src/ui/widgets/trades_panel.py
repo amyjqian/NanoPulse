@@ -227,6 +227,15 @@ class TradesPanel(QWidget):
         self._stack.addWidget(self._summary_table)   # index 1
         root.addWidget(self._stack, 1)
 
+        # The section-header bands ("TRADE LEVEL" / "ACCOUNT LEVEL")
+        # merge into one full-width cell — re-applied on any change that
+        # can move rows (mirrors the Positions panel's _apply_spans).
+        self._summary_proxy.rowsInserted.connect(self._apply_summary_spans)
+        self._summary_proxy.rowsRemoved.connect(self._apply_summary_spans)
+        self._summary_proxy.modelReset.connect(self._apply_summary_spans)
+        self._summary_proxy.layoutChanged.connect(self._apply_summary_spans)
+        self._apply_summary_spans()
+
         # Initial count — deferred until the stack exists since
         # _refresh_trade_count reads the active view kind from it.
         self._refresh_trade_count()
@@ -279,8 +288,8 @@ class TradesPanel(QWidget):
 
         # Row hover, plus the 1px rule between data rows.  The flat table
         # bands each order's fills (GroupBandDelegate) and puts the rule on
-        # group boundaries only; the summary model's "P&L" row answers
-        # IsFooterRowRole and is skipped either way.
+        # group boundaries only; the summary model's "P&L" / "Acct P&L"
+        # footer rows answer IsFooterRowRole and are skipped either way.
         delegate = delegate_cls(t)
         t.setItemDelegate(delegate)
 
@@ -299,6 +308,26 @@ class TradesPanel(QWidget):
         hdr.setSectionsClickable(True)
         hdr.setSortIndicatorShown(False)
         return t, delegate
+
+    def _apply_summary_spans(self, *_args) -> None:
+        """Merge each section-header band of the summary view into one
+        full-width cell, so the bands read as plain labels rather than
+        a row of columns.
+
+        clearSpans() first — resetting individual cells with
+        setSpan(row, col, 1, 1) triggers Qt's "single cell span won't
+        be added" warning for every ordinary row (same rationale as the
+        Positions panel's _apply_spans)."""
+        table = self._summary_table
+        proxy = self._summary_proxy
+        table.clearSpans()
+        cols = proxy.columnCount()
+        for row in range(proxy.rowCount()):
+            idx = proxy.index(row, 0)
+            rank = idx.data(tt.SectionRankRole)
+            if rank == 3 or (
+                    rank == 0 and idx.data(tt.IsFooterRowRole)):
+                table.setSpan(row, 0, 1, cols)
 
     # ── Selection behaviour ─────────────────────────────────────────────────
 

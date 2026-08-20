@@ -26,7 +26,7 @@ from zoneinfo import ZoneInfo
 
 from PySide6.QtCore import QModelIndex, QSortFilterProxyModel, Qt, Signal
 
-from .table_theme import IsFooterRowRole, SortValueRole
+from .table_theme import IsFooterRowRole, SectionRankRole, SortValueRole
 
 log = logging.getLogger(__name__)
 
@@ -270,17 +270,28 @@ class TradesFilterProxy(QSortFilterProxyModel):
 
     def lessThan(self, left: QModelIndex,
                  right: QModelIndex) -> bool:  # noqa: N802 (Qt style)
-        """Default sort-role comparison, except the summary's totals
-        footer (the row answering ``IsFooterRowRole``) is pinned to the
-        bottom whichever column/direction is active.  Qt renders
-        descending order by inverting this comparison, so the footer's
-        answer has to flip with the current sort order to stay last."""
+        """Default sort-role comparison, except rows carrying a
+        ``SectionRankRole`` (the summary's window rows / "P&L" footer /
+        cost-basis rows / "Acct P&L" footer) are ordered by rank first,
+        so the sections stay stacked whichever column/direction is
+        active.  Qt renders descending order by inverting this
+        comparison, so the rank answer has to flip with the current sort
+        order to keep the stack in place; within a rank, rows sort
+        normally (footer ranks hold one row each, so their source-order
+        fallback never really runs).  Models without sections answer no
+        rank — every row lands in rank 0 and compares as before."""
         src = self.sourceModel()
         if src is not None:
-            if src.data(left, IsFooterRowRole):
-                return self.sortOrder() == Qt.SortOrder.DescendingOrder
-            if src.data(right, IsFooterRowRole):
-                return self.sortOrder() == Qt.SortOrder.AscendingOrder
+            l_rank = int(src.data(left, SectionRankRole) or 0)
+            r_rank = int(src.data(right, SectionRankRole) or 0)
+            if l_rank != r_rank:
+                if self.sortOrder() == Qt.SortOrder.AscendingOrder:
+                    return l_rank < r_rank
+                return l_rank > r_rank
+            if l_rank and src.data(left, IsFooterRowRole):
+                if self.sortOrder() == Qt.SortOrder.AscendingOrder:
+                    return left.row() < right.row()
+                return left.row() > right.row()
         return super().lessThan(left, right)
 
     # ── Core filter ─────────────────────────────────────────────────────────
