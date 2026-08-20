@@ -13,8 +13,8 @@ IB's ``realized_pnl`` (computed against the account's average cost, a
 basis that reaches outside the window) is deliberately NOT folded into
 R/U — it stays visible in the separate Rlz P&L column, and in the
 second "Acct P&L" footer row, whose cost-basis walk takes IB at its
-word for fills that closed positions opened before the window (see
-``TestAcctPnlFooter``).
+word on every closing fill — whole, never re-paired against in-window
+buys (see ``TestAcctPnlFooter``).
 
 Every P&L number the model reports is GROSS; the Comm column deducts
 commission exactly once (Net P&L = P&L − Comm).
@@ -502,10 +502,11 @@ def _cbu(m, idx=0):
 
 
 class TestAcctPnlFooter:
-    """The cost-basis totals row.  A fill that closed a position opened
-    before the window contributes IB's avg-cost ``realized_pnl``
-    (prorated, gross of the commission IB folded in) instead of opening
-    a window-short.  Realized-only: U.P&L and P&L stay blank and
+    """The cost-basis totals row.  Every fill carrying a nonzero
+    ``realized_pnl`` contributes IB's avg-cost number directly (whole,
+    gross of the commission IB folded in) — it never pairs against
+    in-window lots, so the section reconciles with the flat view's
+    Rlz P&L column.  Realized-only: U.P&L and P&L stay blank and
     Net P&L = R.P&L − Comm.  The window-relative numbers above it must
     never move."""
 
@@ -538,9 +539,12 @@ class TestAcctPnlFooter:
         assert m._cost_value(S_COL_UNPAIRED_PNL) is None
         assert m._cost_value(S_COL_NET_TOTAL) is None
 
-    def test_pure_in_window_round_trip_matches_window_footer(self):
-        # Nothing reaches outside the window → both footers agree on the
-        # realized columns.
+    def test_pure_in_window_round_trip_takes_ib_number(self):
+        # Even a fully in-window round trip reports IB's realized in the
+        # account section — the sell never re-pairs against the buy, so
+        # the section always sums to the flat view's Rlz P&L column.
+        # (Here IB's 50 happens to equal the round trip; against a
+        # blended average cost it wouldn't, and IB's number wins.)
         m = TradesSummaryModel()
         m.add_fill(_fill("e1", "BOT", 5, 100.0))
         m.add_fill(_fill("e2", "SLD", 5, 110.0, realized_pnl=50.0,
@@ -552,10 +556,12 @@ class TestAcctPnlFooter:
             assert m._cost_value(col) == m._total_value(col)
         assert m._cost_value(S_COL_PAIRED_PNL) == 50.0
 
-    def test_partial_close_prorates_ib_realized(self):
-        # Buy 4 today, sell 10 (rpnl on the whole execution): 4 pair
-        # in-window; the unmatched 6/10 take IB's number prorated, plus
-        # the same fraction of the closing fill's commission.
+    def test_close_with_same_window_buys_takes_ib_realized_whole(self):
+        # Buy 4 today, sell 10 (rpnl on the whole execution): the window
+        # section pairs 4 and marks the rest; the account section takes
+        # IB's number WHOLE — no in-window pairing, no proration — plus
+        # the closing fill's own commission added back.  The 4 buys stay
+        # in the walk's undisplayed open remainder.
         m = TradesSummaryModel()
         m.add_fill(_fill("e1", "BOT", 4, 100.0))
         m.add_fill(_fill("e2", "SLD", 10, 110.0, realized_pnl=600.0,
@@ -563,9 +569,8 @@ class TestAcctPnlFooter:
         m.set_last_price("AAA", 105.0)
         assert _r(m) == (110.0 - 100.0) * 4
         assert _u(m) == (110.0 - 105.0) * 6
-        assert _cbr(m) == pytest.approx(
-            (110.0 - 100.0) * 4 + 600.0 * 0.6 + 1.0 * 0.6)
-        assert _cbu(m) == 0.0
+        assert _cbr(m) == pytest.approx(600.0 + 1.0)
+        assert _cbu(m) == pytest.approx((105.0 - 100.0) * 4)
 
     def test_futures_closing_realized_is_unscaled_dollars(self):
         # cb closing terms are IB dollar amounts — never multiplied by
@@ -593,18 +598,17 @@ class TestAcctPnlFooter:
         assert _r(m) == 0.0
         assert _u(m) == (110.0 - 104.0) * 6
 
-    def test_matched_row_trims_to_round_trip_only(self):
-        # Match buy & sell: the cost-basis row follows the window row's
-        # matched semantics — trimmed round trip only, no closing fold,
-        # U pinned at 0.
+    def test_matched_row_keeps_ib_realized(self):
+        # Match buy & sell trims the WINDOW row to its round trip, but
+        # the cost-basis row is untouched: IB's realized is what the
+        # account actually booked — a display-side trim can't change it.
         m = TradesSummaryModel()
         m.add_fill(_fill("e1", "BOT", 4, 100.0))
         m.add_fill(_fill("e2", "SLD", 10, 110.0, realized_pnl=600.0,
                          t="2026-05-29T11:00:00"))
         key = m.row_key(1)      # row 0 is the "TRADE LEVEL" band
         m.match_symbol(key)
-        assert _cbr(m) == (110.0 - 100.0) * 4
-        assert _cbu(m) == 0.0
+        assert _cbr(m) == 600.0
 
     def test_hidden_and_filtered_fills_excluded(self):
         from src.ui.widgets.trades_summary_model import S_COL_PAIRED_PNL
