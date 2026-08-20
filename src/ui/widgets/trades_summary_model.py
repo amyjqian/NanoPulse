@@ -12,8 +12,10 @@ bucket and emits the right ``beginInsertRows`` / ``dataChanged`` pairs.
 The table stacks two labeled sections, each closed by its own "TOTAL"
 row: "TRADE LEVEL" (window-relative rows — what did this window's
 trading make?) then "ACCOUNT LEVEL" (the same keys with their
-COST-BASIS numbers: IB's avg-cost realized folded in, so closing an
-overnight position shows the P&L against what was actually paid).  Both sections are
+COST-BASIS numbers: every closing fill contributes IB's avg-cost
+``realized_pnl`` directly, so the section reconciles with the flat
+view's Rlz P&L column and shows P&L against what was actually paid —
+even when the close also had same-window buys).  Both sections are
 built from the same aggregates and filters; only the walk differs.  The
 cost-basis section is REALIZED-ONLY: its U.P&L / P&L cells stay blank
 (a homemade mark next to IB's authoritative realized number would read
@@ -640,19 +642,25 @@ class TradesSummaryModel(QAbstractTableModel):
     @staticmethod
     def _walk_account_cost_basis(fills: list[dict]) -> dict[str, float]:
         """Cost-basis variant of ``_walk_account`` — feeds the "Acct P&L"
-        footer row.  Same chronological FIFO pairing, but a leftover that
-        really closed a position opened *outside* the window is taken at
-        IB's word instead of opening a window-short.
+        footer row.  IB's avg-cost realized is taken DIRECTLY: a fill
+        carrying a nonzero ``realized_pnl`` (stamped by IB's
+        commissionReport on every closing execution, computed against
+        the account's average cost — a basis we can't see) contributes
+        that number as-is, so the section reconciles with the flat
+        view's Rlz P&L column instead of re-pairing against in-window
+        buys.
 
         Three outcomes per fill, in that order:
 
-        * it closes in-window lots on the other side → a **paired** round
-          trip, valued gross from both legs' own fill prices,
-        * whatever is left closed a position opened outside the window —
-          recognised by a nonzero ``realized_pnl``, which IB's
-          commissionReport stamps on every closing execution (computed
-          against the account's average cost, a basis we can't see) →
-          **closing**, taken from IB and prorated,
+        * it carries a nonzero ``realized_pnl`` → **closing**, taken
+          whole from IB — it never pairs against in-window lots (IB
+          already valued the close against the account's average cost;
+          pairing it here too would both double-count and disagree with
+          the per-fill Rlz P&L column),
+        * it closes in-window lots on the other side → a **paired**
+          round trip, valued gross from both legs' own fill prices —
+          reached only by fills IB stamped $0 on (scratch closes, or
+          closes whose commissionReport hasn't landed yet),
         * otherwise it opens a lot → the **open** remainder.  (Tracked
           in the walk for completeness, but not displayed: the Acct P&L
           section is realized-only.)
@@ -661,12 +669,11 @@ class TradesSummaryModel(QAbstractTableModel):
         commissionReports stamp realizedPNL = 0.0 on opening executions
         too, so ``is not None`` would classify every opening leg as a $0
         close and pin U.P&L at zero.  (A genuine scratch close at exactly
-        $0.00 falls through to opening — same as an opening leg, and
-        harmlessly close to truth.)  A closing fill whose
-        commissionReport hasn't landed yet also falls through: it sits
-        in the undisplayed open remainder until the report arrives and
-        the re-emitted fill sends the walk round again — self-healing,
-        never double-counted.
+        $0.00 falls through to pairing — harmlessly close to truth.)  A
+        closing fill whose commissionReport hasn't landed yet also falls
+        through: it pairs in-window (or sits in the undisplayed open
+        remainder) until the report arrives and the re-emitted fill
+        sends the walk round again — self-healing, never double-counted.
 
         IB's ``realized_pnl`` is already NET of both legs' commissions,
         so ``closing_comm`` carries back the part of that deduction this
@@ -697,6 +704,11 @@ class TradesSummaryModel(QAbstractTableModel):
             comm_unit = comm / qty
             rpnl = f.get("realized_pnl", None)
 
+            if rpnl:
+                out["closing_realized"] += float(rpnl)
+                out["closing_comm"] += comm
+                continue
+
             left = qty
             while left > 0 and lots and lots[0][2] != side:
                 lot = lots[0]
@@ -714,13 +726,7 @@ class TradesSummaryModel(QAbstractTableModel):
                 if lot[0] <= 0:
                     lots.pop(0)
 
-            if left <= 0:
-                continue
-            if rpnl:
-                frac = left / qty
-                out["closing_realized"] += float(rpnl) * frac
-                out["closing_comm"] += comm * frac
-            else:
+            if left > 0:
                 lots.append([left, price, side, comm_unit])
 
         for qty, price, side, _comm_unit in lots:
@@ -791,17 +797,17 @@ class TradesSummaryModel(QAbstractTableModel):
     # ── Cost-basis P&L (the "Acct P&L" footer row) ──────────────────────────
 
     def _cb_realized_total(self, key: tuple[str, str]) -> float:
-        """Cost-basis R.P&L for one key: the in-window round trips plus
-        IB's realized P&L on fills that closed a position opened before
-        the window — GROSS, with the commission IB folded into its
-        realized number added back so ``P&L − Comm`` deducts commission
-        exactly once.  A matched key shows the trimmed round trip only —
-        that's the point of matching."""
+        """Cost-basis R.P&L for one key: IB's avg-cost realized on every
+        closing fill, plus the in-window round trips of fills IB stamped
+        $0 on (scratch closes / reports not yet landed) — GROSS, with
+        the commission IB folded into its realized number added back so
+        ``P&L − Comm`` deducts commission exactly once.  Matching does
+        NOT trim this section: IB's realized is what the account
+        actually booked, unchanged by a display-side trim (the window
+        section above carries the trimmed round-trip view)."""
         walk = self._walk_for_key(key)
         realized = self._paired_net(
             walk, self._key_multiplier(key), prefix="cb_")
-        if self.is_matched(key):
-            return realized
         return (realized + walk["cb_closing_realized"]
                 + walk["cb_closing_comm"])
 
