@@ -296,8 +296,14 @@ class FlashTradeView(QWidget):
             self._account_list.selection_changed.connect(
                 lambda _s: self._refresh_percent_previews())
         if self._accounts_model is not None:
+            # Trailing throttle, NOT a restarting debounce: summary
+            # batches emit hundreds of dataChanged per 250 ms, so a
+            # restarted single-shot never expired and previews never
+            # refreshed from this path.  isActive() gating fires the
+            # refresh 500 ms after the first change of a burst.
             self._accounts_model.dataChanged.connect(
-                lambda *_a: self._pct_refresh_debounce.start())
+                lambda *_a: (self._pct_refresh_debounce.isActive()
+                             or self._pct_refresh_debounce.start()))
 
     def _percent_sizing_accounts(
             self, symbol: str) -> list[tuple[str, float, float, float]]:
@@ -886,6 +892,11 @@ class FlashTradeView(QWidget):
             except RuntimeError:
                 pass
             try:
+                prev.pnl_single_batch_updated.disconnect(
+                    self._on_pnl_single_batch)
+            except RuntimeError:
+                pass
+            try:
                 prev.account_pnl_updated.disconnect(self._on_account_pnl_updated)
             except RuntimeError:
                 pass
@@ -908,6 +919,7 @@ class FlashTradeView(QWidget):
         worker.flatten_close_needed.connect(self._on_flatten_close_needed)
         worker.reverse_close_needed.connect(self._on_reverse_close_needed)
         worker.pnl_single_updated.connect(self._on_pnl_single_updated)
+        worker.pnl_single_batch_updated.connect(self._on_pnl_single_batch)
         worker.account_pnl_updated.connect(self._on_account_pnl_updated)
         worker.fill_updated.connect(self._on_fill_updated)
         # Last-price feeds → trades summary, so the P&L footer row can
@@ -1107,9 +1119,17 @@ class FlashTradeView(QWidget):
     def _on_pnl_single_updated(self, account: str, con_id: int,
                                daily_pnl: float, realized_pnl: float,
                                unrealized_pnl: float) -> None:
-        """Per-position P&L from pnlSingleEvent → update position panel."""
+        """Per-position P&L from pnlSingleEvent → update position panel.
+        Live streams arrive through ``_on_pnl_single_batch``; this
+        per-key form remains for the snapshot replay path."""
         self._account_position.update_pnl_single(
             account, con_id, daily_pnl, realized_pnl, unrealized_pnl)
+
+    def _on_pnl_single_batch(self, batch: list) -> None:
+        """One 250 ms flush worth of per-position P&L updates."""
+        update = self._account_position.update_pnl_single
+        for account, con_id, daily, realized, unrealized in batch:
+            update(account, con_id, daily, realized, unrealized)
 
     def _on_account_pnl_updated(self, account: str, daily_pnl: float,
                                 realized_pnl: float,

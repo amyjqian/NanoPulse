@@ -438,11 +438,15 @@ class PositionsSummaryModel(QAbstractTableModel):
     def _rebuild(self) -> None:
         """Fold `_positions` into per-con_id aggregates, applying the
         account filter and show-zero rule.  Clears `_hidden_con_ids`
-        because a dataset change shouldn't silently hide rows."""
-        self.beginResetModel()
-        self._agg.clear()
-        self._order.clear()
-        self._hidden_con_ids.clear()
+        because a dataset change shouldn't silently hide rows.
+
+        Streaming batches land here ~4×/s, and a ``beginResetModel``
+        drops selection/scroll and forces the view to refetch
+        everything — so when the fold produces the SAME rows in the
+        SAME order (the overwhelmingly common case: values moved,
+        structure didn't) and no rows are hidden, this emits a
+        values-only ``dataChanged`` instead of resetting."""
+        new_agg: dict[int, dict] = {}
 
         # Phase 1: fold every included position into its con_id bucket.
         for (account, con_id), pos in self._positions.items():
@@ -450,24 +454,38 @@ class PositionsSummaryModel(QAbstractTableModel):
                 continue
             if not self._matches_search(account, pos):
                 continue
-            agg = self._agg.get(con_id)
+            agg = new_agg.get(con_id)
             if agg is None:
                 agg = self._empty_agg(con_id, pos)
-                self._agg[con_id] = agg
+                new_agg[con_id] = agg
             self._fold(agg, account, pos)
 
-        # Phase 2: apply show-zero rule and materialise `_order` sorted
+        # Phase 2: apply show-zero rule and materialise the order sorted
         # by absolute market value (biggest exposure at the top).
         visible = [
-            (c, a) for c, a in self._agg.items()
+            (c, a) for c, a in new_agg.items()
             if self._show_zero or abs(a.get("position", 0.0)) > _ZERO_EPS
         ]
         visible.sort(
             key=lambda it: abs(it[1].get("market_value", 0.0) or 0.0),
             reverse=True,
         )
-        self._order = [c for c, _a in visible]
+        new_order = [c for c, _a in visible]
 
+        if (new_order == self._order and self._order
+                and not self._hidden_con_ids):
+            self._agg = new_agg
+            self.dataChanged.emit(
+                self.index(0, 0),
+                self.index(self.rowCount() - 1, self.columnCount() - 1),
+                [Qt.ItemDataRole.DisplayRole,
+                 Qt.ItemDataRole.ForegroundRole])
+            return
+
+        self.beginResetModel()
+        self._agg = new_agg
+        self._order = new_order
+        self._hidden_con_ids.clear()
         self.endResetModel()
 
     def _passes_account_filter(self, account: str) -> bool:

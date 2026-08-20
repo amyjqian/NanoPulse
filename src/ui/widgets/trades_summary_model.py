@@ -116,6 +116,51 @@ def _empty_walk() -> dict[str, float]:
     return {k: 0.0 for k in _WALK_KEYS}
 
 
+def _compute_agg_key(fill: dict) -> tuple[str, str]:
+    """Fresh aggregation key for *fill* — see ``_agg_key`` for the rules."""
+    con_id = int(fill.get("con_id", 0) or 0)
+    if con_id > 0:
+        return (f"cid:{con_id}", fill.get("sec_type", "") or "")
+    return (fill.get("symbol", "") or "—", fill.get("sec_type", "") or "")
+
+
+def stamp_fill(fill: dict) -> None:
+    """Precompute per-fill derived values ONCE, at store time.
+
+    The P&L walks and filters used to re-run ``datetime.fromisoformat``
+    (plus a tz conversion) and rebuild the agg-key string for every fill
+    on every access — the dominant per-fill cost once a session holds
+    thousands of fills.  Stamps live on the fill dict itself (shared
+    with the flat ``TradesModel``, so both views benefit); underscore
+    keys are invisible to the column renderers, which read named keys.
+    A ``None`` ``_ts_dt`` covers both "no timestamp" and "unparseable"
+    — the filters treat the two identically (the fill passes).
+    """
+    ts = fill.get("time_sort", "")
+    dt = None
+    if ts:
+        try:
+            dt = datetime.fromisoformat(ts)
+        except ValueError:
+            dt = None
+        else:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_ET)
+    fill["_ts_dt"] = dt
+    fill["_ts_date"] = dt.astimezone(_ET).date() if dt is not None else None
+    fill["_agg_key"] = _compute_agg_key(fill)
+
+
+# Roles the P&L-family dataChanged emits actually change.  Naming them
+# (instead of the empty "everything changed" vector) lets the sort/filter
+# proxy skip work for roles it doesn't watch; SortValueRole stays listed
+# so an active P&L-column sort keeps live-reordering.
+_PNL_ROLES = [
+    Qt.ItemDataRole.DisplayRole,
+    Qt.ItemDataRole.ForegroundRole,
+    SortValueRole,
+]
+
 _S_RIGHT_ALIGN_COLS = {
     S_COL_BUYS, S_COL_SELLS, S_COL_NET,
     S_COL_AVG_BUY, S_COL_AVG_SELL, S_COL_TRANS_TOTAL,
@@ -198,6 +243,28 @@ class TradesSummaryModel(QAbstractTableModel):
         # fed by the host via ``set_last_price``.  The P&L footer row
         # marks unclosed (net long/short) positions to these prices.
         self._last_prices: dict[str, float] = {}
+
+        # ── P&L caches ────────────────────────────────────────────────
+        # A key's FIFO walk depends only on (its fills, the filter state,
+        # the hidden set) — never on prices, which enter through the O(1)
+        # ``_mark_open`` term.  So walks cache per key and price ticks
+        # touch no fills at all.  Without this, every P&L cell repaint
+        # re-scanned and re-walked EVERY stored fill (the footer row cost
+        # 18·rows·fills fill-visits per paint — ~0.9 s at 5 000 fills —
+        # on every tick and every fill: the app's slow-over-a-session
+        # signature).
+        # key → {exec_id: fill}; mirrors ``_fills``, not the visible set.
+        self._fills_by_key: dict[tuple[str, str], dict[str, dict]] = {}
+        # key → walk dict from ``_walk_fills``.  Treat cached walks as
+        # immutable.  Invalidation: popped per-key on ``add_fill`` /
+        # ``_drop_symbol_row``; cleared wholesale by
+        # ``_rebuild_from_fills`` (every filter setter routes there) and
+        # ``clear``.  hide/match/restore and prices never invalidate.
+        self._walk_cache: dict[tuple[str, str], dict[str, float]] = {}
+        # Bumped whenever the stored fill set or the hidden set changes —
+        # the price-independent half of ``pnl_totals`` memoizes on it.
+        self._fills_rev: int = 0
+        self._pnl_memo: tuple | None = None
 
         # Shared cell fonts — same family, weight and size as every other
         # table in the two tabs (family + weight only; the size comes from
@@ -356,14 +423,21 @@ class TradesSummaryModel(QAbstractTableModel):
     def _fills_for_key(self, key: tuple[str, str]) -> list[dict]:
         """This key's currently-counted fills in time order (earliest
         first) — same filter set the aggregates are built from."""
-        out = [f for f in self._fills.values()
-               if self._passes_filter(f) and self._agg_key(f) == key]
+        bucket = self._fills_by_key.get(key)
+        if not bucket:
+            return []
+        out = [f for f in bucket.values() if self._passes_filter(f)]
         out.sort(key=lambda f: f.get("time_sort", "") or "")
         return out
 
     def _walk_for_key(self, key: tuple[str, str]) -> dict[str, float]:
-        """``_walk_fills`` over this row's currently-counted fills."""
-        return self._walk_fills(self._fills_for_key(key))
+        """``_walk_fills`` over this row's currently-counted fills.
+        Cached per key (see ``_walk_cache``) — do not mutate the result."""
+        walk = self._walk_cache.get(key)
+        if walk is None:
+            walk = self._walk_fills(self._fills_for_key(key))
+            self._walk_cache[key] = walk
+        return walk
 
     @classmethod
     def _walk_fills(cls, fills: list[dict]) -> dict[str, float]:
@@ -570,8 +644,24 @@ class TradesSummaryModel(QAbstractTableModel):
         sel = {a for a in (accounts or ()) if a}
         anchor = self._compute_anchor()
 
+        # Memoize the price-independent half.  This runs on the status
+        # bar's 1 s timer forever, so the O(fills) scan+group+walk must
+        # not repeat when nothing but prices moved — the mark term below
+        # reads ``_last_prices`` live, so ticks are reflected without
+        # invalidation.  The anchor in the key makes midnight rollover
+        # invalidate naturally.
+        memo_key = (self._fills_rev, frozenset(sel), days_back,
+                    threshold, anchor)
+        if self._pnl_memo is not None and self._pnl_memo[0] == memo_key:
+            _, groups_list, comm_total, r_total = self._pnl_memo
+            u_total = sum(self._mark_open(w, m) for w, m in groups_list)
+            return r_total, u_total, r_total + u_total, comm_total
+
         def in_frame(f: dict) -> bool:
             if threshold is not None:
+                if "_ts_dt" in f:
+                    dt = f["_ts_dt"]
+                    return True if dt is None else dt >= threshold
                 ts = f.get("time_sort", "")
                 if not ts:
                     return True
@@ -608,6 +698,7 @@ class TradesSummaryModel(QAbstractTableModel):
                 pass
 
         r_total = u_total = 0.0
+        groups_list: list[tuple[dict, dict]] = []
         for fills in groups.values():
             fills.sort(key=lambda f: f.get("time_sort", "") or "")
             newest = fills[-1]
@@ -621,8 +712,12 @@ class TradesSummaryModel(QAbstractTableModel):
                 "last_fill_price": float(newest.get("price", 0.0) or 0.0),
             }
             walk = self._walk_fills(fills)
+            groups_list.append((walk, meta))
             r_total += self._paired_net(walk, meta["multiplier"])
             u_total += self._mark_open(walk, meta)
+        # groups_list keeps the grouping loop's order, so a memo hit sums
+        # the mark terms in the identical order — float-exact results.
+        self._pnl_memo = (memo_key, groups_list, comm_total, r_total)
         return r_total, u_total, r_total + u_total, comm_total
 
     def _total_value(self, col: int) -> float | None:
@@ -884,10 +979,10 @@ class TradesSummaryModel(QAbstractTableModel):
         conId.  A root symbol traded as both a stock and an option (e.g.
         TSLA) keeps separate rows because each contract has its own conId.
         """
-        con_id = int(fill.get("con_id", 0) or 0)
-        if con_id > 0:
-            return (f"cid:{con_id}", fill.get("sec_type", "") or "")
-        return (fill.get("symbol", "") or "—", fill.get("sec_type", "") or "")
+        cached = fill.get("_agg_key")
+        if cached is not None:
+            return cached
+        return _compute_agg_key(fill)
 
     @staticmethod
     def _fill_display_symbol(fill: dict) -> str:
@@ -909,8 +1004,17 @@ class TradesSummaryModel(QAbstractTableModel):
         them back in) but only aggregated into the visible rows when
         they fall inside the current window.
         """
+        if "_agg_key" not in fill:
+            stamp_fill(fill)
         exec_id = fill.get("exec_id", "")
         key = self._agg_key(fill)
+
+        # Invalidate the walk cache before any early return — a stored
+        # fill changes this key's walk whether or not it is currently
+        # visible, and a re-emit may have migrated keys.
+        self._walk_cache.pop(key, None)
+        self._fills_rev += 1
+        self._pnl_memo = None
 
         # Detect an anchor advance (the midnight ET rollover — a fresh
         # session's first fill arrives and "today" has moved forward).
@@ -927,14 +1031,23 @@ class TradesSummaryModel(QAbstractTableModel):
         # have arrived for the same execId).  Only subtract if the prior
         # fill was actually counted (i.e. it passed the filter).
         prev = self._fills.get(exec_id) if exec_id else None
-        if prev is not None and self._passes_filter(prev):
+        if prev is not None:
             prev_key = self._agg_key(prev)
-            self._subtract_from_agg(prev_key, prev)
-            if self._agg.get(prev_key, {}).get("fill_count", 0) == 0:
-                self._drop_symbol_row(prev_key)
+            if prev_key != key:
+                self._walk_cache.pop(prev_key, None)
+            bucket = self._fills_by_key.get(prev_key)
+            if bucket is not None:
+                bucket.pop(exec_id, None)
+                if not bucket:
+                    del self._fills_by_key[prev_key]
+            if self._passes_filter(prev):
+                self._subtract_from_agg(prev_key, prev)
+                if self._agg.get(prev_key, {}).get("fill_count", 0) == 0:
+                    self._drop_symbol_row(prev_key)
 
         if exec_id:
             self._fills[exec_id] = fill
+            self._fills_by_key.setdefault(key, {})[exec_id] = fill
 
         if anchor_changed:
             # Rebuild from all fills under the new anchor; we've already
@@ -972,11 +1085,11 @@ class TradesSummaryModel(QAbstractTableModel):
             row = self._order.index(key)
             self.dataChanged.emit(
                 self.index(row, 0),
-                self.index(row, _S_NUM_COLS - 1))
+                self.index(row, _S_NUM_COLS - 1), _PNL_ROLES)
             total_row = len(self._order)
             self.dataChanged.emit(
                 self.index(total_row, 0),
-                self.index(total_row, _S_NUM_COLS - 1))
+                self.index(total_row, _S_NUM_COLS - 1), _PNL_ROLES)
 
     def set_days_back(self, days: int) -> None:
         """Change the date window (1 = today, 2 = last 2 trading days,
@@ -1024,6 +1137,10 @@ class TradesSummaryModel(QAbstractTableModel):
         if new == self._hidden_fills:
             return
         self._hidden_fills = new
+        # Hidden fills also gate ``pnl_totals``, which doesn't see the
+        # other view filters — bump its revision explicitly.
+        self._fills_rev += 1
+        self._pnl_memo = None
         self._rebuild_from_fills()
 
     def set_last_price(self, symbol: str, price: float) -> None:
@@ -1052,12 +1169,12 @@ class TradesSummaryModel(QAbstractTableModel):
                 hit = True
                 self.dataChanged.emit(
                     self.index(row, 0),
-                    self.index(row, _S_NUM_COLS - 1))
+                    self.index(row, _S_NUM_COLS - 1), _PNL_ROLES)
         if hit:
             total_row = len(self._order)
             self.dataChanged.emit(
                 self.index(total_row, 0),
-                self.index(total_row, _S_NUM_COLS - 1))
+                self.index(total_row, _S_NUM_COLS - 1), _PNL_ROLES)
 
     def clear(self) -> None:
         if not self._order and not self._fills:
@@ -1066,6 +1183,10 @@ class TradesSummaryModel(QAbstractTableModel):
         self._agg.clear()
         self._order.clear()
         self._fills.clear()
+        self._fills_by_key.clear()
+        self._walk_cache.clear()
+        self._fills_rev += 1
+        self._pnl_memo = None
         self._hidden_symbols.clear()
         self._hidden_fills.clear()
         self._matched_keys.clear()
@@ -1093,7 +1214,7 @@ class TradesSummaryModel(QAbstractTableModel):
             total_row = len(self._order)
             self.dataChanged.emit(
                 self.index(total_row, 0),
-                self.index(total_row, _S_NUM_COLS - 1))
+                self.index(total_row, _S_NUM_COLS - 1), _PNL_ROLES)
 
     def restore_hidden(self) -> None:
         """Un-hide every user-hidden row.  Order after restore is not
@@ -1158,17 +1279,21 @@ class TradesSummaryModel(QAbstractTableModel):
             return
         row = self._order.index(key)
         self.dataChanged.emit(
-            self.index(row, 0), self.index(row, _S_NUM_COLS - 1))
+            self.index(row, 0), self.index(row, _S_NUM_COLS - 1),
+            _PNL_ROLES)
         total_row = len(self._order)
         self.dataChanged.emit(
             self.index(total_row, 0),
-            self.index(total_row, _S_NUM_COLS - 1))
+            self.index(total_row, _S_NUM_COLS - 1), _PNL_ROLES)
 
     # ── Date-filter helpers ─────────────────────────────────────────────────
 
     @staticmethod
     def _fill_local_date(fill: dict) -> date | None:
-        """Parse a fill's ``time_sort`` into an ET calendar date."""
+        """Fill's ``time_sort`` as an ET calendar date — from the
+        ``stamp_fill`` stamp when present, parsed otherwise."""
+        if "_ts_date" in fill:
+            return fill["_ts_date"]
         ts = fill.get("time_sort", "")
         if not ts:
             return None
@@ -1208,6 +1333,9 @@ class TradesSummaryModel(QAbstractTableModel):
         # to reflect exactly that cutoff (match what the flat view is
         # already showing).
         if self._time_threshold is not None:
+            if "_ts_dt" in fill:
+                dt = fill["_ts_dt"]
+                return True if dt is None else dt >= self._time_threshold
             ts = fill.get("time_sort", "")
             if not ts:
                 return True
@@ -1244,6 +1372,7 @@ class TradesSummaryModel(QAbstractTableModel):
         of the time.  User-hides are cleared here because the dataset
         changed: keeping a hide across filter windows would silently
         exclude rows the user may not realize are gone."""
+        self._walk_cache.clear()   # filter state feeding the walks changed
         self.beginResetModel()
         self._agg.clear()
         self._order.clear()
@@ -1373,6 +1502,7 @@ class TradesSummaryModel(QAbstractTableModel):
         # aggregate — drop from internal state only; no row signals
         # needed because the view isn't showing them.
         self._matched_keys.discard(key)
+        self._walk_cache.pop(key, None)
         if key in self._hidden_symbols:
             self._hidden_symbols.discard(key)
             self._agg.pop(key, None)

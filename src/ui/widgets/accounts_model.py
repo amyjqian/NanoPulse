@@ -18,6 +18,7 @@ from PySide6.QtCore import (
     QAbstractTableModel,
     QModelIndex,
     Qt,
+    Signal,
 )
 
 import logging
@@ -82,6 +83,12 @@ def detect_account_type(account: str) -> str:
 
 class AccountsTableModel(QAbstractTableModel):
     """Central aggregation model for all IBKR account summaries."""
+
+    # A connection label flipped online/offline.  Dedicated signal so
+    # listeners that only care about the dim/⚠ row state (e.g.
+    # AccountListPanel) don't have to re-check it on every one of the
+    # hundreds of per-tag ``dataChanged`` emits in a summary batch.
+    connection_state_changed = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -374,6 +381,7 @@ class AccountsTableModel(QAbstractTableModel):
                 tl = self.index(row_idx, 0)
                 br = self.index(row_idx, last_col)
                 self.dataChanged.emit(tl, br, [Qt.ItemDataRole.DisplayRole])
+        self.connection_state_changed.emit()
 
     def is_label_connected(self, label: str | None) -> bool:
         """True when ``label`` is currently reporting a live TWS

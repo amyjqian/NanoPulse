@@ -105,7 +105,13 @@ def setup_logging(level: int = logging.INFO) -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     root = logging.getLogger()
-    root.setLevel(logging.DEBUG)  # capture everything; handlers filter
+    # Gate at the logger, not just the handlers: with the root pinned to
+    # DEBUG, every log.debug() in the hot paths (price ticks, portfolio
+    # batches, order events) built a LogRecord and ran findCaller's
+    # stack walk only for both handlers to reject it.  Pass
+    # ``setup_logging(logging.DEBUG)`` to capture debug in the file
+    # handler again — the level flows through to it below.
+    root.setLevel(level)
 
     # ── Prevent duplicate handlers on repeated calls ──────────────────────────
     if root.handlers:

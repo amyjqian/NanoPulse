@@ -18,7 +18,7 @@ import math
 import random
 import string
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from src.core.enums import OrderAction, OrderType
@@ -311,6 +311,9 @@ class IBWorkerThread(QThread):
     # per-position P&L from pnlSingleEvent
     # (account, con_id, daily_pnl, realized_pnl, unrealized_pnl)
     pnl_single_updated = Signal(str, int, float, float, float)
+    # Batched form: [(account, con_id, daily, realized, unrealized), …] —
+    # one QMetaCallEvent per 250 ms flush instead of one per position.
+    pnl_single_batch_updated = Signal(list)
     # account-level P&L from pnlEvent
     # (account, daily_pnl, realized_pnl, unrealized_pnl)
     account_pnl_updated = Signal(str, float, float, float)
@@ -388,6 +391,12 @@ class IBWorkerThread(QThread):
         self._depth_tickers: dict[str, object] = {}
         self._ticker_to_depth_sym: dict[int, str] = {}
         self._depth_dirty: set[str] = set()
+        # L1 price coalescing (same 100 ms cadence as depth): raw ticks
+        # mark these dirty; ``_depth_flush_loop`` emits at most 10×/s per
+        # symbol.  Subscribe paths still emit directly for instant first
+        # paint.
+        self._active_price_dirty: bool = False
+        self._bg_price_dirty: dict[str, object] = {}
 
         # Order tracking: order_id → Trade
         self._trades: dict[str, object] = {}
@@ -653,6 +662,12 @@ class IBWorkerThread(QThread):
         zeroed = 0
         for key, cached in list(self._portfolio_cache.items()):
             if key not in current_keys:
+                # Only the flat *transition* emits (and logs): entries
+                # already at zero were announced on an earlier refresh,
+                # and re-emitting every historically-flat position made
+                # the batch (and this log) grow monotonically all day.
+                if cached.get("position", 0.0) == 0.0:
+                    continue
                 zero = dict(cached)
                 zero["position"]     = 0.0
                 zero["market_value"] = 0.0
@@ -1114,6 +1129,9 @@ class IBWorkerThread(QThread):
                 self._depth_tickers.clear()
                 self._ticker_to_depth_sym.clear()
                 self._depth_dirty.clear()
+                # Pending coalesced L1 emits reference dead tickers.
+                self._active_price_dirty = False
+                self._bg_price_dirty.clear()
                 # Clear pnlSingle subscriptions so they are re-established
                 # after reconnect (IB drops all subscriptions on disconnect).
                 self._pnl_single_subs.clear()
@@ -1216,16 +1234,19 @@ class IBWorkerThread(QThread):
                 self._portfolio_buffer.clear()
                 self.portfolio_updated.emit(p_batch)
 
-            # RC #1: flush pnl_single buffer — at most 4 batch emissions/second
-            # instead of one QMetaCallEvent per raw pnlSingleEvent tick.
+            # RC #1: flush pnl_single buffer — ONE list-payload signal per
+            # 250 ms window instead of one QMetaCallEvent per position.
             # The dict naturally de-duplicates: only the latest value per
-            # (account, conId) is kept, so rapid ticks collapse into one emit.
+            # (account, conId) is kept, so rapid ticks collapse into one
+            # batch entry.
             if self._pnl_single_buffer:
-                for (acct, con_id), (daily, realized, unrealized) in \
-                        list(self._pnl_single_buffer.items()):
-                    self.pnl_single_updated.emit(
-                        acct, con_id, daily, realized, unrealized)
+                pnl_batch = [
+                    (acct, con_id, daily, realized, unrealized)
+                    for (acct, con_id), (daily, realized, unrealized)
+                    in self._pnl_single_buffer.items()
+                ]
                 self._pnl_single_buffer.clear()
+                self.pnl_single_batch_updated.emit(pnl_batch)
 
             # RC #3: process deferred pnlSingle cancellations for flat positions.
             # Positions that reached zero ≥60 s ago have their reqPnLSingle
@@ -3472,11 +3493,15 @@ class IBWorkerThread(QThread):
         tickers for the multi-symbol cache.
         """
         for ticker in tickers:
-            # Single-symbol active subscription (existing behavior)
+            # Single-symbol active subscription — mark dirty; the 100 ms
+            # flush loop coalesces bursts (same treatment as depth): the
+            # unthrottled form emitted per L1 tick and every emit fanned
+            # into ladder full-grid repaints, trades-summary marks and
+            # ticker-strip restyles on the GUI thread.
             if (self._active_ticker is not None
                     and self._active_price_symbol
                     and ticker is self._active_ticker):
-                self._on_price_update(ticker)
+                self._active_price_dirty = True
 
             # Options-income ticket quote batch (O(1) reverse index)
             if self._ticker_to_opt_conid:
@@ -3490,7 +3515,7 @@ class IBWorkerThread(QThread):
             if self._ticker_to_sym:
                 sym = self._ticker_to_sym.get(id(ticker))
                 if sym:
-                    self._emit_bg_price(sym, ticker)
+                    self._bg_price_dirty[sym] = ticker
 
             # Depth-of-market hot path: mark dirty, don't emit here — the
             # 100 ms ``_depth_flush_loop`` coalesces bursts so we don't
@@ -3571,6 +3596,7 @@ class IBWorkerThread(QThread):
             finally:
                 self._active_ticker = None
                 self._active_price_symbol = ""
+                self._active_price_dirty = False
 
     # ── Background market data (multi-symbol cache) ───────────────────────────
 
@@ -3656,6 +3682,7 @@ class IBWorkerThread(QThread):
         self._bg_tickers.clear()
         self._bg_last_bid_ask.clear()    # clear stale bid/ask cache
         self._ticker_to_sym.clear()  # RC #6: clear reverse index
+        self._bg_price_dirty.clear()     # pending emits reference dead tickers
         log.debug("Worker %s: all %d bg subscriptions cleared",
                   self._label, count)
 
@@ -3769,6 +3796,22 @@ class IBWorkerThread(QThread):
         """
         while self._running:
             await asyncio.sleep(0.1)
+
+            # L1 price coalescing shares this loop's cadence: flush the
+            # active symbol and any dirty background symbols at most
+            # 10×/s each.  First paint stays instant — subscribe paths
+            # emit directly.
+            if self._active_price_dirty:
+                self._active_price_dirty = False
+                if (self._active_ticker is not None
+                        and self._active_price_symbol):
+                    self._on_price_update(self._active_ticker)
+            if self._bg_price_dirty:
+                bg_flush = self._bg_price_dirty
+                self._bg_price_dirty = {}
+                for sym, ticker in bg_flush.items():
+                    self._emit_bg_price(sym, ticker)
+
             if not self._depth_dirty:
                 continue
             for sym in list(self._depth_dirty):
@@ -3869,6 +3912,13 @@ class IBWorkerThread(QThread):
         * _portfolio_cache entries for zero-position instruments whose
           reqPnLSingle subscription has already been cancelled (they will
           never receive another update).
+        * _fills_cache entries older than 10 calendar days — comfortably
+          past the UI's widest preset (7 trading days), and the fills
+          snapshot is the Trades tab's source of truth after a rewire,
+          so nothing a preset can show is dropped.
+        * _order_status_cache entries for terminal orders from previous
+          days (today's stay: the blotter shows them all session).
+        * _conid_contract_meta entries no cache references any more.
         """
         # Refs generated before the YYMMDD switch carry a 4-digit MMDD, so
         # match on both prefixes; a legacy ref simply prunes as stale on
@@ -3924,13 +3974,65 @@ class IBWorkerThread(QThread):
             self._portfolio_cache.pop(key, None)
             self._pnl_single_cache.pop(key, None)
 
-        if stale_refs or stale_rejected or stale_trades or stale_pos:
+        # ── _fills_cache ─────────────────────────────────────────────────────
+        # time_sort is ISO-style, so a lexicographic date compare works.
+        fills_cutoff = (now_et - timedelta(days=10)).date().isoformat()
+        stale_fills = [
+            eid for eid, f in self._fills_cache.items()
+            if (f.get("time_sort", "") or "")[:10] < fills_cutoff
+            and f.get("time_sort")
+        ]
+        for eid in stale_fills:
+            self._fills_cache.pop(eid, None)
+
+        # ── _order_status_cache ──────────────────────────────────────────────
+        terminal = ("Filled", "Cancelled", "Canceled",
+                    "Inactive", "ApiCancelled", "Completed",
+                    "Rejected", "ValidationError")
+        today_iso = now_et.date().isoformat()
+        stale_status: list[str] = []
+        for oid, d in self._order_status_cache.items():
+            if d.get("status", "") not in terminal:
+                continue
+            if today_prefix in oid or legacy_prefix in oid:
+                continue   # today's internal order — keep
+            ts = d.get("time_sort", "") or ""
+            if ts and ts[:10] < today_iso:
+                stale_status.append(oid)
+            elif not ts and "_nano_" in oid:
+                # Internal ref from a previous day (prefix check above
+                # already excluded today's) with no timestamp.
+                stale_status.append(oid)
+        for oid in stale_status:
+            self._order_status_cache.pop(oid, None)
+
+        # ── _conid_contract_meta ─────────────────────────────────────────────
+        if self._conid_contract_meta:
+            referenced: set[int] = set()
+            for f in self._fills_cache.values():
+                cid = f.get("con_id", 0)
+                if cid:
+                    referenced.add(int(cid))
+            for trade in self._trades.values():
+                cid = getattr(getattr(trade, "contract", None), "conId", 0)
+                if cid:
+                    referenced.add(int(cid))
+            for (_acct, cid) in self._portfolio_cache:
+                referenced.add(int(cid))
+            for cid in [c for c in self._conid_contract_meta
+                        if c not in referenced]:
+                self._conid_contract_meta.pop(cid, None)
+
+        if (stale_refs or stale_rejected or stale_trades or stale_pos
+                or stale_fills or stale_status):
             log.debug(
                 "Worker %s: pruned %d order refs, %d rejected orders, "
-                "%d stale trades, %d flat positions",
+                "%d stale trades, %d flat positions, %d old fills, "
+                "%d old status entries",
                 self._label,
                 len(stale_refs), len(stale_rejected),
-                len(stale_trades), len(stale_pos))
+                len(stale_trades), len(stale_pos),
+                len(stale_fills), len(stale_status))
 
     def _on_account_summary(self, value) -> None:
         """De-duplicate rapid ticks into the buffer dict.
@@ -4178,9 +4280,17 @@ class IBWorkerThread(QThread):
     def _on_ib_error(self, reqId, errorCode, errorString, contract) -> None:
         """Handle IB error events – detect market-data failures like 10197
         and order rejections like 201."""
-        tws_log.warning("[%s] EVENT     errorEvent → reqId=%s errorCode=%s "
-                        "errorString=%s contract=%s",
-                        self._label, reqId, errorCode, errorString, contract)
+        if errorCode in (2104, 2106, 2158):
+            # Routine farm-status notices arrive constantly; skip the
+            # Contract repr (a full dataclass format) for them.
+            tws_log.warning("[%s] EVENT     errorEvent → reqId=%s "
+                            "errorCode=%s errorString=%s",
+                            self._label, reqId, errorCode, errorString)
+        else:
+            tws_log.warning("[%s] EVENT     errorEvent → reqId=%s "
+                            "errorCode=%s errorString=%s contract=%s",
+                            self._label, reqId, errorCode, errorString,
+                            contract)
 
         # Error 354 — "Requested market data is not subscribed."  The
         # options ticket first tries frozen data (type 2), which needs a
@@ -4263,6 +4373,22 @@ class IBWorkerThread(QThread):
 
     # ── Global order listener ─────────────────────────────────────────────────
 
+    @staticmethod
+    def _trade_order_key(order, order_status) -> str:
+        """Canonical order key for a Trade — the exact derivation
+        ``_build_trade_dict`` uses (see its docstring for the rules).
+        Split out so ``_on_global_order_status`` can decide to skip a
+        handled order without building the full dict."""
+        order_ref = getattr(order, "orderRef", "") or ""
+        acct = getattr(order, "account", "") or ""
+        if order_ref.startswith("nano_"):
+            return f"{acct}_{order_ref}"
+        perm_id = getattr(order, "permId", 0) or getattr(
+            order_status, "permId", 0)
+        if perm_id:
+            return f"{acct}_p{perm_id}"
+        return f"{acct}_{order.orderId}"
+
     def _build_trade_dict(self, trade, fill_map: dict | None = None) -> dict | None:
         """Build an order-status dict from an ib_async Trade object.
 
@@ -4300,13 +4426,9 @@ class IBWorkerThread(QThread):
                 trade.orderStatus, "permId", 0)
             acct = getattr(order, "account", "") or ""
 
-            if order_ref.startswith("nano_"):
-                # Internal NanoPulse order — account + orderRef is immutable.
-                order_id = f"{acct}_{order_ref}"
-            elif perm_id:
-                order_id = f"{acct}_p{perm_id}"
-            else:
-                order_id = f"{acct}_{order.orderId}"
+            # Single source of truth for the key — shared with the
+            # global handler's early skip.
+            order_id = self._trade_order_key(order, trade.orderStatus)
 
             # ── Fill price ────────────────────────────────────────────────
             # 1. orderStatus.avgFillPrice (populated for live orders)
@@ -4672,11 +4794,24 @@ class IBWorkerThread(QThread):
         restored from snapshot do NOT have closures, so we must emit for
         them here — otherwise cancel/fill updates after reconnect are lost.
         """
+        # Skip BEFORE building the full dict: this global callback fires
+        # for every status of every order, and for session-placed orders
+        # the per-trade closure already emits AND writes the same
+        # tws_log/order_log lines — paying ~200 lines of attribute
+        # walking (plus a duplicate disk write) per event just to throw
+        # the result away was measurable all day.
+        try:
+            if (self._trade_order_key(trade.order, trade.orderStatus)
+                    in self._has_status_handler):
+                return
+        except Exception:
+            pass   # fall through to the full build, which guards itself
+
         d = self._build_trade_dict(trade)
         if not d:
             return
 
-        # Log every global order status event to TWS log
+        # Log every unhandled global order status event to TWS log
         tws_log.info("[%s] EVENT     global orderStatusEvent → orderId=%s "
                      "status=%s symbol=%s action=%s filled=%s avgFill=%s "
                      "orderRef=%s permId=%s",
@@ -4690,12 +4825,7 @@ class IBWorkerThread(QThread):
                      d.get("order_ref", ""),
                      getattr(trade.order, "permId", 0))
 
-        # Only skip if a per-trade _on_status closure is handling this order.
-        # Snapshot-registered trades (in _trades but NOT _has_status_handler)
-        # must be emitted here so cancel/fill status reaches the UI.
         order_id = d["order_id"]
-        if order_id in self._has_status_handler:
-            return
 
         # Log to order log for external or snapshot-restored orders
         order_log.info("[%s] ORDER-STATUS  %s | status=%s symbol=%s "

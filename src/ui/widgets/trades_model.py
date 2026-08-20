@@ -9,6 +9,7 @@ re-snapshot after a reconnect is idempotent.
 from __future__ import annotations
 
 import logging
+from bisect import bisect_left
 from typing import Any
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
@@ -123,8 +124,14 @@ class TradesModel(QAbstractTableModel):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        # Fills oldest→newest INTERNALLY; the view presents them reversed
+        # (view row r ↔ internal position len-1-r).  Live fills arrive in
+        # chronological order, so the hot path is a pure append and the
+        # exec-id index below never shifts — the previous newest-first
+        # list re-shifted (and rebuilt the whole index dict) on every
+        # insert, O(N²) over a session.
         self._rows: list[dict] = []
-        # execId → row index (for dedupe + surgical commission patches)
+        # execId → INTERNAL position (for dedupe + surgical patches)
         self._index: dict[str, int] = {}
 
         # Shared cell fonts — same family, weight and size as the Positions
@@ -142,9 +149,10 @@ class TradesModel(QAbstractTableModel):
 
     def row_data(self, row: int) -> dict | None:
         """Return the raw row dict so ``TradesFilterProxy`` can filter on
-        keys directly without string-scanning every display column."""
+        keys directly without string-scanning every display column.
+        *row* is a VIEW row (newest first)."""
         if 0 <= row < len(self._rows):
-            return self._rows[row]
+            return self._rows[len(self._rows) - 1 - row]
         return None
 
     # ── Qt model plumbing ───────────────────────────────────────────────────
@@ -174,11 +182,12 @@ class TradesModel(QAbstractTableModel):
         row_idx = index.row()
         if row_idx < 0 or row_idx >= len(self._rows):
             return None
-        row = self._rows[row_idx]
+        row = self._rows[len(self._rows) - 1 - row_idx]
         col = index.column()
 
         if role == GroupKeyRole:
-            return order_group_key(row)
+            gk = row.get("_group_key")
+            return gk if gk is not None else order_group_key(row)
         if role == SortValueRole:
             return self._sort_value(row, col)
         if role == Qt.ItemDataRole.DisplayRole:
@@ -351,37 +360,45 @@ class TradesModel(QAbstractTableModel):
         flat view always reads newest-first regardless of arrival
         order."""
         exec_id = fill.get("exec_id", "")
+        if "_group_key" not in fill:
+            # Precompute the band key once — GroupBandDelegate asks for
+            # it per painted cell.
+            fill["_group_key"] = order_group_key(fill)
 
         if exec_id and exec_id in self._index:
-            row = self._index[exec_id]
-            self._rows[row] = fill
-            top_left = self.index(row, 0)
-            bottom_right = self.index(row, _NUM_COLS - 1)
+            pos = self._index[exec_id]
+            self._rows[pos] = fill
+            view_row = len(self._rows) - 1 - pos
+            top_left = self.index(view_row, 0)
+            bottom_right = self.index(view_row, _NUM_COLS - 1)
             self.dataChanged.emit(top_left, bottom_right)
             return
 
-        # Descending-time insertion: find the first existing row whose
-        # time_sort is strictly older than the incoming fill's.
-        # time_sort is an ISO-style string, so lexicographic compare
-        # matches chronological order.  Blank time_sort sorts oldest
-        # (ends up at the tail).
+        # Ascending-time insertion (internal order).  time_sort is an
+        # ISO-style string, so lexicographic compare matches
+        # chronological order.  bisect_left places an equal-timestamp
+        # fill BEFORE existing equals internally — i.e. below them in
+        # the newest-first view, exactly where the old descending scan
+        # put it.  Blank time_sort sorts to the internal front = the
+        # view's tail, also as before.  Live fills are newest ⇒ the
+        # common case is a pure append and no index entry ever shifts.
         ts = fill.get("time_sort", "") or ""
-        idx = 0
-        for existing in self._rows:
-            if (existing.get("time_sort", "") or "") < ts:
-                break
-            idx += 1
+        n = len(self._rows)
+        pos = bisect_left(self._rows, ts,
+                          key=lambda f: f.get("time_sort", "") or "")
 
-        self.beginInsertRows(QModelIndex(), idx, idx)
-        self._rows.insert(idx, fill)
-        # Every existing row with index >= idx shifted down by one.
-        if self._index:
-            self._index = {
-                eid: (r + 1 if r >= idx else r)
-                for eid, r in self._index.items()
-            }
+        view_row = n - pos     # where the new fill appears in the view
+        self.beginInsertRows(QModelIndex(), view_row, view_row)
+        self._rows.insert(pos, fill)
+        if pos < n:
+            # Rare out-of-order insert (reconnect replay emits fills
+            # pre-sorted, so live sessions never hit this): shift the
+            # entries at or after the insertion point.
+            for eid, p in self._index.items():
+                if p >= pos:
+                    self._index[eid] = p + 1
         if exec_id:
-            self._index[exec_id] = idx
+            self._index[exec_id] = pos
         self.endInsertRows()
 
     def clear(self) -> None:

@@ -203,8 +203,9 @@ class TestPanelSignal:
         panel.update_order("oid3", _order(order_id="oid3", con_id=896505480,
                                           sec_type="OPT",
                                           status="Submitted"))
-        src_row = panel._model._order_map["oid3"]
-        stored = panel._model.order_at(src_row)
+        m = panel._model
+        stored = next(m.order_at(r) for r in range(m.rowCount())
+                      if m.order_id_at(r) == "oid3")
         assert stored["con_id"] == 896505480
         assert stored["sec_type"] == "OPT"
 

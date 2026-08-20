@@ -471,9 +471,21 @@ class RowHoverDelegate(QStyledItemDelegate):
     def _set_hover_row(self, row: int | None) -> None:
         if row == self._hover_row:
             return
+        prev = self._hover_row
         self._hover_row = row
         view = self.parent()
-        if view is not None and hasattr(view, "viewport"):
+        if view is None or not hasattr(view, "viewport"):
+            return
+        # Repaint only the two affected rows.  A full viewport update
+        # here re-ran every visible cell's data() chain on each row
+        # crossing — on the value-heavy blotters that is real work.
+        if hasattr(view, "rowViewportPosition") and hasattr(view, "rowHeight"):
+            vp = view.viewport()
+            for r in (prev, row):
+                if r is not None and r >= 0:
+                    vp.update(QRect(0, view.rowViewportPosition(r),
+                                    vp.width(), view.rowHeight(r)))
+        else:
             view.viewport().update()
 
     def eventFilter(self, obj, event) -> bool:
@@ -563,6 +575,7 @@ class GroupBandDelegate(FooterAwareRowDelegate):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._parity: list[int] = []
+        self._keys: list = []
         self._dirty = True
         model = parent.model() if parent is not None else None
         if model is not None:
@@ -582,6 +595,7 @@ class GroupBandDelegate(FooterAwareRowDelegate):
     def _rebuild(self) -> None:
         model = self.parent().model()
         parity: list[int] = []
+        keys: list = []
         prev_key = object()   # sentinel: never equal to a real key
         band = 1              # flipped to 0 by the first row
         for row in range(model.rowCount()):
@@ -590,7 +604,9 @@ class GroupBandDelegate(FooterAwareRowDelegate):
                 band ^= 1
                 prev_key = key
             parity.append(band)
+            keys.append(key)
         self._parity = parity
+        self._keys = keys
         self._dirty = False
 
     def _band_for(self, row: int) -> int:
@@ -599,7 +615,15 @@ class GroupBandDelegate(FooterAwareRowDelegate):
         return self._parity[row] if 0 <= row < len(self._parity) else 0
 
     def _wants_separator(self, index, below) -> bool:
-        # Only where the group changes.
+        # Only where the group changes.  Compare the cached keys from
+        # ``_rebuild`` — two data() round-trips per painted cell
+        # (each rebuilding the group-key string) added up on a table
+        # that repaints with live fills.
+        if self._dirty:
+            self._rebuild()
+        row = index.row()
+        if 0 <= row < len(self._keys) - 1:
+            return self._keys[row] != self._keys[row + 1]
         return (index.data(self.group_key_role)
                 != below.data(self.group_key_role))
 

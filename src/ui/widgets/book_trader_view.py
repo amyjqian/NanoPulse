@@ -36,6 +36,7 @@ handlers route Book Trader clicks to the same worker methods):
 from __future__ import annotations
 
 import logging
+import weakref
 from pathlib import Path
 
 from PySide6.QtCore import QSize, Qt, Signal
@@ -377,8 +378,11 @@ class BookTraderView(QWidget):
         self._live_orders: dict[str, dict] = {}
         # Workers whose ``order_status_updated`` signal is already
         # connected to our slot.  Tracked so we don't double-connect on
-        # repeat ``_wire_order_status`` calls.
-        self._order_status_wired: set = set()
+        # repeat ``_wire_order_status`` calls.  A WeakSet so replaced /
+        # disconnected IBWorkerThread objects aren't kept alive for the
+        # app's lifetime; a NEW worker under the same label is a
+        # different object and gets wired as before.
+        self._order_status_wired: weakref.WeakSet = weakref.WeakSet()
 
         # Ladder model/view (built first so _reload_tier_sections can call it).
         # ``rows_each_side`` defaults to 20 → 41-row ladder; the view scrolls
@@ -622,6 +626,9 @@ class BookTraderView(QWidget):
         # sees exactly what a click would submit.
         self._ladder.set_qty_provider(self._ladder_badge_qty)
         self._ladder.set_armed_summary_provider(self._format_attached_summary)
+        # Lazily-imported OrderEntryPanel class (circular-import dodge),
+        # cached for the badge's per-mouse-move summary calls.
+        self._oep_cls = None
         # Populate tick combo for the initial contract.
         self._populate_tick_combo()
 
@@ -824,6 +831,11 @@ class BookTraderView(QWidget):
             bids.append((self._last_bid, self._last_bid_size))
         if self._last_ask > 0 and self._last_ask_size > 0:
             asks.append((self._last_ask, self._last_ask_size))
+        # feed_depth invalidates the whole grid — skip when the
+        # synthesised book is identical to the last render.
+        if (bids, asks) == getattr(self, "_l1_rendered", None):
+            return
+        self._l1_rendered = (bids, asks)
         self._model.feed_depth(bids, asks)
 
     def _on_order_status(self, data: dict) -> None:
@@ -1052,7 +1064,13 @@ class BookTraderView(QWidget):
         """
         # Reuse the helpers from OrderEntryPanel — they already do the
         # tier-section → dollar-amount math the action buttons rely on.
-        from src.ui.widgets.order_entry_panel import OrderEntryPanel as _OEP
+        # Local import dodges a circular import; cached because this
+        # runs from the ladder's mouse-move handler.
+        _OEP = self._oep_cls
+        if _OEP is None:
+            from src.ui.widgets.order_entry_panel import (
+                OrderEntryPanel as _OEP)
+            self._oep_cls = _OEP
         parts: list[str] = []
         tp = _OEP._tier_amount(self._pt_section)
         if tp is not None:

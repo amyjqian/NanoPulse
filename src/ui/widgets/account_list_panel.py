@@ -27,6 +27,7 @@ from .accounts_model import (
     COL_ACCOUNT,
     COL_ALIAS,
     COL_NET_LIQ,
+    COL_TOTAL_CASH,
     COL_TYPE,
 )
 from src.core import config_manager
@@ -370,21 +371,38 @@ class _AccountRow(QFrame):
         return self._checked
 
     def set_balance(self, balance: str) -> None:
-        self._balance_neg = self._parse_neg(balance)
-        self._balance_lbl.setText(self._format_balance(balance))
+        """Update the big balance label.  Skips the setText and — more
+        importantly — the setStyleSheet (a full QSS re-polish) when
+        nothing changed: the 250 ms summary batches re-send every tag,
+        so most calls are no-ops."""
+        neg = self._parse_neg(balance)
+        text = self._format_balance(balance)
+        if text == self._balance_lbl.text() and neg == self._balance_neg:
+            return
+        self._balance_neg = neg
+        self._balance_lbl.setText(text)
         self._balance_lbl.setStyleSheet(
             f"color: {self._big_color()}; background: transparent;")
 
     def set_cash(self, cash: dict[str, float]) -> None:
         """Pick out the USD cash balance and render it under the name.  No
-        USD entry hides the sub-line."""
+        USD entry hides the sub-line.  No-op when the value is unchanged."""
         usd = cash.get("USD")
-        self._usd = float(usd) if usd is not None else None
+        new = float(usd) if usd is not None else None
+        if new == self._usd:
+            return
+        self._usd = new
         self._refresh_usd()
 
-    def set_name(self, alias: str) -> None:
-        self._base_name = alias if alias else self._account
+    def set_name(self, alias: str) -> bool:
+        """Set the display name; returns True when it actually changed
+        (the caller reorders rows only then — sort order is name-based)."""
+        base = alias if alias else self._account
+        if base == self._base_name:
+            return False
+        self._base_name = base
         self._refresh_name_label()
+        return True
 
     def set_checked(self, checked: bool) -> None:
         self._checked = checked
@@ -711,6 +729,8 @@ class AccountListPanel(QWidget):
 
         # React to model changes
         self._model.dataChanged.connect(self._on_model_data_changed)
+        self._model.connection_state_changed.connect(
+            self._refresh_connected_states)
         self._model.rowsInserted.connect(self._on_rows_changed)
         self._model.rowsRemoved.connect(self._on_rows_changed)
 
@@ -1309,24 +1329,30 @@ class AccountListPanel(QWidget):
 
     def _on_model_data_changed(self, topLeft: QModelIndex,
                                bottomRight: QModelIndex, roles=None) -> None:
-        net_liq_touched = False
+        """Column-aware: the 250 ms summary batches emit one dataChanged
+        per (account, tag) — ~hundreds per flush.  Only the columns this
+        panel renders trigger row updates (the row widgets additionally
+        skip unchanged values), and rows re-sort only when a display
+        name actually changed — the sort key is name-based, so balance
+        ticks never alter the order.  Connection flips arrive via the
+        model's dedicated ``connection_state_changed`` signal."""
+        c0, c1 = topLeft.column(), bottomRight.column()
+        name_changed = False
         for row_idx in range(topLeft.row(), bottomRight.row() + 1):
             if row_idx >= len(self._model._table_data):
                 continue
             rd = self._model._table_data[row_idx]
             r = self._account_rows.get(rd[COL_ACCOUNT])
-            if r:
+            if not r:
+                continue
+            if c0 <= COL_NET_LIQ <= c1 or c0 <= COL_TOTAL_CASH <= c1:
                 r.set_balance(rd[COL_NET_LIQ])
-                r.set_name(rd[COL_ALIAS] if rd[COL_ALIAS] else rd[COL_ACCOUNT])
                 r.set_cash(self._model.get_cash_by_currency(rd[COL_ACCOUNT]))
-                net_liq_touched = True
-        # ``set_connection_status`` on the model emits ``dataChanged`` to
-        # signal a label-wide flip; refresh every row's offline indicator
-        # so the dim/⚠ state stays in sync with the worker's reality.
-        self._refresh_connected_states()
-        # Balances just changed — re-sort so the account with the most
-        # money bubbles to the top (within its selected/unselected group).
-        if net_liq_touched:
+            if c0 <= COL_ALIAS <= c1:
+                if r.set_name(rd[COL_ALIAS] if rd[COL_ALIAS]
+                              else rd[COL_ACCOUNT]):
+                    name_changed = True
+        if name_changed:
             self._reorder_rows()
 
     def _on_rows_changed(self, *args) -> None:
