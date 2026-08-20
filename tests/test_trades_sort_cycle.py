@@ -110,20 +110,27 @@ def test_summary_sort_keeps_footer_pinned(qtbot):
         return [proxy.index(r, S_COL_SYMBOL).data()
                 for r in range(proxy.rowCount())]
 
-    def footer_last():
-        last = proxy.index(proxy.rowCount() - 1, 0)
-        return bool(last.data(IsFooterRowRole))
+    def bands_pinned():
+        # The section headers and the two TOTAL rows all keep their
+        # spots under any sort.
+        return all(bool(proxy.index(r, 0).data(IsFooterRowRole))
+                   for r in (0, 3, 4, 7))
 
-    assert rows() == ["AAA", "BBB", "P&L"]
+    stacked = ["TRADE LEVEL", "AAA", "BBB", "TOTAL",
+               "ACCOUNT LEVEL", "AAA", "BBB", "TOTAL"]
+    assert rows() == stacked
 
     _click(panel, "summary", S_COL_NET_TOTAL)   # descending: +10 first
-    assert rows() == ["AAA", "BBB", "P&L"]
-    assert footer_last()
+    assert rows() == stacked
+    assert bands_pinned()
 
     _click(panel, "summary", S_COL_NET_TOTAL)   # ascending: −10 first
-    assert rows() == ["BBB", "AAA", "P&L"]
-    assert footer_last()
+    # The account section's P&L cells are blank (realized-only), so its
+    # rows keep source order under a P&L-column sort.
+    assert rows() == ["TRADE LEVEL", "BBB", "AAA", "TOTAL",
+                      "ACCOUNT LEVEL", "AAA", "BBB", "TOTAL"]
+    assert bands_pinned()
 
     _click(panel, "summary", S_COL_NET_TOTAL)   # cleared: insertion order
-    assert rows() == ["AAA", "BBB", "P&L"]
-    assert footer_last()
+    assert rows() == stacked
+    assert bands_pinned()

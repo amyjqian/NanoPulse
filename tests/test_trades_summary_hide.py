@@ -59,7 +59,8 @@ def test_match_buy_sell_trims_and_recomputes():
     # 10 bought @100, 4 sold @110 → net long 6, raw net total = -560.
     m.add_fill(_fill("e1", "AAA", "BOT", 10, 100.0, con_id=1))
     m.add_fill(_fill("e2", "AAA", "SLD", 4, 110.0, con_id=1))
-    key = m.row_key(0)
+    # Row 0 is the "TRADE LEVEL" band; symbol rows sit below it.
+    key = m.row_key(1)
 
     assert m.can_match(key) is True
     assert m._net_total(m._effective_agg(key)) == -560.0
@@ -84,8 +85,8 @@ def test_can_match_false_when_balanced_or_one_sided():
     m.add_fill(_fill("e2", "AAA", "SLD", 5, 100.0, con_id=1))
     m.add_fill(_fill("e3", "BBB", "BOT", 7, 200.0, con_id=2))  # one-sided
 
-    aaa = m.row_key(0)
-    bbb = m.row_key(1)
+    aaa = m.row_key(1)
+    bbb = m.row_key(2)
     assert m.can_match(aaa) is False   # balanced
     assert m.can_match(bbb) is False   # no sell leg
     # match_symbol is a no-op on an ineligible row.
@@ -97,7 +98,7 @@ def test_match_reflected_in_totals():
     m = TradesSummaryModel()
     m.add_fill(_fill("e1", "AAA", "BOT", 10, 100.0, con_id=1))
     m.add_fill(_fill("e2", "AAA", "SLD", 4, 110.0, con_id=1))
-    key = m.row_key(0)
+    key = m.row_key(1)
 
     # Totals fold over effective aggs, so matching changes the footer.
     before = m._total_cell_text(S_COL_NET_TOTAL)
@@ -114,7 +115,7 @@ def test_visible_fill_count_excludes_hidden():
     m.add_fill(_fill("e3", "BBB", "BOT", 5, 200.0, con_id=2))
     assert m.visible_fill_count() == 3
 
-    m.hide_symbol(m.row_key(0))  # hide AAA (2 fills)
+    m.hide_symbol(m.row_key(1))  # hide AAA (2 fills)
     assert m.visible_fill_count() == 1
 
     m.restore_hidden()
@@ -136,16 +137,17 @@ def test_hide_multiple_selected_summary_rows(qtbot):
     proxy = panel._summary_proxy
     model = panel._summary_model
 
-    # Select the AAA (row 0) and BBB (row 1) rows.
+    # Select the AAA and BBB rows (rows 1 and 2 — row 0 is the
+    # "TRADE LEVEL" band).
     sm = table.selectionModel()
     flag = (QItemSelectionModel.SelectionFlag.Select
             | QItemSelectionModel.SelectionFlag.Rows)
-    for r in (0, 1):
+    for r in (1, 2):
         sm.select(proxy.index(r, 0), flag)
 
     panel._hide_selected_summary_rows()
 
-    remaining = {model.row_data(r)["symbol"] for r in range(len(model._order))}
+    remaining = {model._agg[k]["symbol"] for k in model._order}
     assert remaining == {"CCC"}
     assert model.hidden_count() == 2
     # Counter reflects only CCC's single fill now.
@@ -200,8 +202,8 @@ def test_flat_hide_propagates_to_summary(qtbot):
     model = panel._summary_model
 
     def agg_for(sym):
-        for r in range(len(model._order)):
-            d = model.row_data(r)
+        for k in model._order:
+            d = model._agg[k]
             if d["symbol"] == sym:
                 return d
         return None
@@ -268,7 +270,7 @@ def test_summary_view_trade_count_tracks_hide(qtbot):
     assert "3 trds" in bar._trades_count_label.text()
 
     # Hiding AAA (2 fills) drops the count to BBB's single fill.
-    panel._summary_model.hide_symbol(panel._summary_model.row_key(0))
+    panel._summary_model.hide_symbol(panel._summary_model.row_key(1))
     assert "1 trd" in bar._trades_count_label.text()
 
     # Restoring brings the count back.

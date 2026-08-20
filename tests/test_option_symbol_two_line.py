@@ -8,6 +8,7 @@ single-line / raw forms.
 """
 from __future__ import annotations
 
+import pytest
 from PySide6.QtCore import Qt
 
 from src.ui.widgets.trades_model import COL_SYMBOL, TradesModel
@@ -17,6 +18,20 @@ from src.utils.helpers import (
     format_option_symbol, format_option_symbol_two_line)
 
 _OCC = "AAPL  260918C00250000"
+
+
+@pytest.fixture(autouse=True)
+def _pin_today(monkeypatch):
+    """The summary's date filter is strict-today, so pin "today" to the
+    fixture fills' date — otherwise the fills fall outside the default
+    1-day window whenever the suite runs on a later date."""
+    from datetime import date
+
+    import src.ui.widgets.trades_filter_proxy as tfp
+    import src.ui.widgets.trades_summary_model as tsm
+    pinned = date(2026, 8, 19)          # the day the fills are dated
+    monkeypatch.setattr(tfp, "today_et", lambda: pinned)
+    monkeypatch.setattr(tsm, "today_et", lambda: pinned)
 
 
 def _fill(**over) -> dict:
@@ -94,7 +109,8 @@ class TestTradesViews:
     def test_summary_symbol_cell_is_two_line(self, qtbot):
         m = TradesSummaryModel()
         m.add_fill(_fill())
-        text = m.index(0, S_COL_SYMBOL).data(Qt.ItemDataRole.DisplayRole)
+        # Row 0 is the "TRADE LEVEL" band; the symbol row sits below it.
+        text = m.index(1, S_COL_SYMBOL).data(Qt.ItemDataRole.DisplayRole)
         assert text == "AAPL Sep18\n250 C"
 
     def test_positions_flat_symbol_cell_is_two_line(self, qtbot):
@@ -153,5 +169,5 @@ class TestTradesViews:
         from src.ui.widgets.table_theme import SortValueRole
         m = TradesSummaryModel()
         m.add_fill(_fill())
-        v = m.index(0, S_COL_SYMBOL).data(SortValueRole)
+        v = m.index(1, S_COL_SYMBOL).data(SortValueRole)
         assert "\n" not in v

@@ -11,7 +11,10 @@ P&L = R.P&L + U.P&L always.
 
 IB's ``realized_pnl`` (computed against the account's average cost, a
 basis that reaches outside the window) is deliberately NOT folded into
-R/U — it stays visible in the separate Rlz P&L column.
+R/U — it stays visible in the separate Rlz P&L column, and in the
+second "Acct P&L" footer row, whose cost-basis walk takes IB at its
+word for fills that closed positions opened before the window (see
+``TestAcctPnlFooter``).
 
 Every P&L number the model reports is GROSS; the Comm column deducts
 commission exactly once (Net P&L = P&L − Comm).
@@ -59,12 +62,12 @@ def _fill(exec_id, side, shares, price, *, realized_pnl=None, con_id=1,
     return d
 
 
-def _r(m, row=0):
-    return m._realized_total(m.row_key(row))
+def _r(m, idx=0):
+    return m._realized_total(m._order[idx])
 
 
-def _u(m, row=0):
-    key = m.row_key(row)
+def _u(m, idx=0):
+    key = m._order[idx]
     return m._unrealized_total(key, m._effective_agg(key))
 
 
@@ -483,3 +486,315 @@ def test_footer_reconciles_r_plus_u():
     assert r == 0.0
     assert u == (110.0 - 104.0) * 6 + (103.0 - 100.0) * 10
     assert total == r + u
+
+
+def _cbr(m, idx=0):
+    return m._cb_realized_total(m._order[idx])
+
+
+def _cbu(m, idx=0):
+    """Cost-basis open remainder marked to last — tracked by the walk
+    (classification evidence: what did NOT divert to IB's realized)
+    but never displayed; the account-level section is realized-only."""
+    key = m._order[idx]
+    return m._mark_open(m._walk_for_key(key), m._effective_agg(key),
+                        prefix="cb_")
+
+
+class TestAcctPnlFooter:
+    """The cost-basis totals row.  A fill that closed a position opened
+    before the window contributes IB's avg-cost ``realized_pnl``
+    (prorated, gross of the commission IB folded in) instead of opening
+    a window-short.  Realized-only: U.P&L and P&L stay blank and
+    Net P&L = R.P&L − Comm.  The window-relative numbers above it must
+    never move."""
+
+    def test_overnight_close_shows_ib_realized(self):
+        # Sell 100 today, bought yesterday at $95: window R is 0 (the
+        # sell is a window-short marked to price), Acct R is IB's $500.
+        m = TradesSummaryModel()
+        m.add_fill(_fill("e1", "SLD", 100, 100.0, realized_pnl=500.0))
+        m.set_last_price("AAA", 98.0)
+        assert _r(m) == 0.0
+        assert _u(m) == (100.0 - 98.0) * 100
+        assert _cbr(m) == 500.0
+        assert _cbu(m) == 0.0
+
+    def test_closing_commission_added_back_gross(self):
+        # IB's realized is net of both legs' commissions; the cost-basis
+        # R adds the closing fill's own commission back so the Net P&L
+        # column deducts commission exactly once.
+        m = TradesSummaryModel()
+        m.add_fill(_fill("e1", "SLD", 6, 110.0, realized_pnl=57.0)
+                   | {"commission": 1.2})
+        from src.ui.widgets.trades_summary_model import (
+            S_COL_NET_INCL_COMM, S_COL_NET_TOTAL, S_COL_PAIRED_PNL,
+            S_COL_UNPAIRED_PNL,
+        )
+        assert _cbr(m) == pytest.approx(58.2)
+        assert m._cost_value(S_COL_PAIRED_PNL) == pytest.approx(58.2)
+        assert m._cost_value(S_COL_NET_INCL_COMM) == pytest.approx(57.0)
+        # Realized-only: no unrealized or combined total in this section.
+        assert m._cost_value(S_COL_UNPAIRED_PNL) is None
+        assert m._cost_value(S_COL_NET_TOTAL) is None
+
+    def test_pure_in_window_round_trip_matches_window_footer(self):
+        # Nothing reaches outside the window → both footers agree on the
+        # realized columns.
+        m = TradesSummaryModel()
+        m.add_fill(_fill("e1", "BOT", 5, 100.0))
+        m.add_fill(_fill("e2", "SLD", 5, 110.0, realized_pnl=50.0,
+                         t="2026-05-29T11:00:00"))
+        from src.ui.widgets.trades_summary_model import (
+            S_COL_NET_INCL_COMM, S_COL_PAIRED_PNL,
+        )
+        for col in (S_COL_PAIRED_PNL, S_COL_NET_INCL_COMM):
+            assert m._cost_value(col) == m._total_value(col)
+        assert m._cost_value(S_COL_PAIRED_PNL) == 50.0
+
+    def test_partial_close_prorates_ib_realized(self):
+        # Buy 4 today, sell 10 (rpnl on the whole execution): 4 pair
+        # in-window; the unmatched 6/10 take IB's number prorated, plus
+        # the same fraction of the closing fill's commission.
+        m = TradesSummaryModel()
+        m.add_fill(_fill("e1", "BOT", 4, 100.0))
+        m.add_fill(_fill("e2", "SLD", 10, 110.0, realized_pnl=600.0,
+                         t="2026-05-29T11:00:00") | {"commission": 1.0})
+        m.set_last_price("AAA", 105.0)
+        assert _r(m) == (110.0 - 100.0) * 4
+        assert _u(m) == (110.0 - 105.0) * 6
+        assert _cbr(m) == pytest.approx(
+            (110.0 - 100.0) * 4 + 600.0 * 0.6 + 1.0 * 0.6)
+        assert _cbu(m) == 0.0
+
+    def test_futures_closing_realized_is_unscaled_dollars(self):
+        # cb closing terms are IB dollar amounts — never multiplied by
+        # the contract multiplier (MNQ ×2 here).
+        m = TradesSummaryModel()
+        m.add_fill(_fut("c1", "SLD", 30100.0, "10:00:00", "A",
+                        realized_pnl=198.78))
+        m.set_last_price("MNQ", 30160.0)
+        assert _cbr(m) == pytest.approx(198.78 + 0.61)
+        assert _cbu(m) == 0.0
+
+    def test_rpnl_reemit_self_heals(self):
+        # Live flow: the execution lands before its commissionReport.
+        # Until then the cost-basis leg marks to last (same as the
+        # window leg); the re-emitted fill with realized_pnl swings it
+        # to IB's number.  Window numbers never move.
+        m = TradesSummaryModel()
+        m.add_fill(_fill("e1", "SLD", 6, 110.0))
+        m.set_last_price("AAA", 104.0)
+        assert _cbr(m) == 0.0
+        assert _cbu(m) == (110.0 - 104.0) * 6
+        m.add_fill(_fill("e1", "SLD", 6, 110.0, realized_pnl=57.0))
+        assert _cbr(m) == 57.0
+        assert _cbu(m) == 0.0
+        assert _r(m) == 0.0
+        assert _u(m) == (110.0 - 104.0) * 6
+
+    def test_matched_row_trims_to_round_trip_only(self):
+        # Match buy & sell: the cost-basis row follows the window row's
+        # matched semantics — trimmed round trip only, no closing fold,
+        # U pinned at 0.
+        m = TradesSummaryModel()
+        m.add_fill(_fill("e1", "BOT", 4, 100.0))
+        m.add_fill(_fill("e2", "SLD", 10, 110.0, realized_pnl=600.0,
+                         t="2026-05-29T11:00:00"))
+        key = m.row_key(1)      # row 0 is the "TRADE LEVEL" band
+        m.match_symbol(key)
+        assert _cbr(m) == (110.0 - 100.0) * 4
+        assert _cbu(m) == 0.0
+
+    def test_hidden_and_filtered_fills_excluded(self):
+        from src.ui.widgets.trades_summary_model import S_COL_PAIRED_PNL
+        m = TradesSummaryModel()
+        m.add_fill(_fill("e1", "SLD", 100, 100.0, realized_pnl=500.0)
+                   | {"account_id": "U111"})
+        m.add_fill(_fill("e2", "SLD", 10, 50.0, realized_pnl=70.0,
+                         con_id=2, symbol="BBB") | {"account_id": "U222"})
+        assert m._cost_value(S_COL_PAIRED_PNL) == pytest.approx(570.0)
+        m.hide_symbol(m._order[1])
+        assert m._cost_value(S_COL_PAIRED_PNL) == pytest.approx(500.0)
+        m.restore_hidden()
+        m.set_selected_accounts({"U222"})
+        assert m._cost_value(S_COL_PAIRED_PNL) == pytest.approx(70.0)
+
+    def test_cost_footer_is_realized_net_of_commission(self):
+        from src.ui.widgets.trades_summary_model import (
+            S_COL_NET_INCL_COMM, S_COL_PAIRED_PNL,
+        )
+        m = TradesSummaryModel()
+        m.add_fill(_fill("e1", "SLD", 100, 100.0, realized_pnl=500.0)
+                   | {"commission": 2.0})
+        m.add_fill(_fill("e2", "BOT", 10, 100.0, con_id=2, symbol="BBB")
+                   | {"commission": 0.5})
+        m.set_last_price("BBB", 103.0)
+        r = m._cost_value(S_COL_PAIRED_PNL)
+        net = m._cost_value(S_COL_NET_INCL_COMM)
+        assert r == pytest.approx(502.0)        # 500 + closing comm 2.0
+        assert net == pytest.approx(r - 2.5)    # every in-frame commission
+
+
+class TestSummarySections:
+    """Qt-level mechanics of the stacked-sections layout ("TRADE LEVEL"
+    band · window rows · TOTAL · "ACCOUNT LEVEL" band · cost-basis rows
+    · TOTAL): row counts, labels, roles, removal bookkeeping, search
+    and sort behavior."""
+
+    def _model(self):
+        m = TradesSummaryModel()
+        m.add_fill(_fill("e1", "SLD", 6, 110.0, con_id=1))
+        m.add_fill(_fill("e2", "BOT", 10, 100.0, con_id=2, symbol="BBB"))
+        return m
+
+    def test_row_count_and_labels(self):
+        from PySide6.QtCore import Qt
+
+        from src.ui.widgets.table_theme import IsFooterRowRole
+        m = self._model()
+        assert m.rowCount() == 8
+        get = lambda r: m.data(m.index(r, 0), Qt.ItemDataRole.DisplayRole)
+        assert [get(r) for r in range(8)] == [
+            "TRADE LEVEL", "AAA", "BBB", "TOTAL",
+            "ACCOUNT LEVEL", "AAA", "BBB", "TOTAL"]
+        # Every band row (headers and totals) renders with the no-hover
+        # band role — the symbol rows are ordinary data rows.
+        assert [bool(m.data(m.index(r, 0), IsFooterRowRole))
+                for r in range(8)] == [
+            True, False, False, True, True, False, False, True]
+        # Nothing outside the header's spanned cell.
+        assert m.data(m.index(0, 1), Qt.ItemDataRole.DisplayRole) == ""
+
+    def test_section_ranks(self):
+        from src.ui.widgets.table_theme import SectionRankRole
+        m = self._model()
+        assert [m.data(m.index(r, 0), SectionRankRole)
+                for r in range(8)] == [0, 1, 1, 2, 3, 4, 4, 5]
+
+    def test_cb_rows_show_their_own_numbers(self):
+        from PySide6.QtCore import Qt
+
+        from src.ui.widgets.trades_summary_model import (
+            S_COL_NET_INCL_COMM, S_COL_NET_TOTAL, S_COL_PAIRED_PNL,
+            S_COL_UNPAIRED_PNL,
+        )
+        m = TradesSummaryModel()
+        # AAA closed an overnight long (IB realized $500, comm $2);
+        # BBB opened an in-window long (marks to 103).
+        m.add_fill(_fill("e1", "SLD", 100, 100.0, realized_pnl=500.0,
+                         con_id=1) | {"commission": 2.0})
+        m.add_fill(_fill("e2", "BOT", 10, 100.0, con_id=2, symbol="BBB"))
+        m.set_last_price("BBB", 103.0)
+        get = lambda r, c: m.data(m.index(r, c), Qt.ItemDataRole.DisplayRole)
+        # cb rows sit at rows 5 (AAA) and 6 (BBB), under the "ACCOUNT
+        # LEVEL" band.  Realized-only: the U.P&L / P&L cells stay blank
+        # in the whole section.
+        assert get(5, S_COL_PAIRED_PNL) == "+502.00"     # 500 + comm back
+        assert get(5, S_COL_UNPAIRED_PNL) == ""
+        assert get(5, S_COL_NET_TOTAL) == ""
+        assert get(5, S_COL_NET_INCL_COMM) == "+500.00"
+        assert get(6, S_COL_UNPAIRED_PNL) == ""
+        # The account section's TOTAL row is the sum of the cb rows.
+        assert get(7, S_COL_PAIRED_PNL) == "+502.00"
+        assert get(7, S_COL_NET_TOTAL) == ""
+        assert get(7, S_COL_NET_INCL_COMM) == "+500.00"
+        # The window row for AAA is untouched by IB's number.
+        assert get(1, S_COL_PAIRED_PNL) == "0.00"
+
+    def test_cb_rows_repeat_the_shared_columns(self):
+        from PySide6.QtCore import Qt
+
+        from src.ui.widgets.trades_summary_model import (
+            S_COL_AVG_SELL, S_COL_BUYS, S_COL_COMMISSION, S_COL_NET,
+            S_COL_SELLS, S_COL_TRANS_TOTAL,
+        )
+        m = TradesSummaryModel()
+        m.add_fill(_fill("e1", "SLD", 100, 100.0, realized_pnl=500.0)
+                   | {"commission": 2.0})
+        get = lambda r, c: m.data(m.index(r, c), Qt.ItemDataRole.DisplayRole)
+        # Quantities / averages / commission / volume are identical in
+        # both sections (same fills).  One key: row 1 window symbol,
+        # row 2 its TOTAL, row 4 cost-basis symbol, row 5 its TOTAL.
+        for col in (S_COL_BUYS, S_COL_SELLS, S_COL_NET, S_COL_AVG_SELL,
+                    S_COL_COMMISSION, S_COL_TRANS_TOTAL):
+            assert get(4, col) == get(1, col)
+        assert get(4, S_COL_SELLS) == "100"
+        assert get(4, S_COL_COMMISSION) == "2.00"
+        # Both TOTAL rows carry the same Comm / Trans totals too.
+        assert get(5, S_COL_COMMISSION) == get(2, S_COL_COMMISSION) == "2.00"
+        assert get(5, S_COL_TRANS_TOTAL) == get(2, S_COL_TRANS_TOTAL)
+
+    def test_empty_model_has_no_footers(self):
+        assert TradesSummaryModel().rowCount() == 0
+
+    def test_hiding_last_aggregate_drops_all_rows(self):
+        m = TradesSummaryModel()
+        m.add_fill(_fill("e1", "SLD", 6, 110.0))
+        assert m.rowCount() == 6
+        m.hide_symbol(m.row_key(1))
+        assert m.rowCount() == 0
+        m.restore_hidden()
+        assert m.rowCount() == 6
+
+    def test_hide_from_a_cb_row_hides_the_pair(self):
+        # row_key on a cost-basis row answers the same key, so the
+        # panel's hide flow works from either section.
+        m = self._model()
+        assert m.row_key(5) == m.row_key(1)
+        m.hide_symbol(m.row_key(5))
+        assert m.rowCount() == 6       # BBB pair + the four band rows
+        m.restore_hidden()
+        assert m.rowCount() == 8
+
+    def test_sections_stay_stacked_under_sort(self):
+        from PySide6.QtCore import Qt
+
+        from src.ui.widgets.trades_filter_proxy import TradesFilterProxy
+        from src.ui.widgets.trades_summary_model import S_COL_BUYS
+        m = self._model()
+        proxy = TradesFilterProxy(is_summary=True)
+        proxy.setSourceModel(m)
+        for order in (Qt.SortOrder.AscendingOrder,
+                      Qt.SortOrder.DescendingOrder):
+            proxy.sort(S_COL_BUYS, order)
+            assert proxy.rowCount() == 8
+            labels = [proxy.data(proxy.index(r, 0),
+                                 Qt.ItemDataRole.DisplayRole)
+                      for r in range(8)]
+            assert labels[0] == "TRADE LEVEL"
+            assert labels[3] == "TOTAL"
+            assert labels[4] == "ACCOUNT LEVEL"
+            assert labels[-1] == "TOTAL"
+            assert sorted(labels[1:3]) == ["AAA", "BBB"]
+            assert sorted(labels[5:7]) == ["AAA", "BBB"]
+
+    def test_search_filters_both_sections(self):
+        from PySide6.QtCore import Qt
+
+        from src.ui.widgets.trades_filter_proxy import TradesFilterProxy
+        m = self._model()
+        proxy = TradesFilterProxy(is_summary=True)
+        proxy.setSourceModel(m)
+        proxy.setSearchText("BBB")
+        labels = [proxy.data(proxy.index(r, 0),
+                             Qt.ItemDataRole.DisplayRole)
+                  for r in range(proxy.rowCount())]
+        assert labels == ["TRADE LEVEL", "BBB", "TOTAL",
+                          "ACCOUNT LEVEL", "BBB", "TOTAL"]
+
+    def test_acct_section_is_price_independent(self):
+        # Window-flat (SLD w/ rpnl paired against a re-buy): nothing the
+        # Acct section displays depends on the price — R.P&L is IB's
+        # number plus in-window round trips, and the section shows no
+        # unrealized mark of our own.
+        m = TradesSummaryModel()
+        m.add_fill(_fill("e1", "SLD", 6, 110.0, realized_pnl=57.0))
+        m.add_fill(_fill("e2", "BOT", 6, 108.0, t="2026-05-29T11:00:00"))
+        assert _u(m) == 0.0                       # window NET 0 → U 0
+        before = _cbr(m)
+        m.set_last_price("AAA", 104.0)
+        assert _cbr(m) == before == 57.0
+        # The undisplayed cb open remainder (the re-buy the closing fill
+        # couldn't pair with) still tracks classification correctly.
+        assert _cbu(m) == (104.0 - 108.0) * 6

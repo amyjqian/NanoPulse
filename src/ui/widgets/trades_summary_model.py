@@ -8,6 +8,17 @@ Exchange List.
 The model owns the aggregate state.  ``add_fill`` either updates an
 existing row (dedupe by execId) or folds a new fill into its symbol's
 bucket and emits the right ``beginInsertRows`` / ``dataChanged`` pairs.
+
+The table stacks two labeled sections, each closed by its own "TOTAL"
+row: "TRADE LEVEL" (window-relative rows — what did this window's
+trading make?) then "ACCOUNT LEVEL" (the same keys with their
+COST-BASIS numbers: IB's avg-cost realized folded in, so closing an
+overnight position shows the P&L against what was actually paid).  Both sections are
+built from the same aggregates and filters; only the walk differs.  The
+cost-basis section is REALIZED-ONLY: its U.P&L / P&L cells stay blank
+(a homemade mark next to IB's authoritative realized number would read
+as IB's unrealized — the Positions tab carries the real one) and
+Net P&L = R.P&L − Comm.
 """
 from __future__ import annotations
 
@@ -25,7 +36,8 @@ from src.utils.helpers import (
     format_option_symbol, format_option_symbol_two_line)
 
 from .table_theme import (
-    CELL_FONT_BOLD, IsFooterRowRole, SortValueRole, header_alignment)
+    CELL_FONT_BOLD, IsFooterRowRole, SectionRankRole, SortValueRole,
+    header_alignment)
 
 log = logging.getLogger(__name__)
 
@@ -100,6 +112,13 @@ _FILL_SEARCH_KEYS: tuple[str, ...] = (
 
 _S_NUM_COLS = len(S_HEADERS)
 
+# Labels on the bands that open the two sections and on their totals
+# rows (each section closes with its own "TOTAL" line).
+TRADE_SECTION_LABEL = "TRADE LEVEL"
+ACCT_SECTION_LABEL = "ACCOUNT LEVEL"
+DAY_TOTAL_LABEL = "TOTAL"
+ACCT_TOTAL_LABEL = "TOTAL"
+
 # Components of a FIFO walk over one contract's fills (see
 # ``TradesSummaryModel._walk_account``).  Every value is per-point —
 # the contract multiplier is applied by the callers that turn these
@@ -109,6 +128,14 @@ _WALK_KEYS: tuple[str, ...] = (
     "paired_comm",
     "open_buys_qty", "open_buys_notional",
     "open_sells_qty", "open_sells_notional",
+    # ``cb_``-prefixed twins from the cost-basis walk
+    # (``_walk_account_cost_basis``), which feeds the "Acct P&L" footer
+    # row.  Same shapes, except ``cb_closing_realized``/``cb_closing_comm``
+    # are IB dollar amounts (no multiplier).
+    "cb_paired_qty", "cb_paired_buys_notional", "cb_paired_sells_notional",
+    "cb_paired_comm", "cb_closing_realized", "cb_closing_comm",
+    "cb_open_buys_qty", "cb_open_buys_notional",
+    "cb_open_sells_qty", "cb_open_sells_notional",
 )
 
 
@@ -179,6 +206,8 @@ TEXT_BOLD  = Theme.POS_TEXT
 # band from the per-symbol rows above without shouting.  Same band as
 # the Positions account headers and Summary totals.
 BG_TOTAL   = Theme.POS_BG_ACCT_BAND
+# Section-header label color — same as the column-header captions.
+CLR_SECTION = Theme.POS_LABEL
 
 
 class TradesSummaryModel(QAbstractTableModel):
@@ -194,6 +223,12 @@ class TradesSummaryModel(QAbstractTableModel):
         self._agg: dict[tuple[str, str], dict] = {}
         # ordered list of keys as presented (insertion order of first fill)
         self._order: list[tuple[str, str]] = []
+        # Keys of the cost-basis section's per-symbol rows, mirroring
+        # ``_order``.  Kept as its own list so structural changes can be
+        # announced to Qt as TWO transactions (window row, then cb row —
+        # the two rows are never adjacent) with the row→key mapping
+        # internally consistent inside each begin/end pair.
+        self._order_cb: list[tuple[str, str]] = []
         # execId → raw fill dict — keeps the last flattened fill per execId so
         # a re-snapshot that re-emits the same fill doesn't double-count it
         self._fills: dict[str, dict] = {}
@@ -276,8 +311,15 @@ class TradesSummaryModel(QAbstractTableModel):
     # ── Proxy helpers ───────────────────────────────────────────────────────
 
     def row_data(self, row: int) -> dict | None:
-        if 0 <= row < len(self._order):
-            return self._agg[self._order[row]]
+        # Cost-basis rows answer their key's aggregate too, so the sort
+        # proxy's substring search filters both sections identically and
+        # the panel's hide/match flows work from either section.  Band
+        # rows (headers, totals, spacer) stay None.
+        key = self._win_key_at(row)
+        if key is None:
+            key = self._cb_key_at(row)
+        if key is not None:
+            return self._agg.get(key)
         return None
 
     def row_key(self, row: int) -> tuple[str, str] | None:
@@ -285,9 +327,10 @@ class TradesSummaryModel(QAbstractTableModel):
         # ``cid:<con_id>`` (see ``_agg_key``) and is *not* derivable from
         # the agg dict's display fields, so callers that want to hide a
         # row must round-trip through this helper.
-        if 0 <= row < len(self._order):
-            return self._order[row]
-        return None
+        key = self._win_key_at(row)
+        if key is not None:
+            return key
+        return self._cb_key_at(row)
 
     def column_keys(self) -> list[str]:
         return list(S_COL_KEYS)
@@ -301,14 +344,63 @@ class TradesSummaryModel(QAbstractTableModel):
         if parent.isValid():
             return 0
         n = len(self._order)
-        # One extra row at the bottom is the "P&L" totals footer (its
-        # R.P&L / U.P&L columns carry the realized/unrealized split).
-        # Hidden entirely when the model has no aggregates so an empty
-        # view doesn't display a stray footer band.
-        return n + 1 if n else 0
+        m = len(self._order_cb)
+        # Layout: the "TRADE LEVEL" header band · n window-relative
+        # symbol rows · that section's "TOTAL" row · the "ACCOUNT LEVEL"
+        # header band · m cost-basis symbol rows · that section's
+        # "TOTAL" row.  Hidden entirely when the model has no aggregates
+        # so an empty view doesn't display stray bands.
+        return n + m + 4 if (n or m) else 0
+
+    def _is_trade_header(self, row: int) -> bool:
+        """The band that opens the window-relative section — row 0."""
+        return bool(self._order) and row == 0
+
+    def _win_key_at(self, row: int) -> tuple[str, str] | None:
+        """Key of the window-relative symbol row at *row* (rows sit
+        below the trade-level header), ``None`` outside that section."""
+        i = row - 1
+        if 0 <= i < len(self._order):
+            return self._order[i]
+        return None
 
     def _is_total_row(self, row: int) -> bool:
-        return bool(self._order) and row == len(self._order)
+        """The "TOTAL" row closing the window section."""
+        return bool(self._order) and row == len(self._order) + 1
+
+    def _is_acct_header(self, row: int) -> bool:
+        """The band that opens the cost-basis section."""
+        return bool(self._order) and row == len(self._order) + 2
+
+    def _is_cost_row(self, row: int) -> bool:
+        """The cost-basis section's "TOTAL" row — the table's last."""
+        return bool(self._order) \
+            and row == len(self._order) + 3 + len(self._order_cb)
+
+    def _cb_key_at(self, row: int) -> tuple[str, str] | None:
+        """Key of the cost-basis symbol row at *row*, ``None`` when *row*
+        isn't in the cost-basis section."""
+        j = row - len(self._order) - 3
+        if 0 <= j < len(self._order_cb):
+            return self._order_cb[j]
+        return None
+
+    def _section_rank(self, row: int) -> int:
+        """Ordering band for the sort proxy (see ``SectionRankRole``).
+        The trade-level header shares rank 0 with rankless models' rows
+        by construction — it is the only summary row there, so it never
+        competes within its rank."""
+        if self._is_trade_header(row):
+            return 0
+        if self._is_total_row(row):
+            return 2
+        if self._is_acct_header(row):
+            return 3
+        if self._is_cost_row(row):
+            return 5
+        if self._cb_key_at(row) is not None:
+            return 4
+        return 1
 
     def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
         return 0 if parent.isValid() else _S_NUM_COLS
@@ -332,17 +424,30 @@ class TradesSummaryModel(QAbstractTableModel):
         row = index.row()
         col = index.column()
 
-        # Available on every row, footer included — the row delegate asks
-        # each row whether it is the totals band.
+        # Available on every row — the row delegate asks each row whether
+        # it is a band (the section headers and the totals rows; symbol
+        # rows in both sections are ordinary data rows), and the sort
+        # proxy asks each row for its section rank.
         if role == IsFooterRowRole:
-            return self._is_total_row(row)
+            return (self._is_trade_header(row) or self._is_total_row(row)
+                    or self._is_acct_header(row) or self._is_cost_row(row))
+        if role == SectionRankRole:
+            return self._section_rank(row)
 
+        if self._is_trade_header(row):
+            return self._trade_header_data(col, role)
         if self._is_total_row(row):
             return self._total_row_data(col, role)
+        if self._is_acct_header(row):
+            return self._acct_header_data(col, role)
+        if self._is_cost_row(row):
+            return self._cost_row_data(col, role)
+        if self._cb_key_at(row) is not None:
+            return self._cb_row_data(row, col, role)
 
-        if row < 0 or row >= len(self._order):
+        key = self._win_key_at(row)
+        if key is None:
             return None
-        key = self._order[row]
         agg = self._effective_agg(key)
         if agg is None:
             return None
@@ -366,16 +471,15 @@ class TradesSummaryModel(QAbstractTableModel):
     # ── Total-row rendering ─────────────────────────────────────────────────
 
     def _total_row_data(self, col: int, role: int) -> Any:
-        """Render a cell on the synthetic footer row that totals every
-        aggregate.  Only the four columns the user asked for carry a
-        number — every other column stays blank so the band reads as a
-        focused summary rather than a second data row."""
+        """Render a cell on the synthetic "TOTAL" row that sums the
+        window section.  Plain row background (bold text and the
+        no-hover band role set it apart); only the P&L-family columns
+        carry a number — every other column stays blank so the row reads
+        as a focused summary rather than a second data row."""
         if role == Qt.ItemDataRole.DisplayRole:
             return self._total_cell_text(col)
         if role == Qt.ItemDataRole.ForegroundRole:
             return self._total_cell_color(col)
-        if role == Qt.ItemDataRole.BackgroundRole:
-            return QColor(BG_TOTAL)
         if role == Qt.ItemDataRole.FontRole:
             return self._total_font
         if role == Qt.ItemDataRole.TextAlignmentRole:
@@ -462,6 +566,8 @@ class TradesSummaryModel(QAbstractTableModel):
             account_fills.sort(key=lambda f: f.get("time_sort", "") or "")
             for k, v in cls._walk_account(account_fills).items():
                 out[k] += v
+            for k, v in cls._walk_account_cost_basis(account_fills).items():
+                out["cb_" + k] += v
         return out
 
     @staticmethod
@@ -483,7 +589,8 @@ class TradesSummaryModel(QAbstractTableModel):
         leg against the current price.  IB's own realized number (which
         is computed against the account's average cost, a basis that
         reaches outside the window) is deliberately NOT folded in; it
-        stays visible in the separate Rlz P&L column.
+        stays visible in the separate Rlz P&L column, and the "Acct P&L"
+        footer row folds it in via ``_walk_account_cost_basis``.
         """
         out = _empty_walk()
         # Open in-window lots, FIFO.  Always all on the same side: a lot
@@ -530,25 +637,127 @@ class TradesSummaryModel(QAbstractTableModel):
                 out["open_sells_notional"] += qty * price
         return out
 
+    @staticmethod
+    def _walk_account_cost_basis(fills: list[dict]) -> dict[str, float]:
+        """Cost-basis variant of ``_walk_account`` — feeds the "Acct P&L"
+        footer row.  Same chronological FIFO pairing, but a leftover that
+        really closed a position opened *outside* the window is taken at
+        IB's word instead of opening a window-short.
+
+        Three outcomes per fill, in that order:
+
+        * it closes in-window lots on the other side → a **paired** round
+          trip, valued gross from both legs' own fill prices,
+        * whatever is left closed a position opened outside the window —
+          recognised by a nonzero ``realized_pnl``, which IB's
+          commissionReport stamps on every closing execution (computed
+          against the account's average cost, a basis we can't see) →
+          **closing**, taken from IB and prorated,
+        * otherwise it opens a lot → the **open** remainder.  (Tracked
+          in the walk for completeness, but not displayed: the Acct P&L
+          section is realized-only.)
+
+        Only a NONZERO realized P&L marks a closing fill: live
+        commissionReports stamp realizedPNL = 0.0 on opening executions
+        too, so ``is not None`` would classify every opening leg as a $0
+        close and pin U.P&L at zero.  (A genuine scratch close at exactly
+        $0.00 falls through to opening — same as an opening leg, and
+        harmlessly close to truth.)  A closing fill whose
+        commissionReport hasn't landed yet also falls through: it sits
+        in the undisplayed open remainder until the report arrives and
+        the re-emitted fill sends the walk round again — self-healing,
+        never double-counted.
+
+        IB's ``realized_pnl`` is already NET of both legs' commissions,
+        so ``closing_comm`` carries back the part of that deduction this
+        window can see (the closing fill's own commission).  Callers add
+        it to keep every reported P&L gross, so the Comm column can
+        subtract commission exactly once instead of twice.
+
+        Returns unprefixed keys; ``_walk_fills`` folds them into the
+        shared walk dict under the ``cb_`` prefix.
+        """
+        out = {
+            "paired_qty": 0.0, "paired_buys_notional": 0.0,
+            "paired_sells_notional": 0.0, "paired_comm": 0.0,
+            "closing_realized": 0.0, "closing_comm": 0.0,
+            "open_buys_qty": 0.0, "open_buys_notional": 0.0,
+            "open_sells_qty": 0.0, "open_sells_notional": 0.0,
+        }
+        lots: list[list] = []
+        for f in fills:
+            side = f.get("side", "")
+            if side not in ("BOT", "SLD"):
+                continue
+            qty = float(f.get("shares", 0.0) or 0.0)
+            if qty <= 0:
+                continue
+            price = float(f.get("price", 0.0) or 0.0)
+            comm = float(f.get("commission") or 0.0)
+            comm_unit = comm / qty
+            rpnl = f.get("realized_pnl", None)
+
+            left = qty
+            while left > 0 and lots and lots[0][2] != side:
+                lot = lots[0]
+                use = min(lot[0], left)
+                if side == "BOT":
+                    out["paired_buys_notional"] += use * price
+                    out["paired_sells_notional"] += use * lot[1]
+                else:
+                    out["paired_sells_notional"] += use * price
+                    out["paired_buys_notional"] += use * lot[1]
+                out["paired_qty"] += use
+                out["paired_comm"] += use * (comm_unit + lot[3])
+                lot[0] -= use
+                left -= use
+                if lot[0] <= 0:
+                    lots.pop(0)
+
+            if left <= 0:
+                continue
+            if rpnl:
+                frac = left / qty
+                out["closing_realized"] += float(rpnl) * frac
+                out["closing_comm"] += comm * frac
+            else:
+                lots.append([left, price, side, comm_unit])
+
+        for qty, price, side, _comm_unit in lots:
+            if side == "BOT":
+                out["open_buys_qty"] += qty
+                out["open_buys_notional"] += qty * price
+            else:
+                out["open_sells_qty"] += qty
+                out["open_sells_notional"] += qty * price
+        return out
+
     # ── P&L built on the walk ───────────────────────────────────────────────
 
     @staticmethod
-    def _paired_net(walk: dict[str, float], multiplier: float) -> float:
+    def _paired_net(walk: dict[str, float], multiplier: float,
+                    prefix: str = "") -> float:
         """Gross cash flow of the closed round trips, multiplier-scaled
-        so futures (NQ × 20, MNQ × 2, …) report in dollars."""
-        return ((walk["paired_sells_notional"] - walk["paired_buys_notional"])
+        so futures (NQ × 20, MNQ × 2, …) report in dollars.  *prefix*
+        selects the walk variant ("" = window-relative, "cb_" =
+        cost-basis)."""
+        return ((walk[prefix + "paired_sells_notional"]
+                 - walk[prefix + "paired_buys_notional"])
                 * multiplier)
 
-    def _mark_open(self, walk: dict[str, float], agg: dict) -> float:
+    def _mark_open(self, walk: dict[str, float], agg: dict,
+                   prefix: str = "") -> float:
         """The walk's open remainder marked to the last price — a
         net-long remainder valued as if sold, a net-short as if bought
         back.  Falls back to the newest fill price when no live quote has
         been seen: without a mark, an all-buys position would report its
-        entire cost as unrealized loss."""
+        entire cost as unrealized loss.  *prefix* selects the walk
+        variant ("" = window-relative, "cb_" = cost-basis)."""
         mult = agg.get("multiplier", 1.0)
-        cash = (walk["open_sells_notional"]
-                - walk["open_buys_notional"]) * mult
-        open_net = walk["open_buys_qty"] - walk["open_sells_qty"]
+        cash = (walk[prefix + "open_sells_notional"]
+                - walk[prefix + "open_buys_notional"]) * mult
+        open_net = (walk[prefix + "open_buys_qty"]
+                    - walk[prefix + "open_sells_qty"])
         if open_net == 0:
             return cash
         last = self._last_price_for(agg)
@@ -578,6 +787,24 @@ class TradesSummaryModel(QAbstractTableModel):
     def _row_pnl_total(self, key: tuple[str, str], agg: dict) -> float:
         """P&L column: R.P&L + U.P&L, so the three always reconcile."""
         return self._realized_total(key) + self._unrealized_total(key, agg)
+
+    # ── Cost-basis P&L (the "Acct P&L" footer row) ──────────────────────────
+
+    def _cb_realized_total(self, key: tuple[str, str]) -> float:
+        """Cost-basis R.P&L for one key: the in-window round trips plus
+        IB's realized P&L on fills that closed a position opened before
+        the window — GROSS, with the commission IB folded into its
+        realized number added back so ``P&L − Comm`` deducts commission
+        exactly once.  A matched key shows the trimmed round trip only —
+        that's the point of matching."""
+        walk = self._walk_for_key(key)
+        realized = self._paired_net(
+            walk, self._key_multiplier(key), prefix="cb_")
+        if self.is_matched(key):
+            return realized
+        return (realized + walk["cb_closing_realized"]
+                + walk["cb_closing_comm"])
+
 
     def _visible_key_aggs(self) -> list[tuple[tuple[str, str], dict]]:
         out = []
@@ -738,7 +965,7 @@ class TradesSummaryModel(QAbstractTableModel):
 
     def _total_cell_text(self, col: int) -> str:
         if col == S_COL_SYMBOL:
-            return "P&L"
+            return DAY_TOTAL_LABEL
         if col == S_COL_TRANS_TOTAL:
             return self._fmt_compact(
                 sum(self._trans_total(a) for a in self._visible_aggs()))
@@ -761,6 +988,172 @@ class TradesSummaryModel(QAbstractTableModel):
                 return QColor(CLR_SELL)
             return QColor(TEXT_DIM)
         return QColor(TEXT)
+
+    # ── Cost-basis ("Acct P&L") footer-row rendering ────────────────────────
+
+    def _trade_header_data(self, col: int, role: int) -> Any:
+        """Render the band that opens the window-relative section — the
+        "TRADE LEVEL" label in the Symbol cell (the view merges the band
+        into ONE full-width cell, so nothing outside column 0 would
+        show).  Label color matches the column-header captions; banded
+        chrome via ``IsFooterRowRole``."""
+        if role == Qt.ItemDataRole.DisplayRole:
+            return TRADE_SECTION_LABEL if col == S_COL_SYMBOL else ""
+        if role == Qt.ItemDataRole.ForegroundRole:
+            return QColor(CLR_SECTION)
+        if role == Qt.ItemDataRole.BackgroundRole:
+            return QColor(BG_TOTAL)
+        if role == Qt.ItemDataRole.FontRole:
+            return self._total_font
+        if role == Qt.ItemDataRole.TextAlignmentRole:
+            return int(Qt.AlignmentFlag.AlignLeft
+                       | Qt.AlignmentFlag.AlignVCenter)
+        return None
+
+    def _acct_header_data(self, col: int, role: int) -> Any:
+        """Render the band that opens the cost-basis section — the
+        "ACCOUNT LEVEL" label, merged into one full-width cell by the
+        view.  Sits below the blank spacer row so the two sections read
+        as distinct blocks."""
+        if role == Qt.ItemDataRole.DisplayRole:
+            return ACCT_SECTION_LABEL if col == S_COL_SYMBOL else ""
+        if role == Qt.ItemDataRole.ForegroundRole:
+            return QColor(CLR_SECTION)
+        if role == Qt.ItemDataRole.BackgroundRole:
+            return QColor(BG_TOTAL)
+        if role == Qt.ItemDataRole.FontRole:
+            return self._total_font
+        if role == Qt.ItemDataRole.TextAlignmentRole:
+            return int(Qt.AlignmentFlag.AlignLeft
+                       | Qt.AlignmentFlag.AlignVCenter)
+        return None
+
+    def _cost_row_data(self, col: int, role: int) -> Any:
+        """Render a cell on the cost-basis section's "TOTAL" row, where
+        a fill that closed a position opened before the window
+        contributes IB's avg-cost realized P&L instead of opening a
+        window-short.  Plain row background, same as the window
+        section's TOTAL."""
+        if role == Qt.ItemDataRole.DisplayRole:
+            return self._cost_cell_text(col)
+        if role == Qt.ItemDataRole.ForegroundRole:
+            return self._cost_cell_color(col)
+        if role == Qt.ItemDataRole.FontRole:
+            return self._total_font
+        if role == Qt.ItemDataRole.TextAlignmentRole:
+            if col in _S_RIGHT_ALIGN_COLS:
+                return int(Qt.AlignmentFlag.AlignRight
+                           | Qt.AlignmentFlag.AlignVCenter)
+            return int(Qt.AlignmentFlag.AlignLeft
+                       | Qt.AlignmentFlag.AlignVCenter)
+        return None
+
+    def _cost_value(self, col: int) -> float | None:
+        """Cost-basis footer number for the R.P&L / Net P&L columns,
+        ``None`` for columns the row leaves blank (the section is
+        realized-only — see ``_cb_cell_value``).  Summed over the same
+        visible set as the "P&L" footer, so hides / matches / account
+        filters gate both rows identically."""
+        pairs = self._visible_key_aggs()
+        if col == S_COL_PAIRED_PNL:
+            return sum(self._cb_realized_total(k) for k, _a in pairs)
+        if col == S_COL_NET_INCL_COMM:
+            return sum(self._cb_realized_total(k) - a.get("commission", 0.0)
+                       for k, a in pairs)
+        return None
+
+    def _cost_cell_text(self, col: int) -> str:
+        if col == S_COL_SYMBOL:
+            return ACCT_TOTAL_LABEL
+        # Trans total / Comm sum the visible rows the same way the "P&L"
+        # footer does — identical values, both sections fold the same
+        # fills.
+        if col == S_COL_TRANS_TOTAL:
+            return self._fmt_compact(
+                sum(self._trans_total(a) for a in self._visible_aggs()))
+        if col == S_COL_COMMISSION:
+            s = sum(a.get("commission", 0.0) for a in self._visible_aggs())
+            return f"{s:,.2f}" if s else ""
+        v = self._cost_value(col)
+        return self._fmt_signed(v) if v is not None else ""
+
+    def _cost_cell_color(self, col: int) -> QColor | None:
+        if col == S_COL_SYMBOL:
+            return QColor(TEXT_BOLD)
+        if col == S_COL_TRANS_TOTAL:
+            return QColor(TEXT_BOLD)
+        v = self._cost_value(col)
+        if v is not None:
+            if v > 0:
+                return QColor(CLR_BUY)
+            if v < 0:
+                return QColor(CLR_SELL)
+            return QColor(TEXT_DIM)
+        return QColor(TEXT)
+
+    def _cb_cell_value(self, key: tuple[str, str], agg: dict,
+                       col: int) -> float | None:
+        """Cost-basis number for a per-symbol row's R.P&L / Net P&L
+        cell, ``None`` for every other column.  The section is
+        REALIZED-ONLY: an unrealized mark of our own next to IB's
+        authoritative realized number reads as IB's unrealized (it
+        isn't — see the Positions tab for that), so U.P&L and P&L stay
+        blank and Net P&L = R.P&L − Comm."""
+        if col == S_COL_PAIRED_PNL:
+            return self._cb_realized_total(key)
+        if col == S_COL_NET_INCL_COMM:
+            return (self._cb_realized_total(key)
+                    - agg.get("commission", 0.0))
+        return None
+
+    def _cb_row_data(self, row: int, col: int, role: int) -> Any:
+        """Render a cell on a cost-basis per-symbol row — same key set
+        and order as the window section above.  R.P&L / Net P&L come
+        from the cost-basis walk; U.P&L and P&L stay BLANK (realized-only
+        section, see ``_cb_cell_value``); every other column delegates to
+        the window row's own renderers (both sections fold the same
+        fills, so quantities, averages, commission and venues are
+        identical by construction).  Ordinary row chrome (no totals
+        band); the "P&L" footer above separates the two sections."""
+        key = self._cb_key_at(row)
+        agg = self._effective_agg(key) if key is not None else None
+        if agg is None:
+            return None
+        blank = col in (S_COL_UNPAIRED_PNL, S_COL_NET_TOTAL)
+        if role == Qt.ItemDataRole.DisplayRole:
+            if blank:
+                return ""
+            v = self._cb_cell_value(key, agg, col)
+            if v is not None:
+                return self._fmt_signed(v)
+            return self._cell_text(agg, col, key)
+        if role == SortValueRole:
+            if blank:
+                return ""
+            v = self._cb_cell_value(key, agg, col)
+            if v is not None:
+                return v
+            return self._sort_value(agg, col, key)
+        if role == Qt.ItemDataRole.ForegroundRole:
+            if blank:
+                return QColor(TEXT_DIM)
+            v = self._cb_cell_value(key, agg, col)
+            if v is not None:
+                if v > 0:
+                    return QColor(CLR_BUY)
+                if v < 0:
+                    return QColor(CLR_SELL)
+                return QColor(TEXT_DIM)
+            return self._cell_color(agg, col, key)
+        if role == Qt.ItemDataRole.TextAlignmentRole:
+            if col in _S_RIGHT_ALIGN_COLS:
+                return int(Qt.AlignmentFlag.AlignRight
+                           | Qt.AlignmentFlag.AlignVCenter)
+            return int(Qt.AlignmentFlag.AlignLeft
+                       | Qt.AlignmentFlag.AlignVCenter)
+        if role == Qt.ItemDataRole.FontRole and col == S_COL_SYMBOL:
+            return self._symbol_font
+        return None
 
     # ── Cell rendering ──────────────────────────────────────────────────────
 
@@ -1060,36 +1453,39 @@ class TradesSummaryModel(QAbstractTableModel):
         if not self._passes_filter(fill):
             return
 
-        # Add to aggregate.  Insert a new row if this key is new.
+        # Add to aggregate.  Insert new rows if this key is new — the
+        # window row and its cost-basis twin are never adjacent, so they
+        # go in as two transactions (rowCount stays consistent inside
+        # each: ``_order`` and ``_order_cb`` are mutated separately).
         if key not in self._agg:
             n = len(self._order)
             if n == 0:
-                # First aggregate materialises the totals row too, so we
-                # insert rows [0, 1] in a single transaction to keep
-                # Qt's row-count bookkeeping consistent.
-                self.beginInsertRows(QModelIndex(), 0, 1)
+                # First aggregate materialises every band row too — rows
+                # [0, 4] (trade header + window row + its TOTAL +
+                # account header + the cost-basis TOTAL) in one
+                # transaction, the cost-basis row in the next.
+                self.beginInsertRows(QModelIndex(), 0, 4)
             else:
-                self.beginInsertRows(QModelIndex(), n, n)
+                # New window row lands at the end of its section, one
+                # below the trade-level header band.
+                self.beginInsertRows(QModelIndex(), n + 1, n + 1)
             self._agg[key] = self._empty_agg(fill)
             self._order.append(key)
+            self.endInsertRows()
+            pos = len(self._order) + 3 + len(self._order_cb)
+            self.beginInsertRows(QModelIndex(), pos, pos)
+            self._order_cb.append(key)
             self.endInsertRows()
 
         self._add_to_agg(key, fill)
 
-        # Refresh the updated row *and* the totals footer.  When the
-        # symbol is user-hidden the row isn't in ``_order`` — we update
-        # the stored aggregate but emit nothing because neither the
-        # hidden row nor the totals (which exclude hidden rows) change
-        # visually.
+        # Refresh the updated rows *and* the totals footers.  When the
+        # symbol is user-hidden the rows aren't in the order lists — we
+        # update the stored aggregate but emit nothing because neither
+        # the hidden rows nor the totals (which exclude hidden rows)
+        # change visually.
         if key in self._order:
-            row = self._order.index(key)
-            self.dataChanged.emit(
-                self.index(row, 0),
-                self.index(row, _S_NUM_COLS - 1), _PNL_ROLES)
-            total_row = len(self._order)
-            self.dataChanged.emit(
-                self.index(total_row, 0),
-                self.index(total_row, _S_NUM_COLS - 1), _PNL_ROLES)
+            self._emit_pnl_rows(key)
 
     def set_days_back(self, days: int) -> None:
         """Change the date window (1 = today, 2 = last 2 trading days,
@@ -1155,26 +1551,18 @@ class TradesSummaryModel(QAbstractTableModel):
         self._last_prices[sym] = price
         if not self._order:
             return
-        # Repaint rows whose symbol has an open leg (their U.P&L / P&L
-        # columns mark to last price) plus the footer bands.  Closed
-        # round-trips don't re-price.
-        hit = False
-        for row, k in enumerate(self._order):
+        # Repaint rows whose symbol has an open window leg (their U.P&L /
+        # P&L columns mark to last price) plus the footer bands.  Closed
+        # round-trips don't re-price, and the cost-basis section is
+        # realized-only — nothing in it depends on the price.
+        for k in list(self._order):
             a = self._effective_agg(k)
             if a is None \
                     or a.get("buys_qty", 0.0) == a.get("sells_qty", 0.0):
                 continue
             if sym in (a.get("root_symbol", ""),
                        (a.get("symbol", "") or "").upper()):
-                hit = True
-                self.dataChanged.emit(
-                    self.index(row, 0),
-                    self.index(row, _S_NUM_COLS - 1), _PNL_ROLES)
-        if hit:
-            total_row = len(self._order)
-            self.dataChanged.emit(
-                self.index(total_row, 0),
-                self.index(total_row, _S_NUM_COLS - 1), _PNL_ROLES)
+                self._emit_pnl_rows(k)
 
     def clear(self) -> None:
         if not self._order and not self._fills:
@@ -1182,6 +1570,7 @@ class TradesSummaryModel(QAbstractTableModel):
         self.beginResetModel()
         self._agg.clear()
         self._order.clear()
+        self._order_cb.clear()
         self._fills.clear()
         self._fills_by_key.clear()
         self._walk_cache.clear()
@@ -1204,17 +1593,21 @@ class TradesSummaryModel(QAbstractTableModel):
             return
         if key not in self._order:
             return
-        row = self._order.index(key)
-        self.beginRemoveRows(QModelIndex(), row, row)
-        self._order.pop(row)
+        i = self._order.index(key)
+        self._remove_cb_row(key)
+        if len(self._order) == 1:
+            # Hiding the last visible aggregate also hides the band
+            # rows — remove all five in one transaction so Qt's
+            # row-count bookkeeping stays consistent.
+            self.beginRemoveRows(QModelIndex(), 0, 4)
+        else:
+            self.beginRemoveRows(QModelIndex(), i + 1, i + 1)
+        self._order.pop(i)
         self._hidden_symbols.add(key)
         self.endRemoveRows()
-        # The totals footer shifted up by one and its values changed.
+        # The footer rows shifted up and their values changed.
         if self._order:
-            total_row = len(self._order)
-            self.dataChanged.emit(
-                self.index(total_row, 0),
-                self.index(total_row, _S_NUM_COLS - 1), _PNL_ROLES)
+            self._emit_pnl_rows(None)
 
     def restore_hidden(self) -> None:
         """Un-hide every user-hidden row.  Order after restore is not
@@ -1226,6 +1619,7 @@ class TradesSummaryModel(QAbstractTableModel):
         for k in list(self._hidden_symbols):
             if k in self._agg and k not in self._order:
                 self._order.append(k)
+        self._order_cb = list(self._order)
         self._hidden_symbols.clear()
         self.endResetModel()
 
@@ -1274,17 +1668,41 @@ class TradesSummaryModel(QAbstractTableModel):
         self._emit_row_and_total(key)
 
     def _emit_row_and_total(self, key: tuple[str, str]) -> None:
-        """Repaint *key*'s visible row and both footer rows."""
+        """Repaint *key*'s visible rows and both footer rows."""
         if key not in self._order:
             return
-        row = self._order.index(key)
-        self.dataChanged.emit(
-            self.index(row, 0), self.index(row, _S_NUM_COLS - 1),
-            _PNL_ROLES)
-        total_row = len(self._order)
+        self._emit_pnl_rows(key)
+
+    def _emit_pnl_rows(self, key: tuple[str, str] | None) -> None:
+        """Repaint the P&L-family cells of *key*'s window and cost-basis
+        rows (when visible) plus both totals footers.  ``None`` repaints
+        the footers only."""
+        n = len(self._order)
+        m = len(self._order_cb)
+        if not (n or m):
+            return
+        if key is not None:
+            if key in self._order:
+                row = 1 + self._order.index(key)
+                self.dataChanged.emit(
+                    self.index(row, 0),
+                    self.index(row, _S_NUM_COLS - 1), _PNL_ROLES)
+            if key in self._order_cb:
+                row = n + 3 + self._order_cb.index(key)
+                self.dataChanged.emit(
+                    self.index(row, 0),
+                    self.index(row, _S_NUM_COLS - 1), _PNL_ROLES)
+        # The two TOTAL rows are separated by the cost-basis section,
+        # so each gets its own rectangle (the header bands carry no
+        # numbers and never need a repaint here).
+        total_row = n + 1
         self.dataChanged.emit(
             self.index(total_row, 0),
             self.index(total_row, _S_NUM_COLS - 1), _PNL_ROLES)
+        acct_row = n + 3 + m
+        self.dataChanged.emit(
+            self.index(acct_row, 0),
+            self.index(acct_row, _S_NUM_COLS - 1), _PNL_ROLES)
 
     # ── Date-filter helpers ─────────────────────────────────────────────────
 
@@ -1385,6 +1803,7 @@ class TradesSummaryModel(QAbstractTableModel):
                 self._agg[key] = self._empty_agg(fill)
                 self._order.append(key)
             self._add_to_agg(key, fill)
+        self._order_cb = list(self._order)
         self.endResetModel()
 
     # ── Internal aggregation helpers ────────────────────────────────────────
@@ -1509,14 +1928,28 @@ class TradesSummaryModel(QAbstractTableModel):
             return
         if key not in self._order:
             return
-        row = self._order.index(key)
+        i = self._order.index(key)
+        self._remove_cb_row(key)
         if len(self._order) == 1:
-            # Dropping the last aggregate also hides the totals footer
-            # so the view goes back to empty — remove both rows in one
+            # Dropping the last aggregate also hides the band rows so
+            # the view goes back to empty — remove all five in one
             # transaction.
-            self.beginRemoveRows(QModelIndex(), 0, 1)
+            self.beginRemoveRows(QModelIndex(), 0, 4)
         else:
-            self.beginRemoveRows(QModelIndex(), row, row)
-        self._order.pop(row)
+            self.beginRemoveRows(QModelIndex(), i + 1, i + 1)
+        self._order.pop(i)
         self._agg.pop(key, None)
+        self.endRemoveRows()
+
+    def _remove_cb_row(self, key: tuple[str, str]) -> None:
+        """Remove *key*'s cost-basis section row (its own transaction —
+        the window-row removal follows separately).  Removed FIRST so
+        the window section's indices are still stable while this row's
+        position is computed."""
+        if key not in self._order_cb:
+            return
+        j = self._order_cb.index(key)
+        cb_row = len(self._order) + 3 + j
+        self.beginRemoveRows(QModelIndex(), cb_row, cb_row)
+        self._order_cb.pop(j)
         self.endRemoveRows()
