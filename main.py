@@ -10,7 +10,7 @@ from PySide6.QtCore import QObject, QTimer
 from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QFont
 
-from src.utils.logger import setup_logging
+from src.utils.logger import set_log_user, setup_logging
 from src.ui.main_window import MainWindow
 from src.ui.auth import AuthWindow
 from src.auth import AuthService
@@ -89,6 +89,11 @@ class AppController(QObject):
 
     def _on_authenticated(self, user) -> None:
         log.info("Signed in as %r (%s)", user.username, user.role.value)
+        # Stamp the order audit trail with this user BEFORE anything can
+        # place an order — every nano_order.log line from here until sign-out
+        # carries the name (see ``set_log_user`` for what it does and does
+        # not prove).
+        set_log_user(user.username)
         # Point config_manager at this user's own app_config-<username>.json
         # before building the main window (which reads layout/prefs on init),
         # and refresh the trading-prefs cache so it reflects the new user.
@@ -134,6 +139,11 @@ class AppController(QObject):
         self._backup = None
         # Drop back to the shared base config until the next user signs in.
         config_manager.set_active_config(None)
+        # Stop attributing order-log lines to the outgoing user.  The
+        # MainWindow is retired below but its workers only stop on the next
+        # event-loop tick, so late cancel/status lines would otherwise still
+        # carry their name.
+        set_log_user(None)
         # Bring up a fresh login window first, then tear down the main window
         # (deferred, so its worker-shutdown closeEvent runs off the signal).
         self._show_auth()
