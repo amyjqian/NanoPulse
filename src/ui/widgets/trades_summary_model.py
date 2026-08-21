@@ -652,11 +652,14 @@ class TradesSummaryModel(QAbstractTableModel):
 
         Three outcomes per fill, in that order:
 
-        * it carries a nonzero ``realized_pnl`` → **closing**, taken
+        * it carries a nonzero ``realized_pnl`` → **closing**, valued
           whole from IB — it never pairs against in-window lots (IB
           already valued the close against the account's average cost;
           pairing it here too would both double-count and disagree with
-          the per-fill Rlz P&L column),
+          the per-fill Rlz P&L column).  It does still RETIRE the lots
+          it closed: leaving them in the book lets the next fill that
+          opens on the other side pair against inventory IB has already
+          realized,
         * it closes in-window lots on the other side → a **paired**
           round trip, valued gross from both legs' own fill prices —
           reached only by fills IB stamped $0 on (scratch closes, or
@@ -677,9 +680,13 @@ class TradesSummaryModel(QAbstractTableModel):
 
         IB's ``realized_pnl`` is already NET of both legs' commissions,
         so ``closing_comm`` carries back the part of that deduction this
-        window can see (the closing fill's own commission).  Callers add
-        it to keep every reported P&L gross, so the Comm column can
-        subtract commission exactly once instead of twice.
+        window can see: the closing fill's own commission, plus the
+        commission on each in-window opening lot the close retires.
+        Callers add it to keep every reported P&L gross, so the Comm
+        column can subtract each commission exactly once instead of
+        twice.  A close of pre-window inventory retires no lots and so
+        adds back only its own — its opening commission never entered
+        the Comm column either, so the two stay in step.
 
         Returns unprefixed keys; ``_walk_fills`` folds them into the
         shared walk dict under the ``cb_`` prefix.
@@ -707,6 +714,36 @@ class TradesSummaryModel(QAbstractTableModel):
             if rpnl:
                 out["closing_realized"] += float(rpnl)
                 out["closing_comm"] += comm
+                # Retire the in-window lots this fill closed.  Its P&L
+                # still comes whole from IB — the walk only needs the
+                # inventory gone, because a later fill that OPENS on the
+                # other side carries realized_pnl 0 and so reaches the
+                # pairing branch below: left in the book, these lots pair
+                # against it and fabricate a round trip nobody traded,
+                # valued across the entire price move since.
+                #
+                # Each retired lot also carries back its own commission:
+                # IB's realized is net of BOTH legs, and the opening leg
+                # is in this window's Comm column, so without this the
+                # Comm column deducts it a second time.  A close of
+                # inventory opened BEFORE the window retires no lots and
+                # adds nothing back — correct, since that commission is
+                # absent from the Comm column too.
+                left = qty
+                while left > 0 and lots and lots[0][2] != side:
+                    lot = lots[0]
+                    use = min(lot[0], left)
+                    out["closing_comm"] += use * lot[3]
+                    lot[0] -= use
+                    left -= use
+                    if lot[0] <= 0:
+                        lots.pop(0)
+                # Any remainder closed pre-window inventory or flipped
+                # the position; either way it opens nothing here.  A
+                # later fill closing the flipped side carries its own IB
+                # realized number, so inventing a lot for the remainder
+                # would only re-create the phantom pairing above in
+                # mirror image.
                 continue
 
             left = qty
