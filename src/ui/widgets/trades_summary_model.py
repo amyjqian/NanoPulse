@@ -11,8 +11,10 @@ bucket and emits the right ``beginInsertRows`` / ``dataChanged`` pairs.
 
 The table stacks two labeled sections, each closed by its own "TOTAL"
 row: "TRADE LEVEL" (window-relative rows — what did this window's
-trading make?) then "ACCOUNT LEVEL" (the same keys with their
-COST-BASIS numbers: every closing fill contributes IB's avg-cost
+trading make?  Its FIFO walk runs as one independent book PER SESSION
+DAY, so a multi-day window is Σ of the daily walks and fills never pair
+across days — see ``_walk_fills``) then "ACCOUNT LEVEL" (the same keys
+with their COST-BASIS numbers: every closing fill contributes IB's avg-cost
 ``realized_pnl`` directly, so the section reconciles with the flat
 view's Rlz P&L column and shows P&L against what was actually paid —
 even when the close also had same-window buys).  Both sections are
@@ -25,7 +27,7 @@ Net P&L = R.P&L − Comm.
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -126,10 +128,20 @@ ACCT_TOTAL_LABEL = "TOTAL"
 # the contract multiplier is applied by the callers that turn these
 # into dollars.
 _WALK_KEYS: tuple[str, ...] = (
+    # Window-relative walk, run as ONE INDEPENDENT FIFO BOOK PER SESSION
+    # DAY (see ``_walk_fills``) — feeds R.P&L / U.P&L / P&L.
     "paired_qty", "paired_buys_notional", "paired_sells_notional",
     "paired_comm",
     "open_buys_qty", "open_buys_notional",
     "open_sells_qty", "open_sells_notional",
+    # ``ws_``-prefixed twins: the SAME walk run once over the whole
+    # window (no day segmentation).  Only the "match buy & sell" trim
+    # reads these — it has to pair the legs down to a flat Net, which a
+    # day-segmented walk can't promise (see ``_effective_agg``).
+    "ws_paired_qty", "ws_paired_buys_notional", "ws_paired_sells_notional",
+    "ws_paired_comm",
+    "ws_open_buys_qty", "ws_open_buys_notional",
+    "ws_open_sells_qty", "ws_open_sells_notional",
     # ``cb_``-prefixed twins from the cost-basis walk
     # (``_walk_account_cost_basis``), which feeds the "Acct P&L" footer
     # row.  Same shapes, except ``cb_closing_realized``/``cb_closing_comm``
@@ -141,8 +153,61 @@ _WALK_KEYS: tuple[str, ...] = (
 )
 
 
+# The eight components ONE walk over ONE fill list produces, unprefixed.
+# ``_walk_fills`` runs the same walk in several framings and folds each
+# result in under its own prefix ("" / "ws_" / "cb_"), so the per-walk
+# helpers must emit bare keys — seeding them from ``_WALK_KEYS`` would
+# re-prefix already-prefixed names.
+_LEG_WALK_KEYS: tuple[str, ...] = (
+    "paired_qty", "paired_buys_notional", "paired_sells_notional",
+    "paired_comm",
+    "open_buys_qty", "open_buys_notional",
+    "open_sells_qty", "open_sells_notional",
+)
+
+
 def _empty_walk() -> dict[str, float]:
     return {k: 0.0 for k in _WALK_KEYS}
+
+
+def _empty_leg_walk() -> dict[str, float]:
+    return {k: 0.0 for k in _LEG_WALK_KEYS}
+
+
+# Contracts whose trading day rolls at 18:00 ET (the CME/ICE electronic
+# session opens for the NEXT trading date), so the P&L walk keeps an
+# evening open and the following morning's close in ONE day book.
+# Everything else (stocks, equity options) keeps the ET calendar date —
+# an 18:00 rollover there would split extended-hours trading, which
+# belongs to the day it printed on.
+_SESSION_ROLLOVER_SEC_TYPES = frozenset({"FUT", "FOP", "CONTFUT"})
+
+
+def session_day(dt: datetime | None, sec_type: str) -> date | None:
+    """Trading-session date of *dt* — the day whose book this fill
+    belongs to, which is what the P&L walk segments on.
+
+    For futures-family contracts an 18:00 ET print opens the *next*
+    trading date's session, so it rolls forward (and skips the weekend:
+    Sunday 18:00 → Monday, and the Friday-evening edge lands on Monday
+    rather than Saturday).  Every other sec_type returns the plain ET
+    calendar date.
+
+    NOTE this is deliberately NOT what the date-window *filter* uses —
+    that stays on the ET calendar date (``_ts_date``) so the summary
+    admits exactly the fills the flat Trades list does.  The session day
+    only decides which fills share a FIFO book once they are in.
+    """
+    if dt is None:
+        return None
+    et = dt.astimezone(_ET)
+    d = et.date()
+    if (et.hour >= 18
+            and (sec_type or "").upper() in _SESSION_ROLLOVER_SEC_TYPES):
+        d += timedelta(days=1)
+        while d.weekday() >= 5:            # Sat/Sun → the next Monday
+            d += timedelta(days=1)
+    return d
 
 
 def _compute_agg_key(fill: dict) -> tuple[str, str]:
@@ -164,6 +229,10 @@ def stamp_fill(fill: dict) -> None:
     keys are invisible to the column renderers, which read named keys.
     A ``None`` ``_ts_dt`` covers both "no timestamp" and "unparseable"
     — the filters treat the two identically (the fill passes).
+
+    Two date stamps, on purpose: ``_ts_date`` is the ET calendar date
+    the window filter admits fills by, ``_ts_session`` the trading-session
+    date the P&L walk segments FIFO books by (see ``session_day``).
     """
     ts = fill.get("time_sort", "")
     dt = None
@@ -177,6 +246,7 @@ def stamp_fill(fill: dict) -> None:
                 dt = dt.replace(tzinfo=_ET)
     fill["_ts_dt"] = dt
     fill["_ts_date"] = dt.astimezone(_ET).date() if dt is not None else None
+    fill["_ts_session"] = session_day(dt, fill.get("sec_type", "") or "")
     fill["_agg_key"] = _compute_agg_key(fill)
 
 
@@ -506,7 +576,12 @@ class TradesSummaryModel(QAbstractTableModel):
         with the earliest sells, so the excess dropped from the larger
         leg is always its latest fills — leaving Net flat and the P&L
         columns reflecting only the closed portion; every other row
-        returns its raw aggregate unchanged."""
+        returns its raw aggregate unchanged.
+
+        Reads the ``ws_`` (whole-window, unsegmented) walk on purpose:
+        "match buy & sell" promises a flat Net, and the day-segmented
+        walk pairs only within each session day, so it would leave the
+        legs unequal whenever a position was carried between days."""
         agg = self._agg.get(key)
         if agg is None or key not in self._matched_keys:
             return agg
@@ -515,13 +590,13 @@ class TradesSummaryModel(QAbstractTableModel):
         if b_q == s_q:
             return agg
         walk = self._walk_for_key(key)
-        if walk["paired_qty"] <= 0:
+        if walk["ws_paired_qty"] <= 0:
             return agg
         eff = dict(agg)
-        eff["buys_qty"] = walk["paired_qty"]
-        eff["sells_qty"] = walk["paired_qty"]
-        eff["buys_notional"] = walk["paired_buys_notional"]
-        eff["sells_notional"] = walk["paired_sells_notional"]
+        eff["buys_qty"] = walk["ws_paired_qty"]
+        eff["sells_qty"] = walk["ws_paired_qty"]
+        eff["buys_notional"] = walk["ws_paired_buys_notional"]
+        eff["sells_notional"] = walk["ws_paired_sells_notional"]
         return eff
 
     # ── Realized-P&L row rendering (paired round-trips only) ────────────────
@@ -559,6 +634,36 @@ class TradesSummaryModel(QAbstractTableModel):
         every number here is linear in the fills — including the mark
         (see ``_mark_open``), so a long in one account and a short in
         another still net correctly.
+
+        Within an account the window-relative walk is segmented further:
+        one INDEPENDENT FIFO BOOK PER SESSION DAY (``session_day``).  A
+        multi-day window ("Last 3 Days") is therefore Σ of each day's
+        own FIFO, not one book spanning the window — Monday's fills can
+        no longer pair with Wednesday's.  That kills the cross-day
+        phantom round trip (a Monday close of a position opened before
+        the window used to open a window-short that Wednesday's genuine
+        new buy would "close"), and makes R.P&L mean the same thing at
+        every window width: what this day's trading closed.
+
+        The trade-off is the mirror case — a position genuinely opened
+        Monday and closed Wednesday is not a day trade, so its two legs
+        land in different books and its profit reports as U.P&L rather
+        than R.P&L.  The **P&L total is unaffected**: R + U depends only
+        on the total notionals and the net open quantity, never on how
+        the fills pair (``_paired_net`` + ``_mark_open`` telescope), so
+        segmentation only moves value between the R and U columns.
+        Marking that carried leg to its own day's settlement would put
+        it back in R, but IB gives us no per-day settlement price here.
+
+        Two walks are NOT segmented, deliberately:
+
+        * the cost-basis walk (``cb_``) takes IB's avg-cost realized
+          whole on every closing fill, a basis that is already
+          day-independent and reconciles with the flat view's Rlz P&L
+          column — segmenting it could only damage its scratch-close
+          fallback,
+        * the whole-window twin (``ws_``), which exists solely so the
+          "match buy & sell" trim can still pair down to a flat Net.
         """
         by_account: dict[str, list[dict]] = {}
         for f in fills:
@@ -566,36 +671,81 @@ class TradesSummaryModel(QAbstractTableModel):
         out = _empty_walk()
         for account_fills in by_account.values():
             account_fills.sort(key=lambda f: f.get("time_sort", "") or "")
-            for k, v in cls._walk_account(account_fills).items():
-                out[k] += v
             for k, v in cls._walk_account_cost_basis(account_fills).items():
                 out["cb_" + k] += v
+            for k, v in cls._walk_account(account_fills).items():
+                out["ws_" + k] += v
+            for day_fills in cls._by_session_day(account_fills):
+                for k, v in cls._walk_account(day_fills).items():
+                    out[k] += v
         return out
+
+    @staticmethod
+    def _by_session_day(fills: list[dict]) -> list[list[dict]]:
+        """*fills* (already time-ordered) split into per-session-day
+        groups, each still in time order, oldest day first.
+
+        Groups on the ``_ts_session`` stamp, falling back to a live
+        ``session_day`` computation for a fill some other path stored
+        before the stamp existed.  Fills with no usable timestamp share
+        one ``None`` bucket rather than being dropped — they are already
+        treated as in-window everywhere else, so they keep pairing
+        against each other.
+        """
+        groups: dict[Any, list[dict]] = {}
+        for f in fills:
+            if "_ts_session" in f:
+                day = f["_ts_session"]
+            else:
+                day = session_day(TradesSummaryModel._fill_dt(f),
+                                  f.get("sec_type", "") or "")
+            groups.setdefault(day, []).append(f)
+        return [groups[k] for k in sorted(
+            groups, key=lambda d: (d is None, d or date.min))]
+
+    @staticmethod
+    def _fill_dt(fill: dict) -> datetime | None:
+        """The fill's ET-aware timestamp — the ``stamp_fill`` stamp when
+        present, parsed from ``time_sort`` otherwise."""
+        if "_ts_dt" in fill:
+            return fill["_ts_dt"]
+        ts = fill.get("time_sort", "")
+        if not ts:
+            return None
+        try:
+            parsed = datetime.fromisoformat(ts)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=_ET)
+        return parsed
 
     @staticmethod
     def _walk_account(fills: list[dict]) -> dict[str, float]:
         """Chronological FIFO walk over ONE account's fills in ONE
         contract (*fills* time-ordered, earliest first).
 
-        WINDOW-RELATIVE by design: the walk sees nothing outside the
-        fills it is given.  Each fill either closes in-window lots on the
-        other side → a **paired** round trip, valued gross from both
-        legs' own fill prices — or opens a lot → the **open** remainder,
-        marked to the current price by ``_mark_open``.
+        FRAME-RELATIVE by design: the walk sees nothing outside the
+        fills it is given.  Each fill either closes lots on the other
+        side that are already in this frame → a **paired** round trip,
+        valued gross from both legs' own fill prices — or opens a lot →
+        the **open** remainder, marked to the current price by
+        ``_mark_open``.
 
-        A fill that really closed a position opened *before* the window
-        (e.g. the morning sale of an overnight long) therefore opens a
-        window-short here: later in-window buys pair against it, and NET
-        0 always means U.P&L 0.  That is the point — R/U/P&L answer
-        "what did this window's trading make?", marking any unmatched
-        leg against the current price.  IB's own realized number (which
-        is computed against the account's average cost, a basis that
-        reaches outside the window) is deliberately NOT folded in; it
-        stays visible in the separate Rlz P&L column, and the "Acct P&L"
-        footer row folds it in via ``_walk_account_cost_basis``.
+        ``_walk_fills`` calls this once per SESSION DAY for the
+        window-relative numbers, so "the frame" is normally one trading
+        day and R.P&L means "what this day's trading closed".  A fill
+        that really closed a position opened before its own day (the
+        morning sale of an overnight long) opens a day-short here and
+        marks to the current price; NET 0 within the day always means
+        U.P&L 0 for that day.  IB's own realized number (computed
+        against the account's average cost, a basis that reaches outside
+        any frame) is deliberately NOT folded in; it stays visible in
+        the separate Rlz P&L column, and the "Acct P&L" footer row folds
+        it in via ``_walk_account_cost_basis``.
         """
-        out = _empty_walk()
-        # Open in-window lots, FIFO.  Always all on the same side: a lot
+        out = _empty_leg_walk()
+        # Open in-frame lots, FIFO.  Always all on the same side: a lot
         # only opens once nothing on the other side is left to close.
         # Each entry is [qty, price, side, commission per unit].
         lots: list[list] = []
@@ -778,14 +928,28 @@ class TradesSummaryModel(QAbstractTableModel):
         return float(mult) if mult else 1.0
 
     def _realized_total(self, key: tuple[str, str]) -> float:
-        """R.P&L for one row: the window's closed round trips, GROSS
-        (commission is deducted once, by the Comm column)."""
+        """R.P&L for one row: Σ over session days of that day's closed
+        round trips, GROSS (commission is deducted once, by the Comm
+        column).  A position carried between days is NOT a round trip
+        here — its value marks through U.P&L instead, leaving the P&L
+        column unchanged (see ``_walk_fills``).
+
+        A MATCHED row is the one exception: "match buy & sell" means
+        "pair the legs across the whole window and drop the remainder",
+        so it reads the unsegmented ``ws_`` walk — the same pairing
+        ``_effective_agg`` trims to, and the same number this row
+        reported before day segmentation."""
         walk = self._walk_for_key(key)
-        return self._paired_net(walk, self._key_multiplier(key))
+        prefix = "ws_" if self.is_matched(key) else ""
+        return self._paired_net(walk, self._key_multiplier(key), prefix)
 
     def _unrealized_total(self, key: tuple[str, str], agg: dict) -> float:
-        """U.P&L for one row: only the *opening* remainder, marked to the
-        last price."""
+        """U.P&L for one row: every session day's unpaired remainder,
+        pooled and marked to the last price.  The pooling is what keeps
+        a genuine cross-day round trip whole — Monday's leftover long
+        and Wednesday's leftover short cancel in the net quantity, so no
+        mark is applied and their two notionals net to the real
+        profit."""
         if self.is_matched(key):
             return 0.0
         return self._mark_open(self._walk_for_key(key), agg)
@@ -1714,20 +1878,14 @@ class TradesSummaryModel(QAbstractTableModel):
 
     @staticmethod
     def _fill_local_date(fill: dict) -> date | None:
-        """Fill's ``time_sort`` as an ET calendar date — from the
-        ``stamp_fill`` stamp when present, parsed otherwise."""
+        """Fill's ``time_sort`` as an ET CALENDAR date — from the
+        ``stamp_fill`` stamp when present, parsed otherwise.  This is
+        what the date window filters on; ``session_day`` (which rolls
+        futures over at 18:00 ET) is what the P&L walk segments on."""
         if "_ts_date" in fill:
             return fill["_ts_date"]
-        ts = fill.get("time_sort", "")
-        if not ts:
-            return None
-        try:
-            parsed = datetime.fromisoformat(ts)
-        except ValueError:
-            return None
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=_ET)
-        return parsed.astimezone(_ET).date()
+        dt = TradesSummaryModel._fill_dt(fill)
+        return dt.astimezone(_ET).date() if dt is not None else None
 
     def _compute_anchor(self) -> date:
         """Rule mirrors ``TradesFilterProxy``: strict "Today" — the
