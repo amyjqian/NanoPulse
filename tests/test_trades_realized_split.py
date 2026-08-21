@@ -600,8 +600,10 @@ class TestAcctPnlFooter:
         # Buy 4 today, sell 10 (rpnl on the whole execution): the window
         # section pairs 4 and marks the rest; the account section takes
         # IB's number WHOLE — no in-window pairing, no proration — plus
-        # the closing fill's own commission added back.  The 4 buys stay
-        # in the walk's undisplayed open remainder.
+        # the closing fill's own commission added back.  The sell still
+        # RETIRES the 4 buys: IB's 600 already values them, so leaving
+        # them in the book would let a later opening sell pair against
+        # inventory that is gone (see ``test_close_retires_the_lots_...``).
         m = TradesSummaryModel()
         m.add_fill(_fill("e1", "BOT", 4, 100.0))
         m.add_fill(_fill("e2", "SLD", 10, 110.0, realized_pnl=600.0,
@@ -610,7 +612,62 @@ class TestAcctPnlFooter:
         assert _r(m) == (110.0 - 100.0) * 4
         assert _u(m) == (110.0 - 105.0) * 6
         assert _cbr(m) == pytest.approx(600.0 + 1.0)
-        assert _cbu(m) == pytest.approx((105.0 - 100.0) * 4)
+        assert _cbu(m) == 0.0
+
+    def test_close_retires_the_lots_it_closed(self):
+        # Long round trip, then a SHORT round trip days later.  IB stamps
+        # realized on the two CLOSING fills only — the opening sell that
+        # starts the short carries 0, so it reaches the pairing branch.
+        # If the close left its buy lot in the book, that opening sell
+        # pairs against it and invents a round trip valued across the
+        # whole 490-point move between them.  Both round trips are worth
+        # 10 points; anything else is fabricated.
+        m = TradesSummaryModel()
+        m.add_fill(_fut("c1", "BOT", 29000.0, "10:00:00", "A"))
+        m.add_fill(_fut("c2", "SLD", 29010.0, "10:05:00", "A",
+                        realized_pnl=20.0 - 2 * 0.61))
+        m.add_fill(_fut("c3", "SLD", 29500.0, "14:00:00", "A"))
+        m.add_fill(_fut("c4", "BOT", 29490.0, "14:05:00", "A",
+                        realized_pnl=20.0 - 2 * 0.61))
+        # MNQ ×2: 10 points each way.  The stale-lot pair would have
+        # added (29500 − 29000) × 2 = +1,000 out of nowhere.
+        assert _cbr(m) == pytest.approx(40.0)
+        assert m._walk_for_key(m._order[0])["cb_paired_qty"] == 0.0
+
+    def test_in_window_opening_commission_added_back_once(self):
+        # AAPL-shaped: one fully in-window round trip.  IB's realized is
+        # net of BOTH legs' commissions, and both are in the Comm column,
+        # so both must come back or Net P&L deducts the opening leg
+        # twice.  Numbers are the live ones from the reported bug.
+        from src.ui.widgets.trades_summary_model import (
+            S_COL_NET_INCL_COMM, S_COL_PAIRED_PNL,
+        )
+        gross, buy_comm, sell_comm = 1148.14, 1.25, 1.49
+        m = TradesSummaryModel()
+        m.add_fill(_fill("e1", "BOT", 100, 200.0) | {"commission": buy_comm})
+        m.add_fill(_fill("e2", "SLD", 100, 200.0 + gross / 100,
+                         realized_pnl=gross - buy_comm - sell_comm,
+                         t="2026-05-29T11:00:00") | {"commission": sell_comm})
+        # Both sections report the same gross round trip and the same net.
+        assert _cbr(m) == pytest.approx(gross)
+        for col in (S_COL_PAIRED_PNL, S_COL_NET_INCL_COMM):
+            assert m._cost_value(col) == pytest.approx(m._total_value(col))
+        assert m._cost_value(S_COL_NET_INCL_COMM) == pytest.approx(
+            gross - buy_comm - sell_comm)
+
+    def test_pre_window_open_adds_back_only_its_own_commission(self):
+        # The mirror case: nothing in-window opened this position, so its
+        # opening commission is absent from the Comm column too.  Adding
+        # back only the closing fill's own keeps the two in step —
+        # Net P&L lands exactly on IB's realized.
+        from src.ui.widgets.trades_summary_model import (
+            S_COL_NET_INCL_COMM, S_COL_PAIRED_PNL,
+        )
+        m = TradesSummaryModel()
+        m.add_fill(_fill("e1", "SLD", 100, 100.0, realized_pnl=500.0)
+                   | {"commission": 1.49})
+        assert m._cost_value(S_COL_PAIRED_PNL) == pytest.approx(501.49)
+        assert m._cost_value(S_COL_NET_INCL_COMM) == pytest.approx(500.0)
 
     def test_futures_closing_realized_is_unscaled_dollars(self):
         # cb closing terms are IB dollar amounts — never multiplied by
