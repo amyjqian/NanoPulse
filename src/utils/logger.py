@@ -19,7 +19,8 @@ Two **dedicated** loggers are also configured:
 
 * ``nano_order`` → ``data/logs/nano_order.log``
   Captures every order that NanoPulse submits to IBKR TWS together with
-  all subsequent status changes, fills, and cancellations.
+  all subsequent status changes, fills, and cancellations.  Each line is
+  stamped with the signed-in NanoPulse username — see ``set_log_user``.
 
 Usage in other modules::
 
@@ -44,8 +45,13 @@ ORDER_LOG_FILE = LOG_DIR / "nano_order.log"
 _CONSOLE_FMT = "%(asctime)s  %(levelname)-5s  %(name)s  %(message)s"
 _FILE_FMT = "%(asctime)s  %(levelname)-5s  [%(name)s:%(lineno)d]  %(message)s"
 _TWS_FMT = "%(asctime)s  %(levelname)-5s  %(message)s"
-_ORDER_FMT = "%(asctime)s  %(levelname)-5s  %(message)s"
+# ``user`` is injected by ``_SessionUserFilter`` — see ``set_log_user``.
+_ORDER_FMT = "%(asctime)s  %(levelname)-5s  %(user)-12s  %(message)s"
 _DATE_FMT = "%H:%M:%S"
+
+# Placeholder written when no one is signed in (startup before the auth
+# gate, and the window between sign-out and the next sign-in).
+NO_USER = "-"
 
 # Maximum 5 MB per file, keep 3 backups → ≤ 20 MB total
 _MAX_BYTES = 5 * 1024 * 1024
@@ -55,12 +61,63 @@ _BACKUP_COUNT = 3
 tws_log: logging.Logger = logging.getLogger("nano_tws")
 order_log: logging.Logger = logging.getLogger("nano_order")
 
+# The signed-in NanoPulse username, stamped onto every nano_order line.
+# One process hosts exactly one session (``AppController`` tears the
+# MainWindow down on sign-out before the next user appears), so a plain
+# module global is enough — and it has to be readable without a lock:
+# most order_log calls come from an ``IBWorkerThread`` coroutine, and a
+# logging filter must never block the thread it runs on.  Rebinding a
+# module global is atomic under the GIL, so the worker either sees the
+# old name or the new one, never a torn value.
+_session_user: str = NO_USER
+
+
+def set_log_user(username: str | None) -> None:
+    """Set the username stamped onto every ``nano_order`` line.
+
+    Call it right after authentication and again with ``None`` on sign-out
+    (``AppController`` does both).  The stamp answers "which NanoPulse
+    session wrote this line", which for the app's own actions
+    (ORDER-SUBMIT / ORDER-PLACE-* / ORDER-CANCEL / ORDER-FLATTEN …) is
+    the person who triggered them.
+
+    It is NOT proof of who originated an order.  ORDER-SNAPSHOT and
+    ORDER-STATUS lines are replays of what TWS pushed — ``reqAllOpenOrders``
+    returns orders from every client on the connection, including ones
+    placed in TWS itself or by another API session.  Those lines carry
+    the username of whoever happened to be watching.  The order id still
+    settles origin: a ``nano_``-prefixed orderRef is ours, an
+    ``{account}_p{permId}`` id came from somewhere else (see
+    ``IBWorkerThread._order_key``).
+    """
+    global _session_user
+    _session_user = (username or NO_USER).strip() or NO_USER
+
+
+def get_log_user() -> str:
+    """The username currently being stamped (``"-"`` when signed out)."""
+    return _session_user
+
+
+class _SessionUserFilter(logging.Filter):
+    """Injects ``record.user`` so ``_ORDER_FMT`` can render it.
+
+    A filter rather than 48 changed call sites: every nano_order line —
+    including ones added later — is stamped without the callers knowing
+    the field exists.  Never returns False; it only decorates.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.user = _session_user
+        return True
+
 
 def _configure_dedicated_logger(
     logger: logging.Logger,
     log_file: Path,
     fmt: str,
     file_level: int = logging.DEBUG,
+    filters: tuple[logging.Filter, ...] = (),
 ) -> None:
     """Attach a rotating-file handler to *logger* (idempotent).
 
@@ -72,6 +129,12 @@ def _configure_dedicated_logger(
     avoid disk I/O from DEBUG-level pnlSingle / accountSummary spam.
     Setting the logger level (not just the handler level) ensures Python
     skips LogRecord creation entirely for below-threshold calls.
+
+    *filters* are attached to the HANDLER, not the logger: when *fmt*
+    names a custom field, only a handler-side filter guarantees every
+    record that reaches the formatter carries it — a logger-side filter
+    is skipped for records that arrive from a child logger, and the
+    formatter would raise on the missing attribute.
     """
     if logger.handlers:
         return  # already configured
@@ -86,6 +149,8 @@ def _configure_dedicated_logger(
     )
     fh.setLevel(file_level)
     fh.setFormatter(logging.Formatter(fmt, datefmt=_DATE_FMT))
+    for filt in filters:
+        fh.addFilter(filt)
     logger.addHandler(fh)
 
 
@@ -144,7 +209,8 @@ def setup_logging(level: int = logging.INFO) -> None:
     _configure_dedicated_logger(tws_log, TWS_LOG_FILE, _TWS_FMT,
                                 file_level=logging.INFO)
     _configure_dedicated_logger(order_log, ORDER_LOG_FILE, _ORDER_FMT,
-                                file_level=logging.INFO)
+                                file_level=logging.INFO,
+                                filters=(_SessionUserFilter(),))
 
     # ── Pipe ib_async (TWS protocol) chatter into nano_tws.log ────────────
     # ib_async's loggers are the source of truth for every wire-level

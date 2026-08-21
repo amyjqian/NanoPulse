@@ -71,7 +71,13 @@ NanoPulse is a PySide6 (Qt) desktop trading front-end for Interactive Brokers, u
 Three loggers, all rotating (5 MB × 3 backups) under `data/logs/`:
 - Root logger → `nanopulse.log` at **INFO** (file + console).
 - `nano_tws` → `nano_tws.log` at **INFO** — `pnlSingleEvent` / `accountSummaryEvent` fire thousands of times per minute and DEBUG saturates the rotating handler's lock.
-- `nano_order` → `nano_order.log` at **INFO** — order audit trail.
+- `nano_order` → `nano_order.log` at **INFO** — order audit trail. Every line is
+  stamped with the signed-in NanoPulse username by a handler-side filter
+  (`set_log_user`, called from `AppController` on sign-in/sign-out), so no
+  `order_log` call site passes it. The stamp names the *session* that wrote the
+  line: for the app's own actions that is who triggered them, but `ORDER-SNAPSHOT`
+  / `ORDER-STATUS` lines are TWS replays that include other clients' orders — the
+  order id settles origin (`nano_`-prefixed ref = ours, `{account}_p{permId}` = not).
 - `ib_async` → piped into `nano_tws.log` at **INFO**.
 
 Drop any of these to DEBUG temporarily when tracing wire-level / state issues.
