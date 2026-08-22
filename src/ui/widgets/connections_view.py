@@ -961,6 +961,13 @@ class ConnectionsView(QWidget):
         # Remove tracked type for this label
         self._detected_types.pop(label, None)
 
+        # Deletion, not disconnection: forget the accounts as well, or the
+        # Accounts panel would keep listing them as offline forever (a
+        # disconnect deliberately keeps them, so they stay visible while
+        # the connection is down).
+        if label:
+            self._model.forget_label(label)
+
         self._cfg_table.removeRow(row)
         self._cfg_table.blockSignals(False)
 

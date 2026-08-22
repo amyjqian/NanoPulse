@@ -90,11 +90,23 @@ class AccountsTableModel(QAbstractTableModel):
     # hundreds of per-tag ``dataChanged`` emits in a summary batch.
     connection_state_changed = Signal()
 
+    # Emitted when the set of accounts KNOWN this session changes — i.e.
+    # a connection was deleted and its accounts forgotten.  Distinct from
+    # rowsRemoved, which also fires on a mere disconnect (where the
+    # accounts are still known, just offline).
+    known_accounts_changed = Signal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._table_data: list[list[str]] = []
         self._row_map: dict[tuple[str, str], int] = {}
         self._acct_to_label: dict[str, str] = {}
+        # Every account seen this session → the connection that reported
+        # it.  Unlike ``_acct_to_label`` this SURVIVES a disconnect, so a
+        # view can still list an offline account (dimmed, no figures)
+        # instead of letting it silently vanish.  Purged only by
+        # ``forget_label``, i.e. when the connection is deleted outright.
+        self._known_accounts: dict[str, str] = {}
         self._aliases: dict[str, str] = config_manager.load_aliases()
         # Buying power tracked separately (not shown as a column in Connections view)
         self._buying_power: dict[str, float] = {}   # account → buying power
@@ -295,6 +307,7 @@ class AccountsTableModel(QAbstractTableModel):
             [label, account, acct_type, alias, "", "", "", ""])   # 8 cols
         self._row_map[(label, account)] = row_idx
         self._acct_to_label[account] = label
+        self._known_accounts[account] = label
         self.endInsertRows()
 
     def get_buying_power(self, account: str) -> float:
@@ -393,6 +406,39 @@ class AccountsTableModel(QAbstractTableModel):
                 br = self.index(row_idx, last_col)
                 self.dataChanged.emit(tl, br, [Qt.ItemDataRole.DisplayRole])
         self.connection_state_changed.emit()
+
+    def known_accounts(self) -> dict[str, str]:
+        """Every account seen this session → its connection label.
+
+        Includes accounts whose connection is currently down: a
+        disconnect stops the data, it does not mean the account ceased to
+        exist.  Callers use this to keep offline accounts on screen
+        (dimmed, figures blanked) rather than letting them disappear.
+        """
+        return dict(self._known_accounts)
+
+    def forget_label(self, label: str) -> None:
+        """Drop *label* entirely — its rows AND its remembered accounts.
+
+        This is connection DELETION, not disconnection.  A disconnected
+        connection keeps its accounts in ``_known_accounts`` so they stay
+        visible-but-offline; a deleted one must leave nothing behind, or
+        its accounts would haunt every view forever.
+
+        Purges before removing rows so anything reacting to the removal
+        already sees them gone, and emits even when there were no rows
+        left to remove (the common case: the connection was disconnected
+        first, then deleted).
+        """
+        gone = [a for a, lbl in self._known_accounts.items() if lbl == label]
+        if not gone and not any(k[0] == label for k in self._row_map):
+            return
+        for account in gone:
+            self._known_accounts.pop(account, None)
+        log.info("Forgetting %d known account(s) for label=%r",
+                 len(gone), label)
+        self.remove_rows_by_label(label)
+        self.known_accounts_changed.emit()
 
     def is_label_connected(self, label: str | None) -> bool:
         """True when ``label`` is currently reporting a live TWS

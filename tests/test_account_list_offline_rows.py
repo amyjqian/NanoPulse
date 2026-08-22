@@ -92,6 +92,82 @@ class TestImmediateOfflineStyling:
         assert "skipped" in _row(panel, "U1111111").toolTip()
 
 
+class TestDefaultGroups:
+    """All / None / no-group used to let offline accounts vanish: with no
+    membership list to diff against, they simply fell out of the model.
+    ``known_accounts`` remembers them for the session instead."""
+
+    @pytest.fixture
+    def allgrp(self, panel):
+        panel._select_default_group("All")
+        return panel
+
+    def test_offline_accounts_stay_listed(self, allgrp):
+        allgrp._model.remove_rows_by_label("Q-ib")
+        assert set(allgrp._account_rows) == set(_GROUP)
+        assert _row(allgrp, "U1111111")._connected is False
+        assert _row(allgrp, "U1111111")._balance_lbl.text() == "–"
+
+    def test_none_group_behaves_the_same(self, panel):
+        panel._select_default_group("None")
+        panel._model.remove_rows_by_label("Q-ib")
+        assert _row(panel, "U4444444")._connected is False
+
+    def test_reconnect_restores_the_figures(self, allgrp):
+        allgrp._model.remove_rows_by_label("Q-ib")
+        allgrp._model.update_batch([
+            ("Q-ib", "U1111111", "NetLiquidation", "268000", "USD")])
+        allgrp._model.set_connection_status("Q-ib", True)
+        r = _row(allgrp, "U1111111")
+        assert r._connected is True
+        assert r._balance_lbl.text() == "268k"
+        assert not r._name_lbl.text().startswith("⚠")
+
+    def test_hidden_accounts_do_not_reappear_when_they_go_offline(
+            self, allgrp):
+        """× hides an account from the default views; going offline must
+        not smuggle it back in."""
+        allgrp._hidden.add("U1111111")
+        allgrp._sync_rows()
+        assert "U1111111" not in allgrp._account_rows
+        allgrp._model.remove_rows_by_label("Q-ib")
+        assert "U1111111" not in allgrp._account_rows
+
+
+class TestForgetLabel:
+    """Deleting a connection must leave nothing behind — otherwise its
+    accounts haunt the panel as permanent offline rows."""
+
+    def test_delete_clears_the_offline_rows(self, panel):
+        panel._select_default_group("All")
+        panel._model.remove_rows_by_label("Q-ib")      # disconnect
+        assert "U1111111" in panel._account_rows
+        panel._model.forget_label("Q-ib")              # delete
+        assert "U1111111" not in panel._account_rows
+        assert "U4444444" not in panel._account_rows
+
+    def test_delete_works_without_a_prior_disconnect(self, panel):
+        panel._select_default_group("All")
+        panel._model.forget_label("Q-ib")
+        assert set(panel._account_rows) == {"U3333333", "U5555555"}
+
+    def test_survivors_are_untouched(self, panel):
+        panel._model.forget_label("Q-ib")
+        assert panel._model.known_accounts() == {
+            "U3333333": "J-ib", "U5555555": "J-ib"}
+
+    def test_unknown_label_is_a_noop(self, panel):
+        seen = []
+        panel._model.known_accounts_changed.connect(lambda: seen.append(1))
+        panel._model.forget_label("nope")
+        assert seen == []
+
+    def test_disconnect_keeps_accounts_known(self, panel):
+        """The distinction the whole mechanism rests on."""
+        panel._model.remove_rows_by_label("Q-ib")
+        assert "U1111111" in panel._model.known_accounts()
+
+
 class TestModelInvariant:
     """``remove_rows_by_label`` must present consistent derived state to
     anything reacting to its row removals."""

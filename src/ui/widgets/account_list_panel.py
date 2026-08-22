@@ -733,6 +733,11 @@ class AccountListPanel(QWidget):
             self._refresh_connected_states)
         self._model.rowsInserted.connect(self._on_rows_changed)
         self._model.rowsRemoved.connect(self._on_rows_changed)
+        # A deleted connection drops its accounts from ``known_accounts``;
+        # without this the offline rows it left behind would never clear
+        # (``remove_rows_by_label`` emits nothing when the rows are
+        # already gone, which is the usual disconnect-then-delete order).
+        self._model.known_accounts_changed.connect(self._on_rows_changed)
 
         self._sync_rows()
 
@@ -1189,21 +1194,31 @@ class AccountListPanel(QWidget):
         # been hidden from All is still a member of any group that
         # includes it, and becomes visible again when the user
         # activates that group.
+        # An account whose connection is down has no model row, but it has
+        # not ceased to exist.  Every view here keeps it on screen with a
+        # row of its own — dimmed, ⚠-prefixed, figures blanked — because a
+        # list that silently shrinks to its online members hides exactly
+        # who an order fan-out is about to skip.  ``known_accounts``
+        # remembers them across a disconnect; deleting the connection
+        # (``forget_label``) is what removes them for good.
         offline_members: set[str] = set()
-        if self._active_group in _DEFAULT_GROUPS:
-            visible = {a for a in model_accounts if a not in self._hidden}
-        elif self._active_group is not None:
+        if self._active_group is not None \
+                and self._active_group not in _DEFAULT_GROUPS:
             g = self._find_group(self._active_group)
             group_members = set(g.get("accounts", [])) if g else set()
             visible = {a for a in model_accounts if a in group_members}
-            # Members whose connection never delivered accounts this
-            # session have no model entry at all.  They still get a row
-            # (dimmed, ⚠-prefixed, "–" balance) — otherwise a partially
-            # offline group silently shrinks to its online members and
-            # the user can't see who an order fan-out will skip.
+            # Scoped to the group's own membership list, which survives a
+            # disconnect on its own — no need to consult known_accounts.
             offline_members = group_members - set(model_accounts)
         else:
+            # All / None / no-group: honour the ``_hidden`` set (× hides
+            # an account from the default views) on both halves, so a
+            # hidden account does not reappear the moment it goes offline.
             visible = {a for a in model_accounts if a not in self._hidden}
+            offline_members = {
+                a for a in self._model.known_accounts()
+                if a not in model_accounts and a not in self._hidden
+            }
 
         # Add new / update existing.
         for acct in visible:
