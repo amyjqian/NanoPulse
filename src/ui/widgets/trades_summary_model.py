@@ -35,7 +35,7 @@ from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
 from PySide6.QtGui import QColor
 
 from src.ui.theme import Theme
-from src.ui.widgets.trades_filter_proxy import today_et, trading_days_cutoff
+from src.ui.widgets.trades_date_filter import TradeWindow, fill_dt, today_et
 from src.utils.helpers import (
     format_option_symbol, format_option_symbol_two_line)
 
@@ -304,18 +304,19 @@ class TradesSummaryModel(QAbstractTableModel):
         # execId → raw fill dict — keeps the last flattened fill per execId so
         # a re-snapshot that re-emits the same fill doesn't double-count it
         self._fills: dict[str, dict] = {}
-        # Date-range filter.  0 means "show every fill regardless of time".
-        # ``_anchor_date`` is strictly today_ET and the lookback counts
-        # trading days (mirrors the rule in TradesFilterProxy so the two
-        # views stay in sync).  Default 1 = "Today" to match
-        # TradesFilterProxy's default so a fresh app shows the same
-        # window in both flat and summary views.
-        self._days_back: int = 1
+        # The date dropdown's selection, as one window (see
+        # ``trades_date_filter``).  Replaces the old ``days_back`` +
+        # ``time_threshold`` pair: those could disagree and every caller
+        # had to know which one won.  Defaults to Today, matching
+        # TradesFilterProxy, so a fresh app shows the same frame in the
+        # flat and summary views.  ``_anchor_date`` is strictly today_ET.
         self._anchor_date: date = today_et()
-        # Time-threshold filter (driven by the search box parsing a
-        # datetime).  When set, it *overrides* the date window — the
-        # user is being explicit about which moment forward to include.
-        self._time_threshold: datetime | None = None
+        self._window: TradeWindow = TradeWindow.last_days(
+            1, self._anchor_date)
+        # Set when the search box parses as a datetime.  Overrides the
+        # combo window unless that window is a session preset — same
+        # precedence the flat proxy applies (``effectiveWindow``).
+        self._search_window: TradeWindow | None = None
         # Lowercased substring the panel pushes from the search box.
         # Aggregation is done over only the matching subset of fills,
         # so typing an account like ``U123`` shows that account's
@@ -697,28 +698,11 @@ class TradesSummaryModel(QAbstractTableModel):
             if "_ts_session" in f:
                 day = f["_ts_session"]
             else:
-                day = session_day(TradesSummaryModel._fill_dt(f),
+                day = session_day(fill_dt(f),
                                   f.get("sec_type", "") or "")
             groups.setdefault(day, []).append(f)
         return [groups[k] for k in sorted(
             groups, key=lambda d: (d is None, d or date.min))]
-
-    @staticmethod
-    def _fill_dt(fill: dict) -> datetime | None:
-        """The fill's ET-aware timestamp — the ``stamp_fill`` stamp when
-        present, parsed from ``time_sort`` otherwise."""
-        if "_ts_dt" in fill:
-            return fill["_ts_dt"]
-        ts = fill.get("time_sort", "")
-        if not ts:
-            return None
-        try:
-            parsed = datetime.fromisoformat(ts)
-        except ValueError:
-            return None
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=_ET)
-        return parsed
 
     @staticmethod
     def _walk_account(fills: list[dict]) -> dict[str, float]:
@@ -1048,18 +1032,15 @@ class TradesSummaryModel(QAbstractTableModel):
     def pnl_totals_today(self, accounts=None
                          ) -> tuple[float, float, float, float]:
         """``pnl_totals`` over today's ET session only."""
-        return self.pnl_totals(accounts, days_back=1)
+        return self.pnl_totals(accounts, TradeWindow.last_days(
+            1, self._compute_anchor()))
 
-    def pnl_totals(self, accounts=None, days_back: int = 1,
-                   threshold: datetime | None = None,
+    def pnl_totals(self, accounts=None, window: TradeWindow | None = None,
                    ) -> tuple[float, float, float, float]:
         """(R.P&L, U.P&L, P&L, commission) for *accounts* (raw IB ids via
-        ``account_id``; empty/None = every account) over a time frame:
-        *threshold* keeps fills at or after that ET moment (the control
-        bar's Morning/Noon/Evening presets) and overrides the day
-        window; otherwise *days_back* counts trading days back from
-        today ET (1 = today, 2 = today + the previous trading day,
-        0/negative = everything).
+        ``account_id``; empty/None = every account) over *window* — any
+        entry from the control bar's date dropdown (see
+        ``trades_date_filter``).  ``None`` means today.
 
         Deliberately independent of the view's search text and account
         filter — this feeds the always-on status-bar aggregate.  Fills
@@ -1077,6 +1058,8 @@ class TradesSummaryModel(QAbstractTableModel):
         """
         sel = {a for a in (accounts or ()) if a}
         anchor = self._compute_anchor()
+        if window is None:
+            window = TradeWindow.last_days(1, anchor)
 
         # Memoize the price-independent half.  This runs on the status
         # bar's 1 s timer forever, so the O(fills) scan+group+walk must
@@ -1084,34 +1067,14 @@ class TradesSummaryModel(QAbstractTableModel):
         # reads ``_last_prices`` live, so ticks are reflected without
         # invalidation.  The anchor in the key makes midnight rollover
         # invalidate naturally.
-        memo_key = (self._fills_rev, frozenset(sel), days_back,
-                    threshold, anchor)
+        memo_key = (self._fills_rev, frozenset(sel),
+                    window.cache_key(), anchor)
         if self._pnl_memo is not None and self._pnl_memo[0] == memo_key:
             _, groups_list, comm_total, r_total = self._pnl_memo
             u_total = sum(self._mark_open(w, m) for w, m in groups_list)
             return r_total, u_total, r_total + u_total, comm_total
 
-        def in_frame(f: dict) -> bool:
-            if threshold is not None:
-                if "_ts_dt" in f:
-                    dt = f["_ts_dt"]
-                    return True if dt is None else dt >= threshold
-                ts = f.get("time_sort", "")
-                if not ts:
-                    return True
-                try:
-                    parsed = datetime.fromisoformat(ts)
-                except ValueError:
-                    return True
-                if parsed.tzinfo is None:
-                    parsed = parsed.replace(tzinfo=_ET)
-                return parsed >= threshold
-            if days_back <= 0:
-                return True
-            local = self._fill_local_date(f)
-            if local is None:
-                return True
-            return local >= trading_days_cutoff(anchor, days_back)
+        in_frame = window.contains_fill
 
         groups: dict[tuple[str, str], list[dict]] = {}
         comm_total = 0.0
@@ -1599,7 +1562,7 @@ class TradesSummaryModel(QAbstractTableModel):
         """Fold a flattened fill into its symbol aggregate, or refresh in
         place if a prior fill with the same execId was already counted.
 
-        Respects the date filter set via ``set_days_back``: fills are
+        Respects the date filter set via ``set_window``: fills are
         always stored in ``_fills`` (so a later filter change can pull
         them back in) but only aggregated into the visible rows when
         they fall inside the current window.
@@ -1623,8 +1586,10 @@ class TradesSummaryModel(QAbstractTableModel):
         # rebuilding is O(n_fills).
         prev_anchor = self._anchor_date
         self._anchor_date = self._compute_anchor()
-        anchor_changed = (
-            self._days_back > 0 and prev_anchor != self._anchor_date)
+        # An unbounded window admits everything, so a date change can't
+        # move any fill in or out of it — skip the rebuild.
+        anchor_changed = (not self._window.is_unbounded
+                          and prev_anchor != self._anchor_date)
 
         # Re-snapshot case: same execId arrived again.  Roll back the old
         # contribution and re-apply with the new data (commission may now
@@ -1694,28 +1659,41 @@ class TradesSummaryModel(QAbstractTableModel):
         if key in self._order:
             self._emit_pnl_rows(key)
 
-    def set_days_back(self, days: int) -> None:
-        """Change the date window (1 = today, 2 = last 2 trading days,
-        …).  0 or negative means "show every fill regardless of time"."""
-        days = max(0, int(days or 0))
-        if days == self._days_back:
+    def set_window(self, window: TradeWindow) -> None:
+        """Change the date window — the control bar's dropdown selection
+        (see ``trades_date_filter``).  Re-aggregates from the stored
+        fills, so a widened window pulls back fills that were filtered
+        out earlier."""
+        if window is None or window == self._window:
             return
-        self._days_back = days
+        self._window = window
         self._rebuild_from_fills()
 
-    def set_time_threshold(self, threshold: datetime | None) -> None:
-        """Re-aggregate using only fills at or after *threshold* (an
-        ET-aware datetime).  ``None`` removes the override and falls
-        back to the date window."""
-        if threshold == self._time_threshold:
+    def set_search_window(self, window: TradeWindow | None) -> None:
+        """Set the window parsed out of the search box (``None`` clears
+        it).  It overrides the combo window unless that window is a
+        session preset, mirroring ``TradesFilterProxy.effectiveWindow``
+        so the flat view and the summary totals never disagree."""
+        if window == self._search_window:
             return
-        self._time_threshold = threshold
+        self._search_window = window
         self._rebuild_from_fills()
+
+    def window(self) -> TradeWindow:
+        """The combo's window, before any typed search narrows it."""
+        return self._window
+
+    def effective_window(self) -> TradeWindow:
+        """The window fills are actually tested against."""
+        if (self._search_window is not None
+                and not self._window.has_time_of_day):
+            return self._search_window
+        return self._window
 
     def set_search_text(self, text: str) -> None:
         """Substring filter applied to the fill stream before
         aggregation.  Callers should pass the raw substring (datetime
-        queries are routed through ``set_time_threshold`` instead)."""
+        queries are routed through ``set_search_window`` instead)."""
         new_search = (text or "").strip().lower()
         if new_search == self._search_text:
             return
@@ -1913,17 +1891,6 @@ class TradesSummaryModel(QAbstractTableModel):
 
     # ── Date-filter helpers ─────────────────────────────────────────────────
 
-    @staticmethod
-    def _fill_local_date(fill: dict) -> date | None:
-        """Fill's ``time_sort`` as an ET CALENDAR date — from the
-        ``stamp_fill`` stamp when present, parsed otherwise.  This is
-        what the date window filters on; ``session_day`` (which rolls
-        futures over at 18:00 ET) is what the P&L walk segments on."""
-        if "_ts_date" in fill:
-            return fill["_ts_date"]
-        dt = TradesSummaryModel._fill_dt(fill)
-        return dt.astimezone(_ET).date() if dt is not None else None
-
     def _compute_anchor(self) -> date:
         """Rule mirrors ``TradesFilterProxy``: strict "Today" — the
         window is always anchored to the current ET date."""
@@ -1947,32 +1914,9 @@ class TradesSummaryModel(QAbstractTableModel):
         return True
 
     def _passes_time_filter(self, fill: dict) -> bool:
-        # Time-threshold overrides the date window — when a user types
-        # a specific moment into the search box we want the aggregates
-        # to reflect exactly that cutoff (match what the flat view is
-        # already showing).
-        if self._time_threshold is not None:
-            if "_ts_dt" in fill:
-                dt = fill["_ts_dt"]
-                return True if dt is None else dt >= self._time_threshold
-            ts = fill.get("time_sort", "")
-            if not ts:
-                return True
-            try:
-                parsed = datetime.fromisoformat(ts)
-            except ValueError:
-                return True
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=_ET)
-            return parsed >= self._time_threshold
-
-        if self._days_back <= 0:
-            return True
-        local_date = self._fill_local_date(fill)
-        if local_date is None:
-            return True
-        return local_date >= trading_days_cutoff(
-            self._anchor_date, self._days_back)
+        """One window, one call — the same predicate the flat proxy and
+        ``pnl_totals`` run, so the three views cannot drift apart."""
+        return self.effective_window().contains_fill(fill)
 
     def _passes_search_filter(self, fill: dict) -> bool:
         if not self._search_text:

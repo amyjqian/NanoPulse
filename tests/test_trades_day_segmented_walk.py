@@ -27,6 +27,7 @@ import pytest
 
 import src.ui.widgets.trades_filter_proxy as tfp
 import src.ui.widgets.trades_summary_model as tsm
+from src.ui.widgets.trades_date_filter import TradeWindow
 from src.ui.widgets.trades_summary_model import TradesSummaryModel, session_day
 
 _ET = ZoneInfo("America/New_York")
@@ -71,7 +72,7 @@ def _fill(exec_id, side, shares, price, t, *, realized_pnl=None,
 
 def _model(*fills, last=None, days_back=3):
     m = TradesSummaryModel()
-    m.set_days_back(days_back)
+    m.set_window(TradeWindow.last_days(days_back, date(2026, 6, 3)))
     for f in fills:
         m.add_fill(f)
     if last is not None:
@@ -164,8 +165,8 @@ class TestNoCrossDayPairing:
         assert u == 0.0
 
     def test_one_day_window_is_unchanged(self):
-        """Segmentation is invisible at days_back=1 — there was only ever
-        one day in the book."""
+        """Segmentation is invisible in a one-day window — there was
+        only ever one day in the book."""
         m = _model(
             _fill("e1", "BOT", 4, 100.0, _WED),
             _fill("e2", "SLD", 10, 110.0, "2026-06-03T14:00:00"),
@@ -274,7 +275,8 @@ class TestStatusBarTotals:
             _fill("e2", "BOT", 1, 20050.0, _WED),
             last=20080.0,
         )
-        r, u, total, _c = m.pnl_totals(days_back=3)
+        r, u, total, _c = m.pnl_totals(
+            None, TradeWindow.last_days(3, date(2026, 6, 3)))
         assert r == 0.0
         assert u == pytest.approx(-50.0)
         assert total == pytest.approx(-50.0)

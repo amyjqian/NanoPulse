@@ -19,8 +19,6 @@ visible-keys order onto the table via ``setColumnHidden`` +
 from __future__ import annotations
 
 import logging
-from datetime import datetime
-from zoneinfo import ZoneInfo
 
 from PySide6.QtCore import QEvent, QItemSelectionModel, Qt, QTimer
 from PySide6.QtGui import QFontMetrics, QKeySequence, QShortcut
@@ -39,6 +37,7 @@ from typing import Callable
 from src.core import config_manager
 from . import table_theme as tt
 from .trades_control_bar import TradesControlBar
+from .trades_date_filter import TradeWindow, window_for_key
 from .trades_filter_proxy import TradesFilterProxy, _try_parse_time_query
 from .trades_model import (
     TradesModel, HEADERS,
@@ -55,26 +54,6 @@ from .trades_summary_model import (
 )
 
 log = logging.getLogger(__name__)
-
-_ET = ZoneInfo("America/New_York")
-
-# Control-bar combo key → (days_back, session-open time-of-day in ET).
-# ``None`` time means no preset threshold; just the rolling N-day
-# window.  Morning uses 09:30 (US equities open); Afternoon 12:00;
-# Evening 18:00 (after the US cash session close, covering the evening
-# futures re-open and overnight trades).
-_FILTER_PRESETS: dict[str, tuple[int, tuple[int, int] | None]] = {
-    "evening":   (1, (18, 0)),
-    "afternoon": (1, (12, 0)),
-    "morning":   (1, (9, 30)),
-    "today":     (1, None),
-    "last_2":    (2, None),
-    "last_3":    (3, None),
-    "last_4":    (4, None),
-    "last_5":    (5, None),
-    "last_6":    (6, None),
-    "last_7":    (7, None),
-}
 
 # ── Theme ─────────────────────────────────────────────────────────────────────
 # The table look is shared with the Positions tab — both tables sit behind
@@ -194,6 +173,10 @@ class TradesPanel(QWidget):
         self._control_bar = TradesControlBar(self)
         self._control_bar.summaryToggled.connect(self._on_summary_toggled)
         self._control_bar.dateFilterChanged.connect(self._on_date_changed)
+        # The named-day entries are literal dates, so they go stale at the
+        # ET midnight rollover — rebuild the combo and re-resolve when the
+        # proxy notices the anchor advance.
+        self._flat_proxy.anchorDateChanged.connect(self._on_anchor_changed)
         self._control_bar.searchTextChanged.connect(self._on_search_changed)
         self._control_bar.settingsClicked.connect(self._on_gear_clicked)
 
@@ -404,20 +387,27 @@ class TradesPanel(QWidget):
         self._refresh_trade_count()
 
     def _on_date_changed(self, key: str) -> None:
-        days, hm = _FILTER_PRESETS.get(key, (1, None))
-        threshold: datetime | None = None
-        if hm is not None:
-            anchor = self._flat_proxy.anchorDate()
-            h, m = hm
-            threshold = datetime(
-                anchor.year, anchor.month, anchor.day, h, m,
-                tzinfo=_ET,
-            )
-        self._flat_proxy.setDaysBack(days)
-        self._summary_model.set_days_back(days)
-        self._flat_proxy.setPresetThreshold(threshold)
-        self._summary_proxy.setPresetThreshold(threshold)
-        self._refresh_summary_threshold()
+        """Resolve the combo key to a window and push it to both views.
+
+        Every entry — session preset, named day, rolling span,
+        week-to-date — is one ``TradeWindow``, so this is the whole
+        mapping the panel used to spell out as a preset table plus a
+        threshold/days_back split.
+        """
+        window = window_for_key(key, self._flat_proxy.anchorDate())
+        self._flat_proxy.setWindow(window)
+        self._summary_model.set_window(window)
+        self._refresh_search_window()
+
+    def _on_anchor_changed(self) -> None:
+        """ET midnight rolled over under a running app.
+
+        The named-day entries are literal dates, so the combo is rebuilt
+        against the new anchor.  Every window is re-resolved either way:
+        even "Today" is yesterday's midnight until it is rebuilt.
+        """
+        self._control_bar.rebuildDateOptions()
+        self._on_date_changed(self._control_bar.filterKey())
 
     def _on_search_changed(self, text: str) -> None:
         self._flat_proxy.setSearchText(text)
@@ -429,7 +419,7 @@ class TradesPanel(QWidget):
         parsed = _try_parse_time_query(text)
         self._summary_model.set_search_text(
             "" if parsed is not None else text)
-        self._refresh_summary_threshold()
+        self._refresh_search_window()
 
     def _refresh_trade_count(self, *_args) -> None:
         """Push the active view's trade count to the control bar.  Flat
@@ -450,14 +440,14 @@ class TradesPanel(QWidget):
         self._last_trade_count = count
         self._control_bar.setTradeCount(count)
 
-    def _refresh_summary_threshold(self) -> None:
-        """Summary model has a single ``_time_threshold`` slot; mirror
-        the proxy's "preset beats search-parsed" priority so the flat
-        view and summary totals stay in sync."""
-        threshold = self._flat_proxy.presetThreshold()
-        if threshold is None:
-            threshold = _try_parse_time_query(self._control_bar.searchText())
-        self._summary_model.set_time_threshold(threshold)
+    def _refresh_search_window(self) -> None:
+        """Mirror the search box's parsed datetime into the summary
+        model.  The precedence against the combo's window lives in one
+        place (``TradeWindow`` consumers' ``effective_window``), so the
+        flat view and the summary totals resolve it identically."""
+        parsed = _try_parse_time_query(self._control_bar.searchText())
+        self._summary_model.set_search_window(
+            TradeWindow.from_threshold(parsed) if parsed else None)
 
     # ── Summary row hide / restore ──────────────────────────────────────────
 
@@ -898,15 +888,14 @@ class TradesPanel(QWidget):
         self._summary_model.set_selected_accounts(accounts)
 
     def pnl_totals(self, accounts=None) -> tuple[float, float, float, float]:
-        """(R.P&L, U.P&L, P&L, commission) across *accounts* (raw IB ids; empty/None
-        = all) over the control bar's current time frame — the status
-        bar's aggregate.  Follows the date combo (Today / Morning / Noon
-        / Evening / Last N Days) but ignores the view's search text,
-        account filter, and hidden rows."""
+        """(R.P&L, U.P&L, P&L, commission) across *accounts* (raw IB ids;
+        empty/None = all) over the control bar's current time frame — the
+        status bar's aggregate.  Follows whatever the date combo is set
+        to but ignores the view's search text, account filter, and
+        hidden rows; ``effectiveWindow`` folds in a datetime typed into
+        the search box, matching what the flat view shows."""
         return self._summary_model.pnl_totals(
-            accounts,
-            days_back=self._flat_proxy.daysBack(),
-            threshold=self._flat_proxy.presetThreshold())
+            accounts, self._flat_proxy.effectiveWindow())
 
     def pnl_timeframe_label(self) -> str:
         """Display label of the active time frame ("Today", "Morning",

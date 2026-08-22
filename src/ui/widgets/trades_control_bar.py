@@ -3,7 +3,8 @@ TradesControlBar – toolbar that lives above the Trades table.
 
 Hosts:
   * ``Summary`` pill button (checkable) — flips QStackedWidget pages.
-  * Date range combo (Today / Last N Days, up to 7).
+  * Date range combo — session presets, named recent days, rolling
+    spans and week-to-date, all built from ``trades_date_filter``.
   * Search line-edit — filters by symbol / side / account / sec-type.
   * Gear button — opens the columns preferences dialog.
 
@@ -23,6 +24,8 @@ from PySide6.QtWidgets import (
 
 from src.ui.theme import Theme
 from . import table_theme as tt
+from .trades_date_filter import (
+    DEFAULT_KEY, date_filter_groups, window_for_key)
 
 # ── Theme tokens ──────────────────────────────────────────────────────────────
 # Mirrors the Positions control bar (account_position_panel.CONTROL_BTN_QSS)
@@ -197,28 +200,18 @@ class TradesControlBar(QWidget):
         # Spacer
         lay.addSpacing(12)
 
-        # Date / time-of-day filter.  Session-of-day presets sit at the
-        # top because they're the most common quick filters during live
-        # trading; the multi-day windows follow.  Items store string
-        # keys as itemData — the panel maps them to (days_back,
-        # time_of_day) when applying the filter.
+        # Date / time-of-day filter.  The entries and their order come
+        # from ``date_filter_groups`` — this bar only renders them, so
+        # the dropdown and the filtering logic can't drift apart.  Items
+        # store the window's key as itemData; the panel resolves it back
+        # to a window when applying the filter.
         self._date_combo = QComboBox(self)
         self._date_combo.setObjectName("tbDateCombo")
-        # Width tracks the widest item ("Last N Days") instead of a
+        # Width tracks the widest item ("Week to Date") instead of a
         # hard-coded min-width.
         self._date_combo.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToContents)
-        self._date_combo.addItem("Evening",   "evening")
-        self._date_combo.addItem("Noon",      "afternoon")
-        self._date_combo.addItem("Morning",   "morning")
-        self._date_combo.addItem("Today",     "today")
-        for n in range(2, 8):
-            self._date_combo.addItem(f"Last {n} Days", f"last_{n}")
-        # Default to Today so first-run doesn't hide fills behind a
-        # time-of-day cutoff.  Set before wiring the signal to avoid
-        # firing a spurious dateFilterChanged during construction.
-        self._date_combo.setCurrentIndex(
-            self._date_combo.findData("today"))
+        self._populate_date_combo()
         self._date_combo.currentIndexChanged.connect(self._on_date_changed)
         lay.addWidget(self._date_combo)
 
@@ -278,16 +271,57 @@ class TradesControlBar(QWidget):
         self._trades_count_label.style().polish(self._trades_count_label)
 
     def filterKey(self) -> str:
-        return str(self._date_combo.currentData() or "today")
+        return str(self._date_combo.currentData() or DEFAULT_KEY)
 
     def filterLabel(self) -> str:
-        """Display text of the active date filter ("Today", "Noon", …)."""
+        """Display text of the active date filter ("Today", "Noon",
+        "Thu, Aug 20", …)."""
         return self._date_combo.currentText()
 
     def setFilterKey(self, key: str) -> None:
-        idx = self._date_combo.findData(key)
+        """Select the entry with itemData *key*.  The key is canonicalised
+        first, so a pre-refactor name ("afternoon" for what is now "noon")
+        still lands on the right item; an unknown key is ignored."""
+        idx = self._date_combo.findData(window_for_key(key).key)
         if idx >= 0:
             self._date_combo.setCurrentIndex(idx)
+
+    def rebuildDateOptions(self) -> bool:
+        """Re-populate the combo against today's date and report whether
+        the selection survived.
+
+        The named-day entries ARE dates ("Thu, Aug 20"), so they all go
+        stale at the ET midnight rollover.  The panel calls this when the
+        proxy's anchor advances; a selection that no longer exists — the
+        day that just fell off the end of the list — falls back to Today
+        and returns ``False`` so the caller knows to re-apply.
+        """
+        want = self.filterKey()
+        blocked = self._date_combo.blockSignals(True)
+        try:
+            self._date_combo.clear()
+            self._populate_date_combo(want)
+        finally:
+            self._date_combo.blockSignals(blocked)
+        return self.filterKey() == want
+
+    def _populate_date_combo(self, select: str = DEFAULT_KEY) -> None:
+        """Fill the combo from ``date_filter_groups``, separating each
+        group.  Selection is set here rather than by the caller so the
+        default (Today) is applied before the signal is wired — a
+        ``setCurrentIndex`` afterwards would fire a spurious
+        ``dateFilterChanged`` during construction."""
+        first = True
+        for group in date_filter_groups():
+            if not first:
+                self._date_combo.insertSeparator(self._date_combo.count())
+            first = False
+            for win in group:
+                self._date_combo.addItem(win.label, win.key)
+        idx = self._date_combo.findData(select)
+        if idx < 0:
+            idx = self._date_combo.findData(DEFAULT_KEY)
+        self._date_combo.setCurrentIndex(max(0, idx))
 
     def searchText(self) -> str:
         return self._search.text()

@@ -84,6 +84,13 @@ Drop any of these to DEBUG temporarily when tracing wire-level / state issues.
 
 Both dedicated loggers set `propagate = False` so their output stays out of the console. `ib_async.*` loggers are explicitly pinned to WARNING+ for the console but DEBUG still reaches the file. Import the dedicated loggers as `from src.utils.logger import tws_log, order_log`.
 
+### Trades date filter (`src/ui/widgets/trades_date_filter.py`)
+- Every entry in the Trades control-bar date dropdown resolves to one `TradeWindow` — a half-open ET interval `[start, end)`, either bound `None` for unbounded. Session presets (Evening 18:00 / Noon 12:00 / Morning 09:30) and Today set only `start`; a named day ("Thu, Aug 20") sets both, so it means that day alone; Last N Days and Week to Date set `start`.
+- **Windows count CALENDAR days — weekends included.** The old `trading_days_cutoff` (Mon–Fri) is gone: "Last 2 Days" on a Monday is Sunday + Monday, and weekend dates appear in the named-day list (the Sunday futures session is real trading). The one surviving weekend skip is `trades_summary_model.session_day`, which rolls a Friday-evening futures print to Monday — that picks a FIFO book, not a filter frame.
+- One predicate, three consumers: `TradesFilterProxy.filterAcceptsRow`, `TradesSummaryModel._passes_time_filter` and `pnl_totals` all call `TradeWindow.contains_fill`. Don't reintroduce a private copy — they used to have one each and drifted.
+- A datetime typed into the search box becomes its own window and replaces the combo's, except when the combo holds a session preset. That precedence lives in `effectiveWindow` / `effective_window` only.
+- Named-day entries are literal dates, so they go stale at ET midnight. `TradesFilterProxy.anchorDateChanged` → `TradesPanel._on_anchor_changed` rebuilds the combo and re-resolves the selection; a day that rolled off the list falls back to Today.
+
 ### UI composition notes
 - The FlashTrade page (`src/ui/widgets/flash_trade_view.py`) wires the `OrderEntryPanel` + `OrderStatusPanel` + `AccountListPanel` + `AccountPositionPanel` around nested `QSplitter`s. Splitter sizes persist under three distinct keys (`flash_main_splitter`, `flash_right_v_splitter`, `flash_top_right_splitter`) via `config_manager.load_layout/save_layout`.
 - New instruments are added ONLY through the symbol-search popup (`symbol_search_popup.py`, the "+" buttons / "/" shortcut); a pick returns qualified contract metadata that the host stores on the new chip entry via `_add_symbol(sym, meta)`.

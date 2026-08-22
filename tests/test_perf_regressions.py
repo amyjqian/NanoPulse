@@ -28,6 +28,7 @@ import pytest
 from PySide6.QtCore import Qt
 
 from src.ui.widgets.table_theme import SortValueRole
+from src.ui.widgets.trades_date_filter import TradeWindow
 from src.ui.widgets.trades_summary_model import TradesSummaryModel
 
 _DAY = "2026-05-29T10:00:00"
@@ -118,7 +119,7 @@ class TestSummaryWalkCache:
         assert walk_counter["n"] == 1   # SY0's key only
 
     @pytest.mark.parametrize("setter,arg", [
-        ("set_days_back", 2),
+        ("set_window", TradeWindow.last_days(2, date(2026, 5, 29))),
         ("set_search_text", "SY"),
         ("set_selected_accounts", {"U1"}),
         ("set_hidden_fills", {"e1"}),

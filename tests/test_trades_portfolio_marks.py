@@ -92,7 +92,7 @@ class TestStatusBarMarksFromPortfolio:
         return m
 
     def test_no_marks_falls_back_to_fill_prices(self, model):
-        _r, u, _t, _c = model.pnl_totals(None, days_back=1)
+        _r, u, _t, _c = model.pnl_totals_today()
         # Newest-fill fallback: MNQ marks at 29860.00 → -119, NVDA at
         # its own buy price → 0.  The incident's exact toolbar number.
         assert u == pytest.approx(-119.0)
@@ -104,7 +104,7 @@ class TestStatusBarMarksFromPortfolio:
         _feed_portfolio_mark(model, {
             "symbol": "NVDA", "local_symbol": "NVDA", "sec_type": "STK",
             "market_price": 222.73})
-        _r, u, _t, _c = model.pnl_totals(None, days_back=1)
+        _r, u, _t, _c = model.pnl_totals_today()
         # MNQ: (29860.5-29889.75)*2*2 + (29860.5-29860)*2*2 = -115
         # NVDA: (222.73-222.58)*200 = +30
         assert u == pytest.approx(-85.0)
@@ -118,7 +118,7 @@ class TestStatusBarMarksFromPortfolio:
         _feed_portfolio_mark(model, {
             "symbol": "MNQ", "local_symbol": "MNQU6", "sec_type": "FUT",
             "market_price": 29860.50})
-        _r, u, _t, _c = model.pnl_totals(None, days_back=1)
+        _r, u, _t, _c = model.pnl_totals_today()
         assert u == pytest.approx(-115.0)
 
     def test_dbl_max_and_zero_prices_are_dropped(self, model):
@@ -128,7 +128,7 @@ class TestStatusBarMarksFromPortfolio:
         _feed_portfolio_mark(model, {
             "symbol": "MNQ", "local_symbol": "MNQU6", "sec_type": "FUT",
             "market_price": 0.0})
-        _r, u, _t, _c = model.pnl_totals(None, days_back=1)
+        _r, u, _t, _c = model.pnl_totals_today()
         assert u == pytest.approx(-119.0)   # both rejected → fallback
 
 
@@ -140,10 +140,10 @@ class TestOptionMarks:
                          "10:00:00"))
         # Underlying's root price in the cache must never mark the option.
         m.set_last_price("QQQ", 670.0)
-        _r, u, _t, _c = m.pnl_totals(None, days_back=1)
+        _r, u, _t, _c = m.pnl_totals_today()
         assert u == pytest.approx(0.0)      # falls back to own fill price
         _feed_portfolio_mark(m, {
             "symbol": "QQQ", "local_symbol": occ, "sec_type": "OPT",
             "market_price": 0.92})
-        _r, u, _t, _c = m.pnl_totals(None, days_back=1)
+        _r, u, _t, _c = m.pnl_totals_today()
         assert u == pytest.approx((0.92 - 0.86) * 100)
