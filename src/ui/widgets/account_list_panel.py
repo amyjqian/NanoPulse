@@ -1502,6 +1502,19 @@ class AccountListPanel(QWidget):
         self._reorder_rows()
         log.info("AccountList: user re-added %s", acct)
 
+    def _all_known_account_ids(self) -> set[str]:
+        """Every account this session knows about, ONLINE OR NOT.
+
+        ``_model._table_data`` holds only accounts whose connection is
+        currently up — a disconnect removes the rows.  Any decision about
+        the full account universe (what "None" unchecks, what "all
+        accounts" means) has to span the offline ones too, or it silently
+        skips exactly the rows the panel is still showing.
+        """
+        online = {rd[COL_ACCOUNT] for rd in self._model._table_data
+                  if rd[COL_ACCOUNT]}
+        return online | set(self._model.known_accounts())
+
     def _is_account_checked(self, account: str) -> bool:
         """Resolve an account's checked state based on the active
         group:
@@ -1526,10 +1539,6 @@ class AccountListPanel(QWidget):
         """Return the number of currently checked (selected) account rows."""
         return sum(1 for r in self._account_rows.values() if r.is_checked)
 
-    def get_selected_accounts(self) -> set[str]:
-        """Return the set of currently checked account IDs."""
-        return {a for a, r in self._account_rows.items() if r.is_checked}
-
     def get_all_accounts(self) -> set[str]:
         """Every account known to the accounts model — regardless of the
         active group, the hidden list, or check state.  The status bar
@@ -1538,8 +1547,7 @@ class AccountListPanel(QWidget):
         rows are only that group's members, so comparing against
         ``_account_rows`` would make any fully-checked group look like
         "everything selected"."""
-        return {row[COL_ACCOUNT] for row in self._model._table_data
-                if row[COL_ACCOUNT]}
+        return self._all_known_account_ids()
 
     def _emit_selection_changed(self) -> None:
         """Broadcast the current selected-account set."""
@@ -1754,8 +1762,13 @@ class AccountListPanel(QWidget):
         """
         if name not in _DEFAULT_GROUPS:
             return
-        all_accounts = {rd[COL_ACCOUNT] for rd in self._model._table_data
-                        if rd[COL_ACCOUNT]}
+        # Spans offline accounts too.  Built from _table_data alone this
+        # missed every account whose connection was down, so "None" left
+        # them OUT of _unchecked — and the explicit re-check loop below,
+        # which walks _account_rows (offline rows included), then read
+        # "not in _unchecked" as "checked" and ticked every offline row
+        # the user had just asked to deselect.
+        all_accounts = self._all_known_account_ids()
         if name == "All":
             self._unchecked = set()
         else:  # "None"
