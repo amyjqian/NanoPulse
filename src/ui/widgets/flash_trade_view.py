@@ -99,6 +99,11 @@ class FlashTradeView(QWidget):
         self._connected_order_workers: dict[str, IBWorkerThread] = {}
         # label → worker for portfolio
         self._connected_portfolio_workers: dict[str, IBWorkerThread] = {}
+        # Connection labels currently reporting DOWN.  Drives the
+        # Positions views' stale rendering (see ``positions_staleness``);
+        # the Trades view is deliberately untouched, because a fill is a
+        # historical event that a dropped connection does not un-happen.
+        self._down_labels: set[str] = set()
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(300)          # debounce 300 ms
@@ -905,6 +910,11 @@ class FlashTradeView(QWidget):
             except RuntimeError:
                 pass
             try:
+                prev.connection_status_changed.disconnect(
+                    self._on_connection_status_for_positions)
+            except RuntimeError:
+                pass
+            try:
                 prev.price_updated.disconnect(self._on_price_for_trades)
             except RuntimeError:
                 pass
@@ -922,6 +932,8 @@ class FlashTradeView(QWidget):
         worker.pnl_single_batch_updated.connect(self._on_pnl_single_batch)
         worker.account_pnl_updated.connect(self._on_account_pnl_updated)
         worker.fill_updated.connect(self._on_fill_updated)
+        worker.connection_status_changed.connect(
+            self._on_connection_status_for_positions)
         # Last-price feeds → trades summary, so the P&L footer row can
         # mark unclosed positions to the last traded price.
         worker.price_updated.connect(self._on_price_for_trades)
@@ -1144,6 +1156,44 @@ class FlashTradeView(QWidget):
             realized_pnl=realized_pnl,
             unrealized_pnl=unrealized_pnl)
         self._push_account_balances(account)
+
+    def _on_connection_status_for_positions(
+        self, label: str, connected: bool,
+    ) -> None:
+        """Track which connections are down and repaint the Positions
+        views accordingly.
+
+        Rows are never removed: a position is a fact about the account
+        and survives the connection, so clearing them would read as
+        "you are flat" while you are still carrying risk.  What does not
+        survive is everything derived from the quote feed — last price,
+        unrealized, realized, day P&L, market value — which freezes at
+        its last value the moment the socket drops.  Those blank out
+        instead (see ``positions_staleness``).
+
+        Nothing is done for a reconnect beyond clearing the flag: the
+        worker's ``_do_portfolio_refresh`` rebuilds from
+        ``ib.positions()`` on every (re)connect and emits zero-qty
+        entries for cached positions that have since gone flat, so a
+        position closed elsewhere during the outage collapses correctly
+        on its own.
+
+        Fills are untouched in both directions.
+        """
+        label = str(label or "")
+        if not label:
+            return
+        before = set(self._down_labels)
+        if connected:
+            self._down_labels.discard(label)
+        else:
+            self._down_labels.add(label)
+        if self._down_labels == before:
+            return
+        log.info("FlashTrade: connection %s %s — positions now stale for %s",
+                 label, "up" if connected else "down",
+                 sorted(self._down_labels) or "nothing")
+        self._account_position.set_stale_labels(self._down_labels)
 
     def _on_fill_updated(self, fill: dict) -> None:
         """Execution arrived (startup snapshot or live execDetailsEvent) →

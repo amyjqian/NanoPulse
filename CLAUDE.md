@@ -84,6 +84,13 @@ Drop any of these to DEBUG temporarily when tracing wire-level / state issues.
 
 Both dedicated loggers set `propagate = False` so their output stays out of the console. `ib_async.*` loggers are explicitly pinned to WARNING+ for the console but DEBUG still reaches the file. Import the dedicated loggers as `from src.utils.logger import tws_log, order_log`.
 
+### Connection loss & stale positions (`src/ui/widgets/positions_staleness.py`)
+- Every position dict the worker emits carries `label` (the connection). `FlashTradeView._on_connection_status_for_positions` tracks which labels are down and pushes the set to both Positions models via `set_stale_labels`.
+- **Rows are never removed on disconnect** — a position is a fact about the account, and an empty Positions tab reads as "you are flat" while the user is still carrying risk. Quantity and average cost keep rendering; the quote-derived columns (last price, unrealized, realized, day P&L, market value) render as `STALE_TEXT` because a frozen number is indistinguishable on screen from a live one.
+- A summary aggregate spans accounts, so **any** stale contributor blanks its live columns — the sums would otherwise be partial totals that read as complete. The TOTAL row excludes stale rows entirely and labels itself `TOTAL *` with a tooltip naming the connections left out.
+- **Fills are deliberately untouched** by all of this. A fill is a historical event a dropped connection does not un-happen, and IB replays only a limited window, so discarding fills would be unrecoverable.
+- Reconnect needs no special handling: `IBWorkerThread._do_portfolio_refresh` rebuilds from `ib.positions()` on every (re)connect and emits zero-qty entries for cached positions that no longer appear, so a position closed elsewhere during the outage collapses to flat on its own.
+
 ### Trades date filter (`src/ui/widgets/trades_date_filter.py`)
 - Every entry in the Trades control-bar date dropdown resolves to one `TradeWindow` — a half-open ET interval `[start, end)`, either bound `None` for unbounded. Session presets (Evening 18:00 / Noon 12:00 / Morning 09:30) and Today set only `start`; a named day ("Thu, Aug 20") sets both, so it means that day alone; Last N Days and Week to Date set `start`.
 - **Windows count CALENDAR days — weekends included.** The old `trading_days_cutoff` (Mon–Fri) is gone: "Last 2 Days" on a Monday is Sunday + Monday, and weekend dates appear in the named-day list (the Sunday futures session is real trading). The one surviving weekend skip is `trades_summary_model.session_day`, which rolls a Friday-evening futures print to Monday — that picks a FIFO book, not a filter frame.
