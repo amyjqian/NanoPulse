@@ -1220,6 +1220,18 @@ class FlashTradeView(QWidget):
         accounts: set[str] = set()
         for lbl in self._down_labels:
             accounts |= self._label_accounts.get(lbl, set())
+        # ``accounts_detected`` only helps for workers that connected
+        # AFTER this view wired itself to them — at startup the signal has
+        # usually already fired, leaving the map empty and account header
+        # bands on screen with no positions beneath.  AccountsTableModel's
+        # session registry is the durable source: it records every account
+        # it has ever seen and deliberately survives a disconnect.
+        if self._accounts_model is not None:
+            accounts |= {
+                acct for acct, lbl
+                in self._accounts_model.known_accounts().items()
+                if lbl in self._down_labels
+            }
         self._account_position.set_offline(self._down_labels, accounts)
         self._trades_panel.set_offline_labels(self._down_labels)
 

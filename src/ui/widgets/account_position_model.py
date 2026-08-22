@@ -268,8 +268,13 @@ class AccountPositionModel(QAbstractTableModel):
 
     def hidden_accounts(self) -> set[str]:
         """Accounts currently hidden because their connection is down.
-        The panel reports the count in its banner — a shorter list of
-        positions must never pass silently for a smaller book."""
+
+        The caller's explicit list UNION every account whose positions
+        came from an offline connection — so the model stays correct even
+        when the caller could not enumerate the accounts (e.g. the
+        worker's ``accounts_detected`` fired before anything was
+        listening).  The panel reports the count in its banner: a shorter
+        list of positions must never pass silently for a smaller book."""
         out = set(self._offline_accounts)
         out |= {
             acct for (acct, _cid), pos in self._positions.items()
@@ -687,7 +692,12 @@ class AccountPositionModel(QAbstractTableModel):
         else:
             scope = set(self._selected_accounts)         # explicit selection
         header_accounts = set(acct_pos.keys())
-        scope -= self._offline_accounts      # no band for a hidden account
+        # No band for a hidden account.  Uses the DERIVED set, not the
+        # caller's list alone: an account band renders from _acct_data,
+        # which carries no connection label, so an incomplete list from
+        # the caller would leave a header showing frozen Net / Excess /
+        # BP with no rows under it.
+        scope -= self.hidden_accounts()
         for acct in scope:
             if acct in self._acct_data:
                 # While searching, a position-less account only keeps its
