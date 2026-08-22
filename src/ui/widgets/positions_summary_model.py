@@ -34,8 +34,6 @@ from PySide6.QtGui import QColor
 from src.ui.theme import Theme
 from src.utils.helpers import format_option_symbol_two_line
 
-from .positions_staleness import (
-    STALE_TEXT, partial_total_tooltip, stale_tooltip)
 from .table_theme import CELL_FONT_BOLD, IsFooterRowRole
 
 from .account_position_model import (
@@ -62,11 +60,6 @@ S_COL_REALIZED_PNL   = 6
 S_COL_MARKET_VALUE   = 7
 S_COL_ACCOUNTS       = 8
 S_COL_EXCHANGE       = 9
-
-# Columns fed by the live quote / PnL streams — blanked on any row whose
-# connection is down (see ``positions_staleness``).  Position, Avg Cost
-# and Accts stay: they are facts about the holding, not the feed.
-_S_LIVE_COLS = frozenset({4, 5, 6, 7})     # Mkt Price / Unrl / Rlzd / Mkt Value
 
 S_HEADERS: list[str] = [
     "Symbol", "Type", "Pos", "Avg Cost", "Mkt Price",
@@ -126,9 +119,10 @@ class PositionsSummaryModel(QAbstractTableModel):
         # the dataset and hidden state never drift apart.
         self._hidden_con_ids: set[int] = set()
 
-        # Connection labels currently disconnected.  Aggregates fed by one
-        # of these blank their live columns — see ``positions_staleness``.
-        self._stale_labels: set[str] = set()
+        # Connection labels currently disconnected.  Their positions stay
+        # in ``_positions`` but are skipped when folding aggregates, so a
+        # reconnect restores them — see ``offline_connections``.
+        self._offline_labels: set[str] = set()
 
         # Mirrors the flat model's show-zero toggle (default True =
         # show flats).  OFF hides aggregates with Σ position ≈ 0 —
@@ -207,18 +201,6 @@ class PositionsSummaryModel(QAbstractTableModel):
             return None
         agg = self._agg[self._order[row]]
 
-        stale = self._agg_stale_labels(agg)
-        # Blank the live columns before the renderers run — each of them
-        # would otherwise return the last value it saw, which is
-        # indistinguishable on screen from a current one.
-        if stale and col in _S_LIVE_COLS:
-            if role == Qt.ItemDataRole.DisplayRole:
-                return STALE_TEXT
-            if role == Qt.ItemDataRole.ForegroundRole:
-                return QColor(TEXT_DIM)
-        if stale and role == Qt.ItemDataRole.ToolTipRole:
-            return stale_tooltip(stale)
-
         if role == Qt.ItemDataRole.DisplayRole:
             return self._cell_text(agg, col)
         if role == Qt.ItemDataRole.ForegroundRole:
@@ -236,30 +218,13 @@ class PositionsSummaryModel(QAbstractTableModel):
     # ── TOTAL footer rendering ──────────────────────────────────────────────
 
     def _visible_aggs(self) -> list[dict]:
-        """Aggregates the footer folds over: currently shown (hidden
-        con_ids excluded) AND fully live.
-
-        Stale aggregates are left out rather than summed in.  Their own
-        cells render blank, so folding them into the footer would
-        contribute a frozen figure to a total that looks current — the
-        exact confusion this whole mechanism exists to prevent.  The
-        footer says so via ``partial_total_tooltip``.
-        """
-        return [self._agg[c] for c in self._order
-                if c in self._agg and not self._agg_stale_labels(self._agg[c])]
-
-    def _excluded_total_labels(self) -> set[str]:
-        """Disconnected labels whose rows the footer had to leave out."""
-        out: set[str] = set()
-        for c in self._order:
-            agg = self._agg.get(c)
-            if agg is not None:
-                out |= self._agg_stale_labels(agg)
-        return out
+        """Aggregates currently shown (hidden con_ids excluded).  The
+        footer folds over these so hiding a row recomputes totals.
+        Offline connections never reach an aggregate at all — they are
+        filtered during the fold — so the footer needs no special case."""
+        return [self._agg[c] for c in self._order if c in self._agg]
 
     def _total_row_data(self, col: int, role: int) -> Any:
-        if role == Qt.ItemDataRole.ToolTipRole:
-            return partial_total_tooltip(self._excluded_total_labels())
         if role == Qt.ItemDataRole.DisplayRole:
             return self._total_cell_text(col)
         if role == Qt.ItemDataRole.ForegroundRole:
@@ -278,8 +243,7 @@ class PositionsSummaryModel(QAbstractTableModel):
 
     def _total_cell_text(self, col: int) -> str:
         if col == S_COL_SYMBOL:
-            # A footer that silently drops rows would read as complete.
-            return "TOTAL *" if self._excluded_total_labels() else "TOTAL"
+            return "TOTAL"
         visible = self._visible_aggs()
         if col == S_COL_UNREALIZED_PNL:
             return _fmt_pnl(_safe_sum(a.get("unrealized_pnl", 0.0)
@@ -371,34 +335,23 @@ class PositionsSummaryModel(QAbstractTableModel):
 
     # ── Public mutation API ─────────────────────────────────────────────────
 
-    def set_stale_labels(self, labels) -> None:
-        """Mark these connection labels disconnected and repaint.
+    def set_offline_labels(self, labels) -> None:
+        """Exclude these (disconnected) connections' positions and rebuild.
 
-        A rebuild is unnecessary — staleness changes how a row renders,
-        never which rows exist — and would drop selection and scroll.
+        A rebuild rather than a repaint, because aggregates genuinely
+        change shape: a contract held only through the dead connection
+        drops out entirely, and one held through both re-folds to the
+        live half.  ``_positions`` is untouched, so reconnecting restores
+        the previous numbers exactly.
         """
         new = {str(x) for x in (labels or ()) if x}
-        if new == self._stale_labels:
+        if new == self._offline_labels:
             return
-        self._stale_labels = new
-        if self._order:
-            self.dataChanged.emit(
-                self.index(0, 0),
-                self.index(self.rowCount() - 1, self.columnCount() - 1))
+        self._offline_labels = new
+        self._rebuild()
 
-    def stale_labels(self) -> set[str]:
-        return set(self._stale_labels)
-
-    def _agg_stale_labels(self, agg: dict) -> set[str]:
-        """Disconnected labels contributing to *agg* (empty = fully live).
-
-        ANY stale contributor poisons the aggregate's live columns: the
-        sums span accounts, so one dead connection makes Unrealized and
-        Mkt Value partial totals — numbers that read as complete and are
-        not.  The per-account rows in the flat view still show which
-        half is live.
-        """
-        return set(agg.get("labels", ())) & self._stale_labels
+    def offline_labels(self) -> set[str]:
+        return set(self._offline_labels)
 
     def update_positions(self, batch: list[dict]) -> None:
         """Merge *batch* per-key into the local position cache and
@@ -522,6 +475,11 @@ class PositionsSummaryModel(QAbstractTableModel):
 
         # Phase 1: fold every included position into its con_id bucket.
         for (account, con_id), pos in self._positions.items():
+            # A disconnected connection's accounts are hidden entirely —
+            # nothing refreshes them, so every figure is frozen (see
+            # ``offline_connections``).
+            if (pos.get("label", "") or "") in self._offline_labels:
+                continue
             if not self._passes_account_filter(account):
                 continue
             if not self._matches_search(account, pos):

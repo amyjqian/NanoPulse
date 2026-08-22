@@ -887,6 +887,15 @@ class TradesPanel(QWidget):
         self._flat_proxy.setSelectedAccounts(accounts)
         self._summary_model.set_selected_accounts(accounts)
 
+    def set_offline_labels(self, labels) -> None:
+        """Hide fills from these (disconnected) connections in both views.
+
+        Filtered, never discarded — IB replays only a limited window, so
+        a fill actually dropped could not be recovered.  Reconnecting
+        restores every row and every P&L figure."""
+        self._flat_proxy.setOfflineLabels(labels)
+        self._summary_model.set_offline_labels(labels)
+
     def pnl_totals(self, accounts=None) -> tuple[float, float, float, float]:
         """(R.P&L, U.P&L, P&L, commission) across *accounts* (raw IB ids;
         empty/None = all) over the control bar's current time frame — the

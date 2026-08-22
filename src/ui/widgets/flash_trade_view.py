@@ -19,6 +19,7 @@ from .order_status_panel import OrderStatusPanel
 from .account_list_panel import AccountListPanel
 from .account_position_panel import AccountPositionPanel
 from .accounts_model import AccountsTableModel
+from .offline_connections import hidden_accounts_notice
 from .trades_panel import TradesPanel
 from .trades_summary_model import portfolio_mark_keys
 from .positions_trades_tabs import PositionsTradesTabs
@@ -104,6 +105,12 @@ class FlashTradeView(QWidget):
         # the Trades view is deliberately untouched, because a fill is a
         # historical event that a dropped connection does not un-happen.
         self._down_labels: set[str] = set()
+        # label → accounts it serves, captured from ``accounts_detected``
+        # on every connect.  Kept here rather than read from
+        # AccountsTableModel because an explicit Disconnect removes that
+        # model's rows (``remove_rows_by_label``), taking the mapping
+        # with it — exactly when it is needed to hide the right accounts.
+        self._label_accounts: dict[str, set[str]] = {}
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(300)          # debounce 300 ms
@@ -911,7 +918,12 @@ class FlashTradeView(QWidget):
                 pass
             try:
                 prev.connection_status_changed.disconnect(
-                    self._on_connection_status_for_positions)
+                    self._on_connection_status_for_visibility)
+            except RuntimeError:
+                pass
+            try:
+                prev.accounts_detected.disconnect(
+                    self._on_accounts_detected_for_visibility)
             except RuntimeError:
                 pass
             try:
@@ -933,7 +945,9 @@ class FlashTradeView(QWidget):
         worker.account_pnl_updated.connect(self._on_account_pnl_updated)
         worker.fill_updated.connect(self._on_fill_updated)
         worker.connection_status_changed.connect(
-            self._on_connection_status_for_positions)
+            self._on_connection_status_for_visibility)
+        worker.accounts_detected.connect(
+            self._on_accounts_detected_for_visibility)
         # Last-price feeds → trades summary, so the P&L footer row can
         # mark unclosed positions to the last traded price.
         worker.price_updated.connect(self._on_price_for_trades)
@@ -1157,28 +1171,37 @@ class FlashTradeView(QWidget):
             unrealized_pnl=unrealized_pnl)
         self._push_account_balances(account)
 
-    def _on_connection_status_for_positions(
+    def _on_accounts_detected_for_visibility(
+        self, label: str, accounts,
+    ) -> None:
+        """Remember which accounts a connection serves.
+
+        Emitted on every connect, before any position arrives, so the
+        mapping is already in place if the connection later drops.
+        """
+        label = str(label or "")
+        if not label:
+            return
+        known = {str(a) for a in (accounts or ()) if a}
+        if known:
+            self._label_accounts[label] = known
+
+    def _on_connection_status_for_visibility(
         self, label: str, connected: bool,
     ) -> None:
-        """Track which connections are down and repaint the Positions
-        views accordingly.
+        """Hide or restore a connection's accounts as it goes down/up.
 
-        Rows are never removed: a position is a fact about the account
-        and survives the connection, so clearing them would read as
-        "you are flat" while you are still carrying risk.  What does not
-        survive is everything derived from the quote feed — last price,
-        unrealized, realized, day P&L, market value — which freezes at
-        its last value the moment the socket drops.  Those blank out
-        instead (see ``positions_staleness``).
+        While a connection is down nothing refreshes its accounts, so
+        their positions and fills are removed from all four views rather
+        than left on screen frozen.  Nothing is discarded — both caches
+        keep their entries and the views filter — so a reconnect restores
+        every row, and the fill history survives (IB replays only a
+        limited window, so a discarded fill would be unrecoverable).
 
-        Nothing is done for a reconnect beyond clearing the flag: the
-        worker's ``_do_portfolio_refresh`` rebuilds from
-        ``ib.positions()`` on every (re)connect and emits zero-qty
-        entries for cached positions that have since gone flat, so a
-        position closed elsewhere during the outage collapses correctly
-        on its own.
-
-        Fills are untouched in both directions.
+        The trade-off is real and deliberate: a hidden position still
+        exists at the broker, and a shorter Positions tab can read as
+        "I am flat".  ``_publish_offline_scope`` therefore always
+        announces what went missing.
         """
         label = str(label or "")
         if not label:
@@ -1190,10 +1213,23 @@ class FlashTradeView(QWidget):
             self._down_labels.add(label)
         if self._down_labels == before:
             return
-        log.info("FlashTrade: connection %s %s — positions now stale for %s",
-                 label, "up" if connected else "down",
-                 sorted(self._down_labels) or "nothing")
-        self._account_position.set_stale_labels(self._down_labels)
+        self._publish_offline_scope(label, connected)
+
+    def _publish_offline_scope(self, label: str, connected: bool) -> None:
+        """Push the offline set to every view and announce the change."""
+        accounts: set[str] = set()
+        for lbl in self._down_labels:
+            accounts |= self._label_accounts.get(lbl, set())
+        self._account_position.set_offline(self._down_labels, accounts)
+        self._trades_panel.set_offline_labels(self._down_labels)
+
+        hidden = self._account_position.hidden_accounts() or accounts
+        if self._down_labels:
+            msg = hidden_accounts_notice(self._down_labels, len(hidden))
+        else:
+            msg = f"{label} reconnected — its accounts are visible again"
+        log.warning("FlashTrade: %s", msg)
+        self.transient_status_message.emit(msg, 8000)
 
     def _on_fill_updated(self, fill: dict) -> None:
         """Execution arrived (startup snapshot or live execDetailsEvent) →

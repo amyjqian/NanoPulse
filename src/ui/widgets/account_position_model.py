@@ -65,23 +65,12 @@ COL_FLATTEN        = 8
 # "Close %" rather than "Close": only the last segment is labelled 100%,
 # so the caption is what tells you 25/50/75 are percentages of the
 # position and not share counts.
-from .positions_staleness import STALE_TEXT, stale_tooltip
-
 HEADERS = [
     "Symbol", "Day P&L", "Qty", "Unrealized", "Avg Price", "Last Price",
     "Realized", "Mkt Value", "Close %",
 ]
 
 NUM_COLS = len(HEADERS)
-
-# Columns fed by the live quote / PnL streams.  They freeze the instant a
-# connection drops, so a stale row renders these as STALE_TEXT instead of
-# a number that looks current.  Qty and Avg Price are omitted on purpose:
-# they are facts about the position, not the feed.
-_LIVE_COLS = frozenset({
-    COL_DAY_PNL, COL_UNREALIZED_PNL, COL_LAST_PRICE,
-    COL_REALIZED_PNL, COL_MARKET_VALUE,
-})
 
 # ── Theme tokens ──────────────────────────────────────────────────────────────
 TEXT     = Theme.POS_TEXT
@@ -189,10 +178,13 @@ class AccountPositionModel(QAbstractTableModel):
     def __init__(self, get_alias=None, parent=None):
         super().__init__(parent)
         self._rows: list[dict] = []
-        # Connection labels currently disconnected.  Rows carrying one of
-        # these keep their quantity / average cost and blank every
-        # quote-derived column — see ``positions_staleness``.
-        self._stale_labels: set[str] = set()
+        # Connection labels currently disconnected.  Their positions stay
+        # in ``_positions`` but are filtered out of the rendered rows, so
+        # a reconnect restores them instantly — see ``offline_connections``.
+        self._offline_labels: set[str] = set()
+        # Accounts served by those connections, so their header bands are
+        # suppressed too (a header renders even with no positions under it).
+        self._offline_accounts: set[str] = set()
         self._row_map: dict[tuple[str, int], int] = {}
         self._acct_row_map: dict[str, int] = {}
         self._positions: dict[tuple[str, int], dict] = {}
@@ -248,25 +240,42 @@ class AccountPositionModel(QAbstractTableModel):
             self._selected_accounts = new
             self.rebuild()
 
-    def set_stale_labels(self, labels) -> None:
-        """Mark these connection labels as disconnected.
+    def set_offline(self, labels, accounts=()) -> None:
+        """Hide everything served by these (disconnected) connections.
 
-        Repaints in place rather than rebuilding — no row appears or
-        disappears, only the live columns change to STALE_TEXT, so a
-        ``dataChanged`` over the visible span is enough and it keeps the
-        user's selection and scroll position.
+        *labels* filters the position rows, which each carry the
+        connection that reported them.  *accounts* additionally
+        suppresses the per-account HEADER bands: a header is rendered
+        for any in-scope account with account-summary data even when it
+        holds nothing, so without this an offline account would still
+        show its (frozen) Net / Excess / BP line with no rows beneath.
+
+        A full rebuild, because rows genuinely appear and disappear.  The
+        ``_positions`` cache is untouched, so reconnecting brings
+        everything straight back.
         """
-        new = {str(x) for x in (labels or ()) if x}
-        if new == self._stale_labels:
+        new_labels = {str(x) for x in (labels or ()) if x}
+        new_accounts = {str(x) for x in (accounts or ()) if x}
+        if (new_labels == self._offline_labels
+                and new_accounts == self._offline_accounts):
             return
-        self._stale_labels = new
-        if self._rows:
-            self.dataChanged.emit(
-                self.index(0, 0),
-                self.index(len(self._rows) - 1, NUM_COLS - 1))
+        self._offline_labels = new_labels
+        self._offline_accounts = new_accounts
+        self.rebuild()
 
-    def stale_labels(self) -> set[str]:
-        return set(self._stale_labels)
+    def offline_labels(self) -> set[str]:
+        return set(self._offline_labels)
+
+    def hidden_accounts(self) -> set[str]:
+        """Accounts currently hidden because their connection is down.
+        The panel reports the count in its banner — a shorter list of
+        positions must never pass silently for a smaller book."""
+        out = set(self._offline_accounts)
+        out |= {
+            acct for (acct, _cid), pos in self._positions.items()
+            if (pos.get("label", "") or "") in self._offline_labels
+        }
+        return out
 
     # ── Qt table interface ────────────────────────────────────────────────────
 
@@ -371,19 +380,6 @@ class AccountPositionModel(QAbstractTableModel):
         # ══════════════════════════════════════════════════════════════════
         con_id = rd.get("con_id", 0)
         pnl_s  = self._pnl_single.get((account, con_id), {})
-        stale  = rd.get("label", "") in self._stale_labels
-
-        # A dropped connection blanks the live columns before any of the
-        # renderers below run — every one of them would otherwise hand
-        # back the last value it saw, indistinguishable from a fresh one.
-        if stale and col in _LIVE_COLS:
-            if role == Qt.ItemDataRole.DisplayRole:
-                return STALE_TEXT
-            if role == Qt.ItemDataRole.ForegroundRole:
-                return QColor(TEXT_MUTED)
-        if stale and role == Qt.ItemDataRole.ToolTipRole:
-            return stale_tooltip({rd.get("label", "")})
-
         if role == Qt.ItemDataRole.DisplayRole:
             if col == COL_SYMBOL:
                 # Options stack root+expiry over strike+right — the symbol
@@ -665,6 +661,11 @@ class AccountPositionModel(QAbstractTableModel):
         acct_pos: dict[str, list] = {}
         for key, pos in self._positions.items():
             account = key[0]
+            # A disconnected connection's accounts are hidden entirely —
+            # nothing is refreshing them, so every figure they carry is
+            # frozen (see ``offline_connections``).
+            if (pos.get("label", "") or "") in self._offline_labels:
+                continue
             # _selected_accounts is None  → no filter, show all
             # _selected_accounts is set() → user deselected all, show nothing
             # _selected_accounts is {...} → show only listed accounts
@@ -686,6 +687,7 @@ class AccountPositionModel(QAbstractTableModel):
         else:
             scope = set(self._selected_accounts)         # explicit selection
         header_accounts = set(acct_pos.keys())
+        scope -= self._offline_accounts      # no band for a hidden account
         for acct in scope:
             if acct in self._acct_data:
                 # While searching, a position-less account only keeps its
