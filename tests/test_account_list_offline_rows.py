@@ -134,6 +134,56 @@ class TestDefaultGroups:
         assert "U1111111" not in allgrp._account_rows
 
 
+class TestDefaultGroupCheckState:
+    """"None" left offline rows ticked.
+
+    ``_select_default_group`` built its account universe from
+    ``_model._table_data``, which a disconnect empties of that
+    connection's accounts.  So "None" put only the ONLINE accounts into
+    ``_unchecked`` — and the explicit re-check loop that follows walks
+    ``_account_rows``, which now includes the offline rows, reading
+    "not in _unchecked" as "checked".  Every offline row came back ticked
+    the moment the user asked to deselect everything.
+    """
+
+    @pytest.fixture
+    def down(self, panel):
+        panel._model.remove_rows_by_label("Q-ib")
+        return panel
+
+    def test_none_unchecks_offline_rows_too(self, down):
+        down._select_default_group("None")
+        assert not any(r.is_checked for r in down._account_rows.values())
+
+    def test_all_checks_everything(self, down):
+        down._select_default_group("All")
+        assert all(r.is_checked for r in down._account_rows.values())
+
+    def test_toggling_back_and_forth_is_stable(self, down):
+        for name in ("None", "All", "None", "All"):
+            down._select_default_group(name)
+            want = name == "All"
+            assert all(r.is_checked is want
+                       for r in down._account_rows.values()), name
+
+    def test_offline_accounts_land_in_the_persisted_unchecked_set(self, down):
+        down._select_default_group("None")
+        assert {"U1111111", "U4444444"} <= down._unchecked
+
+    def test_selection_is_a_subset_of_all_accounts(self, down):
+        """The status bar reads "N of M" — M has to span offline
+        accounts, or a checked offline row makes N exceed M."""
+        down._select_default_group("All")
+        assert set(down.get_selected_accounts()) <= down.get_all_accounts()
+
+    def test_all_accounts_spans_offline(self, down):
+        assert set(_GROUP) <= down.get_all_accounts()
+
+    def test_forgetting_a_connection_drops_it_from_all_accounts(self, down):
+        down._model.forget_label("Q-ib")
+        assert down.get_all_accounts() == {"U3333333", "U5555555"}
+
+
 class TestForgetLabel:
     """Deleting a connection must leave nothing behind — otherwise its
     accounts haunt the panel as permanent offline rows."""
