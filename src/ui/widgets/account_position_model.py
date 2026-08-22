@@ -65,12 +65,23 @@ COL_FLATTEN        = 8
 # "Close %" rather than "Close": only the last segment is labelled 100%,
 # so the caption is what tells you 25/50/75 are percentages of the
 # position and not share counts.
+from .positions_staleness import STALE_TEXT, stale_tooltip
+
 HEADERS = [
     "Symbol", "Day P&L", "Qty", "Unrealized", "Avg Price", "Last Price",
     "Realized", "Mkt Value", "Close %",
 ]
 
 NUM_COLS = len(HEADERS)
+
+# Columns fed by the live quote / PnL streams.  They freeze the instant a
+# connection drops, so a stale row renders these as STALE_TEXT instead of
+# a number that looks current.  Qty and Avg Price are omitted on purpose:
+# they are facts about the position, not the feed.
+_LIVE_COLS = frozenset({
+    COL_DAY_PNL, COL_UNREALIZED_PNL, COL_LAST_PRICE,
+    COL_REALIZED_PNL, COL_MARKET_VALUE,
+})
 
 # ── Theme tokens ──────────────────────────────────────────────────────────────
 TEXT     = Theme.POS_TEXT
@@ -178,6 +189,10 @@ class AccountPositionModel(QAbstractTableModel):
     def __init__(self, get_alias=None, parent=None):
         super().__init__(parent)
         self._rows: list[dict] = []
+        # Connection labels currently disconnected.  Rows carrying one of
+        # these keep their quantity / average cost and blank every
+        # quote-derived column — see ``positions_staleness``.
+        self._stale_labels: set[str] = set()
         self._row_map: dict[tuple[str, int], int] = {}
         self._acct_row_map: dict[str, int] = {}
         self._positions: dict[tuple[str, int], dict] = {}
@@ -232,6 +247,26 @@ class AccountPositionModel(QAbstractTableModel):
         if self._selected_accounts != new:
             self._selected_accounts = new
             self.rebuild()
+
+    def set_stale_labels(self, labels) -> None:
+        """Mark these connection labels as disconnected.
+
+        Repaints in place rather than rebuilding — no row appears or
+        disappears, only the live columns change to STALE_TEXT, so a
+        ``dataChanged`` over the visible span is enough and it keeps the
+        user's selection and scroll position.
+        """
+        new = {str(x) for x in (labels or ()) if x}
+        if new == self._stale_labels:
+            return
+        self._stale_labels = new
+        if self._rows:
+            self.dataChanged.emit(
+                self.index(0, 0),
+                self.index(len(self._rows) - 1, NUM_COLS - 1))
+
+    def stale_labels(self) -> set[str]:
+        return set(self._stale_labels)
 
     # ── Qt table interface ────────────────────────────────────────────────────
 
@@ -336,6 +371,18 @@ class AccountPositionModel(QAbstractTableModel):
         # ══════════════════════════════════════════════════════════════════
         con_id = rd.get("con_id", 0)
         pnl_s  = self._pnl_single.get((account, con_id), {})
+        stale  = rd.get("label", "") in self._stale_labels
+
+        # A dropped connection blanks the live columns before any of the
+        # renderers below run — every one of them would otherwise hand
+        # back the last value it saw, indistinguishable from a fresh one.
+        if stale and col in _LIVE_COLS:
+            if role == Qt.ItemDataRole.DisplayRole:
+                return STALE_TEXT
+            if role == Qt.ItemDataRole.ForegroundRole:
+                return QColor(TEXT_MUTED)
+        if stale and role == Qt.ItemDataRole.ToolTipRole:
+            return stale_tooltip({rd.get("label", "")})
 
         if role == Qt.ItemDataRole.DisplayRole:
             if col == COL_SYMBOL:
