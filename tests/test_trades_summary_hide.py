@@ -15,11 +15,12 @@ from src.ui.widgets.trades_summary_model import (
     TradesSummaryModel,
     S_COL_NET_TOTAL,
 )
+from src.ui.widgets.trades_date_filter import TradeWindow
 from src.ui.widgets.trades_panel import TradesPanel
 
 
 # All fills share one ET calendar date so the default "today" window
-# (days_back=1, anchor falls back to the newest fill date) keeps them
+# (a one-day window, anchored to the newest fill date) keeps them
 # regardless of when the suite runs.
 _DAY = "2026-05-29T10:00:00"
 
@@ -239,7 +240,8 @@ def test_flat_hide_is_session_level(qtbot):
     panel._flat_proxy.hideKeys(["e1"])
     assert panel._flat_proxy.hiddenCount() == 1
 
-    panel._flat_proxy.setDaysBack(3)                 # date window
+    panel._flat_proxy.setWindow(                     # date window
+        TradeWindow.last_days(3, panel._flat_proxy.anchorDate()))
     panel._flat_proxy.setSearchText("AAA")           # substring search
     panel._flat_proxy.setSearchText("")
     panel._flat_proxy.setSelectedAccounts({"U1"})    # account filter

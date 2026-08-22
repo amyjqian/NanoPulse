@@ -10,48 +10,37 @@ Filters on two axes:
       - Otherwise it's a case-insensitive substring match against the
         per-view key set (symbol / side / account / sec_type / exchange
         / order_ref for flat; symbol / exchanges for summary).
-  * Date range — keep rows whose ``time_sort`` ISO timestamp is within
-    the last *N* trading days (ET).  "Today" is strict — the window is
-    always anchored to the current ET date — and the lookback counts
-    trading days (Mon–Fri), so "Last 2 days" on a Monday reaches back
-    to Friday instead of wasting the window on the weekend.  The
-    summary model has no per-fill timestamp, so date filtering is a
-    no-op on it; the flat view is the intended target.
+  * Date range — keep rows whose ``time_sort`` ISO timestamp falls in
+    the active :class:`~.trades_date_filter.TradeWindow`, which is what
+    every entry in the control bar's date dropdown resolves to.  See
+    ``trades_date_filter`` for the window table; the short version is
+    that "Today" is strict (always anchored to the current ET date) and
+    every span counts CALENDAR days, weekends included.  The summary
+    model has no per-fill timestamp — its rows are aggregates — so the
+    window is applied inside ``TradesSummaryModel`` instead and skipped
+    here; the flat view is this proxy's target.
 """
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 from PySide6.QtCore import QModelIndex, QSortFilterProxyModel, Qt, Signal
 
 from .table_theme import IsFooterRowRole, SectionRankRole, SortValueRole
+from .trades_date_filter import TradeWindow, today_et
 
 log = logging.getLogger(__name__)
 
 _ET = ZoneInfo("America/New_York")
 
 
-def today_et() -> date:
-    """Current ET calendar date.  Module-level so tests can pin it."""
-    return datetime.now(_ET).date()
-
-
-def trading_days_cutoff(anchor: date, days_back: int) -> date:
-    """Earliest calendar date inside a "last N days" window ending at
-    *anchor*, counting only trading days (Mon–Fri) — a weekend never
-    consumes part of the window.  ``days_back=1`` → *anchor* itself;
-    2 on a Monday → the preceding Friday.  Weekend-dated fills (Sunday
-    futures session) still pass because the check is ``date >= cutoff``,
-    not membership in the trading-day set."""
-    d = anchor
-    remaining = max(0, int(days_back) - 1)
-    while remaining > 0:
-        d -= timedelta(days=1)
-        if d.weekday() < 5:            # Mon–Fri
-            remaining -= 1
-    return d
+# ``today_et`` is re-exported from ``trades_date_filter`` (imported
+# above) so this module stays the import site it has always been — and
+# so tests that pin the clock by patching ``trades_filter_proxy.today_et``
+# keep working, since the calls below resolve it through this module's
+# own globals.
 
 # Datetime formats accepted in the search box for the time-threshold
 # mode.  Ordered so longer / more specific patterns match first (strptime
@@ -72,10 +61,14 @@ def _try_parse_time_query(text: str) -> datetime | None:
     """Return an ET-aware datetime if *text* looks like a time/date
     query, else ``None``.
 
-    Fills in missing pieces from the current ET clock: month/day-only
+    Fills in missing pieces from the current ET date: month/day-only
     inputs get the current year at 00:00 ET; time-only inputs get
     today's ET date.  Month abbreviations are accepted case-insensitively
-    (``APR21``, ``apr21``, ``Apr21`` all work)."""
+    (``APR21``, ``apr21``, ``Apr21`` all work).
+
+    Reads the date through ``today_et`` rather than calling
+    ``datetime.now`` directly, so the module has exactly one clock and
+    tests that pin the date pin this too."""
     raw = (text or "").strip()
     if not raw:
         return None
@@ -86,7 +79,7 @@ def _try_parse_time_query(text: str) -> datetime | None:
         normalized = raw[:3].title() + raw[3:]
     else:
         normalized = raw
-    now = datetime.now(_ET)
+    now = today_et()
     for fmt in _TIME_FORMATS:
         try:
             dt = datetime.strptime(normalized, fmt)
@@ -120,6 +113,13 @@ class TradesFilterProxy(QSortFilterProxyModel):
     # hidden exec_ids into the summary model and keep the two views in sync.
     hiddenKeysChanged = Signal()
 
+    # Emitted when the ET calendar date advances under a running app (the
+    # midnight rollover).  Every window is resolved against the anchor —
+    # "Today" and the named recent days are literally yesterday's dates
+    # once it moves — so the panel rebuilds the date combo and re-applies
+    # the selection instead of leaving a stale window in place.
+    anchorDateChanged = Signal()
+
     def __init__(self, parent=None, *, is_summary: bool = False):
         super().__init__(parent)
         self._is_summary = is_summary
@@ -128,20 +128,20 @@ class TradesFilterProxy(QSortFilterProxyModel):
         # "+1,234.56" doesn't sort as a string.
         self.setSortRole(SortValueRole)
         self._search: str = ""
-        # When the user types a parseable datetime, the proxy switches
-        # into "time threshold" mode: flat rows are kept only if their
-        # ``time_sort`` is ≥ this moment.  ``None`` means substring mode.
-        self._time_threshold: datetime | None = None
-        # Set by the control-bar combo's session-of-day presets
-        # (Morning / Afternoon / Evening).  Takes priority over the
-        # search-text-parsed threshold above.
-        self._preset_threshold: datetime | None = None
-        self._days_back: int = 1  # "Today" by default
+        # When the user types a parseable datetime the proxy switches into
+        # "time threshold" mode: the typed moment becomes a window of its
+        # own and substring matching is off.  ``None`` = substring mode.
+        self._search_window: TradeWindow | None = None
         # Anchor date used by the date filter — strictly the current ET
         # date ("Today" never shows a previous session's fills).
         # Recomputed on row inserts / model reset so an app left running
         # overnight picks up the midnight rollover.
         self._anchor_date: date = today_et()
+        # The combo's selection.  Every dropdown entry — session preset,
+        # named day, rolling span, week-to-date — is one of these, so the
+        # row test below is a single ``contains`` call.
+        self._window: TradeWindow = TradeWindow.last_days(
+            1, self._anchor_date)
         # Fills the user has temporarily hidden (flat view), keyed by
         # ``exec_id`` so the hide stays attached to the right fill as rows
         # shift on new inserts.  SESSION-LEVEL: hides survive filter /
@@ -183,23 +183,24 @@ class TradesFilterProxy(QSortFilterProxyModel):
         # the proxy just needs to not filter by the raw text.
         if parsed is not None:
             new_search = ""
-            new_threshold = parsed if not self._is_summary else None
+            new_window = (TradeWindow.from_threshold(parsed)
+                          if not self._is_summary else None)
         else:
             new_search = raw.lower()
-            new_threshold = None
-        if new_search == self._search and new_threshold == self._time_threshold:
+            new_window = None
+        if new_search == self._search and new_window == self._search_window:
             return
         self._search = new_search
-        self._time_threshold = new_threshold
+        self._search_window = new_window
         self.invalidateFilter()
 
-    def setDaysBack(self, days: int) -> None:
-        """1 = today, 2 = last 2 trading days, …, 7 = last 7 trading
-        days (weekends don't consume the window)."""
-        days = max(1, int(days or 1))
-        if days == self._days_back:
+    def setWindow(self, window: TradeWindow) -> None:
+        """Apply the date dropdown's selection.  One setter for every
+        entry — the session presets, the named days, the rolling spans
+        and week-to-date all arrive as a ``TradeWindow``."""
+        if window is None or window == self._window:
             return
-        self._days_back = days
+        self._window = window
         self.invalidateFilter()
 
     def setSelectedAccounts(self, accounts) -> None:
@@ -211,20 +212,23 @@ class TradesFilterProxy(QSortFilterProxyModel):
         self._selected_accounts = new
         self.invalidateFilter()
 
-    def setPresetThreshold(self, dt: datetime | None) -> None:
-        """Set the session-of-day preset threshold (Morning / Afternoon /
-        Evening).  ``None`` clears it."""
-        if dt == self._preset_threshold:
-            return
-        self._preset_threshold = dt
-        self.invalidateFilter()
+    def window(self) -> TradeWindow:
+        """The combo's window, before any typed search narrows it."""
+        return self._window
 
-    def daysBack(self) -> int:
-        """Current date window (1 = today, N = last N days)."""
-        return self._days_back
+    def effectiveWindow(self) -> TradeWindow:
+        """The window rows are actually tested against.
 
-    def presetThreshold(self) -> datetime | None:
-        return self._preset_threshold
+        A datetime typed into the search box replaces the combo's window
+        — it is the more specific instruction, and applying both would
+        just double-filter the same rows.  A session preset the user
+        picked deliberately (Morning / Noon / Evening) outranks it, so
+        substring-free time queries can't silently undo the combo.
+        """
+        if (self._search_window is not None
+                and not self._window.has_time_of_day):
+            return self._search_window
+        return self._window
 
     # ── User-driven row hide / restore (flat view) ──────────────────────────
 
@@ -323,32 +327,15 @@ class TradesFilterProxy(QSortFilterProxyModel):
             if acct and acct not in self._selected_accounts:
                 return False
 
-        # Time-threshold filter — show only fills at or after this
-        # moment.  The session-of-day preset (from the combo) beats the
-        # search-parsed threshold so substring search can stay active
-        # alongside a Morning/Afternoon/Evening selection.  Rows with
-        # no time_sort are left visible (safer default than dropping
-        # them silently).
-        effective_threshold = (self._preset_threshold
-                               if self._preset_threshold is not None
-                               else self._time_threshold)
-        if effective_threshold is not None:
-            # Prefer the parse-once stamp the summary model puts on the
-            # shared fill dict (see ``stamp_fill``) — re-parsing here per
-            # row per filter pass was a measurable per-tick cost.
-            if "_ts_dt" in data:
-                ts = data["_ts_dt"]
-            else:
-                ts = None
-                time_sort = data.get("time_sort", "")
-                if time_sort:
-                    try:
-                        ts = datetime.fromisoformat(time_sort)
-                    except ValueError:
-                        ts = None
-                    if ts is not None and ts.tzinfo is None:
-                        ts = ts.replace(tzinfo=_ET)
-            if ts is not None and ts < effective_threshold:
+        # Date window — flat model only.  Summary rows are per-symbol
+        # aggregates with no timestamp of their own, so the window is
+        # applied fill-by-fill inside ``TradesSummaryModel`` instead;
+        # running it here too would test a row that can never carry a
+        # time and pass every one of them.  Fills whose timestamp is
+        # missing or unparseable stay visible (see ``TradeWindow.
+        # contains``) rather than being dropped silently.
+        if not self._is_summary:
+            if not self.effectiveWindow().contains_fill(data):
                 return False
 
         # Substring search — match across the per-view key set.  Keys
@@ -374,24 +361,6 @@ class TradesFilterProxy(QSortFilterProxyModel):
             if not matched:
                 return False
 
-        # Date filter – flat model only.  Skipped when either threshold
-        # is active (a preset or a typed moment is strictly more
-        # restrictive than the relative "last N days" window, so
-        # applying both would just double-filter the same rows).
-        if (not self._is_summary
-                and self._days_back > 0
-                and effective_threshold is None):
-            local = data.get("_ts_date")   # stamp_fill parse-once stamp
-            if local is not None:
-                if local < trading_days_cutoff(self._anchor_date,
-                                               self._days_back):
-                    return False
-            elif "_ts_date" not in data:
-                time_sort = data.get("time_sort", "")
-                if time_sort and not self._within_days(
-                        time_sort, self._days_back):
-                    return False
-
         return True
 
     # ── Date-anchor bookkeeping ─────────────────────────────────────────────
@@ -400,8 +369,10 @@ class TradesFilterProxy(QSortFilterProxyModel):
         prev = self._anchor_date
         self._recompute_anchor()
         if prev != self._anchor_date:
-            # A newer fill advanced the anchor – re-evaluate visible rows.
+            # A newer fill advanced the anchor – re-evaluate visible rows
+            # and let the panel re-resolve the combo against the new date.
             self.invalidateFilter()
+            self.anchorDateChanged.emit()
 
     def _recompute_anchor(self) -> None:
         """Strict "Today": the window is always anchored to the current
@@ -410,12 +381,3 @@ class TradesFilterProxy(QSortFilterProxyModel):
         session is one combo step away.)"""
         self._anchor_date = today_et()
 
-    def _within_days(self, iso_time: str, days_back: int) -> bool:
-        try:
-            ts = datetime.fromisoformat(iso_time)
-        except ValueError:
-            return True
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=_ET)
-        local = ts.astimezone(_ET).date()
-        return local >= trading_days_cutoff(self._anchor_date, days_back)

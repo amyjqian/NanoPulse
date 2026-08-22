@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import pytest
 
+from src.ui.widgets.trades_date_filter import TradeWindow
 from src.ui.widgets.trades_summary_model import TradesSummaryModel
 
 _DAY = "2026-05-29T10:00:00"
@@ -208,15 +209,19 @@ class TestPnlTotalsToday:
     def test_empty_model(self):
         assert TradesSummaryModel().pnl_totals_today() == (0.0, 0.0, 0.0, 0.0)
 
-    def test_days_back_widens_the_window(self):
+    def test_a_wider_window_admits_more_fills(self):
+        from datetime import date
         m = self._model()
         # Yesterday: an open short 1 @500 marked @480 → U +20.
         m.add_fill(_fill("e3", "SLD", 1, 500.0, con_id=3, symbol="OLD",
                          t="2026-05-28T10:00:00") | {"account_id": "U111"})
         m.set_last_price("OLD", 480.0)
-        assert m.pnl_totals(days_back=1)[1] == 42.0    # today only
-        assert m.pnl_totals(days_back=2)[1] == 62.0    # + yesterday
-        assert m.pnl_totals(days_back=0)[1] == 62.0    # 0 = everything
+        anchor = date(2026, 5, 29)
+        last = lambda n: m.pnl_totals(None, TradeWindow.last_days(n, anchor))
+        assert last(1)[1] == 42.0                       # today only
+        assert last(2)[1] == 62.0                       # + yesterday
+        assert m.pnl_totals(
+            None, TradeWindow.unbounded())[1] == 62.0   # everything
 
     def test_commission_sums_over_same_fill_set(self):
         m = TradesSummaryModel()
@@ -248,8 +253,11 @@ class TestPnlTotalsToday:
                         tzinfo=ZoneInfo("America/New_York"))
         morning = datetime(2026, 5, 29, 9, 30,
                            tzinfo=ZoneInfo("America/New_York"))
-        assert m.pnl_totals(threshold=noon) == (0.0, 0.0, 0.0, 0.0)
-        assert m.pnl_totals(threshold=morning) == (8.0, 42.0, 50.0, 0.0)
+        assert m.pnl_totals(
+            None, TradeWindow.from_threshold(noon)) == (0.0, 0.0, 0.0, 0.0)
+        assert m.pnl_totals(
+            None, TradeWindow.from_threshold(morning)
+        ) == (8.0, 42.0, 50.0, 0.0)
 
 
 def test_status_bar_pnl_display(qtbot):
@@ -341,7 +349,7 @@ def test_panel_pnl_follows_date_combo(qtbot):
     assert panel.pnl_totals()[0] == 60.0               # Today (default)
     assert panel.pnl_timeframe_label() == "Today"
 
-    panel._control_bar.setFilterKey("afternoon")       # Noon → 12:00 cutoff
+    panel._control_bar.setFilterKey("noon")            # Noon → 12:00 cutoff
     assert panel.pnl_totals()[0] == 10.0
     assert panel.pnl_timeframe_label() == "Noon"
 
