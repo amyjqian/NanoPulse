@@ -339,6 +339,20 @@ class AccountsTableModel(QAbstractTableModel):
         # Remove from bottom to top to keep indices valid.
         indices = sorted((self._row_map[k]
                          for k in keys_to_remove), reverse=True)
+        # Drop this label's DERIVED state before touching a single row.
+        # ``endRemoveRows`` runs its receivers synchronously, and
+        # AccountListPanel's handler re-resolves every row's connection
+        # state through ``connection_for_account`` /
+        # ``is_label_connected``.  Rebuilding the reverse index only
+        # afterwards (as this method used to) meant those lookups still
+        # reported the removed accounts as belonging to a live label, so
+        # the panel immediately undid the offline styling it had just
+        # applied — the account cards kept their balances and stayed
+        # un-dimmed until something else forced a resync, e.g. switching
+        # account groups and back.
+        for _lbl, acct in keys_to_remove:
+            self._acct_to_label.pop(acct, None)
+        self._connected_labels.pop(label, None)
         for idx in indices:
             # When removing the last remaining data row, the virtual totals
             # row disappears with it — tell Qt both rows are going away.
@@ -354,9 +368,6 @@ class AccountsTableModel(QAbstractTableModel):
         for i, row in enumerate(self._table_data):
             self._row_map[(row[COL_CONNECTION], row[COL_ACCOUNT])] = i
             self._acct_to_label[row[COL_ACCOUNT]] = row[COL_CONNECTION]
-        # Drop the connection-state entry too — the label no longer has
-        # any account rows attached to it, so its state is irrelevant.
-        self._connected_labels.pop(label, None)
         # Surviving totals row needs to recompute after removal.
         if self._table_data:
             self._emit_totals_changed(

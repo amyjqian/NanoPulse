@@ -1223,6 +1223,12 @@ class AccountListPanel(QWidget):
                     acct, self._model._aliases.get(acct, ""), "–", "")
             r = self._account_rows[acct]
             r.set_name(self._model._aliases.get(acct, "") or acct)
+            # Blank the money too, not just dim it.  A row that keeps its
+            # last balance is showing a number nothing is refreshing —
+            # indistinguishable from a live one, and the account may have
+            # been traded elsewhere since the connection dropped.
+            r.set_balance("–")
+            r.set_cash({})
             r.set_connected(False)
 
         # Remove rows whose account should no longer be visible (either
