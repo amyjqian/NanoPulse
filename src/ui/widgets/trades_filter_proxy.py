@@ -153,6 +153,10 @@ class TradesFilterProxy(QSortFilterProxyModel):
         # the row's raw ``account_id`` (the ``account`` column shows the
         # alias).  Empty set = show all, mirroring the positions view.
         self._selected_accounts: set[str] = set()
+        # Connection labels currently disconnected.  Their fills stay in
+        # the model but are filtered out of the view, so a reconnect
+        # restores them — see ``offline_connections``.
+        self._offline_labels: set[str] = set()
 
     # ── Public setters (hooked to the control bar) ──────────────────────────
 
@@ -202,6 +206,23 @@ class TradesFilterProxy(QSortFilterProxyModel):
             return
         self._window = window
         self.invalidateFilter()
+
+    def setOfflineLabels(self, labels) -> None:
+        """Hide fills reported by these (disconnected) connections.
+
+        A filter, never a delete: the fills stay in the source model, so
+        reconnecting brings them back.  That matters more here than for
+        positions — IB replays only a limited window, so a fill actually
+        discarded is gone for good.
+        """
+        new = {str(x) for x in (labels or ()) if x}
+        if new == self._offline_labels:
+            return
+        self._offline_labels = new
+        self.invalidateFilter()
+
+    def offlineLabels(self) -> set[str]:
+        return set(self._offline_labels)
 
     def setSelectedAccounts(self, accounts) -> None:
         """Restrict rows to fills whose ``account_id`` is in *accounts*
@@ -322,6 +343,10 @@ class TradesFilterProxy(QSortFilterProxyModel):
         # accounts, so the summary model filters at aggregation time
         # instead).  Rows without an account_id are left visible rather
         # than silently dropped.
+        if self._offline_labels:
+            if (data.get("label", "") or "") in self._offline_labels:
+                return False
+
         if self._selected_accounts:
             acct = data.get("account_id", "")
             if acct and acct not in self._selected_accounts:

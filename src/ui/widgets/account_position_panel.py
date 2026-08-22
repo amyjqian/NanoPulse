@@ -982,16 +982,18 @@ class AccountPositionPanel(QWidget):
         self._model.set_selected_accounts(accounts)
         self._summary_model.set_selected_accounts(accounts)
 
-    def set_stale_labels(self, labels) -> None:
-        """Mark these connection labels as disconnected in both views.
+    def set_offline(self, labels, accounts=()) -> None:
+        """Hide everything served by these (disconnected) connections.
 
-        Rows stay — a position is a fact about the account, and an empty
-        Positions tab reads as "flat" — but every quote-derived column
-        blanks rather than showing a frozen figure.  See
-        ``positions_staleness``.
-        """
-        self._model.set_stale_labels(labels)
-        self._summary_model.set_stale_labels(labels)
+        Positions and account bands for those accounts disappear from
+        both the flat and summary views until the connection returns.
+        Nothing is discarded — see ``offline_connections``."""
+        self._model.set_offline(labels, accounts)
+        self._summary_model.set_offline_labels(labels)
+
+    def hidden_accounts(self) -> set:
+        """Accounts currently hidden because their connection is down."""
+        return self._model.hidden_accounts()
 
     # ── Control-bar builder ──────────────────────────────────────────────────
 

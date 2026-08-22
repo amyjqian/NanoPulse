@@ -340,6 +340,10 @@ class TradesSummaryModel(QAbstractTableModel):
         # over the aggregate rows couldn't split a mixed-account bucket.
         # Empty set = show all, mirroring the positions view.
         self._selected_accounts: set[str] = set()
+        # Connection labels currently disconnected.  Their fills stay in
+        # ``_fills`` but are excluded from every aggregate, so a
+        # reconnect restores the numbers — see ``offline_connections``.
+        self._offline_labels: set[str] = set()
         # Keys the user asked to "match buy & sell": the larger of the
         # buy/sell legs is trimmed (qty + notional, avg price kept) down
         # to the smaller so Net reads flat and the P&L columns show only
@@ -1068,7 +1072,8 @@ class TradesSummaryModel(QAbstractTableModel):
         # invalidation.  The anchor in the key makes midnight rollover
         # invalidate naturally.
         memo_key = (self._fills_rev, frozenset(sel),
-                    window.cache_key(), anchor)
+                    window.cache_key(), anchor,
+                    frozenset(self._offline_labels))
         if self._pnl_memo is not None and self._pnl_memo[0] == memo_key:
             _, groups_list, comm_total, r_total = self._pnl_memo
             u_total = sum(self._mark_open(w, m) for w, m in groups_list)
@@ -1079,6 +1084,8 @@ class TradesSummaryModel(QAbstractTableModel):
         groups: dict[tuple[str, str], list[dict]] = {}
         comm_total = 0.0
         for f in self._fills.values():
+            if (f.get("label", "") or "") in self._offline_labels:
+                continue
             if self._hidden_fills and (
                     f.get("exec_id", "") in self._hidden_fills):
                 continue
@@ -1700,6 +1707,20 @@ class TradesSummaryModel(QAbstractTableModel):
         self._search_text = new_search
         self._rebuild_from_fills()
 
+    def set_offline_labels(self, labels) -> None:
+        """Exclude fills reported by these (disconnected) connections.
+
+        Re-aggregates from the stored fills; nothing is discarded, so
+        reconnecting restores the previous totals exactly."""
+        new = {str(x) for x in (labels or ()) if x}
+        if new == self._offline_labels:
+            return
+        self._offline_labels = new
+        self._rebuild_from_fills()
+
+    def offline_labels(self) -> set[str]:
+        return set(self._offline_labels)
+
     def set_selected_accounts(self, accounts) -> None:
         """Re-aggregate using only fills whose ``account_id`` is in
         *accounts* (raw IB ids).  Empty/None shows every account."""
@@ -1897,6 +1918,9 @@ class TradesSummaryModel(QAbstractTableModel):
         return today_et()
 
     def _passes_filter(self, fill: dict) -> bool:
+        if self._offline_labels:
+            if (fill.get("label", "") or "") in self._offline_labels:
+                return False
         if self._hidden_fills:
             ek = fill.get("exec_id", "")
             if ek and ek in self._hidden_fills:
