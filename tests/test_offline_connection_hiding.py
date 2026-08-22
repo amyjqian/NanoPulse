@@ -108,6 +108,60 @@ class TestFlatPositions:
         assert seen == []
 
 
+class TestAccountBandsAreSuppressed:
+    """The regression: position rows filtered correctly but the account
+    HEADER band stayed, showing frozen Net / Excess / BP with nothing
+    beneath it.
+
+    Bands render from ``_acct_data``, which carries no connection label,
+    so the model cannot filter them by label the way it filters
+    positions.  It therefore derives the offline account set itself
+    rather than trusting the caller's list, which at startup is usually
+    empty — ``accounts_detected`` fires on connect, typically before
+    FlashTradeView has wired itself to the worker.
+    """
+
+    def _model(self):
+        m = AccountPositionModel()
+        m.update_positions([_pos("J-ib", "U111"), _pos("Q-ib", "U222")])
+        for acct in ("U111", "U222", "U333"):
+            m.set_account_data(acct, net_liq=207129.0, excess_liq=94917.0,
+                               buying_power=312169.0)
+        m.rebuild()
+        return m
+
+    def _accounts(self, m):
+        return {m._rows[r].get("account") for r in range(m.rowCount())}
+
+    def test_band_goes_even_with_no_account_list_supplied(self):
+        """``set_offline`` called with labels only — the real startup
+        case — must still suppress the band."""
+        m = self._model()
+        assert "U222" in self._accounts(m)
+        m.set_offline({"Q-ib"})
+        assert "U222" not in self._accounts(m)
+
+    def test_derived_set_covers_accounts_that_hold_positions(self):
+        m = self._model()
+        m.set_offline({"Q-ib"})
+        assert m.hidden_accounts() == {"U222"}
+
+    def test_explicit_accounts_still_honoured_for_position_less_accounts(self):
+        """An account with only summary data has no position to infer a
+        label from, so the caller's list is the only way to reach it."""
+        m = self._model()
+        assert "U333" in self._accounts(m)
+        m.set_offline({"Q-ib"}, {"U333"})
+        assert "U333" not in self._accounts(m)
+
+    def test_reconnect_restores_the_bands(self):
+        m = self._model()
+        before = self._accounts(m)
+        m.set_offline({"Q-ib"}, {"U222", "U333"})
+        m.set_offline(set(), set())
+        assert self._accounts(m) == before
+
+
 class TestSummaryPositions:
     def _model(self):
         m = PositionsSummaryModel()
@@ -234,6 +288,24 @@ class TestFlashTradeWiring:
         v = self._view(qtbot)
         v._on_connection_status_for_visibility("Q-ib", False)
         assert v._account_position._model._offline_accounts == {"U222", "U333"}
+
+    def test_accounts_also_come_from_the_session_registry(self, qtbot):
+        """``accounts_detected`` fires on connect, usually before this
+        view is wired to the worker — so at startup the map is empty and
+        AccountsTableModel's registry has to supply the accounts."""
+        from src.ui.widgets.accounts_model import AccountsTableModel
+        from src.ui.widgets.flash_trade_view import FlashTradeView
+        am = AccountsTableModel()
+        am.update_batch([
+            ("J-ib", "U111", "NetLiquidation", "1", "USD"),
+            ("Q-ib", "U222", "NetLiquidation", "2", "USD"),
+            ("Q-ib", "U999", "NetLiquidation", "3", "USD")])
+        v = FlashTradeView()
+        qtbot.addWidget(v)
+        v._accounts_model = am
+        assert v._label_accounts == {}          # nothing detected yet
+        v._on_connection_status_for_visibility("Q-ib", False)
+        assert v._account_position._model._offline_accounts == {"U222", "U999"}
 
     def test_it_announces_what_it_hid(self, qtbot):
         v = self._view(qtbot)
