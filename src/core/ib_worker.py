@@ -449,6 +449,10 @@ class IBWorkerThread(QThread):
         # after the worker has already run its initial snapshot.
         self._fills_cache: dict[str, dict] = {}
 
+        # Post-snapshot commission back-fill (see _sweep_late_commissions).
+        # Tracked so a re-snapshot restarts the sweep instead of racing it.
+        self._commission_sweep_task: asyncio.Task | None = None
+
         # Contract metadata per conId, captured at order-placement time.
         # The fill-side twin of _order_symbols: ib_async attaches
         # trade.contract to every live fill for an order it placed, and
@@ -4727,7 +4731,7 @@ class IBWorkerThread(QThread):
         self.fill_updated.emit(d)
 
     async def _snapshot_fills(self) -> None:
-        """Fetch today's fills and emit each through ``fill_updated``.
+        """Fetch the replayable fills and emit each through ``fill_updated``.
 
         Uses ``reqExecutionsAsync`` to trigger/refresh the fetch, then
         reads from ``ib.fills()`` — the internal ib_async cache — which
@@ -4736,6 +4740,16 @@ class IBWorkerThread(QThread):
         objects whose ``CommissionReport`` is never populated (commission
         arrives on a separate callback after execDetailsEnd); ``ib.fills()``
         holds the authoritative merged copies.
+
+        MOST of the merged copies are still report-less at this moment,
+        though: TWS streams the snapshot's commissionReports *after*
+        execDetailsEnd (measured: 25 of 182 had arrived by the read), and
+        for a fill replayed from a previous session ib_async merges the
+        late report WITHOUT firing ``commissionReportEvent`` — the wrapper
+        gates that emit on ``permId2Trade``, which only knows this
+        session's own live orders.  Nothing re-emits those rows, so the
+        Comm / R.P&L cells stayed blank until the next reconnect.
+        ``_sweep_late_commissions`` (kicked off below) closes that gap.
 
         Called on every (re)connection, after ``_snapshot_existing_orders``.
         Cached in ``self._fills_cache`` so ``request_fills_snapshot`` can
@@ -4783,6 +4797,63 @@ class IBWorkerThread(QThread):
             emitted += 1
         tws_log.info("[%s] SNAPSHOT  fills emitted %d (cache size=%d)",
                      self._label, emitted, len(self._fills_cache))
+
+        # Back-fill the commissions that arrive after execDetailsEnd (see
+        # the docstring).  A background task so the connect path isn't
+        # held up; restarted (not stacked) on every re-snapshot.
+        if self._commission_sweep_task is not None:
+            self._commission_sweep_task.cancel()
+        self._commission_sweep_task = asyncio.ensure_future(
+            self._sweep_late_commissions())
+
+    async def _sweep_late_commissions(self) -> None:
+        """Re-emit snapshot fills once their commissionReport has merged.
+
+        Polls ``ib.fills()`` for a short while after a snapshot and
+        re-emits every cached fill whose dict says ``commission is None``
+        but whose merged copy now carries a populated report.  The models
+        dedupe by execId, so each re-emit updates the existing row.  Exits
+        as soon as nothing is missing; the deadline covers fills whose
+        report legitimately never comes (TWS omits a few).
+        """
+        deadline = time.monotonic() + 30.0
+        try:
+            while time.monotonic() < deadline:
+                await asyncio.sleep(2.0)
+                if (not self._running or self._ib is None
+                        or not self._ib.isConnected()):
+                    return
+                missing = {eid for eid, d in self._fills_cache.items()
+                           if d.get("commission") is None}
+                if not missing:
+                    return
+                healed = 0
+                try:
+                    fills = list(self._ib.fills())
+                except Exception:
+                    continue
+                for f in fills:
+                    ex = getattr(f, "execution", None)
+                    eid = getattr(ex, "execId", "") if ex is not None else ""
+                    if eid not in missing:
+                        continue
+                    report = getattr(f, "commissionReport", None)
+                    if report is None or not getattr(report, "execId", ""):
+                        continue    # still not merged
+                    try:
+                        d = self._flatten_fill(f)
+                    except Exception:
+                        continue
+                    self._fills_cache[eid] = d
+                    self.fill_updated.emit(d)
+                    healed += 1
+                if healed:
+                    tws_log.info(
+                        "[%s] SNAPSHOT  commission back-fill re-emitted %d "
+                        "fill(s), %d still without a report",
+                        self._label, healed, len(missing) - healed)
+        except asyncio.CancelledError:
+            pass    # superseded by a newer snapshot, or shutting down
 
     def _on_global_order_status(self, trade) -> None:
         """Global ``orderStatusEvent`` callback – fires for **every** order
