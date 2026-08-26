@@ -104,6 +104,25 @@ _SEARCH_KEYS_FLAT = (
 _SEARCH_KEYS_SUMMARY = ("symbol", "sec_type", "exchanges")
 
 
+def _sort_value_less(left, right) -> bool:
+    """Order two ``SortValueRole`` values for a *secondary* sort column.
+
+    Only reached once the higher-priority columns tied, so it never has to
+    reproduce Qt's own comparison — it just has to be total and not raise
+    on the mixed types the models emit (floats, ints, strings, blanks).
+    Blanks sort first, numbers before text.
+    """
+    if left is None or right is None:
+        return left is None and right is not None
+    l_num = isinstance(left, (int, float)) and not isinstance(left, bool)
+    r_num = isinstance(right, (int, float)) and not isinstance(right, bool)
+    if l_num and r_num:
+        return left < right
+    if l_num != r_num:
+        return l_num
+    return str(left).lower() < str(right).lower()
+
+
 class TradesFilterProxy(QSortFilterProxyModel):
     """Proxy model wiring the control-bar search box + date range to the
     flat/summary trades sources."""
@@ -157,6 +176,10 @@ class TradesFilterProxy(QSortFilterProxyModel):
         # the model but are filtered out of the view, so a reconnect
         # restores them — see ``offline_connections``.
         self._offline_labels: set[str] = set()
+        # Active sort as (column, order) in priority order — empty means
+        # source order.  A second entry only appears when the user
+        # ⇧-clicks another caption; see ``TradesPanel``.
+        self._sort_specs: list[tuple[int, Qt.SortOrder]] = []
 
     # ── Public setters (hooked to the control bar) ──────────────────────────
 
@@ -293,6 +316,74 @@ class TradesFilterProxy(QSortFilterProxyModel):
 
     # ── Sorting ─────────────────────────────────────────────────────────────
 
+    # The Accounts table on the Connect tab decorates its captions with
+    # these same glyphs.  Qt's own sort indicator is invisible on these
+    # tables — ``TABLE_QSS`` styles ``QHeaderView::section``, and a
+    # style-sheeted header draws no built-in arrow — so the arrow lives
+    # in the caption text instead of ``setSortIndicatorShown``.
+    SORT_ASC_GLYPH = "\u25b2"      # ▲
+    SORT_DESC_GLYPH = "\u25bc"     # ▼
+
+    def sortSpecs(self) -> list[tuple[int, Qt.SortOrder]]:  # noqa: N802
+        """Active sort, as ``(column, order)`` in priority order.
+
+        Empty = unsorted (the source model's natural order).  The list is
+        the single source of truth for both the comparison in
+        :meth:`lessThan` and the ▲/▼ in the caption strip.
+        """
+        return list(self._sort_specs)
+
+    def setSortSpecs(  # noqa: N802
+        self, specs: list[tuple[int, Qt.SortOrder]],
+    ) -> None:
+        self._sort_specs = [(int(c), o) for c, o in specs]
+        # ``invalidate`` first: Qt's ``sort`` no-ops when the primary
+        # column and order are unchanged, which is exactly the case when
+        # the user only added or flipped a *secondary* column.
+        self.invalidate()
+        if self._sort_specs:
+            first_col, first_order = self._sort_specs[0]
+            self.sort(first_col, first_order)
+        else:
+            # sort(-1) is Qt's documented "back to source order".
+            self.sort(-1)
+
+    def sort(self, column: int,
+             order: Qt.SortOrder = Qt.SortOrder.AscendingOrder) -> None:  # noqa: N802
+        """Re-sort, then repaint the caption strip.
+
+        ``headerData`` reads the arrows off ``_sort_specs``, so the strip
+        is stale until the header is told to re-ask — including for
+        ``sort(-1)``, which drops them.
+        """
+        super().sort(column, order)
+        cols = self.columnCount()
+        if cols > 0:
+            self.headerDataChanged.emit(
+                Qt.Orientation.Horizontal, 0, cols - 1)
+
+    def headerData(self, section: int, orientation: Qt.Orientation,
+                   role: int = Qt.ItemDataRole.DisplayRole):  # noqa: N802
+        """Caption, plus this column's arrow when it is part of the sort.
+
+        Secondary levels carry their rank ("▼2"), so a multi-column sort
+        reads its own priority order off the strip — same convention as
+        the Accounts table on the Connect tab.
+        """
+        base = super().headerData(section, orientation, role)
+        if (role != Qt.ItemDataRole.DisplayRole
+                or orientation != Qt.Orientation.Horizontal
+                or base is None):
+            return base
+        for rank, (col, order) in enumerate(self._sort_specs, start=1):
+            if col != section:
+                continue
+            arrow = (self.SORT_ASC_GLYPH
+                     if order == Qt.SortOrder.AscendingOrder
+                     else self.SORT_DESC_GLYPH)
+            return f"{base} {arrow}" if rank == 1 else f"{base} {arrow}{rank}"
+        return base
+
     def lessThan(self, left: QModelIndex,
                  right: QModelIndex) -> bool:  # noqa: N802 (Qt style)
         """Default sort-role comparison, except rows carrying a
@@ -317,7 +408,41 @@ class TradesFilterProxy(QSortFilterProxyModel):
                 if self.sortOrder() == Qt.SortOrder.AscendingOrder:
                     return left.row() < right.row()
                 return left.row() > right.row()
-        return super().lessThan(left, right)
+        return self._compare_specs(left, right)
+
+    def _compare_specs(self, left: QModelIndex,
+                       right: QModelIndex) -> bool:
+        """Walk the sort specs in priority order, first difference wins.
+
+        With a single spec this is exactly Qt's own comparison — the
+        common case stays byte-identical.  Additional specs only ever
+        break a tie the ones above them left.
+
+        Qt renders a descending PRIMARY by inverting whatever this
+        returns, so the raw answer is right for spec 0 and every later
+        spec has to pre-invert to survive that flip (once for its own
+        direction, once for the primary's).
+        """
+        specs = self._sort_specs
+        src = self.sourceModel()
+        if src is None or len(specs) < 2:
+            return super().lessThan(left, right)
+        primary = specs[0][1]
+        role = self.sortRole()
+        for rank, (col, order) in enumerate(specs):
+            l_raw = src.data(src.index(left.row(), col), role)
+            r_raw = src.data(src.index(right.row(), col), role)
+            if l_raw == r_raw:
+                continue
+            if rank == 0:
+                return super().lessThan(left, right)
+            result = _sort_value_less(l_raw, r_raw)
+            if order == Qt.SortOrder.DescendingOrder:
+                result = not result
+            if primary == Qt.SortOrder.DescendingOrder:
+                result = not result
+            return result
+        return False
 
     # ── Core filter ─────────────────────────────────────────────────────────
 

@@ -311,9 +311,12 @@ class OrderStatusPanel(QWidget):
         # ── Table view ───────────────────────────────────────────────────
         self._table = QTableView()
         self._table.setModel(self._proxy)
-        # Shared chrome: no zebra, no gridlines, uppercase captions, row
-        # height, and the viewport mouse tracking the hover delegate needs.
-        tt.apply_table_chrome(self._table)
+        # Shared chrome: no zebra, no gridlines, row height, and the
+        # viewport mouse tracking the hover delegate needs.  Captions read
+        # as written (sentence case) rather than uppercased — same strip
+        # as the Positions and Trades blotters.
+        tt.apply_table_chrome(self._table,
+                              header_font=tt.COL_HEADER_FONT_MIXED)
         self._table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows)
         # Rows aren't click-selectable — hover is the only pointer cue,
@@ -375,7 +378,7 @@ class OrderStatusPanel(QWidget):
 
     def _apply_font_metrics_widths(self) -> None:
         fm = QFontMetrics(self._table.font())
-        hdr_fm = QFontMetrics(tt.COL_HEADER_FONT)
+        hdr_fm = QFontMetrics(tt.COL_HEADER_FONT_MIXED)
 
         col_samples = {
             COL_SYMBOL:  "WWWWWW",

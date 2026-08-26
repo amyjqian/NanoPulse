@@ -671,7 +671,10 @@ class ColumnsPage(QWidget):
         except Exception:
             return ""
         key_to_header = dict(zip(all_keys, all_hdrs))
-        names = [key_to_header.get(k, k).title() for k in visible][:7]
+        # Captions are already written the way they should read — .title()
+        # here used to re-case them ("Avg price" → "Avg Price", "R.P&L" →
+        # "R.P&L"), so the subtitle disagreed with the table.
+        names = [key_to_header.get(k, k) for k in visible][:7]
         return ", ".join(names) + (", \u2026" if len(visible) > len(names) else "")
 
     def _refresh_overview_subtitles(self) -> None:

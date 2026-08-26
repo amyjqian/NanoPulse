@@ -106,21 +106,12 @@ class TradesPanel(QWidget):
             "visible", list(_DEFAULT_FLAT_VISIBLE))
         self._visible_summary = persisted["summary"].get(
             "visible", list(_DEFAULT_SUMMARY_VISIBLE))
-        # Migration: surface newly-introduced columns to users whose
-        # persisted visible-list predates them.  Without this, upgrade
-        # → new column hidden forever until the user opens Preferences.
-        for new_key, after_key in (
-                ("trans_total", "avg_sell"),
-                ("sec_type", "symbol"),
-                ("paired_pnl", "trans_total"),
-                ("unpaired_pnl", "paired_pnl"),
-        ):
-            if new_key not in self._visible_summary:
-                try:
-                    i = self._visible_summary.index(after_key)
-                    self._visible_summary.insert(i + 1, new_key)
-                except ValueError:
-                    self._visible_summary.append(new_key)
+        # Surface columns introduced since this config was last written,
+        # so an upgrade doesn't leave a new column hidden forever.  The
+        # comparison is against the ``known`` list stamped at save time —
+        # never against the current visible list, or a column the user
+        # deliberately removed would come back on every launch.
+        needs_stamp = self._migrate_new_columns(persisted)
         self._saved_widths_flat: dict[str, int] = dict(
             persisted["flat"].get("widths", {}))
         self._saved_widths_summary: dict[str, int] = dict(
@@ -132,13 +123,13 @@ class TradesPanel(QWidget):
         self._save_timer.setInterval(350)
         self._save_timer.timeout.connect(self._save_persisted_columns)
 
-        # Header-click sort state per view kind: (logical column, order).
-        # ``(-1, None)`` = unsorted (source order).  Clicking a caption
-        # cycles descending → ascending → unsorted.
-        self._sort_state: dict[str, tuple[int, Qt.SortOrder | None]] = {
-            "flat": (-1, None),
-            "summary": (-1, None),
-        }
+        # The sort itself lives on the proxies (``sortSpecs``) — this is
+        # only the modifier the pending caption click was made with.
+        # ``sectionClicked`` carries no modifiers, and reading the live
+        # keyboard state when it arrives is a different question from
+        # "was Shift down when the button went down", so the press is
+        # caught on the way past in ``eventFilter``.
+        self._additive_click = False
 
         # Suppress save callbacks while we programmatically move/resize
         # sections during init and apply_columns.
@@ -152,6 +143,12 @@ class TradesPanel(QWidget):
         self._wire_header_signals(self._summary_table, "summary")
 
         self._suspend_save = False
+
+        # Write the known-column stamp (plus anything the migration just
+        # added) straight away.  Until it lands, the legacy fallback in
+        # _migrate_new_columns re-runs on every launch.
+        if needs_stamp:
+            self._save_persisted_columns()
 
     # ── UI construction ─────────────────────────────────────────────────────
 
@@ -202,10 +199,15 @@ class TradesPanel(QWidget):
             self._sync_summary_hidden_fills)
 
         self._stack = QStackedWidget(self)
+        # Both trade tables render their captions as written ("R.P&L",
+        # "Avg buy", "Order id") rather than uppercased; Positions and
+        # Order Status keep the shared uppercase strip.
         self._flat_table, self._flat_row_delegate = \
-            self._make_table(self._flat_proxy, tt.GroupBandDelegate)
+            self._make_table(self._flat_proxy, tt.GroupBandDelegate,
+                             header_font=tt.COL_HEADER_FONT_MIXED)
         self._summary_table, self._summary_row_delegate = \
-            self._make_table(self._summary_proxy)
+            self._make_table(self._summary_proxy,
+                             header_font=tt.COL_HEADER_FONT_MIXED)
         self._stack.addWidget(self._flat_table)      # index 0
         self._stack.addWidget(self._summary_table)   # index 1
         root.addWidget(self._stack, 1)
@@ -248,7 +250,8 @@ class TradesPanel(QWidget):
         flat_delete_sc.setContext(Qt.ShortcutContext.WidgetShortcut)
         flat_delete_sc.activated.connect(self._hide_selected_flat_rows)
 
-    def _make_table(self, proxy, delegate_cls=tt.FooterAwareRowDelegate
+    def _make_table(self, proxy, delegate_cls=tt.FooterAwareRowDelegate,
+                    header_font=tt.COL_HEADER_FONT
                     ) -> tuple[QTableView, tt.FooterAwareRowDelegate]:
         """Build one of the two trade tables.
 
@@ -258,9 +261,10 @@ class TradesPanel(QWidget):
         """
         t = QTableView(self)
         t.setModel(proxy)
-        # Shared chrome: no zebra, no gridlines, uppercase captions, and
-        # viewport mouse tracking for the row-hover delegate.
-        tt.apply_table_chrome(t)
+        # Shared chrome: no zebra, no gridlines, and viewport mouse
+        # tracking for the row-hover delegate.  Caption casing is the one
+        # thing the two trade tables don't share — see the call sites.
+        tt.apply_table_chrome(t, header_font=header_font)
         t.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         # Click selects a row; ⌘-click toggles individual rows and ⇧-click
         # extends a range — Qt's ExtendedSelection gives all three, and it
@@ -284,10 +288,11 @@ class TradesPanel(QWidget):
         hdr.setSectionsMovable(True)
         # Caption clicks drive the desc → asc → unsorted cycle in
         # ``_on_header_sort_clicked``.  The view's own sortingEnabled stays
-        # off — it only knows Qt's two-state asc/desc toggle.  The header
-        # flips its indicator itself on click (that's built into
-        # QHeaderView when sections are clickable); the handler overwrites
-        # it with the cycle's actual state right after.
+        # off — it only knows Qt's two-state asc/desc toggle.  Qt's own
+        # indicator stays off too: a style-sheeted QHeaderView draws no
+        # built-in arrow, so ``TradesFilterProxy.headerData`` appends a
+        # ▲/▼ glyph to the sorted caption instead (same as the Accounts
+        # table on the Connect tab).
         hdr.setSectionsClickable(True)
         hdr.setSortIndicatorShown(False)
         return t, delegate
@@ -323,7 +328,14 @@ class TradesPanel(QWidget):
         """
         tt.clear_selections(getattr(self, "_flat_table", None),
                             getattr(self, "_summary_table", None))
+        # A column drag right before switching tabs must not sit in the
+        # debounce waiting for an event loop that may never come back.
+        self.flush_pending_column_state()
         super().hideEvent(event)
+
+    def closeEvent(self, event) -> None:
+        self.flush_pending_column_state()
+        super().closeEvent(event)
 
     def _apply_flat_default_widths(self) -> None:
         samples = {
@@ -345,7 +357,8 @@ class TradesPanel(QWidget):
             COL_LIQUIDATION:  "LIQ",
             COL_LAST_LIQ:     "LLQ",
         }
-        self._apply_default_widths(self._flat_table, samples, HEADERS)
+        self._apply_default_widths(self._flat_table, samples, HEADERS,
+                                   tt.COL_HEADER_FONT_MIXED)
 
     def _apply_summary_default_widths(self) -> None:
         samples = {
@@ -365,18 +378,28 @@ class TradesPanel(QWidget):
             S_COL_REALIZED:      "+9,999.99",
             S_COL_EXCHANGES:     "NASDAQ, ARCA",
         }
-        self._apply_default_widths(self._summary_table, samples, S_HEADERS)
+        self._apply_default_widths(self._summary_table, samples, S_HEADERS,
+                                   tt.COL_HEADER_FONT_MIXED)
 
     @staticmethod
     def _apply_default_widths(table: QTableView, samples: dict[int, str],
-                              headers: list[str]) -> None:
+                              headers: list[str],
+                              header_font=tt.COL_HEADER_FONT) -> None:
         """Size each column to fit its widest value *and* its caption —
-        the uppercase tracked-out captions are wider than they look."""
+        the tracked-out captions are wider than they look.  *header_font*
+        must match the strip the table actually draws, or a mixed-case
+        header gets sized as though it were uppercased.
+
+        Captions are measured with the sort glyph and a rank digit
+        appended: a sorted column carries a trailing ▲/▼, a secondary one
+        carries its rank too ("▲2"), and a column sized to the bare
+        caption would elide exactly that suffix away."""
         fm     = QFontMetrics(table.font())
-        hdr_fm = QFontMetrics(tt.COL_HEADER_FONT)
+        hdr_fm = QFontMetrics(header_font)
         for col, sample in samples.items():
+            caption = f"{headers[col]} {TradesFilterProxy.SORT_ASC_GLYPH}2"
             table.setColumnWidth(
-                col, tt.default_column_width(fm, hdr_fm, sample, headers[col]))
+                col, tt.default_column_width(fm, hdr_fm, sample, caption))
 
     # ── Control-bar handlers ────────────────────────────────────────────────
 
@@ -682,7 +705,11 @@ class TradesPanel(QWidget):
         self._apply_column_visibility(kind)
         # Re-snapshot so widths (possibly new columns) are captured too.
         self._snapshot_into_state(kind)
-        self._save_timer.start()
+        # Apply is one deliberate click, not the drag storm the debounce
+        # exists for — write it out now so quitting right afterwards
+        # can't drop it.
+        self._save_timer.stop()
+        self._save_persisted_columns()
 
     def _apply_column_visibility(self, kind: str) -> None:
         """Project the visible-keys list onto the QTableView header:
@@ -731,6 +758,10 @@ class TradesPanel(QWidget):
 
     def _wire_header_signals(self, table: QTableView, kind: str) -> None:
         hdr = table.horizontalHeader()
+        # The VIEWPORT, not the header: QHeaderView is a scroll area, so
+        # the press lands there and only reaches the header itself through
+        # viewportEvent — a filter on the header widget never sees it.
+        hdr.viewport().installEventFilter(self)
         hdr.sectionResized.connect(
             lambda _logical, _old, _new, k=kind: self._on_header_changed(k))
         hdr.sectionMoved.connect(
@@ -738,43 +769,80 @@ class TradesPanel(QWidget):
         hdr.sectionClicked.connect(
             lambda logical, k=kind: self._on_header_sort_clicked(k, logical))
 
-    # ── Header-click sorting (desc → asc → unsorted) ────────────────────────
+    # ── Header-click sorting (desc → asc → unsorted, ⇧ = add a level) ───────
+
+    def eventFilter(self, obj, event):  # noqa: N802 (Qt style)
+        """Record the modifier a caption click was pressed with.
+
+        Filters the two header viewports only (wired in
+        ``_wire_header_signals``); ``sectionClicked`` then fires with the
+        button release and reads the flag back.
+        """
+        if event.type() == QEvent.Type.MouseButtonPress:
+            self._additive_click = bool(
+                event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        return super().eventFilter(obj, event)
 
     def _on_header_sort_clicked(self, kind: str, logical: int) -> None:
         """Cycle the clicked column through descending → ascending →
-        unsorted.  Clicking a different column starts its cycle fresh at
-        descending.  Unsorted restores the source model's natural order
-        (flat: newest fill first; summary: first-fill insertion order)."""
-        if kind == "flat":
-            table, proxy = self._flat_table, self._flat_proxy
-        else:
-            table, proxy = self._summary_table, self._summary_proxy
-        hdr = table.horizontalHeader()
+        unsorted.
 
-        col, order = self._sort_state.get(kind, (-1, None))
-        if col != logical:
-            col, order = logical, Qt.SortOrder.DescendingOrder
-        elif order == Qt.SortOrder.DescendingOrder:
-            order = Qt.SortOrder.AscendingOrder
-        else:
-            col, order = -1, None
+        A plain click sorts by that column ALONE — clicking a different
+        caption drops whatever was sorted before and starts its cycle
+        fresh at descending.  ⇧-click instead appends the column as the
+        next tie-breaker (or cycles / drops it if it's already in the
+        list), so several columns can be active at once with click order
+        as their priority.  Unsorted restores the source model's natural
+        order (flat: newest fill first; summary: first-fill insertion
+        order).
+        """
+        proxy = self._flat_proxy if kind == "flat" else self._summary_proxy
+        # One press, one gesture: a synthetic click (tests, keyboard
+        # activation) is a plain one.
+        additive = self._additive_click
+        self._additive_click = False
 
-        self._sort_state[kind] = (col, order)
-        if order is None:
-            # sort(-1) is Qt's documented "back to source order".
-            proxy.sort(-1)
-            hdr.setSortIndicatorShown(False)
-            hdr.setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+        specs = proxy.sortSpecs()
+        idx = next((i for i, (c, _) in enumerate(specs) if c == logical), None)
+        if not additive and (idx is None or len(specs) > 1):
+            # Plain click on a caption that isn't the whole current sort:
+            # collapse to this column alone.
+            specs = [(logical, Qt.SortOrder.DescendingOrder)]
+        elif idx is None:
+            specs.append((logical, Qt.SortOrder.DescendingOrder))
+        elif specs[idx][1] == Qt.SortOrder.DescendingOrder:
+            specs[idx] = (logical, Qt.SortOrder.AscendingOrder)
         else:
-            proxy.sort(col, order)
-            hdr.setSortIndicatorShown(True)
-            hdr.setSortIndicator(col, order)
+            # Third click on this column → it leaves the sort.
+            specs.pop(idx)
+
+        # The ▲/▼ (and the "2"/"3" rank on the secondary levels) the user
+        # sees is drawn by ``TradesFilterProxy`` into the caption text —
+        # Qt's own indicator never renders through the style-sheeted
+        # header — and the proxy repaints the strip itself.
+        proxy.setSortSpecs(specs)
 
     def _on_header_changed(self, kind: str) -> None:
         if self._suspend_save:
             return
         self._snapshot_into_state(kind)
         self._save_timer.start()
+
+    def flush_pending_column_state(self) -> None:
+        """Write a debounced column resize out now.
+
+        A drag emits sectionResized many times a second, so the write is
+        debounced by 350 ms — but a QTimer needs an event loop to fire,
+        and on quit ``MainWindow.closeEvent`` blocks the GUI thread in
+        ``worker.wait(3000)`` and then exits.  A resize made just before
+        closing was therefore snapshotted into memory and never reached
+        disk, so the column came back at its old width next launch.
+        Hosts must call this on shutdown; the panel also drains itself on
+        hide and close.
+        """
+        if self._save_timer.isActive():
+            self._save_timer.stop()
+            self._save_persisted_columns()
 
     def _snapshot_into_state(self, kind: str) -> None:
         """Read the table's current visual order + widths back into our
@@ -813,12 +881,86 @@ class TradesPanel(QWidget):
             self._visible_summary = visible
             self._saved_widths_summary = widths
 
+    # ── New-column migration ────────────────────────────────────────────────
+
+    # Summary columns added after the first release, each with the column
+    # it should follow.  Only consulted for configs written before the
+    # ``known`` stamp existed — after that, new keys are detected
+    # generically by diffing against the stamp.
+    _LEGACY_NEW_SUMMARY_COLUMNS = (
+        ("trans_total", "avg_sell"),
+        ("sec_type", "symbol"),
+        ("paired_pnl", "trans_total"),
+        ("unpaired_pnl", "paired_pnl"),
+    )
+
+    def _migrate_new_columns(self, persisted: dict[str, dict]) -> bool:
+        """Add columns this persisted config predates, mutating the
+        in-memory visible lists in place.
+
+        Returns True when the config has to be written back — either a
+        column was inserted, or the section carries no ``known`` stamp
+        yet.  The stamp is what makes a *removal* stick: without it the
+        legacy fallback below would re-run every launch and resurrect the
+        very columns the user had just taken out.
+        """
+        needs_stamp = False
+        for kind, model, visible in (
+                ("flat", self._flat_model, self._visible_flat),
+                ("summary", self._summary_model, self._visible_summary)):
+            section = persisted[kind]
+            if "visible" not in section:
+                # First run for this view — ``visible`` is the built-in
+                # default, so every column is already accounted for.
+                needs_stamp = True
+                continue
+
+            known = section.get("known")
+            if isinstance(known, list):
+                all_keys = model.column_keys()
+                for key in all_keys:
+                    if key in known or key in visible:
+                        continue
+                    self._insert_after_neighbour(visible, all_keys, key)
+                    needs_stamp = True
+                continue
+
+            # Legacy config, written before the stamp: one last pass over
+            # the hardcoded table, then the stamp takes over for good.
+            needs_stamp = True
+            if kind != "summary":
+                continue
+            for key, after_key in self._LEGACY_NEW_SUMMARY_COLUMNS:
+                if key in visible:
+                    continue
+                try:
+                    visible.insert(visible.index(after_key) + 1, key)
+                except ValueError:
+                    visible.append(key)
+        return needs_stamp
+
+    @staticmethod
+    def _insert_after_neighbour(visible: list[str], all_keys: list[str],
+                                key: str) -> None:
+        """Insert *key* into *visible* after its nearest visible left-hand
+        neighbour in the model's column order, so a newly-introduced
+        column lands where the model puts it rather than at the far end."""
+        idx = all_keys.index(key)
+        for left in reversed(all_keys[:idx]):
+            if left in visible:
+                visible.insert(visible.index(left) + 1, key)
+                return
+        visible.insert(0, key)
+
     # ── Persistence (preferences.trades_columns) ────────────────────────────
 
     # Bumped when a restyle changes what a column needs to be wide enough
     # for.  v2 = the shared table look (wider cell padding, uppercase
-    # captions, tabular figures).
-    _STYLE_VERSION = 2
+    # captions, tabular figures).  v3 = the flat list's mixed-case
+    # captions, which are narrower than the uppercase ones they replace.
+    # v4 = the same for the summary, plus its shorter Volume / Avg buy /
+    # Avg sell captions.
+    _STYLE_VERSION = 4
 
     def _load_persisted_columns(self) -> dict[str, dict]:
         """Returns ``{"flat": {"visible": [...], "widths": {...}},
@@ -858,10 +1000,15 @@ class TradesPanel(QWidget):
                 "flat": {
                     "visible": list(self._visible_flat),
                     "widths":  dict(self._saved_widths_flat),
+                    # Every column the model offers today.  Next launch
+                    # diffs against this to spot genuinely new columns,
+                    # instead of re-adding ones the user removed.
+                    "known":   self._flat_model.column_keys(),
                 },
                 "summary": {
                     "visible": list(self._visible_summary),
                     "widths":  dict(self._saved_widths_summary),
+                    "known":   self._summary_model.column_keys(),
                 },
             }
             config_manager.save_preferences(prefs)

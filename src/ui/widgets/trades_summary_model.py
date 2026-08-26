@@ -94,7 +94,7 @@ S_COL_EXCHANGES     = 14
 
 S_HEADERS: list[str] = [
     "Symbol", "Type", "Buys", "Sells", "Net",
-    "Avg buy price", "Avg sell price", "Trans total",
+    "Avg buy", "Avg sell", "Volume",
     "R.P&L", "U.P&L", "P&L", "Comm", "Net P&L", "Rlz P&L", "Exchanges",
 ]
 
@@ -1242,7 +1242,7 @@ class TradesSummaryModel(QAbstractTableModel):
     def _cost_cell_text(self, col: int) -> str:
         if col == S_COL_SYMBOL:
             return ACCT_TOTAL_LABEL
-        # Trans total / Comm sum the visible rows the same way the "P&L"
+        # Volume / Comm sum the visible rows the same way the "P&L"
         # footer does — identical values, both sections fold the same
         # fills.
         if col == S_COL_TRANS_TOTAL:
@@ -1353,7 +1353,7 @@ class TradesSummaryModel(QAbstractTableModel):
     @staticmethod
     def _fmt_compact(v: float) -> str:
         """Human-readable amount: plain for values <$1 k, ``k`` suffix up
-        to a million, ``m`` suffix beyond.  Used by the Trans total
+        to a million, ``m`` suffix beyond.  Used by the Volume
         column where futures notionals routinely run into the millions
         (NQ at ~$20 k face × hundreds of contracts)."""
         if v == 0:

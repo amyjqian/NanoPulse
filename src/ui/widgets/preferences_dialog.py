@@ -1425,7 +1425,20 @@ class PreferencesDialog(QDialog):
         self._prefs["trading_stocks"] = stocks_data
         self._prefs["trading_guards"] = guards_data
         self._prefs["cash_management"] = self._cash_page.collect()
-        config_manager.save_preferences(self._prefs)
+
+        # ``self._prefs`` is the snapshot taken when the dialog opened, so
+        # writing it whole would roll back every preference saved since —
+        # and the Columns pages are exactly that case: Apply persists
+        # through the owning panel (``trades_columns`` /
+        # ``positions_columns``) immediately, then this closeEvent put the
+        # pre-Apply copy back, so a removed column returned on restart.
+        # The hourly auto-backup stamps (``backup``) land here too.
+        # Re-read and merge only the sections this dialog actually owns.
+        prefs = config_manager.load_preferences()
+        for section in _DEFAULTS:
+            prefs[section] = self._prefs[section]
+        self._prefs = prefs
+        config_manager.save_preferences(prefs)
 
         # Push into the in-memory singletons so the next trade uses fresh values
         from src.core.trading_prefs import trading_prefs
