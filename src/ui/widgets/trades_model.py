@@ -88,7 +88,7 @@ COL_LAST_LIQ      = 16
 
 HEADERS: list[str] = [
     "Time", "Symbol", "Type", "Side", "Qty", "Price", "Exch", "Ref",
-    "Account", "Expiry", "Strike / right", "Comm", "Rlz P&L",
+    "Account", "Expiry", "Strike / right", "Comm", "R.P&L",
     "Order id", "Submitter", "Liquidation", "Last liquidity",
 ]
 

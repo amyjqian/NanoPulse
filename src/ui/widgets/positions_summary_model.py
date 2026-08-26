@@ -13,9 +13,10 @@ with positions-stream semantics:
   * Data arrives as full-portfolio batches via `update_positions`;
     every call folds from scratch so an account going flat correctly
     drops its contribution to weighted avg cost.
-  * Futures correction: IB occasionally reports `avg_cost` in
-    dollars-per-contract when it should be per-point; the flat model's
-    `_compute_display_avg` fixes this before aggregation.
+  * Multiplier correction: IB reports `avg_cost` per contract for
+    futures and options while quoting per point; the flat model's
+    `_compute_display_avg` puts them in the same unit before
+    aggregation.
 
 Columns
 ──────
@@ -61,9 +62,11 @@ S_COL_MARKET_VALUE   = 7
 S_COL_ACCOUNTS       = 8
 S_COL_EXCHANGE       = 9
 
+# Sentence case, and rendered as written — the summary table opts out of
+# the shared uppercase caption strip (see AccountPositionPanel).
 S_HEADERS: list[str] = [
-    "Symbol", "Type", "Pos", "Avg Cost", "Mkt Price",
-    "Unrealized", "Realized", "Mkt Value", "Accts", "Exch",
+    "Symbol", "Type", "Qty", "Avg price", "Mkt price",
+    "U.P&L", "R.P&L", "Mkt value", "Accts", "Exch",
 ]
 
 # Column key used by the Preferences dialog / column visibility state.
@@ -254,7 +257,7 @@ class PositionsSummaryModel(QAbstractTableModel):
         if col == S_COL_MARKET_VALUE:
             return _fmt_mktval(_safe_sum(a.get("market_value", 0.0)
                                          for a in visible))
-        # Position / Avg Cost / Mkt Price / Accts / Exch / Type — blank;
+        # Qty / Avg price / Mkt price / Accts / Exch / Type — blank;
         # signed sum across different contracts is meaningless.
         return ""
 
@@ -373,8 +376,8 @@ class PositionsSummaryModel(QAbstractTableModel):
             con_id = pos.get("con_id")
             if not account or con_id is None:
                 continue
-            # Apply the futures avg-cost correction on our own copy so
-            # we don't mutate the dict the flat model is using.
+            # Apply the avg-cost multiplier correction on our own copy
+            # so we don't mutate the dict the flat model is using.
             p = dict(pos)
             AccountPositionModel._compute_display_avg(p)
             self._positions[(account, int(con_id))] = p

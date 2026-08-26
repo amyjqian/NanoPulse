@@ -102,7 +102,8 @@ _TITLE_FONT = QFont("Inter, Helvetica Neue, Arial", 11)
 _TITLE_FONT.setWeight(QFont.Weight.Bold)
 
 _TABLE_FONT = tt.TABLE_FONT
-_COL_HEADER_FONT = tt.COL_HEADER_FONT
+# Both tables here render captions as written rather than uppercased.
+_COL_HEADER_FONT_MIXED = tt.COL_HEADER_FONT_MIXED
 _INFO_LABEL_FONT  = QFont("JetBrains Mono, Menlo, Consolas, monospace", 10)
 _INFO_VALUE_FONT  = QFont("JetBrains Mono, Menlo, Consolas, monospace", 10, QFont.Weight.Bold)
 tt.enable_tabular_figures(_INFO_LABEL_FONT, _INFO_VALUE_FONT)
@@ -322,9 +323,11 @@ _POS_COL_KEYS = [
     "symbol", "day_pnl", "qty", "unrealized_pnl",
     "avg_price", "last_price", "realized_pnl", "market_value",
 ]
+# Mirrors ``account_position_model.HEADERS`` minus the close control —
+# the Columns page reads this one, the table draws that one.
 _POS_COL_HEADERS = [
-    "Symbol", "Day P&L", "Qty", "Unrealized",
-    "Avg Price", "Last Price", "Realized", "Mkt Value",
+    "Symbol", "Daily P&L", "Qty", "U.P&L",
+    "Avg price", "Last price", "R.P&L", "Mkt value",
 ]
 _POS_KEY_TO_COL: dict[str, int] = {k: i for i, k in enumerate(_POS_COL_KEYS)}
 
@@ -423,7 +426,7 @@ class CloseControlDelegate(QStyledItemDelegate):
     def _seg_rects(self, cell_rect: QRect) -> list[QRect]:
         """One QRect per segment, left-aligned in the cell.
 
-        Left rather than right so the control sits just past Mkt Value at
+        Left rather than right so the control sits just past Mkt value at
         a fixed offset: the column is the stretch column, so a
         right-aligned control drifts with the panel's width and lands a
         long way from the numbers it acts on.
@@ -693,9 +696,12 @@ class AccountPositionPanel(QWidget):
         # ── Table ────────────────────────────────────────────────────────
         self._table = QTableView()
         self._table.setModel(self._model)
-        # Shared chrome: no zebra, no gridlines, uppercase captions, and
-        # viewport mouse tracking for the row-hover delegates.
-        tt.apply_table_chrome(self._table)
+        # Shared chrome: no zebra, no gridlines, and viewport mouse
+        # tracking for the row-hover delegates.  Captions read as written
+        # ("Daily P&L", "U.P&L") rather than uppercased — the summary
+        # table below keeps the shared uppercase strip.
+        tt.apply_table_chrome(self._table,
+                              header_font=tt.COL_HEADER_FONT_MIXED)
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         # Rows aren't click-selectable — hover is the only pointer cue.
         tt.disable_click_selection(self._table)
@@ -743,7 +749,10 @@ class AccountPositionPanel(QWidget):
         # ── Summary table (one row per con_id, totals footer) ─────────────
         self._summary_table = QTableView()
         self._summary_table.setModel(self._summary_model)
-        tt.apply_table_chrome(self._summary_table)
+        # Captions read as written ("Qty", "U.P&L"), matching the flat
+        # Positions table above rather than the uppercase strip.
+        tt.apply_table_chrome(self._summary_table,
+                              header_font=tt.COL_HEADER_FONT_MIXED)
         self._summary_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows)
         tt.disable_click_selection(self._summary_table)
@@ -823,7 +832,7 @@ class AccountPositionPanel(QWidget):
 
     def _apply_default_col_widths(self) -> None:
         fm     = QFontMetrics(self._table.font())
-        hdr_fm = QFontMetrics(_COL_HEADER_FONT)
+        hdr_fm = QFontMetrics(_COL_HEADER_FONT_MIXED)
         for col, sample in self._COL_SAMPLES.items():
             self._table.setColumnWidth(
                 col, tt.default_column_width(fm, hdr_fm, sample, HEADERS[col]))
@@ -833,7 +842,7 @@ class AccountPositionPanel(QWidget):
             COL_FLATTEN,
             CloseControlDelegate._control_width(seg_fm) + _SEG_MARGIN_R + 8)
 
-    # v2: the column set changed (Account → Symbol/Day P&L split), so a
+    # v2: the column set changed (Account → Symbol/Daily P&L split), so a
     # state saved under the old key would apply the wrong widths to the
     # wrong columns.  A new key retires those silently.
     _SETTINGS_KEY = "AccountPositionPanel/headerState_v2"
@@ -1290,7 +1299,7 @@ class AccountPositionPanel(QWidget):
            directly; new shape is nested under ``["flat"|"summary"]`` so
            the two views can persist independently.
         2. The flat view's old ``"account"`` column doubled as the per-row
-           Day P&L; it is now a plain ``"day_pnl"`` column sitting after
+           Daily P&L; it is now a plain ``"day_pnl"`` column sitting after
            Symbol.
         """
         pc = prefs.get("positions_columns")
@@ -1308,7 +1317,7 @@ class AccountPositionPanel(QWidget):
             keys = [("day_pnl" if k == "account" else k)
                     for k in flat["visible"]]
             # Symbol leads the row now; anyone whose saved order still puts
-            # Day P&L first gets the two swapped rather than reset.
+            # Daily P&L first gets the two swapped rather than reset.
             if "symbol" in keys and "day_pnl" in keys \
                     and keys.index("day_pnl") < keys.index("symbol"):
                 keys.remove("symbol")
@@ -1336,7 +1345,7 @@ class AccountPositionPanel(QWidget):
 
     def _apply_summary_default_col_widths(self) -> None:
         fm     = QFontMetrics(self._summary_table.font())
-        hdr_fm = QFontMetrics(_COL_HEADER_FONT)
+        hdr_fm = QFontMetrics(_COL_HEADER_FONT_MIXED)
         for col, sample in self._SUMMARY_COL_SAMPLES.items():
             self._summary_table.setColumnWidth(
                 col,

@@ -202,6 +202,11 @@ COL_HEADER_FONT.setWeight(QFont.Weight.DemiBold)
 COL_HEADER_FONT.setCapitalization(QFont.Capitalization.AllUppercase)
 COL_HEADER_FONT.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 106)
 
+# Same label strip without the shouting — captions render as written
+# ("Rlz P&L", not "RLZ P&L").  Used by the flat Trades list.
+COL_HEADER_FONT_MIXED = QFont(COL_HEADER_FONT)
+COL_HEADER_FONT_MIXED.setCapitalization(QFont.Capitalization.MixedCase)
+
 
 def enable_tabular_figures(*fonts: QFont) -> None:
     """Turn on the OpenType 'tnum' feature where Qt supports it.
@@ -331,12 +336,16 @@ ROW_SEP_PEN          = QPen(QColor(ROW_SEP))
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def apply_table_chrome(view: QTableView) -> None:
+def apply_table_chrome(view: QTableView, *,
+                       header_font: QFont = COL_HEADER_FONT) -> None:
     """Give *view* the shared table look.
 
     Also turns on viewport mouse tracking: without it the hover delegates
     below only see a MouseMove while a button is held, so row hover
     silently does nothing.  Every table must go through here.
+
+    *header_font* selects the caption strip — pass ``COL_HEADER_FONT_MIXED``
+    for a table whose captions read as written rather than uppercased.
     """
     view.setAlternatingRowColors(False)
     view.setShowGrid(False)
@@ -348,18 +357,21 @@ def apply_table_chrome(view: QTableView) -> None:
     view.verticalHeader().setVisible(False)
     view.verticalHeader().setDefaultSectionSize(ROW_H)
     view.viewport().setMouseTracking(True)
-    view.horizontalHeader().setFont(COL_HEADER_FONT)
+    view.horizontalHeader().setFont(header_font)
 
 
 def default_column_width(fm: QFontMetrics, hdr_fm: QFontMetrics,
                          sample: str, caption: str = "") -> int:
     """Width that fits a column's widest value *and* its caption.
 
-    The uppercase tracked-out captions are wider than they look, so sizing
-    from the sample value alone truncates the header.
+    The tracked-out captions are wider than they look, so sizing from the
+    sample value alone truncates the header.  *hdr_fm* must be built from
+    the header's own font: QFontMetrics applies that font's capitalization,
+    so an uppercased strip measures as uppercase without the caller having
+    to shout the caption itself (which would over-size a mixed-case one).
     """
     return max(fm.horizontalAdvance(sample),
-               hdr_fm.horizontalAdvance(caption.upper())) + CELL_PAD
+               hdr_fm.horizontalAdvance(caption)) + CELL_PAD
 
 
 def header_alignment(section: int, right_align_cols) -> int:

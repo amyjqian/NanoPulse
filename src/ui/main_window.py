@@ -496,8 +496,11 @@ class MainWindow(QWidget):
         """Save geometry and stop all worker threads before closing."""
         self._save_geometry()
 
-        # Persist order-status column widths
+        # Persist order-status column widths, and drain the Trades
+        # panel's debounced column state — a resize in the last 350 ms
+        # before quitting would otherwise die with the event loop.
         self._flash_trade._order_status.save_table_state()
+        self._flash_trade.trades_panel.flush_pending_column_state()
 
         log.info("closeEvent – shutting down %d worker(s)",
                  len(self.active_threads))

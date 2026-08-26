@@ -12,8 +12,8 @@ For every account group the model inserts:
 
 Columns
 ───────
-Symbol(0) DayP&L(1) Qty(2) Unrealized(3) AvgPrice(4)
-LastPrice(5) Realized(6) MktValue(7) Close(8)
+Symbol(0) DailyP&L(1) Qty(2) U.P&L(3) AvgPrice(4)
+LastPrice(5) R.P&L(6) MktValue(7) Close(8)
 """
 from __future__ import annotations
 
@@ -65,12 +65,20 @@ COL_FLATTEN        = 8
 # "Close %" rather than "Close": only the last segment is labelled 100%,
 # so the caption is what tells you 25/50/75 are percentages of the
 # position and not share counts.
+# Sentence case, and rendered as written — the flat Positions table opts
+# out of the shared uppercase caption strip (see AccountPositionPanel).
+# Keep in sync with ``account_position_panel._POS_COL_HEADERS``, which is
+# the same list minus the close control and drives the Columns page.
 HEADERS = [
-    "Symbol", "Day P&L", "Qty", "Unrealized", "Avg Price", "Last Price",
-    "Realized", "Mkt Value", "Close %",
+    "Symbol", "Daily P&L", "Qty", "U.P&L", "Avg price", "Last price",
+    "R.P&L", "Mkt value", "Close %",
 ]
 
 NUM_COLS = len(HEADERS)
+
+# Sec types IB quotes per point but reports avgCost per contract for.
+# See ``AccountPositionModel._compute_display_avg``.
+_MULTIPLIED_SEC_TYPES = frozenset({"FUT", "FOP", "OPT"})
 
 # ── Theme tokens ──────────────────────────────────────────────────────────────
 TEXT     = Theme.POS_TEXT
@@ -765,16 +773,53 @@ class AccountPositionModel(QAbstractTableModel):
         ])
 
     @staticmethod
+    def _contract_multiplier(pos: dict) -> float:
+        """The contract's multiplier — the one IB declared on the
+        contract, or, failing that, implied from the position's own
+        market value.  1.0 when there is nothing to go on."""
+        try:
+            mult = float(pos.get("multiplier") or 0)
+        except (TypeError, ValueError):
+            mult = 0.0
+        if mult > 1:
+            return mult
+        position     = pos.get("position", 0) or 0
+        market_price = pos.get("market_price", 0) or 0
+        market_value = pos.get("market_value", 0) or 0
+        if position and market_price and market_value:
+            implied = abs(market_value / (position * market_price))
+            if implied > 1:
+                return implied
+        return 1.0
+
+    @staticmethod
     def _compute_display_avg(pos: dict) -> None:
-        sec_type     = pos.get("sec_type", "")
-        position     = pos.get("position", 0)
-        market_price = pos.get("market_price", 0)
-        avg_cost     = pos.get("avg_cost", 0)
-        display_avg  = avg_cost
-        if sec_type == "FUT" and position != 0 and market_price != 0:
-            market_value  = pos.get("market_value", 0)
-            implied_mult  = abs(market_value / (position * market_price))
-            if implied_mult > 1:
-                display_avg = avg_cost / implied_mult
+        """Put avg cost in the same unit as the quote sitting next to it.
+
+        IB reports ``Position.avgCost`` per CONTRACT for anything with a
+        multiplier — a QQQ put trading at 1.42 arrives as 156.95 on a
+        100x contract — while ``market_price`` is per point.  Showing
+        both raw put an option's cost basis two orders of magnitude above
+        its own last price.  This used to correct ``FUT`` only, so
+        options and options-on-futures showed the per-contract figure.
+
+        IB is not perfectly consistent (some futures arrive already per
+        point), so the division is applied only when it actually brings
+        avg cost nearer the quote.  Before the first quote there is
+        nothing to compare against — and no way to imply a multiplier
+        either — so the declared multiplier is taken at its word.
+        """
+        sec_type    = pos.get("sec_type", "")
+        avg_cost    = pos.get("avg_cost", 0) or 0
+        display_avg = avg_cost
+        if sec_type in _MULTIPLIED_SEC_TYPES and avg_cost:
+            mult = AccountPositionModel._contract_multiplier(pos)
+            if mult > 1:
+                per_point    = avg_cost / mult
+                market_price = pos.get("market_price", 0) or 0
+                if (not market_price
+                        or abs(per_point - market_price)
+                        < abs(avg_cost - market_price)):
+                    display_avg = per_point
         pos["display_avg"] = display_avg
 
