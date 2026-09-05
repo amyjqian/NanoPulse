@@ -1539,6 +1539,16 @@ class AccountListPanel(QWidget):
         """Return the number of currently checked (selected) account rows."""
         return sum(1 for r in self._account_rows.values() if r.is_checked)
 
+    def get_visible_accounts(self) -> set[str]:
+        """The accounts currently rendered as rows — the active user
+        group's members (online or not) when a group is active, every
+        non-hidden account otherwise.  This is the panel's DISPLAY
+        scope, independent of check state: the Book Trader ladder uses
+        it to decide which accounts' resting orders it may badge and
+        act on (an order outside the active group must be neither shown
+        nor cancelled by a ladder click)."""
+        return set(self._account_rows)
+
     def get_all_accounts(self) -> set[str]:
         """Every account known to the accounts model — regardless of the
         active group, the hidden list, or check state.  The status bar

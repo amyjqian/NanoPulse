@@ -376,6 +376,10 @@ class BookTraderView(QWidget):
         # order_id.  Used to render order-badges on the ladder for the
         # currently active symbol.
         self._live_orders: dict[str, dict] = {}
+        # ``fn() -> set[str] | None`` naming the accounts currently in
+        # scope (the active account group's members).  Pushed by the
+        # host via ``set_account_scope_provider``; None means unscoped.
+        self._account_scope_provider = None
         # Workers whose ``order_status_updated`` signal is already
         # connected to our slot.  Tracked so we don't double-connect on
         # repeat ``_wire_order_status`` calls.  A WeakSet so replaced /
@@ -866,6 +870,40 @@ class BookTraderView(QWidget):
             self._live_orders[order_id] = dict(data)
         self._refresh_ladder_orders()
 
+    def set_account_scope_provider(self, provider) -> None:
+        """Host pushes ``fn() -> set[str] | None`` naming the accounts
+        currently in scope (the active account group's members).  The
+        ladder only badges — and only cancels/moves on click — orders
+        belonging to in-scope accounts; None / no provider = unscoped."""
+        self._account_scope_provider = provider
+        self._refresh_ladder_orders()
+
+    def refresh_order_badges(self) -> None:
+        """Re-project ``_live_orders`` onto the ladder — the host calls
+        this when the account scope changed (group switch, membership
+        edit) since no order event fires then."""
+        self._refresh_ladder_orders()
+
+    def _account_scope(self) -> set[str] | None:
+        """Resolve the current account scope, or None when unscoped."""
+        if self._account_scope_provider is None:
+            return None
+        try:
+            return self._account_scope_provider()
+        except Exception:
+            log.exception("BookTrader: account scope provider failed")
+            return None
+
+    @staticmethod
+    def _order_in_scope(od: dict, scope: set[str] | None) -> bool:
+        """True when the order belongs to an in-scope account.  Orders
+        with no account field stay visible (fail-open — never make an
+        order invisible because a payload field went missing)."""
+        if scope is None:
+            return True
+        acct = od.get("account") or ""
+        return not acct or acct in scope
+
     def _refresh_ladder_orders(self) -> None:
         """Project ``_live_orders`` into a list the model can render."""
         if not self._active_symbol:
@@ -883,10 +921,17 @@ class BookTraderView(QWidget):
             if local:
                 accepted.add(local)
 
+        scope = self._account_scope()
         markers: list[dict] = []
         for od in self._live_orders.values():
             sym = (od.get("symbol") or "").upper()
             if sym not in accepted:
+                continue
+            # Orders for accounts outside the active account group get
+            # no badge — the ladder reflects only the accounts the
+            # order fan-out targets (see also _ladder_toggle, which
+            # applies the same scope so a click can't cancel them).
+            if not self._order_in_scope(od, scope):
                 continue
             otype = (od.get("order_type") or "").upper()
             if otype == "LMT":
@@ -1178,9 +1223,15 @@ class BookTraderView(QWidget):
 
             # Collect resting same-side LMTs for this symbol — keeping
             # (order_id, price) so we can match against the click.
+            # Scoped to the active account group, same as the badges:
+            # an order the ladder doesn't show must not be cancelled or
+            # "moved" by a click either.
+            scope = self._account_scope()
             same_side_lmt: list[tuple[str, float]] = []
             for oid, od in self._live_orders.items():
                 if (od.get("symbol") or "").upper() not in accepted:
+                    continue
+                if not self._order_in_scope(od, scope):
                     continue
                 if (od.get("action") or "").upper() != action:
                     continue

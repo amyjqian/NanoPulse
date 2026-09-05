@@ -299,6 +299,21 @@ class FlashTradeView(QWidget):
         if hasattr(self._book_trading, "set_percent_context"):
             self._book_trading.set_percent_context(
                 self._percent_sizing_accounts)
+
+        # ── Ladder order badges follow the active account group ──────────
+        # The ladder only shows (and only cancels/moves on click) orders
+        # belonging to the accounts the panel currently displays — an
+        # order resting for an account outside the active group is not
+        # part of what a fan-out here would touch.  Refresh on group
+        # switch and selection changes; membership edits emit
+        # selection_changed too.
+        if isinstance(self._account_list, AccountListPanel):
+            self._book_trading.set_account_scope_provider(
+                self._account_list.get_visible_accounts)
+            self._account_list.active_group_changed.connect(
+                lambda _n: self._book_trading.refresh_order_badges())
+            self._account_list.selection_changed.connect(
+                lambda _s: self._book_trading.refresh_order_badges())
         self._pct_refresh_debounce = QTimer(self)
         self._pct_refresh_debounce.setSingleShot(True)
         self._pct_refresh_debounce.setInterval(500)
