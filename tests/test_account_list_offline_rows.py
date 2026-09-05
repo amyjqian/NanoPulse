@@ -257,3 +257,27 @@ class TestModelInvariant:
         assert panel._model._acct_to_label == {}
         assert all(r._connected is False
                    for r in panel._account_rows.values())
+
+
+class TestMidRemovalReads:
+    """endRemoveRows receivers read the model back synchronously (the
+    offline-filter chain ends in ``_get_financial_col``), so ``_row_map``
+    must already be consistent when each removal is emitted.  It used to be
+    rebuilt only after ALL rows were popped, so a surviving account that
+    sat BELOW a removed row kept a stale index past the end of the
+    shrunken ``_table_data`` — IndexError from ``get_net_liquidation``."""
+
+    def test_survivor_balance_readable_during_removal(self, qtbot):
+        m = AccountsTableModel()
+        m.update_batch([
+            ("Q-ib", "U1111111", "NetLiquidation", "268000", "USD"),
+            ("Q-ib", "U4444444", "NetLiquidation", "235342", "USD"),
+            ("Q-ib", "U2222222", "NetLiquidation", "120000", "USD"),
+            ("J-ib", "U3333333", "NetLiquidation", "207129", "USD"),
+        ])
+        seen = []
+        m.rowsRemoved.connect(
+            lambda *_a: seen.append(m.get_net_liquidation("U3333333")))
+        m.remove_rows_by_label("Q-ib")
+        assert seen == [207129.0] * len(seen) and seen
+        assert m.get_net_liquidation("U3333333") == 207129.0

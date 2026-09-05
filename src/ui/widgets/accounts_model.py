@@ -321,7 +321,7 @@ class AccountsTableModel(QAbstractTableModel):
         if label is None:
             return 0.0
         row_idx = self._row_map.get((label, account))
-        if row_idx is None:
+        if row_idx is None or row_idx >= len(self._table_data):
             return 0.0
         try:
             return float(self._table_data[row_idx][col] or 0.0)
@@ -374,13 +374,17 @@ class AccountsTableModel(QAbstractTableModel):
             else:
                 self.beginRemoveRows(QModelIndex(), idx, idx)
             self._table_data.pop(idx)
+            # _row_map must be rebuilt BEFORE endRemoveRows: its receivers
+            # run synchronously and read the model back (the offline-filter
+            # chain ends in _get_financial_col), so a map still holding
+            # pre-removal indices sends them past the end of the shrunken
+            # _table_data.  _acct_to_label stays as purged above — putting
+            # the dying label's not-yet-popped rows back would make its
+            # accounts read as live again mid-removal.
+            self._row_map.clear()
+            for i, row in enumerate(self._table_data):
+                self._row_map[(row[COL_CONNECTION], row[COL_ACCOUNT])] = i
             self.endRemoveRows()
-        # Rebuild _row_map and _acct_to_label after removals
-        self._row_map.clear()
-        self._acct_to_label.clear()
-        for i, row in enumerate(self._table_data):
-            self._row_map[(row[COL_CONNECTION], row[COL_ACCOUNT])] = i
-            self._acct_to_label[row[COL_ACCOUNT]] = row[COL_CONNECTION]
         # Surviving totals row needs to recompute after removal.
         if self._table_data:
             self._emit_totals_changed(
