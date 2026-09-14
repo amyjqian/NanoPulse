@@ -3,7 +3,7 @@ Options Income ticket — right-hand order rail (§3, §4.5–4.7).
 
 One compact top-aligned block inside a fixed-width column: order line,
 contracts stepper + MAX, limit price (stepper / typed entry /
-Bid-Mid-Ask chips), then Cancel + Submit order directly beneath.
+Bid-Mid-Ask chips), then Submit order directly beneath.
 
 The rail is a pure view: it owns the qty/price input state and emits
 signals; every derived number is pushed in by the ticket.
@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.ui.theme import Theme, hover_shades
+from src.ui.theme import Theme
 from src.core.options_income import snap_to_tick, to_dec
 
 ACCENT_BLUE = "#539BF5"
@@ -58,7 +58,6 @@ class OrderRail(QWidget):
     price_changed = Signal(object)       # Decimal
     side_changed = Signal(str)           # "BUY" | "SELL"
     submit_clicked = Signal()
-    cancel_clicked = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -186,22 +185,12 @@ class OrderRail(QWidget):
             arow.addWidget(btn, stretch=1)
         outer.addLayout(arow)
 
-        # Close + Submit sit right under the price anchors, keeping the
-        # whole order flow in one compact block.
+        # Submit sits right under the price anchors, keeping the whole
+        # order flow in one compact block.  (The ticket lives in a
+        # permanent tab, so there is nothing to dismiss — no Cancel /
+        # Close button; per-order Cancel lives on the session strip.)
         brow = QHBoxLayout()
         brow.setSpacing(8)
-        self._cancel_btn = QPushButton("Cancel", self)
-        self._cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        # Same look as the order-entry panel's Cancel action button
-        # (order_entry_panel._make_btn with Theme.CLR_CANCEL).
-        _cancel_hover, _cancel_pressed = hover_shades(Theme.CLR_CANCEL)
-        self._cancel_btn.setStyleSheet(
-            f"QPushButton{{ background:{Theme.CLR_CANCEL}; color:#ffffff;"
-            " border:none; border-radius:6px; padding:9px 16px;"
-            " font-size:11px; font-weight:bold; }"
-            f"QPushButton:hover{{ background:{_cancel_hover}; }}"
-            f"QPushButton:pressed{{ background:{_cancel_pressed}; }}")
-        self._cancel_btn.clicked.connect(self.cancel_clicked.emit)
         self._sell_btn = QPushButton("Submit order", self)
         self._sell_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._sell_btn.setStyleSheet(
@@ -210,8 +199,6 @@ class OrderRail(QWidget):
             " font-size:12px; font-weight:bold; }"
             "QPushButton:disabled{ background:#3a3f4d; color:#6A7690; }")
         self._sell_btn.clicked.connect(self.submit_clicked.emit)
-        # Equal-width pair — both take an identical share of the row.
-        brow.addWidget(self._cancel_btn, stretch=1)
         brow.addWidget(self._sell_btn, stretch=1)
         outer.addLayout(brow)
         outer.addStretch(1)
@@ -391,12 +378,6 @@ class OrderRail(QWidget):
 
     def _submit_label(self) -> str:
         return "Submit order"
-
-    def set_cancel_label(self, text: str) -> None:
-        """Relabel the footer's dismiss button — after the first submit
-        "Cancel" reads as "cancel my order", so the ticket flips it to
-        "Close"."""
-        self._cancel_btn.setText(text)
 
     def set_sell_enabled(self, enabled: bool, reason: str = "") -> None:
         """Disabled state replaces the label with the reason (§4.7)."""

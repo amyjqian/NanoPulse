@@ -296,10 +296,14 @@ def _apply_chip_style(btn: QPushButton, selected: bool) -> None:
 
     Chips whose ``chip_small`` property is set (option chips showing a
     compact two-line "QQQ Aug7 ⏎ 670 P" label) get a smaller font and
-    tighter padding so both lines fit the standard chip height.
+    tighter padding so both lines fit the standard chip height.  Chips
+    with ``chip_compact`` set (the Options tab's grid) are one size down
+    from the default — same look, less height.
     """
     if bool(btn.property("chip_small")):
         font, pad = "9px", "1px 4px"
+    elif bool(btn.property("chip_compact")):
+        font, pad = "11px", "3px 9px"
     else:
         font, pad = "12px", "4px 12px"
     if bool(btn.property("chip_expired")):
@@ -441,6 +445,7 @@ class SymbolChipBar(QWidget):
     symbols_reordered = Signal(list)         # list[str] — new symbol order
 
     _CHIP_HEIGHT = 28
+    _CHIP_HEIGHT_COMPACT = 24
 
     def __init__(
         self,
@@ -449,8 +454,11 @@ class SymbolChipBar(QWidget):
         columns: int = 5,
         max_rows_per_group: int = 2,
         max_stk_rows: int = 3,
+        compact: bool = False,
     ) -> None:
         super().__init__(parent)
+        # ``compact`` → shorter chips with the 11-px face (Options tab).
+        self._compact = bool(compact)
         self._columns = max(1, columns)
         self._max_rows_per_group = max(1, max_rows_per_group)
         # The STK group gets an extra row (3 × columns chips) — stock
@@ -546,6 +554,7 @@ class SymbolChipBar(QWidget):
         btn = DraggableChip(sym, sec_type, self._on_drop,
                             label=disp if is_opt else None)
         btn.setProperty("chip_small", is_opt)
+        btn.setProperty("chip_compact", self._compact and not is_opt)
         try:
             from src.core import instruments
             if instruments.is_expired_fut(sym):
@@ -553,7 +562,8 @@ class SymbolChipBar(QWidget):
                 btn.setToolTip("Expired contract — right-click to remove")
         except Exception:
             pass
-        btn.setFixedHeight(self._CHIP_HEIGHT)
+        btn.setFixedHeight(self._CHIP_HEIGHT_COMPACT if self._compact
+                           else self._CHIP_HEIGHT)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         _apply_chip_style(btn, sym == self._active)
         attach_exchange_badge(btn, sym)

@@ -617,20 +617,37 @@ class AccountPositionModel(QAbstractTableModel):
         pos = self._positions.get((account, int(con_id)))
         return dict(pos) if pos is not None else None
 
-    def stk_positions_for_account(self, account: str) -> list[dict]:
-        """All non-flat STK positions held by *account*.
+    def stk_positions_for_accounts(self, accounts) -> list[dict]:
+        """Non-flat STK positions across *accounts*, ONE entry per symbol
+        with ``position`` and ``market_value`` summed over the accounts
+        that hold it (other fields come from the first holder seen).
 
-        Used by the Options Income ticket to build its position chips."""
-        out = []
+        Used by the Options Income ticket to rank its position chips —
+        the ticket fans out to every checked account, so a symbol held
+        in three accounts is one chip, not three."""
+        wanted = set(accounts or ())
+        by_symbol: dict[str, dict] = {}
         for (acct, _con_id), pos in self._positions.items():
-            if acct != account:
+            if acct not in wanted:
                 continue
             if (pos.get("sec_type") or "STK") != "STK":
                 continue
-            if not (pos.get("position") or 0):
+            qty = float(pos.get("position") or 0.0)
+            if not qty:
                 continue
-            out.append(dict(pos))
-        return out
+            sym = (pos.get("symbol") or pos.get("local_symbol") or "").upper()
+            if not sym:
+                continue
+            agg = by_symbol.get(sym)
+            if agg is None:
+                agg = dict(pos)
+                agg["position"] = qty
+                agg["market_value"] = float(pos.get("market_value") or 0.0)
+                by_symbol[sym] = agg
+            else:
+                agg["position"] += qty
+                agg["market_value"] += float(pos.get("market_value") or 0.0)
+        return list(by_symbol.values())
 
     def position_for_symbol(self, account: str, symbol: str) -> dict | None:
         """Full position dict for the *account*'s STK holding in *symbol*

@@ -71,6 +71,21 @@ class TestImmediateOfflineStyling:
         panel._model.remove_rows_by_label("Q-ib")
         assert _row(panel, "U1111111")._name_lbl.text().startswith("⚠ ")
 
+    def test_buying_power_sub_line(self, panel):
+        """BP rides under the total in the compact k/M form, appears
+        once the tag arrives, follows changes, and blanks offline."""
+        r = _row(panel, "U1111111")
+        assert r._bp is None and r._bp_container.isHidden()
+        panel._model.update_batch([
+            ("Q-ib", "U1111111", "BuyingPower", "536000", "USD")])
+        assert r._bp_val.text() == "536k"
+        assert not r._bp_container.isHidden()
+        panel._model.update_batch([
+            ("Q-ib", "U1111111", "BuyingPower", "1250000", "USD")])
+        assert r._bp_val.text() == "1.2M"
+        panel._model.remove_rows_by_label("Q-ib")
+        assert r._bp is None and r._bp_container.isHidden()
+
     def test_money_is_blanked_not_frozen(self, panel):
         """A balance nothing refreshes reads exactly like a live one, and
         the account may have been traded elsewhere since."""

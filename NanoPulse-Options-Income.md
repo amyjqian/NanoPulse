@@ -34,19 +34,28 @@ hard-capped by available collateral.
 
 ## 2. Entry point
 
-**Right-click the account-level row** in the Positions panel → context menu → **"Options income…"**
+The ticket is the permanent **Options** tab beside **Positions** and **Trades** on the Trade
+page (`PositionsTradesTabs`). There is no popup and no context-menu entry any more.
 
-The context menu (see the Positions view in the reference) contains:
+**Accounts:** the ticket has no account of its own. It follows the Account List selection
+(All / a user group such as gamma, core, beta / individual cards) exactly like Buy/Sell in the
+order panel:
 
-```
-mgn-jack-01 · ACCOUNT          (header, non-interactive)
-Options income…                → opens the ticket
-────────────────────────────
-Sweep in — cash to SGOV
-Sweep out — SGOV to cash
-────────────────────────────
-Flatten all positions
-```
+- a submit sends the **same qty to every checked + connected account**, one payload per account
+  (`_target_accounts=[account]`), each with its own `orderRef`;
+- **MAX** is the smallest per-account capacity, so no account is over-sized; the worker's whatIf
+  pre-check still gates each order;
+- the Submit button is disabled with the reason when any checked account is ineligible, when no
+  account is checked, or when the "Orders on all accounts" guard (Settings → Trading) applies;
+- the "This session" strip shows one row per account (ACCOUNT column) and cancels on that
+  account's own connection.
+
+The header shows the symbol, price/change and the **summed share count + weighted average cost**
+across the checked accounts. Chips show the bare ticker.
+
+**Market data** (chain, strikes, quotes, symbol search) streams on the highest-priority *connected*
+TWS connection — the same one the order panel's price feed uses — never on a checked account's
+connection. Orders still go to each account's own connection.
 
 Implementation notes:
 - `QTableView`/`QTableWidget` → `setContextMenuPolicy(Qt.CustomContextMenu)` +

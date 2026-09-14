@@ -1,18 +1,20 @@
 """
 Options Income ticket — the "This session" order table.
 
-The ticket stays open after a submit so several orders can be laddered
+The ticket stays put after a submit so several orders can be laddered
 back-to-back; outcomes must therefore be visible in the ticket itself
-(the main window's Orders panel sits behind this modal dialog).  Every
-order submitted from this window gets one row here — updated live from
-the worker's ``order_status_updated`` stream, matched by ``orderRef`` —
-with a clickable Cancel cell while the order is still open at TWS
-(two-step: a first click arms "Confirm?", a second click within 3 s
-sends the cancel — a stray click alone can never cancel an order).
+(the Orders panel is a separate pane the user may have collapsed).  Every
+order submitted from the ticket gets one row here — one per target
+account, since a submit fans out to every checked account — updated
+live from the worker's ``order_status_updated`` stream, matched by
+``orderRef``, with a clickable Cancel cell while the order is still open
+at TWS (two-step: a first click arms "Confirm?", a second click within
+3 s sends the cancel — a stray click alone can never cancel an order).
 
 Rendered as a table with the same dark styling as the strike ladder
-(``chain_table.ChainView``).  Columns: TIME · ACTION · QTY · SYMBOL
-(underlying stock) · STRIKE · TYPE (CALL/PUT) · PRICE · STATUS · CANCEL.
+(``chain_table.ChainView``).  Columns: TIME · ACCOUNT · ACTION · QTY ·
+SYMBOL (underlying stock) · STRIKE · TYPE (CALL/PUT) · PRICE · STATUS ·
+CANCEL.
 
 Pure view: the ticket owns the worker wiring and calls ``add_order`` /
 ``update_order``; Cancel clicks surface as ``cancel_requested(ref)``.
@@ -42,17 +44,18 @@ log = logging.getLogger(__name__)
 _COL_LAYOUT_KEY = "options_session_columns"
 
 COL_TIME = 0
-COL_ACTION = 1
-COL_QTY = 2
-COL_SYMBOL = 3
-COL_STRIKE = 4
-COL_TYPE = 5
-COL_PRICE = 6
-COL_STATUS = 7
-COL_CANCEL = 8
+COL_ACCOUNT = 1
+COL_ACTION = 2
+COL_QTY = 3
+COL_SYMBOL = 4
+COL_STRIKE = 5
+COL_TYPE = 6
+COL_PRICE = 7
+COL_STATUS = 8
+COL_CANCEL = 9
 
-HEADERS = ["TIME", "ACTION", "QTY", "SYMBOL", "STRIKE", "TYPE", "PRICE",
-           "STATUS", "CANCEL"]
+HEADERS = ["TIME", "ACCOUNT", "ACTION", "QTY", "SYMBOL", "STRIKE", "TYPE",
+           "PRICE", "STATUS", "CANCEL"]
 NUM_COLS = len(HEADERS)
 
 _MONO = QFont("JetBrains Mono, Menlo, Consolas, monospace", 11)
@@ -67,8 +70,8 @@ _CLR_REJECTED = "#F85149"
 
 
 class _SessionModel(QAbstractTableModel):
-    """Row dicts: ref, time, action, qty, symbol, strike, right, price,
-    status, fill, error, cancel_clicked.  Newest order on top."""
+    """Row dicts: ref, time, account, action, qty, symbol, strike, right,
+    price, status, fill, error, cancel_clicked.  Newest order on top."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -98,6 +101,8 @@ class _SessionModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.DisplayRole:
             if col == COL_TIME:
                 return rd.get("time", "")
+            if col == COL_ACCOUNT:
+                return rd.get("account", "")
             if col == COL_ACTION:
                 return rd.get("action", "")
             if col == COL_QTY:
@@ -201,7 +206,7 @@ class _SessionModel(QAbstractTableModel):
 
 
 class SessionOrdersStrip(QTableView):
-    """The orders submitted from this ticket window, newest on top."""
+    """The orders submitted from this ticket, newest on top."""
 
     cancel_requested = Signal(str)           # orderRef
 
@@ -345,7 +350,8 @@ class SessionOrdersStrip(QTableView):
     # ── API (called by the ticket) ──────────────────────────────────────────
 
     def add_order(self, ref: str, fields: dict) -> None:
-        """*fields*: time, action, qty, symbol, strike, right, price."""
+        """*fields*: time, account (alias or id, display only), action,
+        qty, symbol, strike, right, price."""
         rd = dict(fields)
         rd.update({"ref": ref, "status": "", "fill": "–", "error": "",
                    "cancel_clicked": False})

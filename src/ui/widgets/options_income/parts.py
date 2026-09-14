@@ -1,9 +1,9 @@
 """
 Options Income ticket — selector widgets.
 
-* :class:`SymbolChipBar`  — preset symbol chips (with share counts), a
-  type-to-search box (worker ``reqMatchingSymbols`` results arrive via
-  ``set_search_results``), right-click chip removal, QSettings persistence.
+* :class:`SymbolChipBar`  — the ticket's symbol chips on the Book
+  Trader's chip grid (position-derived + searched groups, right-click
+  removal, QSettings persistence).  Symbols come in via ``select``.
 * :class:`RightToggle`    — the Calls / Puts segmented toggle shown left
   of the EXPIRY chips (the order side lives on the rail's Buy / Sell
   toggle).
@@ -16,20 +16,18 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import QSettings, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QFont, QFontMetrics
+from PySide6.QtCore import QSettings, Qt, Signal
+from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QHBoxLayout,
-    QLineEdit,
-    QListWidget,
-    QListWidgetItem,
     QMenu,
     QPushButton,
+    QVBoxLayout,
     QWidget,
 )
 
 from src.ui.theme import Theme
-from src.ui.widgets.order_panel_parts import DraggableChip
+from src.ui.widgets.order_panel_parts import SymbolChipBar as ChipGrid
 from src.core.options_income import Expiry
 
 log = logging.getLogger(__name__)
@@ -38,17 +36,19 @@ ACCENT_BLUE = "#539BF5"          # active-selection blue used app-wide
 
 
 def _symbol_chip_style(active: bool) -> str:
-    """Solid-blue active / grey inactive — matches the Book Trader and
-    order-entry symbol chips (order_panel_parts._apply_chip_style).
-    Duplicated verbatim by convention to avoid a cross-panel import."""
+    """Solid-blue active / grey inactive for the Call/Put toggle and the
+    expiry chips — the Book Trader symbol-chip look
+    (order_panel_parts._apply_chip_style) one size down."""
+    # One step smaller than the symbol chips (11 px, tighter padding):
+    # these are selectors above the ladder, not the trade's subject.
     if active:
         return ("QPushButton{background:#539BF5;color:white;border:none;"
-                "border-radius:6px;padding:4px 12px;font-weight:bold;"
-                "font-size:12px}"
+                "border-radius:5px;padding:3px 10px;font-weight:bold;"
+                "font-size:11px}"
                 "QPushButton:hover{background:#6BA8F6}")
     return ("QPushButton{background:#232A3B;color:#A3AFC2;border:none;"
-            "border-radius:6px;padding:4px 12px;font-weight:600;"
-            "font-size:12px}"
+            "border-radius:5px;padding:3px 10px;font-weight:600;"
+            "font-size:11px}"
             "QPushButton:hover{background:#334058}")
 
 
@@ -60,47 +60,59 @@ DEFAULT_CHIPS = ["QQQ", "SPY", "NVDA", "TSLA", "NBIS"]
 _SETTINGS_KEY = "OptionsTicket/symbolChips"
 
 _POS_CHIP_MAX = 5        # top-N account positions shown as chips
+_GRID_COLS = 4           # chips per row
+_GRID_ROWS = 3           # rows — the grid never overflows past this
+_CHIP_MAX = _GRID_COLS * _GRID_ROWS
 _POS_CHIP_MIN_SHARES = 100  # only CC-capable holdings become chips
 
 
 class SymbolChipBar(QWidget):
-    """Chip row + search box (§4.1).
+    """The ticket's symbol chips (§4.1) — the Book Trader's chip grid
+    (``order_panel_parts.SymbolChipBar`` in compact mode: ``_GRID_COLS``
+    × ``_GRID_ROWS`` chips one size down from the Book Trader's,
+    blue-active / grey, drag-reorder, right-click remove) fed from two
+    groups:
 
-    Two chip groups: the account's existing positions (top
-    ``_POS_CHIP_MAX`` STK holdings with ≥ ``_POS_CHIP_MIN_SHARES``
-    shares, by market value — derived, not persisted) and searched
-    symbols (persisted to QSettings, appended to the right).  Chips are
-    drag-reorderable like the Book Trader ladder chips.
+    * existing positions across the checked accounts (top
+      ``_POS_CHIP_MAX`` STK holdings with ≥ ``_POS_CHIP_MIN_SHARES``
+      shares in total, by market value — derived, not persisted), then
+    * searched symbols (persisted to QSettings, appended to the right).
+
+    Symbols are added by the host through :meth:`select` (the ticker
+    strip's "+" opens the shared symbol-search popup).  The grid holds
+    at most ``_CHIP_MAX`` chips: a new symbol on a full grid replaces
+    the LAST searched chip rather than becoming an invisible overflow
+    entry (same rule as the Book Trader's chip bar).  Chips show the
+    bare ticker; share counts live under the ticker strip.
 
     Signals
     -------
     symbol_selected(str)          — a chip became active
-    search_requested(int, str)    — debounced search text (tokened);
-                                    host routes to the worker and calls
-                                    :meth:`set_search_results`
     """
 
     symbol_selected = Signal(str)
-    search_requested = Signal(int, str)
 
-    def __init__(self, get_shares, get_positions=None, parent=None):
-        """*get_shares(symbol) -> float* — account share count for chips.
-        *get_positions() -> list[dict]* — the account's STK positions
-        (``symbol``, ``position``, ``market_value``)."""
+    def __init__(self, get_positions=None, parent=None):
+        """*get_positions() -> list[dict]* — STK positions across the
+        checked accounts, one entry per symbol (``symbol``, ``position``,
+        ``market_value``)."""
         super().__init__(parent)
-        self._get_shares = get_shares
         self._get_positions = get_positions or (lambda: [])
         self._custom: list[str] = self._load_chips()   # searched, persisted
         self._pos_syms: list[str] = []                 # derived positions
         self._order: list[str] = []                    # display order
-        self._buttons: dict[str, QPushButton] = {}
-        self._token = 0
-        self._build_ui()
-        self._sync_order()
-        # No chip starts active — opening the ticket at account level
-        # shows the bar unselected; the host selects a chip only when
-        # it was launched with a specific symbol.
+        # No chip starts active — the tab opens with the bar unselected
+        # until the user picks a chip.
         self._active: str = ""
+        col = QVBoxLayout(self)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(0)
+        self._grid = ChipGrid(self, columns=_GRID_COLS,
+                              max_stk_rows=_GRID_ROWS, compact=True)
+        self._grid.symbol_selected.connect(lambda s, _sec: self.select(s))
+        self._grid.symbol_remove_requested.connect(self._remove_chip)
+        self._grid.symbols_reordered.connect(self._on_reordered)
+        col.addWidget(self._grid)
         self._rebuild_chips()
 
     # ── Persistence ─────────────────────────────────────────────────────────
@@ -121,7 +133,8 @@ class SymbolChipBar(QWidget):
     # ── Chip groups ─────────────────────────────────────────────────────────
 
     def _position_symbols(self) -> list[str]:
-        """Top account holdings that can back a covered call."""
+        """Top holdings (across the checked accounts) that can back a
+        covered call."""
         try:
             positions = list(self._get_positions() or [])
         except Exception:
@@ -161,96 +174,31 @@ class SymbolChipBar(QWidget):
         for s in custom:
             if s not in order:
                 order.append(s)
+        if len(order) > _CHIP_MAX:
+            # A persisted list longer than the grid (an older, bigger
+            # layout) is pruned to what fits — the grid would hide the
+            # tail anyway, and a hidden chip is a stale one.
+            dropped = order[_CHIP_MAX:]
+            order = order[:_CHIP_MAX]
+            self._custom = [s for s in self._custom if s not in dropped]
+            self._save_chips()
         self._order = order
 
     # ── UI ──────────────────────────────────────────────────────────────────
 
-    def _build_ui(self) -> None:
-        row = QHBoxLayout(self)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(6)
-        self._chip_row = QHBoxLayout()
-        self._chip_row.setSpacing(6)
-        row.addLayout(self._chip_row)
-        row.addStretch(1)
-
-        self._search = QLineEdit(self)
-        self._search.setPlaceholderText("Search symbol")
-        self._search.setFixedWidth(180)
-        self._search.setStyleSheet(
-            f"QLineEdit{{ background:#1B2130; color:{Theme.TEXT};"
-            f" border:1px solid {Theme.BORDER}; border-radius:6px;"
-            " padding:2px 10px; font-size:11px; }"
-            f"QLineEdit:focus{{ border-color:{ACCENT_BLUE}; }}")
-        # The search box was the tall element in the row (28 px vs the
-        # chips' 23) — pin it to the chips' own height so the whole bar
-        # matches the account panel's group-chip strip.
-        probe = QPushButton("X")
-        probe.setStyleSheet(_symbol_chip_style(False))
-        self._search.setFixedHeight(probe.sizeHint().height())
-        probe.deleteLater()
-        self._search.textEdited.connect(self._on_search_edited)
-        self._search.returnPressed.connect(self._pick_first_result)
-        row.addWidget(self._search)
-
-        # Results popup — child of the bar, floated under the search box.
-        self._popup = QListWidget(self)
-        self._popup.setWindowFlags(Qt.WindowType.ToolTip)
-        self._popup.setStyleSheet(
-            f"QListWidget{{ background:#1B2130; color:{Theme.TEXT};"
-            f" border:1px solid {Theme.BORDER}; border-radius:6px;"
-            " font-size:11px; }"
-            "QListWidget::item{ padding:5px 10px; }"
-            f"QListWidget::item:selected{{ background:{ACCENT_BLUE};"
-            " color:#ffffff; }")
-        self._popup.itemClicked.connect(self._on_result_clicked)
-        self._popup.hide()
-
-        self._debounce = QTimer(self)
-        self._debounce.setSingleShot(True)
-        self._debounce.setInterval(350)
-        self._debounce.timeout.connect(self._fire_search)
-
-    def _chip_width(self) -> int:
-        """Uniform chip width: 5-char ticker + space + 4-digit count,
-        measured in the chip's bold 12-px font (+ the 12-px QSS padding
-        each side)."""
-        f = QFont(self.font())
-        f.setPixelSize(12)
-        f.setBold(True)
-        return QFontMetrics(f).horizontalAdvance("XXXXX 8,888") + 24 + 4
-
     def _rebuild_chips(self) -> None:
         self._sync_order()
-        while self._chip_row.count():
-            item = self._chip_row.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        self._buttons.clear()
-        width = self._chip_width()
-        for sym in self._order:
-            shares = float(self._get_shares(sym) or 0.0)
-            # Chips with no position show just the ticker — a share-count
-            # suffix only adds noise across a whole bar of flat symbols.
-            label = f"{sym} {int(shares):,}" if shares >= 1 else sym
-            # One drag group ("OPTINC") so any chip can be dropped onto
-            # any other — same mechanics as the ladder chips.
-            btn = DraggableChip(sym, "OPTINC", self._on_chip_drop, self)
-            btn.setText(label)
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setStyleSheet(_symbol_chip_style(sym == self._active))
-            # Fixed width keeps the bar tidy: every chip identical, and
-            # the row can never crush a chip into clipping its label.
-            btn.setFixedWidth(width)
-            btn.clicked.connect(lambda _c=False, s=sym: self.select(s))
-            btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-            btn.customContextMenuRequested.connect(
-                lambda _pos, s=sym: self._remove_chip(s))
-            self._buttons[sym] = btn
-            self._chip_row.addWidget(btn)
+        self._grid.set_symbols([(sym, "STK") for sym in self._order])
+        self._grid.set_active(self._active or None)
+
+    @property
+    def _buttons(self) -> dict[str, QPushButton]:
+        """symbol → chip button (the grid's), for tests / tooling."""
+        return self._grid._buttons     # noqa: SLF001 — same package family
 
     def refresh_counts(self) -> None:
-        """Re-render chips (call after position data changes)."""
+        """Re-render chips (call after position data or the checked
+        accounts change — the position group is re-derived)."""
         self._rebuild_chips()
 
     # ── Chips API ───────────────────────────────────────────────────────────
@@ -258,11 +206,22 @@ class SymbolChipBar(QWidget):
     def active_symbol(self) -> str:
         return self._active
 
+    def symbols(self) -> list[str]:
+        """Every symbol currently shown as a chip (display order)."""
+        return list(self._order)
+
     def select(self, symbol: str) -> None:
         symbol = symbol.upper()
         self._sync_order()
         if symbol not in self._order and symbol not in self._custom:
             # Searched symbols become persistent chips on the right.
+            # A full grid drops its last searched chip to make room —
+            # dropping the entry IS the cleanup.
+            if len(self._order) >= _CHIP_MAX:
+                last = next((s for s in reversed(self._order)
+                             if s in self._custom), None)
+                if last is not None:
+                    self._custom.remove(last)
             self._custom.append(symbol)
             self._save_chips()
         if symbol == self._active:
@@ -272,25 +231,32 @@ class SymbolChipBar(QWidget):
         self._rebuild_chips()
         self.symbol_selected.emit(symbol)
 
-    def _on_chip_drop(self, src: str, dst: str) -> None:
-        """Ladder-style drag reorder: insert *src* at *dst*'s slot."""
-        if (src == dst or src not in self._order
-                or dst not in self._order):
-            return
-        self._order.remove(src)
-        self._order.insert(self._order.index(dst), src)
-        # Persist the searched chips' relative order (position chips
-        # are derived per account, so their order is session-only).
+    def _on_reordered(self, order: list) -> None:
+        """Grid drag-reorder → adopt the new order and persist the
+        searched chips' relative order (position chips are derived from
+        the checked accounts, so their order is session-only)."""
+        self._order = [str(s) for s in order if s in self._order]
         custom = set(self._custom)
         self._custom = [s for s in self._order if s in custom]
         self._save_chips()
         self._rebuild_chips()
 
+    def _on_chip_drop(self, src: str, dst: str) -> None:
+        """Ladder-style drag reorder: insert *src* at *dst*'s slot."""
+        if (src == dst or src not in self._order
+                or dst not in self._order):
+            return
+        order = list(self._order)
+        order.remove(src)
+        order.insert(order.index(dst), src)
+        self._on_reordered(order)
+
     def _remove_chip(self, symbol: str) -> None:
         """Right-click removes a searched chip outright (ladder-chip
-        behavior).  Position chips are derived from the account and
-        stay; the last remaining chip also stays."""
+        behavior).  Position chips are derived from the checked accounts
+        and stay; the last remaining chip also stays."""
         if symbol not in self._custom or len(self._order) <= 1:
+            self._rebuild_chips()      # grid may have dropped it visually
             return
         self._custom.remove(symbol)
         self._save_chips()
@@ -304,80 +270,6 @@ class SymbolChipBar(QWidget):
                 self.symbol_selected.emit(self._active)
         else:
             self._rebuild_chips()
-
-    # ── Search ──────────────────────────────────────────────────────────────
-
-    def _on_search_edited(self, text: str) -> None:
-        if len(text.strip()) < 1:
-            self._popup.hide()
-            return
-        self._debounce.start()
-
-    def _fire_search(self) -> None:
-        text = self._search.text().strip()
-        if not text:
-            return
-        self._token += 1
-        self.search_requested.emit(self._token, text)
-
-    def set_search_results(self, token: int, results: list[dict]) -> None:
-        """Worker search results.  Stale tokens are dropped; max 6 shown,
-        each as ``TICKER · Company Name · position``."""
-        if token != self._token or not self._search.hasFocus():
-            return
-        self._popup.clear()
-        shown = 0
-        for r in results:
-            if shown >= 6:
-                break
-            # The worker emits every match — the ticket only trades US
-            # stock options, so keep STK/USD rows here.
-            if r.get("sec_type") != "STK":
-                continue
-            if (r.get("currency") or "USD") != "USD":
-                continue
-            sym = str(r.get("symbol", "")).upper()
-            if not sym:
-                continue
-            shares = float(self._get_shares(sym) or 0.0)
-            pos_txt = f"{int(shares):,} sh" if shares >= 1 else "no position"
-            desc = r.get("description", "")
-            item = QListWidgetItem(
-                f"{sym} · {desc} · {pos_txt}" if desc
-                else f"{sym} · {pos_txt}")
-            item.setData(Qt.ItemDataRole.UserRole, sym)
-            self._popup.addItem(item)
-            shown += 1
-        if not shown:
-            self._popup.hide()
-            return
-        below = self._search.mapToGlobal(self._search.rect().bottomLeft())
-        self._popup.setFixedWidth(max(260, self._search.width()))
-        self._popup.setFixedHeight(min(6, shown) * 30 + 8)
-        self._popup.move(below.x(), below.y() + 4)
-        self._popup.setCurrentRow(0)
-        self._popup.show()
-
-    def _pick_first_result(self) -> None:
-        if self._popup.isVisible() and self._popup.count():
-            self._on_result_clicked(self._popup.item(0))
-
-    def _on_result_clicked(self, item: QListWidgetItem) -> None:
-        sym = str(item.data(Qt.ItemDataRole.UserRole) or "")
-        self._popup.hide()
-        self._search.clear()
-        if sym:
-            self.select(sym)   # appends as a chip + activates
-
-    def keyPressEvent(self, event) -> None:  # noqa: N802 (Qt override)
-        if event.key() == Qt.Key.Key_Escape and self._popup.isVisible():
-            self._popup.hide()
-            return
-        super().keyPressEvent(event)
-
-    def hideEvent(self, event) -> None:  # noqa: N802 (Qt override)
-        self._popup.hide()
-        super().hideEvent(event)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
