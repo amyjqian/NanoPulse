@@ -236,12 +236,22 @@ class AccountsTableModel(QAbstractTableModel):
         """
         totals_to_refresh: set[int] = set()
         for label, account, tag, value, currency in batch:
-            # Buying power is cached but not shown as a column in Connections view
+            # Buying power is cached but not shown as a column in the
+            # Connections view.  The Account List cards render it, so
+            # nudge the account's row when it CHANGES (it arrives in every
+            # 250 ms batch — an unconditional emit would be pure churn).
             if tag == "BuyingPower":
                 try:
-                    self._buying_power[account] = float(value)
+                    bp = float(value)
                 except (ValueError, TypeError):
-                    pass
+                    continue
+                if self._buying_power.get(account) != bp:
+                    self._buying_power[account] = bp
+                    row_idx = self._row_map.get((label, account))
+                    if row_idx is not None:
+                        mi = self.index(row_idx, COL_NET_LIQ)
+                        self.dataChanged.emit(
+                            mi, mi, [Qt.ItemDataRole.DisplayRole])
                 continue
 
             # Per-account, per-currency cash from the reqAccountUpdatesMulti

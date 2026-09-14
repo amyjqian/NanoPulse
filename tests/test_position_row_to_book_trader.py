@@ -547,3 +547,51 @@ class TestTickSizeResolution:
     def test_unknown_future_defaults_quarter(self):
         assert btv._tick_size_for_contract(
             {"symbol": "XYZ9", "sec_type": "FUT"}) == 0.25
+
+
+# ── Options ticket strike → pinned chip (no activation) ──────────────────────
+
+class TestPinOptionChip:
+    _CONTRACT = {
+        "conid": 9007, "symbol": "NVDA", "sec_type": "OPT",
+        "exchange": "SMART", "currency": "USD",
+        "local_symbol": "nvda  260918c00187500",
+        "expiry": "20260918", "strike": 187.5, "right": "C",
+        "multiplier": "100", "min_tick": 0.05,
+    }
+
+    def _stub(self, symbols):
+        calls = []
+
+        class _S:
+            _symbols = list(symbols)
+
+            def _add_symbol(self, sym, meta=None, *, activate=True):
+                calls.append((sym, meta, activate))
+
+        return _S(), calls
+
+    def test_pins_by_occ_key_without_activating(self):
+        stub, calls = self._stub(["AAPL"])
+        btv.BookTraderView.pin_option_chip(stub, dict(self._CONTRACT))
+        assert len(calls) == 1
+        sym, meta, activate = calls[0]
+        assert sym == "NVDA  260918C00187500"     # upper-cased OCC key
+        assert activate is False
+        assert meta["conid"] == "9007"
+        assert meta["sec_type"] == "OPT"
+        assert meta["min_tick"] == 0.05
+        assert meta["local_symbol"] == sym
+
+    def test_existing_chip_is_a_noop(self):
+        stub, calls = self._stub(["NVDA  260918C00187500"])
+        btv.BookTraderView.pin_option_chip(stub, dict(self._CONTRACT))
+        assert calls == []
+
+    def test_no_conid_or_key_never_pins(self):
+        stub, calls = self._stub([])
+        btv.BookTraderView.pin_option_chip(
+            stub, {**self._CONTRACT, "conid": None})
+        btv.BookTraderView.pin_option_chip(
+            stub, {**self._CONTRACT, "local_symbol": ""})
+        assert calls == []

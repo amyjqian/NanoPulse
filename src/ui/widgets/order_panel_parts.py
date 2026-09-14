@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from typing import Iterable, Sequence
 
-from PySide6.QtCore import QMimeData, Qt, Signal
+from PySide6.QtCore import QMimeData, Qt, QTimer, Signal
 from PySide6.QtGui import QDrag, QFont, QMouseEvent
 from PySide6.QtWidgets import (
     QGridLayout,
@@ -68,6 +68,10 @@ class TickerStrip(QWidget):
     emits ``add_symbol_clicked`` so the host can show its own
     symbol-search popup (kept on the host because it needs access to
     ``ReferenceData`` / persistence).
+
+    ``show_bid_ask=False`` hides the bid/ask pair (the Options tab wants
+    just last · change · change%); ``update_price`` still accepts the
+    values so the host wiring is unchanged.
     """
 
     add_symbol_clicked = Signal()
@@ -77,9 +81,11 @@ class TickerStrip(QWidget):
         parent=None,
         *,
         no_pct_change_symbols: Iterable[str] = DEFAULT_NO_PCT_CHANGE,
+        show_bid_ask: bool = True,
     ) -> None:
         super().__init__(parent)
         self._no_pct: set[str] = {s.upper() for s in no_pct_change_symbols}
+        self._show_bid_ask = bool(show_bid_ask)
         self._symbol: str = ""
         self._last: float = 0.0
         self._bid: float = 0.0
@@ -142,9 +148,17 @@ class TickerStrip(QWidget):
         top_row.addWidget(self._lbl_symbol)
         top_row.addWidget(self._lbl_price)
         top_row.addSpacing(6)
-        top_row.addWidget(self._lbl_bid)
-        top_row.addWidget(self._lbl_ask)
-        top_row.addSpacing(6)
+        if self._show_bid_ask:
+            top_row.addWidget(self._lbl_bid)
+            top_row.addWidget(self._lbl_ask)
+            top_row.addSpacing(6)
+        else:
+            # Keep the labels parented (update_price still writes them)
+            # but out of the layout and invisible.
+            self._lbl_bid.setParent(self)
+            self._lbl_ask.setParent(self)
+            self._lbl_bid.hide()
+            self._lbl_ask.hide()
         top_row.addWidget(self._lbl_change)
         top_row.addWidget(self._lbl_change_pct)
         top_row.addStretch(1)
@@ -296,10 +310,14 @@ def _apply_chip_style(btn: QPushButton, selected: bool) -> None:
 
     Chips whose ``chip_small`` property is set (option chips showing a
     compact two-line "QQQ Aug7 ⏎ 670 P" label) get a smaller font and
-    tighter padding so both lines fit the standard chip height.
+    tighter padding so both lines fit the standard chip height.  Chips
+    with ``chip_compact`` set (the Options tab's grid) are one size down
+    from the default — same look, less height.
     """
     if bool(btn.property("chip_small")):
         font, pad = "9px", "1px 4px"
+    elif bool(btn.property("chip_compact")):
+        font, pad = "11px", "3px 9px"
     else:
         font, pad = "12px", "4px 12px"
     if bool(btn.property("chip_expired")):
@@ -346,14 +364,22 @@ class DraggableChip(QPushButton):
         parent=None,
         *,
         label: str | None = None,
+        grid=None,
     ) -> None:
         # *label* is display-only (e.g. a compact option label); the chip's
         # identity for drag payloads / dedupe / callbacks stays *sym*.
+        # *grid* is the owning SymbolChipBar — its rebuilds are frozen
+        # for the duration of this chip's drag.
         super().__init__(label if label is not None else sym, parent)
         self._sym = sym
         self._sec_type = sec_type
         self._on_drop = on_drop
+        self._grid = grid
         self._press_pos = None
+        # (callback, src, dst) parked by the DROP TARGET's dropEvent,
+        # executed by THIS chip once its drag.exec() has returned — see
+        # dropEvent for why the reorder must not run any earlier.
+        self._pending_drop: tuple | None = None
         self.setAcceptDrops(True)
 
     def mousePressEvent(self, e: QMouseEvent) -> None:  # noqa: N802
@@ -383,7 +409,29 @@ class DraggableChip(QPushButton):
         # Clearing _press_pos suppresses a late-arriving click when the
         # cursor returns to this chip without a drop.
         self._press_pos = None
-        drag.exec(Qt.DropAction.MoveAction)
+        self._pending_drop = None
+        # Freeze the owning grid's rebuilds for the drag's lifetime: a
+        # live refresh (position tick → refresh_counts → set_symbols)
+        # firing mid-drag would destroy the chips under the cursor and
+        # the native drag loop then delivers dragging updates to freed
+        # widgets — the crash the diagnostic reports show inside
+        # processDrag/sendDraggingUpdate.
+        if self._grid is not None:
+            self._grid._begin_chip_drag()
+        try:
+            drag.exec(Qt.DropAction.MoveAction)
+        finally:
+            if self._grid is not None:
+                self._grid._end_chip_drag()
+        # The drop target parked the reorder here instead of running it
+        # (see dropEvent).  drag.exec() has fully unwound now, so the
+        # grid rebuild (which deleteLater()s every chip, this one
+        # included) is finally safe.  One more hop through a 0-ms timer
+        # puts the rebuild on the main loop, outside this mouse handler.
+        pending, self._pending_drop = self._pending_drop, None
+        if pending is not None:
+            cb, src, dst = pending
+            QTimer.singleShot(0, lambda: cb(src, dst))
 
     def dragEnterEvent(self, e) -> None:  # noqa: N802
         md = e.mimeData()
@@ -422,7 +470,24 @@ class DraggableChip(QPushButton):
             return
         e.acceptProposedAction()
         if self._on_drop is not None:
-            self._on_drop(src_sym, self._sym)
+            # NEVER run the reorder from inside the drop: the callback
+            # rebuilds the grid, which deleteLater()s this chip AND the
+            # drag source — whose ``drag.exec()`` nested event loop is
+            # still on the stack.  A 0-ms singleShot is NOT safe either:
+            # timers posted here fire inside that same nested loop (the
+            # macOS drop animation keeps it spinning), which then also
+            # services the deferred deletes and drag.exec() returns into
+            # a destroyed C++ widget (hard crash).  Instead the reorder
+            # is parked ON THE DRAG SOURCE, which triggers it only after
+            # its drag.exec() call has returned.
+            cb, dst = self._on_drop, self._sym
+            src_widget = e.source()
+            if isinstance(src_widget, DraggableChip):
+                src_widget._pending_drop = (cb, src_sym, dst)
+            else:
+                # Foreign/synthetic source (tests) — no nested drag loop
+                # to protect against; a deferred call is fine.
+                QTimer.singleShot(0, lambda: cb(src_sym, dst))
 
 
 class SymbolChipBar(QWidget):
@@ -441,6 +506,11 @@ class SymbolChipBar(QWidget):
     symbols_reordered = Signal(list)         # list[str] — new symbol order
 
     _CHIP_HEIGHT = 28
+    _CHIP_HEIGHT_COMPACT = 24
+    # Compact chips are fixed-width: six uppercase letters at the 11-px
+    # face plus the 9-px side padding.  Keeps the Options grid columns
+    # aligned instead of each chip sizing to its ticker.
+    _CHIP_WIDTH_COMPACT = 64
 
     def __init__(
         self,
@@ -449,8 +519,11 @@ class SymbolChipBar(QWidget):
         columns: int = 5,
         max_rows_per_group: int = 2,
         max_stk_rows: int = 3,
+        compact: bool = False,
     ) -> None:
         super().__init__(parent)
+        # ``compact`` → shorter chips with the 11-px face (Options tab).
+        self._compact = bool(compact)
         self._columns = max(1, columns)
         self._max_rows_per_group = max(1, max_rows_per_group)
         # The STK group gets an extra row (3 × columns chips) — stock
@@ -460,6 +533,13 @@ class SymbolChipBar(QWidget):
         self._entries: list[tuple[str, str]] = []  # (sym, sec_type)
         self._buttons: dict[str, QPushButton] = {}
         self._active: str | None = None
+        # While one of this grid's chips is being dragged, rebuilds are
+        # FROZEN: destroying the chips mid-drag (a live refresh_counts
+        # firing on a position tick) leaves the native drag loop
+        # delivering dragging updates to freed widgets — a segfault.
+        # The newest deferred rebuild is applied when the drag ends.
+        self._drag_depth = 0
+        self._pending_entries: list[tuple[str, str]] | None = None
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -467,6 +547,11 @@ class SymbolChipBar(QWidget):
         self._grid = QGridLayout()
         self._grid.setSpacing(4)
         self._grid.setContentsMargins(0, 0, 0, 0)
+        if self._compact:
+            # Compact chips are fixed-width — park the leftover width in
+            # a trailing stretch column so the chips stay left-aligned
+            # instead of drifting apart inside stretched cells.
+            self._grid.setColumnStretch(self._columns, 1)
         inner = QWidget()
         inner.setLayout(self._grid)
         outer.addWidget(inner)
@@ -478,9 +563,28 @@ class SymbolChipBar(QWidget):
         ``(symbol, sec_type)`` tuples.  Sec-type ``"FUT"`` goes to the FUT
         row group; anything else (STK, OPT, unknown) goes to the STK group.
         Preserves the incoming order within each group.
+
+        A call landing while a chip drag is in flight is deferred until
+        the drag ends (see ``_begin_chip_drag``) — only the newest
+        deferred list survives.
         """
+        if self._drag_depth:
+            self._pending_entries = list(entries)
+            return
         self._entries = list(entries)
         self._rebuild_grid()
+
+    # ── Drag freeze (called by DraggableChip around drag.exec) ────────────────
+
+    def _begin_chip_drag(self) -> None:
+        self._drag_depth += 1
+
+    def _end_chip_drag(self) -> None:
+        self._drag_depth = max(0, self._drag_depth - 1)
+        if self._drag_depth == 0 and self._pending_entries is not None:
+            entries, self._pending_entries = self._pending_entries, None
+            self._entries = entries
+            self._rebuild_grid()
 
     def set_active(self, sym: str | None) -> None:
         """Highlight the chip for *sym*; pass None to clear the highlight."""
@@ -491,9 +595,17 @@ class SymbolChipBar(QWidget):
     def remove(self, sym: str) -> None:
         """Remove *sym* from the grid (host-driven, called after the host
         has updated its persisted symbol list)."""
-        self._entries = [(s, sec) for (s, sec) in self._entries if s != sym]
         if self._active == sym:
             self._active = None
+        if self._drag_depth:
+            # Mid-drag: edit the deferred list (or fork one from the
+            # live entries) — the visible chips stay untouched.
+            base = (self._pending_entries if self._pending_entries
+                    is not None else self._entries)
+            self._pending_entries = [(s, sec) for (s, sec) in base
+                                     if s != sym]
+            return
+        self._entries = [(s, sec) for (s, sec) in self._entries if s != sym]
         self._rebuild_grid()
 
     @property
@@ -544,8 +656,9 @@ class SymbolChipBar(QWidget):
         disp = format_option_symbol_two_line(sym)
         is_opt = disp != sym
         btn = DraggableChip(sym, sec_type, self._on_drop,
-                            label=disp if is_opt else None)
+                            label=disp if is_opt else None, grid=self)
         btn.setProperty("chip_small", is_opt)
+        btn.setProperty("chip_compact", self._compact and not is_opt)
         try:
             from src.core import instruments
             if instruments.is_expired_fut(sym):
@@ -553,7 +666,10 @@ class SymbolChipBar(QWidget):
                 btn.setToolTip("Expired contract — right-click to remove")
         except Exception:
             pass
-        btn.setFixedHeight(self._CHIP_HEIGHT)
+        btn.setFixedHeight(self._CHIP_HEIGHT_COMPACT if self._compact
+                           else self._CHIP_HEIGHT)
+        if self._compact and not is_opt:
+            btn.setFixedWidth(self._CHIP_WIDTH_COMPACT)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         _apply_chip_style(btn, sym == self._active)
         attach_exchange_badge(btn, sym)

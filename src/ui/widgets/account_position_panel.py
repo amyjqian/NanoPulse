@@ -643,8 +643,6 @@ class CloseControlDelegate(QStyledItemDelegate):
 class AccountPositionPanel(QWidget):
     """Grouped portfolio positions table with per-account header rows."""
 
-    position_action_requested = Signal(dict)
-    account_action_requested  = Signal(dict)
     refresh_requested         = Signal()
     position_close_requested  = Signal(str, int, int)  # account, con_id, pct (100=flatten)
     # Row click on either table — full position dict (summary rows carry
@@ -779,13 +777,6 @@ class AccountPositionPanel(QWidget):
         self._summary_table.customContextMenuRequested.connect(
             self._on_summary_context_menu)
 
-        # Context menu on the flat/grouped table — account rows get the
-        # Options income / sweep / flatten menu; STK position rows get a
-        # direct "Options income…" that pre-fills the symbol.
-        self._table.setContextMenuPolicy(
-            Qt.ContextMenuPolicy.CustomContextMenu)
-        self._table.customContextMenuRequested.connect(
-            self._on_positions_context_menu)
         delete_sc = QShortcut(
             QKeySequence(Qt.Key.Key_Delete), self._summary_table)
         delete_sc.setContext(Qt.ShortcutContext.WidgetShortcut)
@@ -924,59 +915,15 @@ class AccountPositionPanel(QWidget):
         """Return localSymbol (or root symbol) for the given (account, conId)."""
         return self._model.get_symbol_for_position(account, con_id)
 
-    def _on_positions_context_menu(self, pos) -> None:
-        """Right-click on the flat/grouped positions table.
-
-        * Account header row → **Options income…** (single entry).
-        * STK position row → **Options income…** pre-filled with that
-          symbol.
-
-        Emits ``account_action_requested`` / ``position_action_requested``;
-        FlashTradeView routes the actions.
-        """
-        idx = self._table.indexAt(pos)
-        if not idx.isValid():
-            return
-        row_type = idx.data(RowTypeRole)
-        global_pos = self._table.viewport().mapToGlobal(pos)
-
-        if row_type == ROW_TYPE_HEADER:
-            account = idx.data(FlattenRole) or ""
-            if not account:
-                return
-            menu = QMenu(self._table)
-            options_act = menu.addAction("Options income…")
-            if menu.exec(global_pos) is options_act:
-                self.account_action_requested.emit(
-                    {"action": "options_income", "account": account})
-            return
-
-        if row_type == ROW_TYPE_POSITION:
-            key = idx.data(PositionKeyRole)
-            if not key:
-                return
-            account, con_id = key
-            row = self._model.position_data(account, con_id)
-            if row is None or (row.get("sec_type") or "") != "STK":
-                return
-            menu = QMenu(self._table)
-            act = menu.addAction("Options income…")
-            if menu.exec(global_pos) is act:
-                self.position_action_requested.emit({
-                    "action": "options_income",
-                    "account": account,
-                    "symbol": row.get("symbol", ""),
-                    "position": dict(row),
-                })
-
     def position_for_symbol(self, account: str, symbol: str) -> dict | None:
         """Full STK position dict for (account, symbol), or None."""
         return self._model.position_for_symbol(account, symbol)
 
-    def stk_positions_for_account(self, account: str) -> list[dict]:
-        """All non-flat STK positions for *account* (model delegate —
-        FlashTradeView hands this to the Options Income ticket)."""
-        return self._model.stk_positions_for_account(account)
+    def stk_positions_for_accounts(self, accounts) -> list[dict]:
+        """Non-flat STK positions across *accounts*, one entry per symbol
+        (model delegate — FlashTradeView hands this to the Options
+        Income ticket for its position chips)."""
+        return self._model.stk_positions_for_accounts(accounts)
 
     def held_shares(self, account: str, symbol: str) -> float:
         """Shares *account* currently holds in *symbol* (0.0 if none/unknown)."""

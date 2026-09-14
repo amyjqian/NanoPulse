@@ -23,6 +23,7 @@ from .offline_connections import hidden_accounts_notice
 from .trades_panel import TradesPanel
 from .trades_summary_model import portfolio_mark_keys
 from .positions_trades_tabs import PositionsTradesTabs
+from .options_income import OptionsIncomeTicket
 
 log = logging.getLogger(__name__)
 
@@ -163,9 +164,32 @@ class FlashTradeView(QWidget):
         self._trades_panel = TradesPanel(
             self, open_preferences=self._open_preferences_callback,
         )
+        # Options Income ticket — the third tab.  It carries no account
+        # of its own: ``get_accounts`` hands it the Account List's
+        # checked accounts, and a submit fans out one payload per
+        # account through ``_on_order_requested``.  Chain / quotes come
+        # from ``get_data_worker`` — the highest-priority connected
+        # connection, the same one the order panel's price feed uses —
+        # NOT from a checked account's connection: entitlements belong
+        # to a connection, and a lower-priority one may have none.
+        # ``is_margin_account`` is left None (every account runs the
+        # margin math, as the popup ticket always did) — the summary
+        # feed doesn't expose the account type.
+        self._options_ticket = OptionsIncomeTicket(
+            get_accounts=self._options_target_accounts,
+            fanout_blocked=self._options_fanout_blocked,
+            get_worker=self._find_worker_for_account,
+            get_data_worker=self._market_data_worker,
+            get_buying_power=self._account_buying_power,
+            get_position=self._account_position.position_for_symbol,
+            get_positions=self._account_position.stk_positions_for_accounts,
+            account_label=self._account_display_name,
+            parent=self,
+        )
         self._positions_trades = PositionsTradesTabs(
             positions_widget=self._account_position,
             trades_widget=self._trades_panel,
+            options_widget=self._options_ticket,
             parent=self,
         )
 
@@ -223,6 +247,18 @@ class FlashTradeView(QWidget):
         self._order_entry.hot_button_cancel.connect(
             self._on_hot_button_cancel)
 
+        # ── Wire options ticket → order placement ───────────────────────────
+        # Each payload names a single account in ``_target_accounts``
+        # (path 2 in _on_order_requested); the role gate and the "all
+        # accounts" guard were already applied by _options_fanout_blocked
+        # before the ticket emitted.
+        self._options_ticket.order_ready.connect(self._on_order_requested)
+        # A picked strike lands on the Book Trader chip bar (pin only —
+        # the ladder's active symbol stays put) so the leg can be
+        # laddered there too.
+        self._options_ticket.leg_selected.connect(
+            self._book_trading.pin_option_chip)
+
         # ── Wire book trader (mirrors order-entry signal surface) ────────────
         # BookTraderView submits through the same handlers so TP/SL/Trail
         # children, multi-account fan-out, and close-tier routing all
@@ -262,6 +298,10 @@ class FlashTradeView(QWidget):
         if isinstance(self._account_list, AccountListPanel):
             self._account_list.selection_changed.connect(
                 self._on_positions_selection_changed)
+            # The Options ticket follows the same selection; a group
+            # switch re-points its data connection and chips too.
+            self._account_list.active_group_changed.connect(
+                lambda _n: self._options_ticket.on_accounts_changed())
             # Cash-sweep right-click menu: provide the sweep-symbol quote and
             # handle the chosen action.
             self._account_list.set_sweep_quote_provider(self._sweep_quote)
@@ -276,11 +316,6 @@ class FlashTradeView(QWidget):
         # no account-level flatten here — that lives on the Account List cards.
         self._account_position.position_close_requested.connect(
             self._on_position_close_requested)
-        # Context menus: Options income (account rows + STK rows) / sweeps
-        self._account_position.account_action_requested.connect(
-            self._on_account_action_requested)
-        self._account_position.position_action_requested.connect(
-            self._on_position_action_requested)
         # Row click → jump the Book Trader ladder to that instrument
         self._account_position.position_row_clicked.connect(
             self._on_position_row_clicked)
@@ -319,6 +354,14 @@ class FlashTradeView(QWidget):
         self._pct_refresh_debounce.setInterval(500)
         self._pct_refresh_debounce.timeout.connect(
             self._refresh_percent_previews)
+        # Options ticket chips / share totals follow live positions —
+        # trailing throttle over the portfolio batches (same idiom as
+        # the percent previews above).
+        self._options_pos_debounce = QTimer(self)
+        self._options_pos_debounce.setSingleShot(True)
+        self._options_pos_debounce.setInterval(500)
+        self._options_pos_debounce.timeout.connect(
+            self._options_ticket.on_positions_changed)
         if isinstance(self._account_list, AccountListPanel):
             self._account_list.selection_changed.connect(
                 lambda _s: self._refresh_percent_previews())
@@ -381,6 +424,8 @@ class FlashTradeView(QWidget):
         # subscribe depth.
         if hasattr(self._book_trading, "refresh_subscriptions"):
             self._book_trading.refresh_subscriptions()
+        # Same for the Options ticket's chain/quote connection.
+        self._options_ticket.refresh_workers()
 
     def set_trading_allowed(self, allowed: bool) -> None:
         """Enable/disable order placement for this session (admins → False)."""
@@ -434,17 +479,7 @@ class FlashTradeView(QWidget):
                 log.warning("FlashTrade: no accounts checked – aborting order")
                 return
 
-            # User guard: refuse a fan-out that covers every visible
-            # account (Settings → Trading → Order Guards).
-            from src.core.trading_prefs import trading_prefs
-            if (not trading_prefs.allow_all_accounts_orders()
-                    and self._account_list.is_full_fanout_selection()):
-                log.warning(
-                    "FlashTrade: order blocked – orders on all %d accounts "
-                    "are disabled in preferences", len(accounts))
-                self.transient_status_message.emit(
-                    "Orders on all accounts are disabled "
-                    "(Settings → Trading).", 5000)
+            if self._all_accounts_guard_blocks(len(accounts)):
                 return
 
         # Skip offline workers up front so the UI can tell the user what
@@ -522,11 +557,16 @@ class FlashTradeView(QWidget):
         )
         from src.core.trading_prefs import trading_prefs
 
-        tick = tick_size_for_contract(
-            sec_type,
-            symbol=contract.get("symbol", ""),
-            local_symbol=contract.get("local_symbol", ""),
-        )
+        # A payload-supplied tick wins: the Options ticket knows the
+        # leg's real min_tick from contract details, while
+        # tick_size_for_contract hard-codes 0.01 for OPT (nickel-tick
+        # options exist).
+        tick = (float(payload.get("min_tick") or 0)
+                or tick_size_for_contract(
+                    sec_type,
+                    symbol=contract.get("symbol", ""),
+                    local_symbol=contract.get("local_symbol", ""),
+                ))
         prefs = trading_prefs.get(sec_type)
 
         # Helper: compute the limit-cap price (returns 0 when no base price)
@@ -545,14 +585,38 @@ class FlashTradeView(QWidget):
         peg_offset = None
 
         if order_type == "MID":
-            # Buy/Sell @Mid → IB Adaptive Algo + limit cap
-            limit_price = _cap_price()
-            adaptive_priority = prefs.get("mid_price_behavior", "Normal")
+            # Buy/Sell @Mid → IB Adaptive Algo + limit cap.  Options
+            # carry their own limit (the leg's mid) and a fixed Normal
+            # priority — trading_prefs.get("OPT") falls back to the
+            # FUTURES prefs, which must not leak into option orders.
+            if sec_type == "OPT":
+                limit_price = float(payload.get("limit_price") or 0) \
+                    or _cap_price()
+                adaptive_priority = "Normal"
+            else:
+                limit_price = _cap_price()
+                adaptive_priority = prefs.get("mid_price_behavior", "Normal")
             log.info("FlashTrade: %s @Mid %s base=%.4f tick=%.4f → "
                      "ADAPTIVE limit=%.4f priority=%s",
                      action, symbol, last_price, tick,
                      limit_price, adaptive_priority)
             order_type = "ADAPTIVE"
+
+        elif order_type in ("BID", "ASK") and sec_type == "OPT":
+            # Options ticket passive peg → Pegged to Primary (REL) at
+            # the touch (offset 0 — one-tick-inside can trip option
+            # tick-increment rules), capped/floored at the payload's
+            # limit (the leg's mid).  Checked BEFORE the prefs branch:
+            # the OPT→FUT prefs fallback would otherwise route options
+            # into the futures ADAPTIVE path.
+            peg_offset = float(payload.get("peg_offset") or 0.0)
+            limit_price = float(payload.get("limit_price") or 0) \
+                or _cap_price()
+            log.info("FlashTrade: OPT %s @%s %s tick=%.4f → "
+                     "PEG_PRIM limit=%.4f peg_offset=%.4f",
+                     action, order_type, symbol, tick,
+                     limit_price, peg_offset)
+            order_type = "PEG_PRIM"
 
         elif order_type in ("BID", "ASK"):
             if action == "BUY":
@@ -608,8 +672,11 @@ class FlashTradeView(QWidget):
             log.info("FlashTrade: %s LMT %s @ %.4f (passthrough)",
                      action, symbol, limit_price)
 
-        elif order_type == "MKT" and last_price > 0:
-            # MKT → cap with a limit if Limit Cap Offset is set
+        elif order_type == "MKT" and last_price > 0 and sec_type != "OPT":
+            # MKT → cap with a limit if Limit Cap Offset is set.  OPT is
+            # exempt: the prefs here are the futures fallback and would
+            # silently convert an options market order into a capped
+            # limit at a foreign tick.
             cap_value = float(prefs.get("limit_cap", 0))
             if cap_value != 0:
                 limit_price = _cap_price()
@@ -761,20 +828,73 @@ class FlashTradeView(QWidget):
                 f"(no Net Liq data or size resolved to 0): "
                 f"{', '.join(pct_skipped)}", 6000)
 
-    def _on_account_action_requested(self, data: dict) -> None:
-        """Positions-panel account context menu → route the action."""
-        account = str(data.get("account") or "")
-        if account and data.get("action") == "options_income":
-            self._open_options_ticket(account)
+    _ALL_ACCOUNTS_GUARD_MSG = ("Orders on all accounts are disabled "
+                               "(Settings → Trading).")
 
-    def _on_position_action_requested(self, data: dict) -> None:
-        """STK position-row context menu → Options income pre-filled."""
-        if data.get("action") != "options_income":
-            return
-        account = str(data.get("account") or "")
-        if account:
-            self._open_options_ticket(account,
-                                      symbol=data.get("symbol") or None)
+    def _full_fanout_guarded(self) -> bool:
+        """User guard: a fan-out that covers every visible account is
+        refused (Settings → Trading → Order Guards).  Pure check — one
+        copy for the order panel's Buy/Sell path and the Options ticket."""
+        from src.core.trading_prefs import trading_prefs
+        return (not trading_prefs.allow_all_accounts_orders()
+                and self._account_list.is_full_fanout_selection())
+
+    def _all_accounts_guard_blocks(self, count: int) -> bool:
+        """The Buy/Sell path's guard: check + warn + status-bar message."""
+        if self._full_fanout_guarded():
+            log.warning(
+                "FlashTrade: order blocked – orders on all %d accounts "
+                "are disabled in preferences", count)
+            self.transient_status_message.emit(
+                self._ALL_ACCOUNTS_GUARD_MSG, 5000)
+            return True
+        return False
+
+    def _options_target_accounts(self) -> list[str]:
+        """Accounts the Options ticket sizes against and fans out to —
+        the Account List's checked accounts.  Side-effect free: the
+        ticket calls this on every recompute (quote ticks included)."""
+        if not isinstance(self._account_list, AccountListPanel):
+            return []
+        return list(self._account_list.get_selected_accounts())
+
+    def _options_fanout_blocked(self) -> str:
+        """Why the Options ticket may not submit right now ("" = it
+        may): the admin role gate, or the "all accounts" guard.  Shown
+        as the Submit button's label, so no status-bar message here."""
+        if not self._trading_allowed:
+            return "Trading is disabled for admin accounts"
+        if (isinstance(self._account_list, AccountListPanel)
+                and self._account_list.get_selected_accounts()
+                and self._full_fanout_guarded()):
+            return self._ALL_ACCOUNTS_GUARD_MSG.rstrip(".")
+        return ""
+
+    def _market_data_worker(self) -> IBWorkerThread | None:
+        """The connection market data should come from: the
+        highest-priority connected worker (Settings → Connections
+        priority), the same rule the order panel's background price
+        feed and the symbol-search popup use.  None while nothing is
+        online."""
+        from src.ui.widgets.symbol_search_popup import (
+            connected_workers_by_priority,
+        )
+        workers = connected_workers_by_priority(self._active_threads)
+        return workers[0] if workers else None
+
+    def _account_buying_power(self, account: str) -> float:
+        if self._accounts_model is None:
+            return 0.0
+        return float(self._accounts_model.get_buying_power(account) or 0.0)
+
+    def _account_display_name(self, account: str) -> str:
+        """Alias when the user set one, else the account id (session
+        strip rows in the Options ticket)."""
+        if self._accounts_model is not None:
+            alias = self._accounts_model._aliases.get(account, "")
+            if alias:
+                return alias
+        return account
 
     def _on_position_row_clicked(self, pos: dict) -> None:
         """Position row click → jump Book Trader to that instrument."""
@@ -783,45 +903,6 @@ class FlashTradeView(QWidget):
     def _on_order_symbol_clicked(self, order: dict) -> None:
         """Order-blotter Symbol click → jump Book Trader to that instrument."""
         self._book_trading.focus_order(order)
-
-    def _open_options_ticket(self, account: str,
-                             symbol: str | None = None) -> None:
-        """Open the Options Income ticket pre-filled with *account* (and
-        optionally *symbol*).  Orders route back through
-        ``_on_order_requested`` so role-gating and blotter wiring apply."""
-        if not self._trading_allowed:
-            log.warning(
-                "FlashTrade: options ticket blocked — user cannot trade")
-            self.transient_status_message.emit(
-                "Trading is disabled for admin accounts.", 4000)
-            return
-        from src.ui.widgets.options_income import OptionsIncomeTicket
-
-        def _buying_power(acct: str) -> float:
-            if self._accounts_model is None:
-                return 0.0
-            return float(self._accounts_model.get_buying_power(acct) or 0.0)
-
-        worker = self._find_worker_for_account(account)
-        if worker is not None:
-            self._ensure_worker_connected(worker)
-
-        alias = ""
-        if self._accounts_model is not None:
-            alias = self._accounts_model._aliases.get(account, "")
-        ticket = OptionsIncomeTicket(
-            account=account,
-            get_worker=self._find_worker_for_account,
-            get_buying_power=_buying_power,
-            get_position=self._account_position.position_for_symbol,
-            symbol=symbol,
-            display_account=alias or account,
-            get_account_positions=lambda:
-                self._account_position.stk_positions_for_account(account),
-            parent=self,
-        )
-        ticket.order_ready.connect(self._on_order_requested)
-        ticket.exec()
 
     def _find_worker_for_account(self, account: str) -> IBWorkerThread | None:
         """Look up the correct worker thread for a given account ID."""
@@ -1028,6 +1109,8 @@ class FlashTradeView(QWidget):
         """Receive portfolio position batch from worker thread → update panel."""
         log.debug("FlashTrade: portfolio batch received (%d positions)", len(batch))
         self._account_position.update_positions(batch)
+        if not self._options_pos_debounce.isActive():
+            self._options_pos_debounce.start()
 
         # Feed each position's IB market price into the trades-summary
         # price cache.  Portfolio updates cover every HELD symbol without
@@ -1089,6 +1172,8 @@ class FlashTradeView(QWidget):
         # Trades view follows the same checked-accounts selection
         # (empty set = show all, matching the positions view).
         self._trades_panel.set_selected_accounts(accounts)
+        # Options ticket: checked accounts ARE its fan-out targets.
+        self._options_ticket.on_accounts_changed()
         for account in (accounts or []):
             self._push_account_balances(account)
 

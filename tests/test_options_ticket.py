@@ -2,8 +2,9 @@
 
 Covers: chain → expiries → strikes → quotes population, default
 selections, qty caps (CC shares / CSP buying power), the three synced
-price inputs, ineligible states, stale-token rejection and the submitted
-payload shape.
+price inputs, ineligible states, stale-token rejection, the submitted
+payload shape and the per-account fan-out (same qty to every checked
+account, MAX = the smallest capacity, one payload per account).
 """
 from __future__ import annotations
 
@@ -101,11 +102,19 @@ def _contracts(right: str) -> list[dict]:
 
 @pytest.fixture(autouse=True)
 def _isolate_chip_settings(monkeypatch):
-    """Keep the chip bar off the real QSettings and the ticket geometry
-    off the real config JSON during tests."""
+    """Keep the chip bar off the real QSettings and the ticket's splitter
+    / column layout off the real config JSON during tests."""
     monkeypatch.setattr(SymbolChipBar, "_load_chips",
                         staticmethod(lambda: list(DEFAULT_CHIPS)))
     monkeypatch.setattr(SymbolChipBar, "_save_chips",
+                        lambda self: None)
+    monkeypatch.setattr(SymbolChipBar, "_load_hidden",
+                        staticmethod(lambda: set()))
+    monkeypatch.setattr(SymbolChipBar, "_save_hidden",
+                        lambda self: None)
+    monkeypatch.setattr(SymbolChipBar, "_load_active",
+                        staticmethod(lambda: ""))
+    monkeypatch.setattr(SymbolChipBar, "_save_active",
                         lambda self: None)
     from src.core import config_manager
     monkeypatch.setattr(config_manager, "load_layout",
@@ -114,26 +123,43 @@ def _isolate_chip_settings(monkeypatch):
                         lambda layout, path=None: None)
 
 
-def _make(qtbot, *, shares=300.0, bp=2_523_356.0, symbol="NVDA",
-          is_margin=True, worker=None):
-    worker = worker if worker is not None else FakeWorker()
+ACCOUNT = "mgn-jack-02"
 
-    def get_position(_acct, sym):
-        if sym == symbol and shares:
-            return {"position": shares, "avg_cost": 164.20,
+
+def _make(qtbot, *, shares=300.0, bp=2_523_356.0, symbol="NVDA",
+          is_margin=True, worker=None, accounts=(ACCOUNT,),
+          blocked=""):
+    """Build a ticket following *accounts* (the checked accounts).
+    *shares* / *bp* are either one value for every account or a dict
+    keyed by account; *symbol* pre-selects a chip (None = none)."""
+    worker = worker if worker is not None else FakeWorker()
+    # A list is used as-is so a test can mutate the "checked" set.
+    accounts = accounts if isinstance(accounts, list) else list(accounts)
+
+    def _per(value, acct):
+        return value.get(acct, 0.0) if isinstance(value, dict) else value
+
+    def get_position(acct, sym):
+        held = _per(shares, acct)
+        if sym == symbol and held:
+            return {"position": held, "avg_cost": 164.20,
                     "con_id": UNDERLYING_CONID, "market_price": SPOT,
                     "sec_type": "STK", "symbol": sym}
         return None
 
     t = OptionsIncomeTicket(
-        account="mgn-jack-02",
+        get_accounts=lambda: list(accounts),
+        fanout_blocked=lambda: blocked,
         get_worker=lambda a: worker,
-        get_buying_power=lambda a: bp,
+        get_data_worker=lambda: worker,
+        get_buying_power=lambda a: _per(bp, a),
         get_position=get_position,
-        symbol=symbol,
-        is_margin=is_margin,
+        get_positions=lambda accts: [],
+        is_margin_account=lambda a: is_margin,
     )
     qtbot.addWidget(t)
+    if symbol:
+        t._chips.select(symbol)
     return t, worker
 
 
@@ -157,9 +183,9 @@ def _deliver_selected_quote(t, w, bid=3.04, ask=3.16):
 
 # ── Flow ─────────────────────────────────────────────────────────────────────
 
-def test_account_level_open_selects_no_chip(qtbot):
-    # Right-click at account level → no symbol → nothing pre-selected,
-    # no chain requested until the user picks a chip.
+def test_starts_with_no_chip_selected(qtbot):
+    # The tab opens with no symbol → nothing pre-selected, no chain
+    # requested until the user picks a chip.
     t, w = _make(qtbot, symbol=None)
     assert t._chips.active_symbol() == ""
     assert not w.chain_calls
@@ -271,7 +297,9 @@ def test_quote_sets_price_and_figures(qtbot):
     assert row["credit"] == 310.0
     assert row["delta"] == 0.29
     assert (row["bid"], row["ask"], row["last"]) == (3.04, 3.16, 3.08)
-    assert t._rail._order_line.text().startswith("NVDA ")
+    # The rail composes the header from its own side/qty + the pushed
+    # contract description.
+    assert t._rail._order_line.text().startswith("SELL 1 × NVDA ")
     assert t._rail._order_line.text().endswith("187.5 CALL")
     assert t._rail._sell_btn.isEnabled()
 
@@ -283,11 +311,18 @@ def test_cc_max_qty_from_shares(qtbot):
     _deliver_contracts(t, w)
     assert t._max_qty() == 3
     assert t._rail._max_btn.text() == "MAX 3"
-    # Stepper clamps at max.
+    # Stepper + typed entry clamp at max.
     t._rail._on_max()
     assert t._rail.qty() == 3
+    assert not t._rail._qty_plus.isEnabled()
     t._rail._step_qty(+1)
     assert t._rail.qty() == 3
+    t._rail._qty_edit.setText("4")
+    t._rail._on_qty_typed()
+    assert t._rail.qty() == 3
+    assert t._rail._qty_edit.text() == "3"
+    t._rail._step_qty(-1)
+    assert t._rail.qty() == 2
 
 
 def test_cc_ineligible_under_100_shares(qtbot):
@@ -315,6 +350,32 @@ def test_margin_account_can_sell_naked_calls(qtbot):
     assert t._max_qty() == 27
     _deliver_selected_quote(t, w)
     assert t._rail._sell_btn.isEnabled()
+
+
+def test_margin_cc_without_spot_says_waiting_for_price(qtbot):
+    # Margin account, no shares, and no underlying quote yet: the naked
+    # cap can't be sized, so Submit says so — not "not enough margin".
+    t, w = _make(qtbot, shares=0.0, bp=100_000.0)
+    _deliver_chain(t, w)
+    _deliver_contracts(t, w)
+    _deliver_selected_quote(t, w)
+    assert t._spot == 0.0
+    assert not t._rail._sell_btn.isEnabled()
+    assert t._rail._sell_btn.text() == "Waiting for NVDA price"
+    # The underlying quote lands → capacity from margin, Submit enabled.
+    token = w.quote_calls[-1][0]
+    w.option_quote_updated.emit(token, UNDERLYING_CONID,
+                                {"bid": 182.3, "ask": 182.5, "last": 182.40,
+                                 "close": 181.0, "delta": 0.0})
+    _deliver_selected_quote(t, w)
+    assert t._max_qty() == 27
+    assert t._rail._sell_btn.isEnabled()
+    # A cash account with no shares still reads "Not enough shares".
+    t2, w2 = _make(qtbot, shares=40.0, bp=100_000.0, is_margin=False)
+    _deliver_chain(t2, w2)
+    _deliver_contracts(t2, w2)
+    _deliver_selected_quote(t2, w2)
+    assert t2._rail._sell_btn.text() == "Not enough shares"
 
 
 def test_cash_account_cannot_sell_puts(qtbot):
@@ -369,7 +430,9 @@ def test_buy_call_flow(qtbot):
     assert len(payloads) == 1
     p = payloads[0]
     assert p["action"] == "BUY"
-    assert p["type"] == "LMT"
+    # Default mode is Mid — an adaptive midpoint order, not a static
+    # limit.
+    assert p["type"] == "MID"
     assert p["limit_price"] == 3.10
     assert p["_resolved_contract"]["right"] == "C"
 
@@ -421,18 +484,23 @@ def test_price_syncs_three_ways(qtbot):
     _deliver_contracts(t, w)
     _deliver_selected_quote(t, w)
     rail = t._rail
-    # 1. stepper: +1 tick (0.01)
+    assert rail.order_mode() == "MID"      # armed by leg selection
+    # 1. stepper: +1 tick (0.01) — manual control demotes to plain LMT
     rail._step_price(+1)
     assert rail.price() == Decimal("3.11")
+    assert rail.order_mode() == "LMT"
     # 2. typed entry, rounded on editingFinished
     rail._px_edit.setText("3.2")
     rail._on_price_typed()
     assert rail.price() == Decimal("3.20")
-    # 3. anchor chips
+    assert rail.order_mode() == "LMT"
+    # 3. anchor chips arm their tracking mode
     rail._pick_anchor("BID")
     assert rail.price() == Decimal("3.04")
+    assert rail.order_mode() == "BID"
     rail._pick_anchor("ASK")
     assert rail.price() == Decimal("3.16")
+    assert rail.order_mode() == "ASK"
 
 
 def test_delta_keeps_last_known_value(qtbot):
@@ -521,10 +589,13 @@ def test_submit_payload_shape(qtbot):
     assert len(payloads) == 1
     p = payloads[0]
     assert p["action"] == "SELL"
-    assert p["type"] == "LMT"
+    # Picking a strike arms Mid by default → adaptive midpoint order at
+    # the leg's mid, carrying the real contract tick.
+    assert p["type"] == "MID"
     assert p["sec_type"] == "OPT"
     assert p["qty"] == 2
     assert p["limit_price"] == 3.10
+    assert p["min_tick"] == 0.01
     assert p["_target_accounts"] == ["mgn-jack-02"]
     assert p["_what_if_check"] is True
     rc = p["_resolved_contract"]
@@ -554,22 +625,114 @@ def test_market_order_submit(qtbot):
     assert p["type"] == "MKT"
     assert p["limit_price"] == 0.0
     assert p["last_price"] == 3.10          # mid rides along as estimate
-    # Picking a price anchor drops back to a limit order.
+    # Picking a price anchor leaves market mode and arms that anchor's
+    # tracking mode.
     rail._pick_anchor("BID")
     assert not rail.is_market()
+    assert rail.order_mode() == "BID"
     assert rail._px_edit.isEnabled()
 
 
-def _status_event(ref, status, *, account="mgn-jack-02", fill="–", err=""):
-    return {"order_id": f"{account}_{ref}", "order_ref": ref,
-            "symbol": "NVDA 187.5C", "account": account, "action": "SELL",
-            "order_type": "LMT", "quantity": "2", "limit_price": "3.10",
-            "stop_price": "–", "tif": "DAY", "fill_price": fill,
-            "status": status, "time": "10:30:45",
-            "time_sort": "2026-01-01T10:30:45", "error_message": err}
+def test_pegged_and_crossing_submit_payloads(qtbot):
+    # Quote: bid 3.04 / mid 3.10 / ask 3.16.
+    t, w = _make(qtbot)                    # SELL (covered call)
+    _deliver_chain(t, w)
+    _deliver_contracts(t, w)
+    _deliver_selected_quote(t, w)
+    rail = t._rail
+    payloads = []
+    t.order_ready.connect(payloads.append)
+
+    # SELL + Ask = passive → pegged-to-primary, floor = the mid.
+    rail._pick_anchor("ASK")
+    rail._sell_btn.click()
+    p = payloads[-1]
+    assert p["type"] == "ASK"
+    assert p["limit_price"] == 3.10
+    assert p["peg_offset"] == 0.0
+    assert p["min_tick"] == 0.01
+
+    # SELL + Bid = crossing → marketable limit at the live bid.
+    t._submit_relock.stop()
+    t._recompute()
+    rail._pick_anchor("BID")
+    rail._sell_btn.click()
+    p = payloads[-1]
+    assert p["type"] == "LMT"
+    assert p["limit_price"] == 3.04
+    assert "peg_offset" not in p
+
+    # BUY + Bid = passive peg (cap = mid); BUY + Ask = crossing limit.
+    t._submit_relock.stop()
+    t._recompute()
+    rail._pick_side("BUY")
+    rail._sell_btn.click()
+    p = payloads[-1]
+    assert p["action"] == "BUY" and p["type"] == "BID"
+    assert p["limit_price"] == 3.10
+    t._submit_relock.stop()
+    t._recompute()
+    rail._pick_anchor("ASK")
+    rail._sell_btn.click()
+    p = payloads[-1]
+    assert p["type"] == "LMT" and p["limit_price"] == 3.16
 
 
-def test_submit_keeps_ticket_open_and_tracks_session(qtbot):
+def test_strike_selection_emits_leg_for_book_trader_chip(qtbot):
+    # Picking a strike hands the leg's qualified contract to the host,
+    # which pins it as a Book Trader chip (skipped without a conid —
+    # such a chip could never stream).
+    t, w = _make(qtbot)
+    _deliver_chain(t, w)
+    _deliver_contracts(t, w)
+    legs = []
+    t.leg_selected.connect(legs.append)
+    model = t._chain_view.chain_model
+    row = model.row_for_conid(9008)        # 190 call
+    t._on_row_selected(row)
+    assert legs and legs[-1]["conid"] == 9008
+    assert legs[-1]["local_symbol"] == "NVDA 190C"
+    # A row whose contract lost its conid emits nothing.
+    rd = model.row_data(row)
+    rd["contract"] = dict(rd["contract"], conid=None)
+    model.update_row(row, {"contract": rd["contract"]})
+    t._on_row_selected(row)
+    assert legs[-1]["conid"] == 9008       # unchanged — no new emit
+
+
+def test_tracking_mode_follows_quote_until_demoted(qtbot):
+    t, w = _make(qtbot)
+    _deliver_chain(t, w)
+    _deliver_contracts(t, w)
+    _deliver_selected_quote(t, w)
+    rail = t._rail
+    rail._pick_anchor("BID")
+    assert rail.price() == Decimal("3.04")
+    token = w.quote_calls[-1][0]
+    conid = t._selected_leg["conid"]
+    w.option_quote_updated.emit(token, conid,
+                                {"bid": 3.06, "ask": 3.14, "last": 3.10,
+                                 "close": 0.0, "delta": 0.29})
+    # Armed BID mode follows the fresh bid; the segment stays lit.
+    assert rail.order_mode() == "BID"
+    assert rail.price() == Decimal("3.06")
+    # Typing takes manual control — a static limit that no longer moves.
+    rail._px_edit.setText("3.00")
+    rail._on_price_typed()
+    assert rail.order_mode() == "LMT"
+    w.option_quote_updated.emit(token, conid,
+                                {"bid": 3.08, "ask": 3.12, "last": 3.10,
+                                 "close": 0.0, "delta": 0.29})
+    assert rail.price() == Decimal("3.00")
+    # Submit now goes out as the typed limit.
+    payloads = []
+    t.order_ready.connect(payloads.append)
+    rail._sell_btn.click()
+    assert payloads[-1]["type"] == "LMT"
+    assert payloads[-1]["limit_price"] == 3.00
+
+
+def test_submit_keeps_ticket_open_and_relocks(qtbot):
     t, w = _make(qtbot)
     _deliver_chain(t, w)
     _deliver_contracts(t, w)
@@ -579,125 +742,21 @@ def test_submit_keeps_ticket_open_and_tracks_session(qtbot):
     payloads = []
     t.order_ready.connect(payloads.append)
     t._rail._sell_btn.click()
-
-    p = payloads[0]
-    # The ticket pre-generates a worker-format orderRef for tracking.
-    assert p["order_ref"].startswith("nano_")
-    # Dialog is still up (not accepted) and ready for the next order.
-    assert t.result() == 0
-    assert not t._session.isHidden()
-    assert p["order_ref"] in t._session._rows
-    # Qty snaps back to 1; submit is locked out briefly; Cancel → Close.
+    assert len(payloads) == 1 and payloads[0]["qty"] == 2
+    # No ticket-side order tracking: the worker generates the ref and
+    # the Orders panel shows the status.
+    assert "order_ref" not in payloads[0]
+    # The ticket stays put: qty snaps back to 1; submit locked briefly.
     assert t._rail.qty() == 1
     assert not t._rail._sell_btn.isEnabled()
     assert t._rail._sell_btn.text() == "Order submitted ✓"
-    assert t._rail._cancel_btn.text() == "Close"
-    # The relock timer re-enables through the normal recompute path.
+    # The relock timer re-enables through the normal recompute path,
+    # and a second order goes out on its own.
     t._submit_relock.stop()
     t._recompute()
     assert t._rail._sell_btn.isEnabled()
-
-
-def test_session_strip_status_flow_and_cancel(qtbot):
-    t, w = _make(qtbot)
-    _deliver_chain(t, w)
-    _deliver_contracts(t, w)
-    _deliver_selected_quote(t, w)
-
-    payloads = []
-    t.order_ready.connect(payloads.append)
     t._rail._sell_btn.click()
-    ref = payloads[0]["order_ref"]
-    assert ref in t._session._rows
-
-    # Pre-check → open: Cancel appears only once the order is at TWS.
-    w.order_status_updated.emit(_status_event(ref, "Margin check"))
-    assert not t._session.can_cancel(ref)
-    w.order_status_updated.emit(_status_event(ref, "Submitted"))
-    assert t._session.can_cancel(ref)
-    assert t._session.status_text(ref) == "Submitted"
-
-    # Cancel click → worker.cancel_order with the blotter key.
-    t._session.request_cancel(ref)
-    assert w.cancel_order_calls == [f"mgn-jack-02_{ref}"]
-    assert not t._session.can_cancel(ref)       # double-click guard
-    t._session.request_cancel(ref)              # no second worker call
-    assert len(w.cancel_order_calls) == 1
-    w.order_status_updated.emit(_status_event(ref, "Cancelled"))
-    assert not t._session.can_cancel(ref)
-    assert t._session.status_text(ref) == "Cancelled"
-
-    # Statuses for other windows' orders are ignored.
-    w.order_status_updated.emit(_status_event("nano_0731_093000_zzzz",
-                                              "Submitted"))
-    assert "nano_0731_093000_zzzz" not in t._session._rows
-
-
-def test_cancel_requires_confirm_click(qtbot):
-    from src.ui.widgets.options_income.session_strip import COL_CANCEL
-    t, w = _make(qtbot)
-    _deliver_chain(t, w)
-    _deliver_contracts(t, w)
-    _deliver_selected_quote(t, w)
-    payloads = []
-    t.order_ready.connect(payloads.append)
-    t._rail._sell_btn.click()
-    ref = payloads[0]["order_ref"]
-    w.order_status_updated.emit(_status_event(ref, "Submitted"))
-
-    strip = t._session
-    idx = strip._model.index(0, COL_CANCEL)
-    # First click only ARMS — nothing sent to the worker.
-    strip._on_clicked(idx)
-    assert w.cancel_order_calls == []
-    assert strip._rows[ref]["confirm"] is True
-    assert strip._confirm_timer.isActive()
-    # Second click confirms → cancel goes out.
-    strip._on_clicked(idx)
-    assert w.cancel_order_calls == [f"mgn-jack-02_{ref}"]
-    assert strip._rows[ref]["confirm"] is False
-
-    # Re-arm after the order re-opens, then let the window lapse.
-    w.order_status_updated.emit(_status_event(ref, "Submitted"))
-    strip._on_clicked(idx)
-    assert strip._rows[ref]["confirm"] is True
-    strip._disarm_confirm()                    # timer timeout path
-    assert strip._rows[ref]["confirm"] is False
-    assert len(w.cancel_order_calls) == 1      # nothing extra sent
-    # A status event under an armed confirm also disarms.
-    strip._on_clicked(idx)
-    w.order_status_updated.emit(_status_event(ref, "Submitted"))
-    assert strip._rows[ref]["confirm"] is False
-
-
-def test_session_strip_fill_and_reject(qtbot):
-    t, w = _make(qtbot)
-    _deliver_chain(t, w)
-    _deliver_contracts(t, w)
-    _deliver_selected_quote(t, w)
-
-    payloads = []
-    t.order_ready.connect(payloads.append)
-    t._rail._sell_btn.click()
-    ref = payloads[0]["order_ref"]
-
-    w.order_status_updated.emit(_status_event(ref, "Filled", fill="3.12"))
-    assert t._session.status_text(ref) == "Filled @ 3.12"
-    assert not t._session.can_cancel(ref)
-
-    # Second order from the same window gets its own row (newest on
-    # top); a whatIf rejection surfaces with the reason as tooltip.
-    t._submit_relock.stop()
-    t._recompute()
-    t._rail._sell_btn.click()
-    ref2 = payloads[1]["order_ref"]
-    assert ref2 != ref and len(t._session._rows) == 2
-    assert t._session._model.row_data(0)["ref"] == ref2
-    w.order_status_updated.emit(
-        _status_event(ref2, "Rejected", err="Insufficient margin"))
-    assert t._session.status_text(ref2) == "Rejected"
-    assert t._session._rows[ref2]["error"] == "Insufficient margin"
-    assert not t._session.can_cancel(ref2)
+    assert len(payloads) == 2
 
 
 def test_chain_column_widths_persist_across_opens(qtbot, monkeypatch):
@@ -753,34 +812,178 @@ def test_body_splitter_sizes_persist(qtbot, monkeypatch):
     assert t2._body_split.sizes() == saved
 
 
-def test_window_size_persisted_across_opens(qtbot, monkeypatch):
-    from src.core import config_manager
-    store = {}
-    monkeypatch.setattr(config_manager, "load_layout",
-                        lambda path=None: dict(store))
-    monkeypatch.setattr(config_manager, "save_layout",
-                        lambda layout, path=None: store.update(layout))
-    t, w = _make(qtbot)
-    t.resize(1200, 800)
-    t.reject()
-    assert store["options_ticket"] == {"w": 1200, "h": 800}
-    # A new ticket restores the remembered size.
-    t2, _ = _make(qtbot)
-    assert (t2.width(), t2.height()) == (1200, 800)
-
-
 def test_close_cancels_quotes(qtbot):
     t, w = _make(qtbot)
     _deliver_chain(t, w)
     _deliver_contracts(t, w)
     before = w.quote_cancels
-    t.reject()
+    t.close()
     assert w.quote_cancels > before
+
+
+def test_hide_drops_quotes_and_show_resumes(qtbot):
+    # Option quote lines are a capped IB resource — stream only while
+    # the Options tab is the visible one.
+    t, w = _make(qtbot)
+    t.show()
+    qtbot.waitExposed(t)
+    _deliver_chain(t, w)
+    _deliver_contracts(t, w)
+    cancels, subs = w.quote_cancels, len(w.quote_calls)
+    t.hide()
+    assert w.quote_cancels == cancels + 1
+    t.show()
+    assert len(w.quote_calls) == subs + 1
+    assert UNDERLYING_CONID in [c["conid"] for c in w.quote_calls[-1][1]]
+
+
+# ── Accounts: follow the Account List selection, fan out per account ────────
+
+def test_no_accounts_selected_blocks_submit(qtbot):
+    t, w = _make(qtbot, accounts=())
+    # The chain still streams (data connection ≠ account selection);
+    # only the submit is gated.
+    assert t._worker is w and w.chain_calls
+    _deliver_chain(t, w)
+    _deliver_contracts(t, w)
+    _deliver_selected_quote(t, w)
+    assert t._max_qty() == 0
+    assert not t._rail._sell_btn.isEnabled()
+    assert t._rail._sell_btn.text() == "No accounts selected"
+
+
+def test_selection_change_keeps_data_worker(qtbot):
+    # Checking / unchecking accounts re-gates the rail but never
+    # re-points the chain connection (a checked account's own
+    # connection may have no market-data entitlement).
+    selected: list[str] = []
+    w = FakeWorker()
+    t, _ = _make(qtbot, worker=w, accounts=selected)
+    assert t._worker is w
+    _deliver_chain(t, w)
+    _deliver_contracts(t, w)
+    _deliver_selected_quote(t, w)
+    assert t._rail._sell_btn.text() == "No accounts selected"
+    n_chain, cancels = len(w.chain_calls), w.quote_cancels
+    selected.append(ACCOUNT)
+    t.on_accounts_changed()
+    assert t._rail._sell_btn.isEnabled()
+    selected.clear()
+    t.on_accounts_changed()
+    assert t._rail._sell_btn.text() == "No accounts selected"
+    assert len(w.chain_calls) == n_chain and w.quote_cancels == cancels
+
+
+def test_data_worker_swap_rebinds_and_reloads(qtbot):
+    # A higher-priority connection coming online (or a reconnect that
+    # replaced the thread) swaps the data worker and re-fetches the
+    # loaded chain; nothing online → status says so, Submit gated.
+    w1, w2 = FakeWorker(), FakeWorker()
+    current = [w1]
+    t = OptionsIncomeTicket(
+        get_accounts=lambda: [ACCOUNT],
+        get_worker=lambda a: current[0],
+        get_data_worker=lambda: current[0],
+        get_buying_power=lambda a: 100_000.0,
+        get_position=lambda a, s: None,
+        get_positions=lambda accts: [],
+    )
+    qtbot.addWidget(t)
+    t._chips.select("NVDA")
+    assert w1.chain_calls and t._worker is w1
+    cancels = w1.quote_cancels
+    current[0] = w2
+    t.refresh_workers()
+    assert t._worker is w2 and w2.chain_calls
+    assert w1.quote_cancels == cancels + 1   # old connection released
+    current[0] = None
+    t.refresh_workers()
+    assert t._worker is None
+    assert "No TWS connection" in t._status.text()
+    t.refresh_workers()                      # idempotent while offline
+    assert t._worker is None
+
+
+def test_fanout_blocked_reason_wins(qtbot):
+    # Host-side gates (admin role / "orders on all accounts" guard)
+    # surface as the Submit label and stop the submit itself.
+    t, w = _make(qtbot, blocked="Orders on all accounts are disabled")
+    _deliver_chain(t, w)
+    _deliver_contracts(t, w)
+    _deliver_selected_quote(t, w)
+    assert not t._rail._sell_btn.isEnabled()
+    assert t._rail._sell_btn.text() == "Orders on all accounts are disabled"
+    payloads = []
+    t.order_ready.connect(payloads.append)
+    t._on_submit()
+    assert payloads == []
+
+
+def test_two_accounts_same_qty_each_min_capacity(qtbot):
+    # Cash accounts: A holds 300 sh (3 contracts), B holds 100 (1).
+    # MAX is the smallest so the same qty fits every account.
+    t, w = _make(qtbot, accounts=("acct-A", "acct-B"),
+                 shares={"acct-A": 300.0, "acct-B": 100.0},
+                 is_margin=False)
+    assert t._ticker.symbol == "NVDA"
+    _deliver_chain(t, w)
+    _deliver_contracts(t, w)
+    _deliver_selected_quote(t, w)
+    assert t._max_qty() == 1
+    assert t._rail._max_btn.text() == "MAX 1"
+
+    payloads = []
+    t.order_ready.connect(payloads.append)
+    t._rail._sell_btn.click()
+    assert [p["_target_accounts"] for p in payloads] == [["acct-A"],
+                                                          ["acct-B"]]
+    assert all(p["qty"] == 1 and p["_what_if_check"] for p in payloads)
+    assert payloads[0]["_resolved_contract"] == payloads[1]["_resolved_contract"]
+
+
+def test_ineligible_account_blocks_group(qtbot):
+    # Same qty goes to every account — a cash account under 100 shares
+    # can't take a covered call, so the whole fan-out is blocked and
+    # the reason names the account.
+    t, w = _make(qtbot, accounts=("acct-A", "acct-B"),
+                 shares={"acct-A": 300.0, "acct-B": 40.0},
+                 is_margin=False)
+    _deliver_chain(t, w)
+    _deliver_contracts(t, w)
+    _deliver_selected_quote(t, w)
+    assert not t._rail._sell_btn.isEnabled()
+    assert t._rail._sell_btn.text() == "acct-B – Not enough shares"
+
+
+def test_chips_show_bare_ticker(qtbot):
+    t, w = _make(qtbot, shares=300.0)
+    assert t._chips._buttons["NVDA"].text() == "NVDA"
+
+
+def test_ticker_strip_follows_underlying_quote(qtbot):
+    # The Options ticker strip renders symbol · last · change · change%
+    # from the underlying's quote stream — bid/ask are hidden here.
+    t, w = _make(qtbot)
+    _deliver_chain(t, w)
+    _deliver_contracts(t, w)
+    assert t._ticker.symbol == "NVDA"
+    assert t._ticker._lbl_price.text() == "182.40"     # position mark
+    token = w.quote_calls[-1][0]
+    w.option_quote_updated.emit(token, UNDERLYING_CONID,
+                                {"bid": 183.0, "ask": 183.2, "last": 183.1,
+                                 "close": 181.0, "delta": 0.0})
+    assert t._ticker._lbl_price.text() == "183.10"
+    assert t._ticker._lbl_bid.isHidden()
+    assert t._ticker._lbl_ask.isHidden()
+    assert t._ticker._lbl_change.text() == "+2.10"
+    assert t._ticker._lbl_change_pct.text() == "+1.16%"
 
 
 # ── Symbol chips: position group + searched group ────────────────────────────
 
 def test_position_chips_top5_over_100_shares(qtbot, monkeypatch):
+    # Positions arrive pre-aggregated per symbol across the checked
+    # accounts (AccountPositionModel.stk_positions_for_accounts).
     monkeypatch.setattr(SymbolChipBar, "_load_chips",
                         staticmethod(lambda: []))
     positions = [
@@ -792,7 +995,7 @@ def test_position_chips_top5_over_100_shares(qtbot, monkeypatch):
         {"symbol": "BIL", "position": 100.0, "market_value": 9_000.0},
         {"symbol": "GOOG", "position": 150.0, "market_value": 25_000.0},
     ]
-    bar = SymbolChipBar(lambda s: 0.0, get_positions=lambda: positions)
+    bar = SymbolChipBar(get_positions=lambda: positions)
     qtbot.addWidget(bar)
     # Top-5 by market value among holdings ≥100 shares; MSFT (55 sh)
     # excluded even though its market value ranks high.
@@ -811,7 +1014,7 @@ def test_searched_chips_append_right_persist_and_reorder(qtbot, monkeypatch):
         {"symbol": "MU", "position": 300.0, "market_value": 100.0},
         {"symbol": "TSLA", "position": 200.0, "market_value": 50.0},
     ]
-    bar = SymbolChipBar(lambda s: 0.0, get_positions=lambda: positions)
+    bar = SymbolChipBar(get_positions=lambda: positions)
     qtbot.addWidget(bar)
     assert bar._order == ["MU", "TSLA"]
     # A searched symbol lands to the right of the position chips and
@@ -826,15 +1029,124 @@ def test_searched_chips_append_right_persist_and_reorder(qtbot, monkeypatch):
     # Ladder-style drag reorder: drop QQQ onto MU → takes MU's slot.
     bar._on_chip_drop("QQQ", "MU")
     assert bar._order == ["QQQ", "MU", "TSLA"]
-    # Right-click removes a searched chip outright; position chips stay.
+    # Right-click removes ANY chip, active or not: a searched chip is
+    # dropped outright, a position chip goes into the persisted hidden
+    # set so re-derivation doesn't resurrect it.
     bar._remove_chip("MU")
-    assert bar._order == ["QQQ", "MU", "TSLA"]
+    assert bar._order == ["QQQ", "TSLA"]
+    assert "MU" in bar._hidden_pos
     bar._remove_chip("QQQ")
-    assert bar._order == ["MU", "TSLA"]
+    assert bar._order == ["TSLA"]
     assert saved[-1] == []
+    # Even the last remaining chip can be removed — the grid goes empty.
+    bar._remove_chip("TSLA")
+    assert bar._order == []
+    assert bar.active_symbol() == ""
+    # Searching a hidden symbol un-hides its position chip.
+    bar.select("MU")
+    assert "MU" not in bar._hidden_pos
+    assert bar._order == ["MU"]
+    assert bar._custom == []
 
 
-# ── Model accessor ───────────────────────────────────────────────────────────
+def test_chip_grid_is_3_by_4_and_full_grid_replaces_last_searched(
+        qtbot, monkeypatch):
+    saved = ["A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A9", "A10"]
+    monkeypatch.setattr(SymbolChipBar, "_load_chips",
+                        staticmethod(lambda: list(saved)))
+    monkeypatch.setattr(SymbolChipBar, "_save_chips", lambda self: None)
+    positions = [
+        {"symbol": "MU", "position": 300.0, "market_value": 100.0},
+        {"symbol": "TSLA", "position": 200.0, "market_value": 50.0},
+    ]
+    bar = SymbolChipBar(get_positions=lambda: positions)
+    qtbot.addWidget(bar)
+    # 2 position chips + 10 searched = 12 = the 3 × 4 grid, every one
+    # rendered, laid out three per row.
+    assert len(bar._order) == 12 and len(bar._buttons) == 12
+    grid = bar._grid._grid
+    rows = {grid.getItemPosition(i)[0] for i in range(grid.count())}
+    cols = {grid.getItemPosition(i)[1] for i in range(grid.count())}
+    assert rows == {0, 1, 2, 3} and cols == {0, 1, 2}
+    # A new symbol on the full grid replaces the LAST searched chip
+    # (position chips stay) — never a hidden 13th entry.
+    bar.select("NEW")
+    assert len(bar._order) == 12 and "A10" not in bar._order
+    assert bar._order[-1] == "NEW" and bar._order[:2] == ["MU", "TSLA"]
+    assert len(bar._buttons) == 12
+    # A persisted list that already overflows the grid is pruned to it.
+    monkeypatch.setattr(SymbolChipBar, "_load_chips",
+                        staticmethod(lambda: saved + ["A11", "A12"]))
+    bar2 = SymbolChipBar(get_positions=lambda: positions)
+    qtbot.addWidget(bar2)
+    assert len(bar2._order) == 12 and len(bar2._buttons) == 12
+    assert bar2._custom == saved
+
+
+def test_last_selected_symbol_restored_on_worker_bind(qtbot, monkeypatch):
+    # The chip bar reopens with the last session's selection and the
+    # ticket loads its chain as soon as a data worker binds.
+    monkeypatch.setattr(SymbolChipBar, "_load_active",
+                        staticmethod(lambda: "TSLA"))
+    t, w = _make(qtbot, symbol=None)
+    assert t._chips.active_symbol() == "TSLA"
+    assert t._symbol == "TSLA"
+    assert w.chain_calls and w.chain_calls[-1][1]["symbol"] == "TSLA"
+
+
+def test_selecting_a_chip_persists_the_selection(qtbot, monkeypatch):
+    persisted = []
+    monkeypatch.setattr(SymbolChipBar, "_save_active",
+                        lambda self: persisted.append(self._active))
+    t, _w = _make(qtbot)                     # selects NVDA
+    assert persisted[-1] == "NVDA"
+    t._chips.select("QQQ")
+    assert persisted[-1] == "QQQ"
+
+
+# ── Model accessors ──────────────────────────────────────────────────────────
+
+def test_stk_positions_for_accounts_aggregates_per_symbol(qtbot):
+    from src.ui.widgets.account_position_model import AccountPositionModel
+    m = AccountPositionModel()
+
+    def _pos(acct, con_id, sym, qty, mv, sec_type="STK"):
+        return {"label": "conn1", "account": acct, "con_id": con_id,
+                "symbol": sym, "local_symbol": sym, "sec_type": sec_type,
+                "exchange": "NASDAQ", "currency": "USD", "multiplier": "",
+                "position": qty, "avg_cost": 100.0, "market_price": 10.0,
+                "market_value": mv, "unrealized_pnl": 0.0,
+                "realized_pnl": 0.0}
+    m.update_positions([
+        _pos("A", 1, "NVDA", 300.0, 54_720.0),
+        _pos("B", 1, "NVDA", 100.0, 18_240.0),
+        _pos("B", 2, "TSLA", 200.0, 60_000.0),
+        _pos("C", 2, "TSLA", 500.0, 150_000.0),      # not selected
+        _pos("A", 3, "NQU6", 2.0, 40_000.0, "FUT"),  # not STK
+    ])
+    got = {p["symbol"]: p for p in m.stk_positions_for_accounts(["A", "B"])}
+    assert set(got) == {"NVDA", "TSLA"}
+    assert got["NVDA"]["position"] == 400.0
+    assert got["NVDA"]["market_value"] == 72_960.0
+    assert got["TSLA"]["position"] == 200.0
+    assert m.stk_positions_for_accounts([]) == []
+
+
+def test_positions_trades_tabs_has_options_tab(qtbot):
+    from PySide6.QtWidgets import QWidget
+    from src.ui.widgets.positions_trades_tabs import PositionsTradesTabs
+    tabs = PositionsTradesTabs(positions_widget=QWidget(),
+                               trades_widget=QWidget(),
+                               options_widget=QWidget())
+    qtbot.addWidget(tabs)
+    assert [tabs.tabText(i) for i in range(tabs.count())] == [
+        "Positions", "Trades", "Options"]
+    # The corner stack mirrors the tab index, including the third tab.
+    tabs.setCurrentIndex(2)
+    assert tabs._corner_stack.currentIndex() == 2
+    tabs.setCurrentIndex(1)
+    assert tabs._corner_stack.currentIndex() == 1
+
 
 def test_position_for_symbol_roundtrip(qtbot):
     from src.ui.widgets.account_position_model import AccountPositionModel

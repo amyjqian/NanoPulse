@@ -145,3 +145,27 @@ class TestChipDragReorder:
         bar._on_drop("NOPE", "S01")
         bar._on_drop("S01", "NOPE")
         assert orders == []
+
+
+def test_set_symbols_frozen_during_chip_drag(qtbot):
+    # A rebuild landing while a chip drag is in flight must NOT destroy
+    # the chips (the native drag loop would deliver dragging updates to
+    # freed widgets — segfault); the newest deferred list applies when
+    # the drag ends.
+    from src.ui.widgets.order_panel_parts import SymbolChipBar
+    bar = SymbolChipBar(columns=5)
+    qtbot.addWidget(bar)
+    bar.set_symbols([("A", "STK"), ("B", "STK")])
+    buttons_before = dict(bar._buttons)
+    bar._begin_chip_drag()
+    bar.set_symbols([("C", "STK")])
+    assert bar._buttons == buttons_before      # untouched mid-drag
+    bar.set_symbols([("D", "STK"), ("E", "STK")])
+    bar.remove("A")                            # host removal also defers
+    assert bar._buttons == buttons_before
+    bar._end_chip_drag()
+    assert set(bar._buttons) == {"D", "E"}     # newest deferred wins
+    # Balanced begin/end with nothing pending changes nothing.
+    bar._begin_chip_drag()
+    bar._end_chip_drag()
+    assert set(bar._buttons) == {"D", "E"}

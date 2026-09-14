@@ -258,7 +258,7 @@ class _SweepMenu(QMenu):
 
 
 class _AccountRow(QFrame):
-    """A single account card: checkbox | name | balance | × button."""
+    """A single account card: checkbox | name / USD cash | total / BP | ×."""
 
     toggled = Signal(str, bool)
     removed = Signal(str)
@@ -279,6 +279,8 @@ class _AccountRow(QFrame):
         self._base_name: str = alias if alias else account
         # USD cash balance (shown under the name) + base-currency total sign.
         self._usd: float | None = None
+        # Buying power (shown under the total, compact "219k" form).
+        self._bp: float | None = None
         self._balance_neg: bool = self._parse_neg(balance)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -291,7 +293,8 @@ class _AccountRow(QFrame):
 
         # Faithful 2-row grid (ACCOUNT_CARD_SPEC.md):
         #   col0 checkbox (spans both rows) | col1 left column (name / USD bal,
-        #   1fr) | col2 total (top-right) | col3 close (spans both rows).
+        #   1fr) | col2 right column (total / BP) | col3 close (spans both
+        #   rows).
         grid = QGridLayout(self)
         grid.setContentsMargins(10, 5, 10, 5)
         grid.setHorizontalSpacing(12)
@@ -341,6 +344,24 @@ class _AccountRow(QFrame):
         grid.addWidget(
             total, 0, 2,
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom)
+
+        # Buying power sub-line — row 1, top-right, mirroring the USD
+        # cash sub-line on the left: "BP" code + compact mono value.
+        self._bp_container = QWidget()
+        self._bp_container.setStyleSheet("background: transparent;")
+        bp_row = QHBoxLayout(self._bp_container)
+        bp_row.setContentsMargins(0, 0, 0, 0)
+        bp_row.setSpacing(5)
+        self._bp_code = QLabel("BP")
+        self._bp_code.setFont(self._ui_font(10))
+        bp_row.addWidget(self._bp_code, 0, Qt.AlignmentFlag.AlignBottom)
+        self._bp_val = QLabel("")
+        self._bp_val.setFont(self._mono_font(10, demibold=True))
+        bp_row.addWidget(self._bp_val, 0, Qt.AlignmentFlag.AlignBottom)
+        self._bp_container.hide()
+        grid.addWidget(
+            self._bp_container, 1, 2,
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
 
         # Close button — col 3, spanning both rows, vertically centered.
         self._x_btn = QPushButton("×", self)
@@ -393,6 +414,16 @@ class _AccountRow(QFrame):
             return
         self._usd = new
         self._refresh_usd()
+
+    def set_buying_power(self, bp: float | None) -> None:
+        """Render the buying-power sub-line under the total.  ``None``
+        (unknown / offline) hides it.  No-op when unchanged — the value
+        rides in every summary batch."""
+        new = float(bp) if bp is not None else None
+        if new == self._bp:
+            return
+        self._bp = new
+        self._refresh_bp()
 
     def set_name(self, alias: str) -> bool:
         """Set the display name; returns True when it actually changed
@@ -494,6 +525,22 @@ class _AccountRow(QFrame):
             f"color: {self._big_color()}; background: transparent;")
         self._cb.set_enabled_look(online)
         self._refresh_usd()
+        self._refresh_bp()
+
+    def _refresh_bp(self) -> None:
+        """Render (or hide) the buying-power sub-line under the total."""
+        if self._bp is None:
+            self._bp_container.hide()
+            return
+        online = self._connected
+        code_c = _CARD_TEXT3 if online else _CARD_OFF_SECOND
+        val_c = _CARD_TEXT2 if online else _CARD_OFF_SECOND
+        self._bp_code.setStyleSheet(
+            f"color: {code_c}; background: transparent;")
+        self._bp_val.setText(self._format_balance(f"{self._bp}"))
+        self._bp_val.setStyleSheet(
+            f"color: {val_c}; background: transparent;")
+        self._bp_container.show()
 
     def _refresh_usd(self) -> None:
         """Render (or hide) the USD balance sub-line under the name."""
@@ -1166,6 +1213,13 @@ class AccountListPanel(QWidget):
 
     # ── Model synchronisation ─────────────────────────────────────────────────
 
+    def _bp_or_none(self, account: str) -> float | None:
+        """Buying power for the card, or None while the tag hasn't
+        arrived (``get_buying_power`` returns 0.0 for unknown, and a
+        real 0 BP is worth showing — so probe the cache directly)."""
+        bp = self._model._buying_power.get(account)   # noqa: SLF001
+        return float(bp) if bp is not None else None
+
     def _sync_rows(self) -> None:
         """Rebuild / update account rows from the model.
 
@@ -1230,6 +1284,7 @@ class AccountListPanel(QWidget):
             r.set_name(info["alias"] if info["alias"] else acct)
             r.set_balance(info["balance"])
             r.set_cash(self._model.get_cash_by_currency(acct))
+            r.set_buying_power(self._bp_or_none(acct))
             r.set_connected(self._is_account_connected(acct))
 
         for acct in offline_members:
@@ -1244,6 +1299,7 @@ class AccountListPanel(QWidget):
             # been traded elsewhere since the connection dropped.
             r.set_balance("–")
             r.set_cash({})
+            r.set_buying_power(None)
             r.set_connected(False)
 
         # Remove rows whose account should no longer be visible (either
@@ -1369,6 +1425,7 @@ class AccountListPanel(QWidget):
             if c0 <= COL_NET_LIQ <= c1 or c0 <= COL_TOTAL_CASH <= c1:
                 r.set_balance(rd[COL_NET_LIQ])
                 r.set_cash(self._model.get_cash_by_currency(rd[COL_ACCOUNT]))
+                r.set_buying_power(self._bp_or_none(rd[COL_ACCOUNT]))
             if c0 <= COL_ALIAS <= c1:
                 if r.set_name(rd[COL_ALIAS] if rd[COL_ALIAS]
                               else rd[COL_ACCOUNT]):

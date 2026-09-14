@@ -56,6 +56,33 @@ def snap_to_tick(price, tick) -> Decimal:
     return (steps * t).quantize(t.normalize(), rounding=ROUND_HALF_UP)
 
 
+def submit_order_type(mode: str, action: str) -> str:
+    """Payload order type for the rail's order *mode* × *action*.
+
+    ``MID`` works the midpoint (Adaptive) for either side.  ``BID`` /
+    ``ASK`` are pegged-to-primary (REL) only on the PASSIVE side of the
+    book — REL pegs a BUY to the bid and a SELL to the ask, nothing
+    else — so the crossing combinations (BUY at ask, SELL at bid)
+    collapse to a marketable limit at the live touch instead:
+
+        mode →   BUY      SELL
+        MKT      MKT      MKT
+        LMT      LMT      LMT
+        MID      MID      MID
+        BID      BID      LMT   (crossing)
+        ASK      LMT      ASK   (crossing)
+    """
+    mode = (mode or "LMT").upper()
+    action = "BUY" if action == "BUY" else "SELL"
+    if mode in ("MKT", "MID", "LMT"):
+        return mode
+    if mode == "BID":
+        return "BID" if action == "BUY" else "LMT"
+    if mode == "ASK":
+        return "ASK" if action == "SELL" else "LMT"
+    return "LMT"
+
+
 # ── Pricing (§5 of the spec) ──────────────────────────────────────────────────
 
 def credit(px, qty: int, mult: int = MULT) -> Decimal:
