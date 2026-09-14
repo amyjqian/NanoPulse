@@ -203,3 +203,20 @@ def test_moneyness_tags():
     assert oi.moneyness(180.0, 182.4, "C") == "ITM"
     assert oi.moneyness(180.0, 182.4, "P") == "OTM"
     assert oi.moneyness(185.0, 182.4, "P") == "ITM"
+
+
+def test_submit_order_type_matrix():
+    # MID works the midpoint for either side; BID/ASK peg only on the
+    # passive side (REL semantics) — the crossing combinations collapse
+    # to a marketable limit.
+    for action in ("BUY", "SELL"):
+        assert oi.submit_order_type("MKT", action) == "MKT"
+        assert oi.submit_order_type("LMT", action) == "LMT"
+        assert oi.submit_order_type("MID", action) == "MID"
+    assert oi.submit_order_type("BID", "BUY") == "BID"     # passive
+    assert oi.submit_order_type("BID", "SELL") == "LMT"    # crossing
+    assert oi.submit_order_type("ASK", "SELL") == "ASK"    # passive
+    assert oi.submit_order_type("ASK", "BUY") == "LMT"     # crossing
+    # Defensive fallbacks.
+    assert oi.submit_order_type("", "BUY") == "LMT"
+    assert oi.submit_order_type("WAT", "SELL") == "LMT"

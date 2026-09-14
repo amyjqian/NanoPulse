@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from typing import Iterable, Sequence
 
-from PySide6.QtCore import QMimeData, Qt, Signal
+from PySide6.QtCore import QMimeData, Qt, QTimer, Signal
 from PySide6.QtGui import QDrag, QFont, QMouseEvent
 from PySide6.QtWidgets import (
     QGridLayout,
@@ -68,6 +68,10 @@ class TickerStrip(QWidget):
     emits ``add_symbol_clicked`` so the host can show its own
     symbol-search popup (kept on the host because it needs access to
     ``ReferenceData`` / persistence).
+
+    ``show_bid_ask=False`` hides the bid/ask pair (the Options tab wants
+    just last · change · change%); ``update_price`` still accepts the
+    values so the host wiring is unchanged.
     """
 
     add_symbol_clicked = Signal()
@@ -77,9 +81,11 @@ class TickerStrip(QWidget):
         parent=None,
         *,
         no_pct_change_symbols: Iterable[str] = DEFAULT_NO_PCT_CHANGE,
+        show_bid_ask: bool = True,
     ) -> None:
         super().__init__(parent)
         self._no_pct: set[str] = {s.upper() for s in no_pct_change_symbols}
+        self._show_bid_ask = bool(show_bid_ask)
         self._symbol: str = ""
         self._last: float = 0.0
         self._bid: float = 0.0
@@ -142,9 +148,17 @@ class TickerStrip(QWidget):
         top_row.addWidget(self._lbl_symbol)
         top_row.addWidget(self._lbl_price)
         top_row.addSpacing(6)
-        top_row.addWidget(self._lbl_bid)
-        top_row.addWidget(self._lbl_ask)
-        top_row.addSpacing(6)
+        if self._show_bid_ask:
+            top_row.addWidget(self._lbl_bid)
+            top_row.addWidget(self._lbl_ask)
+            top_row.addSpacing(6)
+        else:
+            # Keep the labels parented (update_price still writes them)
+            # but out of the layout and invisible.
+            self._lbl_bid.setParent(self)
+            self._lbl_ask.setParent(self)
+            self._lbl_bid.hide()
+            self._lbl_ask.hide()
         top_row.addWidget(self._lbl_change)
         top_row.addWidget(self._lbl_change_pct)
         top_row.addStretch(1)
@@ -426,7 +440,14 @@ class DraggableChip(QPushButton):
             return
         e.acceptProposedAction()
         if self._on_drop is not None:
-            self._on_drop(src_sym, self._sym)
+            # Defer past the drag machinery: the callback rebuilds the
+            # grid, which deleteLater()s this chip AND the drag source —
+            # whose ``drag.exec()`` nested event loop is still on the
+            # stack and can process those deletions, returning into a
+            # destroyed C++ widget (hard crash).  A 0-ms timer runs the
+            # reorder only after the drop/drag frames have unwound.
+            cb, dst = self._on_drop, self._sym
+            QTimer.singleShot(0, lambda: cb(src_sym, dst))
 
 
 class SymbolChipBar(QWidget):
@@ -446,6 +467,10 @@ class SymbolChipBar(QWidget):
 
     _CHIP_HEIGHT = 28
     _CHIP_HEIGHT_COMPACT = 24
+    # Compact chips are fixed-width: six uppercase letters at the 11-px
+    # face plus the 9-px side padding.  Keeps the Options grid columns
+    # aligned instead of each chip sizing to its ticker.
+    _CHIP_WIDTH_COMPACT = 64
 
     def __init__(
         self,
@@ -475,6 +500,11 @@ class SymbolChipBar(QWidget):
         self._grid = QGridLayout()
         self._grid.setSpacing(4)
         self._grid.setContentsMargins(0, 0, 0, 0)
+        if self._compact:
+            # Compact chips are fixed-width — park the leftover width in
+            # a trailing stretch column so the chips stay left-aligned
+            # instead of drifting apart inside stretched cells.
+            self._grid.setColumnStretch(self._columns, 1)
         inner = QWidget()
         inner.setLayout(self._grid)
         outer.addWidget(inner)
@@ -564,6 +594,8 @@ class SymbolChipBar(QWidget):
             pass
         btn.setFixedHeight(self._CHIP_HEIGHT_COMPACT if self._compact
                            else self._CHIP_HEIGHT)
+        if self._compact and not is_opt:
+            btn.setFixedWidth(self._CHIP_WIDTH_COMPACT)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         _apply_chip_style(btn, sym == self._active)
         attach_exchange_badge(btn, sym)

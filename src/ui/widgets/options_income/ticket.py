@@ -71,6 +71,10 @@ class OptionsIncomeTicket(QWidget):
     """Covered-call / cash-secured-put order ticket (embedded tab)."""
 
     order_ready = Signal(dict)
+    # Fired when the user picks a strike: the leg's qualified contract
+    # dict (conid, local_symbol, min_tick, …).  The host pins it as a
+    # Book Trader option chip so the leg can be laddered there too.
+    leg_selected = Signal(dict)
 
     def __init__(
         self,
@@ -146,7 +150,7 @@ class OptionsIncomeTicket(QWidget):
     def _build_ui(self) -> None:
         """Two columns split by a draggable divider: LEFT = Calls/Puts +
         expiry chips over the strike ladder; RIGHT = the Book Trader's
-        ticker strip (symbol · last · bid · ask · change · "+") → symbol
+        ticker strip (symbol · last · change · change% · "+") → symbol
         chip grid → order rail.  Everything about *what* to trade sits
         directly above the Buy/Sell controls, in the same shape as the
         Book Trader column."""
@@ -161,7 +165,8 @@ class OptionsIncomeTicket(QWidget):
         # opens the shared symbol-search popup.  No share / cost line
         # either — per-account holdings drive MAX, and the Positions tab
         # is where they are read.
-        self._ticker = TickerStrip(self, no_pct_change_symbols=())
+        self._ticker = TickerStrip(self, no_pct_change_symbols=(),
+                                   show_bid_ask=False)
         self._ticker.add_symbol_clicked.connect(self._show_symbol_popup)
 
         # ── Symbol chips (right column, under the strip) ────────────────
@@ -320,6 +325,10 @@ class OptionsIncomeTicket(QWidget):
         if self._symbol:
             # New connection → fresh chain + quotes for the loaded symbol.
             self._load_symbol(self._symbol)
+        elif self._chips.active_symbol():
+            # First worker of the session — load the selection the chip
+            # bar restored from the last session.
+            self._load_symbol(self._chips.active_symbol())
         else:
             self._set_status("Select a symbol to load its option chain.")
 
@@ -842,6 +851,9 @@ class OptionsIncomeTicket(QWidget):
             self._price_pending = False
             self._rail.set_price(mid, anchor="MID")
         self._recompute()
+        if contract.get("conid"):
+            # Without a conid the chip could never stream — skip.
+            self.leg_selected.emit(dict(contract))
 
     # ── Derived state ───────────────────────────────────────────────────────
 
@@ -879,11 +891,15 @@ class OptionsIncomeTicket(QWidget):
             # Market order before any quote arrived — estimate at mid.
             px = oi.to_dec(leg.get("mid") or 0)
 
+        # Spot + dte feed the rail's summary line (yield% / days); the
+        # account count scales the header's total contracts.
+        self._rail.set_trade_context(self._spot, exp.dte if exp else 0,
+                                     len(self._accounts()))
         if leg and exp:
             strike = leg["strike"]
             word = _RIGHT_WORD[_RIGHT[strategy]]
-            # Just the contract — side/qty/price already live on the
-            # rail's own controls and the Sell button.
+            # Just the contract — side/qty/price live on the rail's own
+            # controls; the rail composes the header from them.
             self._rail.set_order_line(
                 f"{self._symbol} {exp.chip_label} {strike:g} {word}")
         else:
@@ -911,6 +927,10 @@ class OptionsIncomeTicket(QWidget):
             self._rail.set_sell_enabled(False, reason)
         elif leg is None or (px <= 0 and not market):
             self._rail.set_sell_enabled(False)
+        elif (self._rail.order_mode() in ("BID", "MID", "ASK")
+                and float(leg.get(self._rail.order_mode().lower()) or 0) <= 0):
+            # A tracking mode needs its live quote — same rule as px<=0.
+            self._rail.set_sell_enabled(False)
         else:
             self._rail.set_sell_enabled(True)
 
@@ -929,7 +949,8 @@ class OptionsIncomeTicket(QWidget):
             return
         qty = self._rail.qty()
         px = self._rail.price()
-        market = self._rail.is_market()
+        mode = self._rail.order_mode()
+        market = mode == "MKT"
         max_qty = self._max_qty()
         # Structural clamp again right before transmit (§7).
         if not (0 < qty <= max_qty) or (px <= 0 and not market):
@@ -962,16 +983,39 @@ class OptionsIncomeTicket(QWidget):
             "strike": leg.get("strike"),
             "right": contract.get("right"),
         }
+        # Mode × side → payload type (§ order modes): MID works the
+        # midpoint (Adaptive), BID/ASK peg to the touch on the passive
+        # side (REL) with the mid as the limit cap/floor, and the
+        # crossing combinations collapse to a marketable limit at the
+        # live touch.  All prices snap to the leg's real tick — options
+        # trade in 0.05/0.10 regimes the generic helpers don't know.
+        action = _ACTION[strategy]
+        otype = oi.submit_order_type(mode, action)
+        tick = float(contract.get("min_tick") or 0.0) or 0.01
+        mid = float(leg.get("mid") or 0)
+        if otype == "MKT":
+            limit = 0.0
+        elif otype in ("MID", "BID", "ASK"):
+            # Adaptive limit / peg cap — the submit-time mid (px as a
+            # fallback keeps the guard-checked price authoritative).
+            limit = float(oi.snap_to_tick(mid or px, tick))
+        elif mode in ("BID", "ASK"):
+            # Crossing side → marketable limit at the live touch.
+            touch = float(leg.get(mode.lower()) or 0)
+            limit = float(oi.snap_to_tick(touch or px, tick))
+        else:
+            limit = float(px)
         # One payload per checked account; the worker generates each
         # order's ref and the Orders panel tracks it from there.
         for account in accounts:
             payload = {
-                "action": _ACTION[strategy],
-                "type": "MKT" if market else "LMT",
+                "action": action,
+                "type": otype,
                 "symbol": contract.get("symbol", self._symbol),
                 "qty": int(qty),
-                "limit_price": 0.0 if market else float(px),
+                "limit_price": limit,
                 "last_price": float(leg.get("mid") or px),
+                "min_tick": tick,
                 "sec_type": "OPT",
                 "profit_take": None,
                 "stop_loss": None,
@@ -980,6 +1024,8 @@ class OptionsIncomeTicket(QWidget):
                 "_target_accounts": [account],
                 "_what_if_check": True,
             }
+            if otype in ("BID", "ASK"):
+                payload["peg_offset"] = 0.0
             log.info("OptionsIncomeTicket: %s → %s", strategy, payload)
             self.order_ready.emit(payload)
         # The ticket stays put for the next order: qty snaps back to 1

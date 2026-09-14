@@ -58,10 +58,12 @@ def _symbol_chip_style(active: bool) -> str:
 
 DEFAULT_CHIPS = ["QQQ", "SPY", "NVDA", "TSLA", "NBIS"]
 _SETTINGS_KEY = "OptionsTicket/symbolChips"
+_HIDDEN_KEY = "OptionsTicket/hiddenPositionChips"
+_ACTIVE_KEY = "OptionsTicket/activeSymbol"
 
 _POS_CHIP_MAX = 5        # top-N account positions shown as chips
-_GRID_COLS = 4           # chips per row
-_GRID_ROWS = 3           # rows — the grid never overflows past this
+_GRID_COLS = 3           # chips per row
+_GRID_ROWS = 4           # rows — the grid never overflows past this
 _CHIP_MAX = _GRID_COLS * _GRID_ROWS
 _POS_CHIP_MIN_SHARES = 100  # only CC-capable holdings become chips
 
@@ -99,11 +101,14 @@ class SymbolChipBar(QWidget):
         super().__init__(parent)
         self._get_positions = get_positions or (lambda: [])
         self._custom: list[str] = self._load_chips()   # searched, persisted
+        self._hidden_pos: set[str] = self._load_hidden()  # removed pos chips
         self._pos_syms: list[str] = []                 # derived positions
         self._order: list[str] = []                    # display order
-        # No chip starts active — the tab opens with the bar unselected
-        # until the user picks a chip.
-        self._active: str = ""
+        # The bar reopens with the last session's selection restored
+        # (empty on a fresh install — nothing active until the user
+        # picks a chip).  The ticket loads the restored symbol's chain
+        # once a data worker binds.
+        self._active: str = self._load_active()
         col = QVBoxLayout(self)
         col.setContentsMargins(0, 0, 0, 0)
         col.setSpacing(0)
@@ -130,6 +135,28 @@ class SymbolChipBar(QWidget):
         QSettings("NanoPulse", "Dashboard").setValue(
             _SETTINGS_KEY, ",".join(self._custom))
 
+    @staticmethod
+    def _load_hidden() -> set[str]:
+        saved = QSettings("NanoPulse", "Dashboard").value(_HIDDEN_KEY)
+        if isinstance(saved, str):
+            saved = [s for s in saved.split(",") if s.strip()]
+        if isinstance(saved, (list, tuple)):
+            return {str(s).upper() for s in saved}
+        return set()
+
+    def _save_hidden(self) -> None:
+        QSettings("NanoPulse", "Dashboard").setValue(
+            _HIDDEN_KEY, ",".join(sorted(self._hidden_pos)))
+
+    @staticmethod
+    def _load_active() -> str:
+        saved = QSettings("NanoPulse", "Dashboard").value(_ACTIVE_KEY)
+        return str(saved).strip().upper() if saved else ""
+
+    def _save_active(self) -> None:
+        QSettings("NanoPulse", "Dashboard").setValue(
+            _ACTIVE_KEY, self._active)
+
     # ── Chip groups ─────────────────────────────────────────────────────────
 
     def _position_symbols(self) -> list[str]:
@@ -145,7 +172,7 @@ class SymbolChipBar(QWidget):
                 if float(p.get("position") or 0.0) < _POS_CHIP_MIN_SHARES:
                     continue
                 sym = str(p.get("symbol") or "").upper()
-                if not sym:
+                if not sym or sym in self._hidden_pos:
                     continue
                 cands.append((abs(float(p.get("market_value") or 0.0)), sym))
             except (TypeError, ValueError):
@@ -212,6 +239,10 @@ class SymbolChipBar(QWidget):
 
     def select(self, symbol: str) -> None:
         symbol = symbol.upper()
+        if symbol in self._hidden_pos:
+            # An explicit search for a removed position chip un-hides it.
+            self._hidden_pos.discard(symbol)
+            self._save_hidden()
         self._sync_order()
         if symbol not in self._order and symbol not in self._custom:
             # Searched symbols become persistent chips on the right.
@@ -228,6 +259,7 @@ class SymbolChipBar(QWidget):
             self._rebuild_chips()
             return
         self._active = symbol
+        self._save_active()
         self._rebuild_chips()
         self.symbol_selected.emit(symbol)
 
@@ -252,19 +284,28 @@ class SymbolChipBar(QWidget):
         self._on_reordered(order)
 
     def _remove_chip(self, symbol: str) -> None:
-        """Right-click removes a searched chip outright (ladder-chip
-        behavior).  Position chips are derived from the checked accounts
-        and stay; the last remaining chip also stays."""
-        if symbol not in self._custom or len(self._order) <= 1:
+        """Right-click removes ANY chip, active or not (ladder-chip
+        behavior) — the grid may go empty.  Searched chips are dropped
+        from the persisted list; position chips are hidden via a
+        persisted exclude set (they are re-derived from holdings on
+        every refresh, so a plain drop would resurrect them) — searching
+        the symbol again un-hides it."""
+        symbol = symbol.upper()
+        if symbol not in self._order:
             self._rebuild_chips()      # grid may have dropped it visually
             return
-        self._custom.remove(symbol)
-        self._save_chips()
+        if symbol in self._custom:
+            self._custom.remove(symbol)
+            self._save_chips()
+        if symbol in self._pos_syms:
+            self._hidden_pos.add(symbol)
+            self._save_hidden()
         if symbol == self._active:
             # Removing the active chip selects the first remaining one
             # and reloads the ticket.
             self._sync_order()
             self._active = self._order[0] if self._order else ""
+            self._save_active()
             self._rebuild_chips()
             if self._active:
                 self.symbol_selected.emit(self._active)

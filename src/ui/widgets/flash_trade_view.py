@@ -253,6 +253,11 @@ class FlashTradeView(QWidget):
         # accounts" guard were already applied by _options_fanout_blocked
         # before the ticket emitted.
         self._options_ticket.order_ready.connect(self._on_order_requested)
+        # A picked strike lands on the Book Trader chip bar (pin only —
+        # the ladder's active symbol stays put) so the leg can be
+        # laddered there too.
+        self._options_ticket.leg_selected.connect(
+            self._book_trading.pin_option_chip)
 
         # ── Wire book trader (mirrors order-entry signal surface) ────────────
         # BookTraderView submits through the same handlers so TP/SL/Trail
@@ -552,11 +557,16 @@ class FlashTradeView(QWidget):
         )
         from src.core.trading_prefs import trading_prefs
 
-        tick = tick_size_for_contract(
-            sec_type,
-            symbol=contract.get("symbol", ""),
-            local_symbol=contract.get("local_symbol", ""),
-        )
+        # A payload-supplied tick wins: the Options ticket knows the
+        # leg's real min_tick from contract details, while
+        # tick_size_for_contract hard-codes 0.01 for OPT (nickel-tick
+        # options exist).
+        tick = (float(payload.get("min_tick") or 0)
+                or tick_size_for_contract(
+                    sec_type,
+                    symbol=contract.get("symbol", ""),
+                    local_symbol=contract.get("local_symbol", ""),
+                ))
         prefs = trading_prefs.get(sec_type)
 
         # Helper: compute the limit-cap price (returns 0 when no base price)
@@ -575,14 +585,38 @@ class FlashTradeView(QWidget):
         peg_offset = None
 
         if order_type == "MID":
-            # Buy/Sell @Mid → IB Adaptive Algo + limit cap
-            limit_price = _cap_price()
-            adaptive_priority = prefs.get("mid_price_behavior", "Normal")
+            # Buy/Sell @Mid → IB Adaptive Algo + limit cap.  Options
+            # carry their own limit (the leg's mid) and a fixed Normal
+            # priority — trading_prefs.get("OPT") falls back to the
+            # FUTURES prefs, which must not leak into option orders.
+            if sec_type == "OPT":
+                limit_price = float(payload.get("limit_price") or 0) \
+                    or _cap_price()
+                adaptive_priority = "Normal"
+            else:
+                limit_price = _cap_price()
+                adaptive_priority = prefs.get("mid_price_behavior", "Normal")
             log.info("FlashTrade: %s @Mid %s base=%.4f tick=%.4f → "
                      "ADAPTIVE limit=%.4f priority=%s",
                      action, symbol, last_price, tick,
                      limit_price, adaptive_priority)
             order_type = "ADAPTIVE"
+
+        elif order_type in ("BID", "ASK") and sec_type == "OPT":
+            # Options ticket passive peg → Pegged to Primary (REL) at
+            # the touch (offset 0 — one-tick-inside can trip option
+            # tick-increment rules), capped/floored at the payload's
+            # limit (the leg's mid).  Checked BEFORE the prefs branch:
+            # the OPT→FUT prefs fallback would otherwise route options
+            # into the futures ADAPTIVE path.
+            peg_offset = float(payload.get("peg_offset") or 0.0)
+            limit_price = float(payload.get("limit_price") or 0) \
+                or _cap_price()
+            log.info("FlashTrade: OPT %s @%s %s tick=%.4f → "
+                     "PEG_PRIM limit=%.4f peg_offset=%.4f",
+                     action, order_type, symbol, tick,
+                     limit_price, peg_offset)
+            order_type = "PEG_PRIM"
 
         elif order_type in ("BID", "ASK"):
             if action == "BUY":
@@ -638,8 +672,11 @@ class FlashTradeView(QWidget):
             log.info("FlashTrade: %s LMT %s @ %.4f (passthrough)",
                      action, symbol, limit_price)
 
-        elif order_type == "MKT" and last_price > 0:
-            # MKT → cap with a limit if Limit Cap Offset is set
+        elif order_type == "MKT" and last_price > 0 and sec_type != "OPT":
+            # MKT → cap with a limit if Limit Cap Offset is set.  OPT is
+            # exempt: the prefs here are the futures fallback and would
+            # silently convert an options market order into a capped
+            # limit at a foreign tick.
             cap_value = float(prefs.get("limit_cap", 0))
             if cap_value != 0:
                 limit_price = _cap_price()

@@ -1659,6 +1659,36 @@ class BookTraderView(QWidget):
             return
         self.focus_position(pos)
 
+    def pin_option_chip(self, contract: dict) -> None:
+        """Add an option contract as a chip WITHOUT activating it.
+
+        Called by the host when the Options ticket's strike selection
+        changes: the leg lands on the chip bar (keyed by its OCC local
+        symbol, pinned at the tail like every option chip) so it can be
+        laddered here later.  Already-present chips are a no-op; a full
+        STK/OPT group follows ``_add_symbol``'s replace-the-last rule.
+        """
+        key = (contract.get("local_symbol") or "").strip().upper()
+        con_id = str(contract.get("conid") or "")
+        if not key or not con_id:
+            return          # no key / could never stream — nothing to pin
+        if key in {s.upper() for s in self._symbols}:
+            return
+        meta = {
+            "conid": con_id,
+            "sec_type": "OPT",
+            "exchange": contract.get("exchange") or "SMART",
+            "currency": contract.get("currency") or "USD",
+            "local_symbol": key,
+            "multiplier": str(contract.get("multiplier") or "100"),
+        }
+        try:
+            if float(contract.get("min_tick") or 0) > 0:
+                meta["min_tick"] = float(contract["min_tick"])
+        except (TypeError, ValueError):
+            pass
+        self._add_symbol(key, meta=meta, activate=False)
+
     # ── Add-symbol popup (searchable) ────────────────────────────────────────
 
     def open_symbol_search(self) -> None:
@@ -1702,7 +1732,8 @@ class BookTraderView(QWidget):
         btn = self._ticker._btn_add      # noqa: SLF001 — private-ish, single-caller
         dlg.open_below(btn)
 
-    def _add_symbol(self, sym: str, meta: dict | None = None) -> None:
+    def _add_symbol(self, sym: str, meta: dict | None = None,
+                    *, activate: bool = True) -> None:
         sym = (sym or "").strip().upper()
         if not sym or sym in {s.upper() for s in self._symbols}:
             return
@@ -1753,8 +1784,11 @@ class BookTraderView(QWidget):
             if len(group) > 10:
                 log.warning("BookTrader: chip group full — %s added and "
                             "activated but its chip is not rendered", sym)
-        # Auto-activate the newly added symbol.
-        self._on_symbol_selected(sym, _sec_type_for(sym))
+        # Auto-activate the newly added symbol (pin-only callers — the
+        # Options ticket's strike click — pass activate=False so the
+        # ladder's active symbol and its subscriptions stay put).
+        if activate:
+            self._on_symbol_selected(sym, _sec_type_for(sym))
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
 

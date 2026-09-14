@@ -108,6 +108,14 @@ def _isolate_chip_settings(monkeypatch):
                         staticmethod(lambda: list(DEFAULT_CHIPS)))
     monkeypatch.setattr(SymbolChipBar, "_save_chips",
                         lambda self: None)
+    monkeypatch.setattr(SymbolChipBar, "_load_hidden",
+                        staticmethod(lambda: set()))
+    monkeypatch.setattr(SymbolChipBar, "_save_hidden",
+                        lambda self: None)
+    monkeypatch.setattr(SymbolChipBar, "_load_active",
+                        staticmethod(lambda: ""))
+    monkeypatch.setattr(SymbolChipBar, "_save_active",
+                        lambda self: None)
     from src.core import config_manager
     monkeypatch.setattr(config_manager, "load_layout",
                         lambda path=None: {})
@@ -289,7 +297,9 @@ def test_quote_sets_price_and_figures(qtbot):
     assert row["credit"] == 310.0
     assert row["delta"] == 0.29
     assert (row["bid"], row["ask"], row["last"]) == (3.04, 3.16, 3.08)
-    assert t._rail._order_line.text().startswith("NVDA ")
+    # The rail composes the header from its own side/qty + the pushed
+    # contract description.
+    assert t._rail._order_line.text().startswith("SELL 1 × NVDA ")
     assert t._rail._order_line.text().endswith("187.5 CALL")
     assert t._rail._sell_btn.isEnabled()
 
@@ -301,11 +311,18 @@ def test_cc_max_qty_from_shares(qtbot):
     _deliver_contracts(t, w)
     assert t._max_qty() == 3
     assert t._rail._max_btn.text() == "MAX 3"
-    # Stepper clamps at max.
+    # Stepper + typed entry clamp at max.
     t._rail._on_max()
     assert t._rail.qty() == 3
+    assert not t._rail._qty_plus.isEnabled()
     t._rail._step_qty(+1)
     assert t._rail.qty() == 3
+    t._rail._qty_edit.setText("4")
+    t._rail._on_qty_typed()
+    assert t._rail.qty() == 3
+    assert t._rail._qty_edit.text() == "3"
+    t._rail._step_qty(-1)
+    assert t._rail.qty() == 2
 
 
 def test_cc_ineligible_under_100_shares(qtbot):
@@ -413,7 +430,9 @@ def test_buy_call_flow(qtbot):
     assert len(payloads) == 1
     p = payloads[0]
     assert p["action"] == "BUY"
-    assert p["type"] == "LMT"
+    # Default mode is Mid — an adaptive midpoint order, not a static
+    # limit.
+    assert p["type"] == "MID"
     assert p["limit_price"] == 3.10
     assert p["_resolved_contract"]["right"] == "C"
 
@@ -465,18 +484,23 @@ def test_price_syncs_three_ways(qtbot):
     _deliver_contracts(t, w)
     _deliver_selected_quote(t, w)
     rail = t._rail
-    # 1. stepper: +1 tick (0.01)
+    assert rail.order_mode() == "MID"      # armed by leg selection
+    # 1. stepper: +1 tick (0.01) — manual control demotes to plain LMT
     rail._step_price(+1)
     assert rail.price() == Decimal("3.11")
+    assert rail.order_mode() == "LMT"
     # 2. typed entry, rounded on editingFinished
     rail._px_edit.setText("3.2")
     rail._on_price_typed()
     assert rail.price() == Decimal("3.20")
-    # 3. anchor chips
+    assert rail.order_mode() == "LMT"
+    # 3. anchor chips arm their tracking mode
     rail._pick_anchor("BID")
     assert rail.price() == Decimal("3.04")
+    assert rail.order_mode() == "BID"
     rail._pick_anchor("ASK")
     assert rail.price() == Decimal("3.16")
+    assert rail.order_mode() == "ASK"
 
 
 def test_delta_keeps_last_known_value(qtbot):
@@ -565,10 +589,13 @@ def test_submit_payload_shape(qtbot):
     assert len(payloads) == 1
     p = payloads[0]
     assert p["action"] == "SELL"
-    assert p["type"] == "LMT"
+    # Picking a strike arms Mid by default → adaptive midpoint order at
+    # the leg's mid, carrying the real contract tick.
+    assert p["type"] == "MID"
     assert p["sec_type"] == "OPT"
     assert p["qty"] == 2
     assert p["limit_price"] == 3.10
+    assert p["min_tick"] == 0.01
     assert p["_target_accounts"] == ["mgn-jack-02"]
     assert p["_what_if_check"] is True
     rc = p["_resolved_contract"]
@@ -598,10 +625,111 @@ def test_market_order_submit(qtbot):
     assert p["type"] == "MKT"
     assert p["limit_price"] == 0.0
     assert p["last_price"] == 3.10          # mid rides along as estimate
-    # Picking a price anchor drops back to a limit order.
+    # Picking a price anchor leaves market mode and arms that anchor's
+    # tracking mode.
     rail._pick_anchor("BID")
     assert not rail.is_market()
+    assert rail.order_mode() == "BID"
     assert rail._px_edit.isEnabled()
+
+
+def test_pegged_and_crossing_submit_payloads(qtbot):
+    # Quote: bid 3.04 / mid 3.10 / ask 3.16.
+    t, w = _make(qtbot)                    # SELL (covered call)
+    _deliver_chain(t, w)
+    _deliver_contracts(t, w)
+    _deliver_selected_quote(t, w)
+    rail = t._rail
+    payloads = []
+    t.order_ready.connect(payloads.append)
+
+    # SELL + Ask = passive → pegged-to-primary, floor = the mid.
+    rail._pick_anchor("ASK")
+    rail._sell_btn.click()
+    p = payloads[-1]
+    assert p["type"] == "ASK"
+    assert p["limit_price"] == 3.10
+    assert p["peg_offset"] == 0.0
+    assert p["min_tick"] == 0.01
+
+    # SELL + Bid = crossing → marketable limit at the live bid.
+    t._submit_relock.stop()
+    t._recompute()
+    rail._pick_anchor("BID")
+    rail._sell_btn.click()
+    p = payloads[-1]
+    assert p["type"] == "LMT"
+    assert p["limit_price"] == 3.04
+    assert "peg_offset" not in p
+
+    # BUY + Bid = passive peg (cap = mid); BUY + Ask = crossing limit.
+    t._submit_relock.stop()
+    t._recompute()
+    rail._pick_side("BUY")
+    rail._sell_btn.click()
+    p = payloads[-1]
+    assert p["action"] == "BUY" and p["type"] == "BID"
+    assert p["limit_price"] == 3.10
+    t._submit_relock.stop()
+    t._recompute()
+    rail._pick_anchor("ASK")
+    rail._sell_btn.click()
+    p = payloads[-1]
+    assert p["type"] == "LMT" and p["limit_price"] == 3.16
+
+
+def test_strike_selection_emits_leg_for_book_trader_chip(qtbot):
+    # Picking a strike hands the leg's qualified contract to the host,
+    # which pins it as a Book Trader chip (skipped without a conid —
+    # such a chip could never stream).
+    t, w = _make(qtbot)
+    _deliver_chain(t, w)
+    _deliver_contracts(t, w)
+    legs = []
+    t.leg_selected.connect(legs.append)
+    model = t._chain_view.chain_model
+    row = model.row_for_conid(9008)        # 190 call
+    t._on_row_selected(row)
+    assert legs and legs[-1]["conid"] == 9008
+    assert legs[-1]["local_symbol"] == "NVDA 190C"
+    # A row whose contract lost its conid emits nothing.
+    rd = model.row_data(row)
+    rd["contract"] = dict(rd["contract"], conid=None)
+    model.update_row(row, {"contract": rd["contract"]})
+    t._on_row_selected(row)
+    assert legs[-1]["conid"] == 9008       # unchanged — no new emit
+
+
+def test_tracking_mode_follows_quote_until_demoted(qtbot):
+    t, w = _make(qtbot)
+    _deliver_chain(t, w)
+    _deliver_contracts(t, w)
+    _deliver_selected_quote(t, w)
+    rail = t._rail
+    rail._pick_anchor("BID")
+    assert rail.price() == Decimal("3.04")
+    token = w.quote_calls[-1][0]
+    conid = t._selected_leg["conid"]
+    w.option_quote_updated.emit(token, conid,
+                                {"bid": 3.06, "ask": 3.14, "last": 3.10,
+                                 "close": 0.0, "delta": 0.29})
+    # Armed BID mode follows the fresh bid; the segment stays lit.
+    assert rail.order_mode() == "BID"
+    assert rail.price() == Decimal("3.06")
+    # Typing takes manual control — a static limit that no longer moves.
+    rail._px_edit.setText("3.00")
+    rail._on_price_typed()
+    assert rail.order_mode() == "LMT"
+    w.option_quote_updated.emit(token, conid,
+                                {"bid": 3.08, "ask": 3.12, "last": 3.10,
+                                 "close": 0.0, "delta": 0.29})
+    assert rail.price() == Decimal("3.00")
+    # Submit now goes out as the typed limit.
+    payloads = []
+    t.order_ready.connect(payloads.append)
+    rail._sell_btn.click()
+    assert payloads[-1]["type"] == "LMT"
+    assert payloads[-1]["limit_price"] == 3.00
 
 
 def test_submit_keeps_ticket_open_and_relocks(qtbot):
@@ -833,8 +961,8 @@ def test_chips_show_bare_ticker(qtbot):
 
 
 def test_ticker_strip_follows_underlying_quote(qtbot):
-    # The Book Trader ticker strip renders symbol · last · bid · ask ·
-    # change from the underlying's quote stream.
+    # The Options ticker strip renders symbol · last · change · change%
+    # from the underlying's quote stream — bid/ask are hidden here.
     t, w = _make(qtbot)
     _deliver_chain(t, w)
     _deliver_contracts(t, w)
@@ -845,8 +973,8 @@ def test_ticker_strip_follows_underlying_quote(qtbot):
                                 {"bid": 183.0, "ask": 183.2, "last": 183.1,
                                  "close": 181.0, "delta": 0.0})
     assert t._ticker._lbl_price.text() == "183.10"
-    assert t._ticker._lbl_bid.text() == "183.00"
-    assert t._ticker._lbl_ask.text() == "183.20"
+    assert t._ticker._lbl_bid.isHidden()
+    assert t._ticker._lbl_ask.isHidden()
     assert t._ticker._lbl_change.text() == "+2.10"
     assert t._ticker._lbl_change_pct.text() == "+1.16%"
 
@@ -901,15 +1029,27 @@ def test_searched_chips_append_right_persist_and_reorder(qtbot, monkeypatch):
     # Ladder-style drag reorder: drop QQQ onto MU → takes MU's slot.
     bar._on_chip_drop("QQQ", "MU")
     assert bar._order == ["QQQ", "MU", "TSLA"]
-    # Right-click removes a searched chip outright; position chips stay.
+    # Right-click removes ANY chip, active or not: a searched chip is
+    # dropped outright, a position chip goes into the persisted hidden
+    # set so re-derivation doesn't resurrect it.
     bar._remove_chip("MU")
-    assert bar._order == ["QQQ", "MU", "TSLA"]
+    assert bar._order == ["QQQ", "TSLA"]
+    assert "MU" in bar._hidden_pos
     bar._remove_chip("QQQ")
-    assert bar._order == ["MU", "TSLA"]
+    assert bar._order == ["TSLA"]
     assert saved[-1] == []
+    # Even the last remaining chip can be removed — the grid goes empty.
+    bar._remove_chip("TSLA")
+    assert bar._order == []
+    assert bar.active_symbol() == ""
+    # Searching a hidden symbol un-hides its position chip.
+    bar.select("MU")
+    assert "MU" not in bar._hidden_pos
+    assert bar._order == ["MU"]
+    assert bar._custom == []
 
 
-def test_chip_grid_is_4_by_3_and_full_grid_replaces_last_searched(
+def test_chip_grid_is_3_by_4_and_full_grid_replaces_last_searched(
         qtbot, monkeypatch):
     saved = ["A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A9", "A10"]
     monkeypatch.setattr(SymbolChipBar, "_load_chips",
@@ -921,13 +1061,13 @@ def test_chip_grid_is_4_by_3_and_full_grid_replaces_last_searched(
     ]
     bar = SymbolChipBar(get_positions=lambda: positions)
     qtbot.addWidget(bar)
-    # 2 position chips + 10 searched = 12 = the 4 × 3 grid, every one
-    # rendered, laid out four per row.
+    # 2 position chips + 10 searched = 12 = the 3 × 4 grid, every one
+    # rendered, laid out three per row.
     assert len(bar._order) == 12 and len(bar._buttons) == 12
     grid = bar._grid._grid
     rows = {grid.getItemPosition(i)[0] for i in range(grid.count())}
     cols = {grid.getItemPosition(i)[1] for i in range(grid.count())}
-    assert rows == {0, 1, 2} and cols == {0, 1, 2, 3}
+    assert rows == {0, 1, 2, 3} and cols == {0, 1, 2}
     # A new symbol on the full grid replaces the LAST searched chip
     # (position chips stay) — never a hidden 13th entry.
     bar.select("NEW")
@@ -941,6 +1081,27 @@ def test_chip_grid_is_4_by_3_and_full_grid_replaces_last_searched(
     qtbot.addWidget(bar2)
     assert len(bar2._order) == 12 and len(bar2._buttons) == 12
     assert bar2._custom == saved
+
+
+def test_last_selected_symbol_restored_on_worker_bind(qtbot, monkeypatch):
+    # The chip bar reopens with the last session's selection and the
+    # ticket loads its chain as soon as a data worker binds.
+    monkeypatch.setattr(SymbolChipBar, "_load_active",
+                        staticmethod(lambda: "TSLA"))
+    t, w = _make(qtbot, symbol=None)
+    assert t._chips.active_symbol() == "TSLA"
+    assert t._symbol == "TSLA"
+    assert w.chain_calls and w.chain_calls[-1][1]["symbol"] == "TSLA"
+
+
+def test_selecting_a_chip_persists_the_selection(qtbot, monkeypatch):
+    persisted = []
+    monkeypatch.setattr(SymbolChipBar, "_save_active",
+                        lambda self: persisted.append(self._active))
+    t, _w = _make(qtbot)                     # selects NVDA
+    assert persisted[-1] == "NVDA"
+    t._chips.select("QQQ")
+    assert persisted[-1] == "QQQ"
 
 
 # ── Model accessors ──────────────────────────────────────────────────────────
