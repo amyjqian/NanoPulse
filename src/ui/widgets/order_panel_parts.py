@@ -364,14 +364,22 @@ class DraggableChip(QPushButton):
         parent=None,
         *,
         label: str | None = None,
+        grid=None,
     ) -> None:
         # *label* is display-only (e.g. a compact option label); the chip's
         # identity for drag payloads / dedupe / callbacks stays *sym*.
+        # *grid* is the owning SymbolChipBar — its rebuilds are frozen
+        # for the duration of this chip's drag.
         super().__init__(label if label is not None else sym, parent)
         self._sym = sym
         self._sec_type = sec_type
         self._on_drop = on_drop
+        self._grid = grid
         self._press_pos = None
+        # (callback, src, dst) parked by the DROP TARGET's dropEvent,
+        # executed by THIS chip once its drag.exec() has returned — see
+        # dropEvent for why the reorder must not run any earlier.
+        self._pending_drop: tuple | None = None
         self.setAcceptDrops(True)
 
     def mousePressEvent(self, e: QMouseEvent) -> None:  # noqa: N802
@@ -401,7 +409,29 @@ class DraggableChip(QPushButton):
         # Clearing _press_pos suppresses a late-arriving click when the
         # cursor returns to this chip without a drop.
         self._press_pos = None
-        drag.exec(Qt.DropAction.MoveAction)
+        self._pending_drop = None
+        # Freeze the owning grid's rebuilds for the drag's lifetime: a
+        # live refresh (position tick → refresh_counts → set_symbols)
+        # firing mid-drag would destroy the chips under the cursor and
+        # the native drag loop then delivers dragging updates to freed
+        # widgets — the crash the diagnostic reports show inside
+        # processDrag/sendDraggingUpdate.
+        if self._grid is not None:
+            self._grid._begin_chip_drag()
+        try:
+            drag.exec(Qt.DropAction.MoveAction)
+        finally:
+            if self._grid is not None:
+                self._grid._end_chip_drag()
+        # The drop target parked the reorder here instead of running it
+        # (see dropEvent).  drag.exec() has fully unwound now, so the
+        # grid rebuild (which deleteLater()s every chip, this one
+        # included) is finally safe.  One more hop through a 0-ms timer
+        # puts the rebuild on the main loop, outside this mouse handler.
+        pending, self._pending_drop = self._pending_drop, None
+        if pending is not None:
+            cb, src, dst = pending
+            QTimer.singleShot(0, lambda: cb(src, dst))
 
     def dragEnterEvent(self, e) -> None:  # noqa: N802
         md = e.mimeData()
@@ -440,14 +470,24 @@ class DraggableChip(QPushButton):
             return
         e.acceptProposedAction()
         if self._on_drop is not None:
-            # Defer past the drag machinery: the callback rebuilds the
-            # grid, which deleteLater()s this chip AND the drag source —
-            # whose ``drag.exec()`` nested event loop is still on the
-            # stack and can process those deletions, returning into a
-            # destroyed C++ widget (hard crash).  A 0-ms timer runs the
-            # reorder only after the drop/drag frames have unwound.
+            # NEVER run the reorder from inside the drop: the callback
+            # rebuilds the grid, which deleteLater()s this chip AND the
+            # drag source — whose ``drag.exec()`` nested event loop is
+            # still on the stack.  A 0-ms singleShot is NOT safe either:
+            # timers posted here fire inside that same nested loop (the
+            # macOS drop animation keeps it spinning), which then also
+            # services the deferred deletes and drag.exec() returns into
+            # a destroyed C++ widget (hard crash).  Instead the reorder
+            # is parked ON THE DRAG SOURCE, which triggers it only after
+            # its drag.exec() call has returned.
             cb, dst = self._on_drop, self._sym
-            QTimer.singleShot(0, lambda: cb(src_sym, dst))
+            src_widget = e.source()
+            if isinstance(src_widget, DraggableChip):
+                src_widget._pending_drop = (cb, src_sym, dst)
+            else:
+                # Foreign/synthetic source (tests) — no nested drag loop
+                # to protect against; a deferred call is fine.
+                QTimer.singleShot(0, lambda: cb(src_sym, dst))
 
 
 class SymbolChipBar(QWidget):
@@ -493,6 +533,13 @@ class SymbolChipBar(QWidget):
         self._entries: list[tuple[str, str]] = []  # (sym, sec_type)
         self._buttons: dict[str, QPushButton] = {}
         self._active: str | None = None
+        # While one of this grid's chips is being dragged, rebuilds are
+        # FROZEN: destroying the chips mid-drag (a live refresh_counts
+        # firing on a position tick) leaves the native drag loop
+        # delivering dragging updates to freed widgets — a segfault.
+        # The newest deferred rebuild is applied when the drag ends.
+        self._drag_depth = 0
+        self._pending_entries: list[tuple[str, str]] | None = None
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -516,9 +563,28 @@ class SymbolChipBar(QWidget):
         ``(symbol, sec_type)`` tuples.  Sec-type ``"FUT"`` goes to the FUT
         row group; anything else (STK, OPT, unknown) goes to the STK group.
         Preserves the incoming order within each group.
+
+        A call landing while a chip drag is in flight is deferred until
+        the drag ends (see ``_begin_chip_drag``) — only the newest
+        deferred list survives.
         """
+        if self._drag_depth:
+            self._pending_entries = list(entries)
+            return
         self._entries = list(entries)
         self._rebuild_grid()
+
+    # ── Drag freeze (called by DraggableChip around drag.exec) ────────────────
+
+    def _begin_chip_drag(self) -> None:
+        self._drag_depth += 1
+
+    def _end_chip_drag(self) -> None:
+        self._drag_depth = max(0, self._drag_depth - 1)
+        if self._drag_depth == 0 and self._pending_entries is not None:
+            entries, self._pending_entries = self._pending_entries, None
+            self._entries = entries
+            self._rebuild_grid()
 
     def set_active(self, sym: str | None) -> None:
         """Highlight the chip for *sym*; pass None to clear the highlight."""
@@ -529,9 +595,17 @@ class SymbolChipBar(QWidget):
     def remove(self, sym: str) -> None:
         """Remove *sym* from the grid (host-driven, called after the host
         has updated its persisted symbol list)."""
-        self._entries = [(s, sec) for (s, sec) in self._entries if s != sym]
         if self._active == sym:
             self._active = None
+        if self._drag_depth:
+            # Mid-drag: edit the deferred list (or fork one from the
+            # live entries) — the visible chips stay untouched.
+            base = (self._pending_entries if self._pending_entries
+                    is not None else self._entries)
+            self._pending_entries = [(s, sec) for (s, sec) in base
+                                     if s != sym]
+            return
+        self._entries = [(s, sec) for (s, sec) in self._entries if s != sym]
         self._rebuild_grid()
 
     @property
@@ -582,7 +656,7 @@ class SymbolChipBar(QWidget):
         disp = format_option_symbol_two_line(sym)
         is_opt = disp != sym
         btn = DraggableChip(sym, sec_type, self._on_drop,
-                            label=disp if is_opt else None)
+                            label=disp if is_opt else None, grid=self)
         btn.setProperty("chip_small", is_opt)
         btn.setProperty("chip_compact", self._compact and not is_opt)
         try:
