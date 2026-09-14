@@ -29,16 +29,15 @@ accounts are checked: market-data entitlements belong to a connection,
 so the ticket asks the one the rest of the app already gets prices
 from.  Orders still go to each account's own connection.
 
-Each submitted order is tracked in the "This session" strip
-(``SessionOrdersStrip``) — one row per account — with its live status,
-and can be cancelled from there while still open.  The tab is
-permanent: quotes are dropped while it is hidden and resumed on show.
+Submitted orders show up in the Orders panel above this tab (live
+status + Cancel) like every other order — the ticket keeps no order
+list of its own.  The tab is permanent: quotes are dropped while it is
+hidden and resumed on show.
 """
 from __future__ import annotations
 
 import logging
 from datetime import date, datetime
-from zoneinfo import ZoneInfo
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
@@ -57,16 +56,11 @@ from src.core import options_income as oi
 from .chain_table import ChainView
 from .parts import ExpirySelector, RightToggle, SymbolChipBar
 from .rail import OrderRail
-from .session_strip import SessionOrdersStrip
 
 log = logging.getLogger(__name__)
 
-_ET = ZoneInfo("America/New_York")
-
-# Layout keys for the ladder | rail divider and the rail-column's
-# order-entry / session-orders divider.
+# Layout key for the ladder | rail divider.
 _SPLIT_KEY = "options_ticket_splitter"
-_RIGHT_SPLIT_KEY = "options_ticket_right_splitter"
 
 _RIGHT = oi.STRATEGY_RIGHT       # strategy → "C" | "P"
 _ACTION = oi.STRATEGY_ACTION     # strategy → "BUY" | "SELL"
@@ -119,8 +113,6 @@ class OptionsIncomeTicket(QWidget):
         self._underlying_conid = 0
         self._spot = 0.0
         self._prev_close = 0.0
-        self._shares = 0.0
-        self._basis = 0.0
         self._chain: dict | None = None
         self._selected_leg: dict | None = None
         self._price_pending = True   # reset price to mid on next leg quote
@@ -129,8 +121,6 @@ class OptionsIncomeTicket(QWidget):
         # underlying's first quote arrives after a spot-less build.
         self._contracts_cache: list = []
         self._rows_spot = 0.0
-        self._session_refs: set[str] = set()   # orderRefs placed here
-        self._ref_account: dict[str, str] = {}  # orderRef → account
 
         self.setObjectName("optionsIncomeTicket")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
@@ -157,9 +147,9 @@ class OptionsIncomeTicket(QWidget):
         """Two columns split by a draggable divider: LEFT = Calls/Puts +
         expiry chips over the strike ladder; RIGHT = the Book Trader's
         ticker strip (symbol · last · bid · ask · change · "+") → symbol
-        chip grid → order rail → "This session" strip.  Everything about
-        *what* to trade sits directly above the Buy/Sell controls, in
-        the same shape as the Book Trader column."""
+        chip grid → order rail.  Everything about *what* to trade sits
+        directly above the Buy/Sell controls, in the same shape as the
+        Book Trader column."""
         outer = QVBoxLayout(self)
         # Tight bottom margin: the ladder should run to the tab's edge.
         outer.setContentsMargins(18, 14, 18, 6)
@@ -168,15 +158,11 @@ class OptionsIncomeTicket(QWidget):
         # ── Ticker strip (right column, top) ────────────────────────────
         # No account / margin badge here: the ticket follows the Account
         # List selection, which the top tab bar already names.  "+"
-        # opens the shared symbol-search popup.  The share total / cost
-        # basis across the checked accounts sits on its own dim line
-        # beneath (hidden while flat) so it never competes with the
-        # strip for the column's width.
+        # opens the shared symbol-search popup.  No share / cost line
+        # either — per-account holdings drive MAX, and the Positions tab
+        # is where they are read.
         self._ticker = TickerStrip(self, no_pct_change_symbols=())
         self._ticker.add_symbol_clicked.connect(self._show_symbol_popup)
-        self._h_pos = QLabel("", self)
-        self._h_pos.setStyleSheet(f"color:{Theme.TEXT_DIM}; font-size:11px;")
-        self._h_pos.hide()
 
         # ── Symbol chips (right column, under the strip) ────────────────
         self._chips = SymbolChipBar(
@@ -227,44 +213,28 @@ class OptionsIncomeTicket(QWidget):
         self._submit_relock.setSingleShot(True)
         self._submit_relock.setInterval(1500)
         self._submit_relock.timeout.connect(self._recompute)
-        # Right pane, itself split top | bottom: order entry (the rail)
-        # above, the "This session" strip — live status + Cancel for the
-        # orders submitted from this ticket (hidden until the first
-        # submit) — below, with its own draggable divider.
+        # Right pane: ticker strip, chips, then the order rail.  Order
+        # status lives in the Orders panel above the tabs, not here.
         right_host = QWidget(self._body_split)
         right = QVBoxLayout(right_host)
         right.setContentsMargins(10, 0, 0, 0)
         right.setSpacing(10)
         right.addWidget(self._ticker)
-        right.addWidget(self._h_pos)
         right.addWidget(self._chips)
-        self._right_split = QSplitter(Qt.Orientation.Vertical, right_host)
-        self._right_split.setHandleWidth(2)
-        self._right_split.setStyleSheet(
-            f"QSplitter::handle {{ background: {Theme.BORDER}; }}")
-        self._right_split.addWidget(self._rail)
-        self._session = SessionOrdersStrip(self._right_split)
-        self._session.cancel_requested.connect(self._on_cancel_order)
-        self._right_split.addWidget(self._session)
-        self._right_split.setStretchFactor(0, 1)   # extra height → rail
-        self._right_split.setStretchFactor(1, 0)
-        self._right_split.setCollapsible(0, False)
-        self._right_split.setCollapsible(1, False)
-        right.addWidget(self._right_split, stretch=1)
+        right.addWidget(self._rail, stretch=1)
         self._body_split.addWidget(right_host)
         self._body_split.setStretchFactor(0, 1)   # extra width → ladder
         self._body_split.setStretchFactor(1, 0)
         self._body_split.setCollapsible(0, False)
         self._body_split.setCollapsible(1, False)
         outer.addWidget(self._body_split, stretch=1)
-        # Restore the last divider positions; save them (debounced — a
-        # drag emits splitterMoved per pixel) whenever one moves.
+        # Restore the last divider position; save it (debounced — a
+        # drag emits splitterMoved per pixel) whenever it moves.
         try:
             layout = config_manager.load_layout()
             sizes = [int(s) for s in (layout.get(_SPLIT_KEY) or [])]
             if len(sizes) == 2 and all(s > 0 for s in sizes):
                 self._body_split.setSizes(sizes)
-            self._apply_right_split_sizes(layout)
         except Exception:
             log.debug("Options ticket: could not restore splitter",
                       exc_info=True)
@@ -273,8 +243,6 @@ class OptionsIncomeTicket(QWidget):
         self._split_save.setInterval(400)
         self._split_save.timeout.connect(self._save_splitter)
         self._body_split.splitterMoved.connect(
-            lambda _pos, _idx: self._split_save.start())
-        self._right_split.splitterMoved.connect(
             lambda _pos, _idx: self._split_save.start())
 
         # Status line (chain errors, offline account, …)
@@ -305,20 +273,20 @@ class OptionsIncomeTicket(QWidget):
 
     def on_accounts_changed(self) -> None:
         """Host hook: the checked accounts / active group changed.
-        Re-derives the position chips and the loaded symbol's share
-        total, and re-gates the rail.  (The data connection does not
-        follow the selection — see :meth:`refresh_workers`.)"""
+        Re-derives the position chips and re-gates the rail (MAX is
+        per-account).  The data connection does not follow the
+        selection — see :meth:`refresh_workers`."""
         self._chips.refresh_counts()
         if self._symbol:
-            self._apply_position_agg(self._symbol)
+            self._seed_from_positions(self._symbol)
         self._recompute()
 
     def on_positions_changed(self) -> None:
         """Host hook (debounced): live position data changed — chip
-        ranking and the loaded symbol's share total follow it."""
+        ranking and the per-account capacities follow it."""
         self._chips.refresh_counts()
         if self._symbol:
-            self._apply_position_agg(self._symbol)
+            self._seed_from_positions(self._symbol)
         self._recompute()
 
     # ── Worker wiring ───────────────────────────────────────────────────────
@@ -348,7 +316,6 @@ class OptionsIncomeTicket(QWidget):
         w.option_contracts_results.connect(self._on_contracts_results)
         w.option_contracts_failed.connect(self._on_request_failed)
         w.option_quote_updated.connect(self._on_quote)
-        w.order_status_updated.connect(self._on_order_status)
         self._wired = True
         if self._symbol:
             # New connection → fresh chain + quotes for the loaded symbol.
@@ -366,7 +333,6 @@ class OptionsIncomeTicket(QWidget):
             (w.option_contracts_results, self._on_contracts_results),
             (w.option_contracts_failed, self._on_request_failed),
             (w.option_quote_updated, self._on_quote),
-            (w.order_status_updated, self._on_order_status),
         ):
             try:
                 sig.disconnect(slot)
@@ -378,29 +344,10 @@ class OptionsIncomeTicket(QWidget):
             pass
         self._wired = False
 
-    def _apply_right_split_sizes(self, layout: dict | None = None) -> None:
-        """Apply the saved order-entry / session-orders divider (only
-        meaningful once the strip is visible — a hidden pane is 0)."""
-        try:
-            if layout is None:
-                layout = config_manager.load_layout()
-            sizes = [int(s) for s in (layout.get(_RIGHT_SPLIT_KEY) or [])]
-            if len(sizes) == 2 and all(s > 0 for s in sizes):
-                self._right_split.setSizes(sizes)
-        except Exception:
-            log.debug("Options ticket: could not restore right splitter",
-                      exc_info=True)
-
     def _collect_splitter_sizes(self, layout: dict) -> None:
         sizes = [int(s) for s in self._body_split.sizes()]
         if len(sizes) == 2 and all(s > 0 for s in sizes):
             layout[_SPLIT_KEY] = sizes
-        # Skip while the strip is hidden — its pane reads 0 and would
-        # wipe the user's chosen height.
-        if not self._session.isHidden():
-            rsizes = [int(s) for s in self._right_split.sizes()]
-            if len(rsizes) == 2 and all(s > 0 for s in rsizes):
-                layout[_RIGHT_SPLIT_KEY] = rsizes
 
     def _save_splitter(self) -> None:
         try:
@@ -464,47 +411,38 @@ class OptionsIncomeTicket(QWidget):
 
     # ── Symbol / position ───────────────────────────────────────────────────
 
-    def _position_agg(self, symbol: str) -> tuple[float, float, int, float]:
-        """``(shares, avg_cost, con_id, market_price)`` for *symbol*
-        summed across the checked+connected accounts: total shares, the
-        share-weighted average cost of the long holdings, and the first
-        known conId / market price."""
-        shares = 0.0
-        cost = 0.0
-        long_shares = 0.0
+    def _position_hint(self, symbol: str) -> tuple[int, float]:
+        """``(con_id, market_price)`` for *symbol* from the first
+        checked+connected account that holds it — seeds the underlying
+        conId and an initial spot before the chain / quote arrive.
+        Share counts are NOT aggregated: MAX is sized per account in
+        :meth:`_account_cap`."""
         con_id = 0
         mkt = 0.0
         for account in self._accounts():
             pos = self._get_position(account, symbol) or {}
-            qty = float(pos.get("position") or 0.0)
-            shares += qty
-            if qty > 0:
-                long_shares += qty
-                cost += qty * float(pos.get("avg_cost") or 0.0)
             if not con_id:
                 con_id = int(pos.get("con_id") or 0)
             if mkt <= 0:
                 mkt = float(pos.get("market_price") or 0.0)
-        basis = cost / long_shares if long_shares > 0 else 0.0
-        return shares, basis, con_id, mkt
+            if con_id and mkt > 0:
+                break
+        return con_id, mkt
 
-    def _apply_position_agg(self, symbol: str) -> None:
-        """Refresh the header's share total / cost basis for *symbol*
+    def _seed_from_positions(self, symbol: str) -> None:
+        """Fill in a missing underlying conId / spot from a held position
         (accounts or positions moved under a loaded chain)."""
-        shares, basis, con_id, mkt = self._position_agg(symbol)
-        self._shares, self._basis = shares, basis
+        con_id, mkt = self._position_hint(symbol)
         if not self._underlying_conid and con_id:
             self._underlying_conid = con_id
         if self._spot <= 0 and mkt > 0:
             self._spot = mkt
-        self._refresh_header()
+            self._refresh_header()
 
     def _load_symbol(self, symbol: str) -> None:
         symbol = symbol.upper()
         self._symbol = symbol
-        shares, basis, con_id, mkt = self._position_agg(symbol)
-        self._shares = shares
-        self._basis = basis
+        con_id, mkt = self._position_hint(symbol)
         self._underlying_conid = con_id
         self._spot = mkt
         self._prev_close = 0.0
@@ -533,20 +471,9 @@ class OptionsIncomeTicket(QWidget):
 
     def _refresh_header(self, bid: float = 0.0, ask: float = 0.0) -> None:
         """Push symbol / spot / bid / ask / prior close into the ticker
-        strip (it formats the change badges itself); the line beneath
-        shows the share total across the checked accounts and the
-        weighted cost basis, and hides for flat symbols."""
+        strip (it formats the change badges itself)."""
         self._ticker.set_symbol(self._symbol)
         self._ticker.update_price(self._spot, bid, ask, self._prev_close)
-        if self._shares >= 1:
-            text = f"{int(self._shares):,} sh"
-            if self._basis > 0:
-                text += f" · Avg {self._basis:,.2f}"
-            self._h_pos.setText(text)
-            self._h_pos.show()
-        else:
-            self._h_pos.setText("")
-            self._h_pos.hide()
 
     def _strategy(self) -> str:
         """BC / CC / BP / CSP — derived from the rail's Buy/Sell toggle
@@ -852,33 +779,6 @@ class OptionsIncomeTicket(QWidget):
         self._set_status(msg, error=True)
         self._recompute()
 
-    # ── Session orders (status stream + cancel) ─────────────────────────────
-
-    def _on_order_status(self, d: dict) -> None:
-        """Worker order-status stream → update this window's strip rows.
-
-        Every order on the connection flows through here; only refs
-        submitted from this ticket are picked up (random 4-letter tags
-        make collisions with other windows practically impossible)."""
-        ref = str(d.get("order_ref") or "")
-        if ref not in self._session_refs:
-            return
-        self._session.update_order(
-            ref, str(d.get("status") or ""),
-            str(d.get("fill_price") or "–"),
-            str(d.get("error_message") or ""))
-
-    def _on_cancel_order(self, ref: str) -> None:
-        account = self._ref_account.get(ref)
-        if not account:
-            return
-        # Each strip row is one account's order — cancel it on THAT
-        # account's connection (a fan-out may span several).  Worker
-        # blotter key format: "{account}_{orderRef}".
-        worker = self._get_worker(account)
-        if worker is not None:
-            worker.cancel_order(f"{account}_{ref}")
-
     # ── Selection changes ───────────────────────────────────────────────────
 
     def _on_strategy_changed(self, _key: str) -> None:
@@ -1062,17 +962,10 @@ class OptionsIncomeTicket(QWidget):
             "strike": leg.get("strike"),
             "right": contract.get("right"),
         }
-        # One payload per checked account, each with its own
-        # pre-generated orderRef (worker format) so the session strip
-        # can match every account's order in the order_status_updated
-        # stream and cancel it on its own connection while open.
-        from src.core.ib_worker import _generate_order_ref
-        first_order = self._session.isHidden()
-        stamp = datetime.now(_ET).strftime("%H:%M:%S")
+        # One payload per checked account; the worker generates each
+        # order's ref and the Orders panel tracks it from there.
         for account in accounts:
-            order_ref = _generate_order_ref()
             payload = {
-                "order_ref": order_ref,
                 "action": _ACTION[strategy],
                 "type": "MKT" if market else "LMT",
                 "symbol": contract.get("symbol", self._symbol),
@@ -1087,29 +980,11 @@ class OptionsIncomeTicket(QWidget):
                 "_target_accounts": [account],
                 "_what_if_check": True,
             }
-            self._session_refs.add(order_ref)
-            self._ref_account[order_ref] = account
-            self._session.add_order(order_ref, {
-                "time": stamp,
-                "account": self._account_label(account),
-                "action": payload["action"],
-                "qty": int(qty),
-                "symbol": self._symbol,
-                "strike": float(leg.get("strike") or 0.0),
-                "right": self._right_toggle.right(),
-                "price": "MKT" if market else f"{px:.2f}",
-            })
             log.info("OptionsIncomeTicket: %s → %s", strategy, payload)
             self.order_ready.emit(payload)
-        # The ticket stays put for the next order.  The submitted orders
-        # land in the session strip (live status + Cancel while open),
-        # qty snaps back to 1 so the next order is sized deliberately,
-        # and the submit button is held down briefly so a double-click
-        # can't transmit twice.
-        if first_order:
-            # The strip's pane was collapsed while hidden — sizes set
-            # then don't stick, so apply the saved divider now.
-            self._apply_right_split_sizes()
+        # The ticket stays put for the next order: qty snaps back to 1
+        # so the next order is sized deliberately, and the submit button
+        # is held down briefly so a double-click can't transmit twice.
         self._rail.reset_qty()
         self._rail.set_sell_enabled(False, "Order submitted ✓")
         self._submit_relock.start()

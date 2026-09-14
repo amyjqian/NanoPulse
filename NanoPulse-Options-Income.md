@@ -47,11 +47,11 @@ order panel:
   pre-check still gates each order;
 - the Submit button is disabled with the reason when any checked account is ineligible, when no
   account is checked, or when the "Orders on all accounts" guard (Settings → Trading) applies;
-- the "This session" strip shows one row per account (ACCOUNT column) and cancels on that
-  account's own connection.
+- submitted orders appear in the Orders panel above the tabs, one row per account, with status
+  and Cancel there — the ticket keeps no order list of its own.
 
-The header shows the symbol, price/change and the **summed share count + weighted average cost**
-across the checked accounts. Chips show the bare ticker.
+The header is the Book Trader's ticker strip (symbol · last · bid · ask · change). No share count
+is shown — MAX already reflects each account's holdings. Chips show the bare ticker.
 
 **Market data** (chain, strikes, quotes, symbol search) streams on the highest-priority *connected*
 TWS connection — the same one the order panel's price feed uses — never on a checked account's

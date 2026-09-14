@@ -4,7 +4,7 @@ Covers: chain → expiries → strikes → quotes population, default
 selections, qty caps (CC shares / CSP buying power), the three synced
 price inputs, ineligible states, stale-token rejection, the submitted
 payload shape and the per-account fan-out (same qty to every checked
-account, MAX = the smallest capacity, one session-strip row each).
+account, MAX = the smallest capacity, one payload per account).
 """
 from __future__ import annotations
 
@@ -604,16 +604,7 @@ def test_market_order_submit(qtbot):
     assert rail._px_edit.isEnabled()
 
 
-def _status_event(ref, status, *, account="mgn-jack-02", fill="–", err=""):
-    return {"order_id": f"{account}_{ref}", "order_ref": ref,
-            "symbol": "NVDA 187.5C", "account": account, "action": "SELL",
-            "order_type": "LMT", "quantity": "2", "limit_price": "3.10",
-            "stop_price": "–", "tif": "DAY", "fill_price": fill,
-            "status": status, "time": "10:30:45",
-            "time_sort": "2026-01-01T10:30:45", "error_message": err}
-
-
-def test_submit_keeps_ticket_open_and_tracks_session(qtbot):
+def test_submit_keeps_ticket_open_and_relocks(qtbot):
     t, w = _make(qtbot)
     _deliver_chain(t, w)
     _deliver_contracts(t, w)
@@ -623,124 +614,21 @@ def test_submit_keeps_ticket_open_and_tracks_session(qtbot):
     payloads = []
     t.order_ready.connect(payloads.append)
     t._rail._sell_btn.click()
-
-    p = payloads[0]
-    # The ticket pre-generates a worker-format orderRef for tracking.
-    assert p["order_ref"].startswith("nano_")
-    # The ticket stays put, ready for the next order.
-    assert not t._session.isHidden()
-    assert p["order_ref"] in t._session._rows
-    assert t._session._rows[p["order_ref"]]["account"] == ACCOUNT
-    # Qty snaps back to 1; submit is locked out briefly.
+    assert len(payloads) == 1 and payloads[0]["qty"] == 2
+    # No ticket-side order tracking: the worker generates the ref and
+    # the Orders panel shows the status.
+    assert "order_ref" not in payloads[0]
+    # The ticket stays put: qty snaps back to 1; submit locked briefly.
     assert t._rail.qty() == 1
     assert not t._rail._sell_btn.isEnabled()
     assert t._rail._sell_btn.text() == "Order submitted ✓"
-    # The relock timer re-enables through the normal recompute path.
+    # The relock timer re-enables through the normal recompute path,
+    # and a second order goes out on its own.
     t._submit_relock.stop()
     t._recompute()
     assert t._rail._sell_btn.isEnabled()
-
-
-def test_session_strip_status_flow_and_cancel(qtbot):
-    t, w = _make(qtbot)
-    _deliver_chain(t, w)
-    _deliver_contracts(t, w)
-    _deliver_selected_quote(t, w)
-
-    payloads = []
-    t.order_ready.connect(payloads.append)
     t._rail._sell_btn.click()
-    ref = payloads[0]["order_ref"]
-    assert ref in t._session._rows
-
-    # Pre-check → open: Cancel appears only once the order is at TWS.
-    w.order_status_updated.emit(_status_event(ref, "Margin check"))
-    assert not t._session.can_cancel(ref)
-    w.order_status_updated.emit(_status_event(ref, "Submitted"))
-    assert t._session.can_cancel(ref)
-    assert t._session.status_text(ref) == "Submitted"
-
-    # Cancel click → worker.cancel_order with the blotter key.
-    t._session.request_cancel(ref)
-    assert w.cancel_order_calls == [f"mgn-jack-02_{ref}"]
-    assert not t._session.can_cancel(ref)       # double-click guard
-    t._session.request_cancel(ref)              # no second worker call
-    assert len(w.cancel_order_calls) == 1
-    w.order_status_updated.emit(_status_event(ref, "Cancelled"))
-    assert not t._session.can_cancel(ref)
-    assert t._session.status_text(ref) == "Cancelled"
-
-    # Statuses for other windows' orders are ignored.
-    w.order_status_updated.emit(_status_event("nano_0731_093000_zzzz",
-                                              "Submitted"))
-    assert "nano_0731_093000_zzzz" not in t._session._rows
-
-
-def test_cancel_requires_confirm_click(qtbot):
-    from src.ui.widgets.options_income.session_strip import COL_CANCEL
-    t, w = _make(qtbot)
-    _deliver_chain(t, w)
-    _deliver_contracts(t, w)
-    _deliver_selected_quote(t, w)
-    payloads = []
-    t.order_ready.connect(payloads.append)
-    t._rail._sell_btn.click()
-    ref = payloads[0]["order_ref"]
-    w.order_status_updated.emit(_status_event(ref, "Submitted"))
-
-    strip = t._session
-    idx = strip._model.index(0, COL_CANCEL)
-    # First click only ARMS — nothing sent to the worker.
-    strip._on_clicked(idx)
-    assert w.cancel_order_calls == []
-    assert strip._rows[ref]["confirm"] is True
-    assert strip._confirm_timer.isActive()
-    # Second click confirms → cancel goes out.
-    strip._on_clicked(idx)
-    assert w.cancel_order_calls == [f"mgn-jack-02_{ref}"]
-    assert strip._rows[ref]["confirm"] is False
-
-    # Re-arm after the order re-opens, then let the window lapse.
-    w.order_status_updated.emit(_status_event(ref, "Submitted"))
-    strip._on_clicked(idx)
-    assert strip._rows[ref]["confirm"] is True
-    strip._disarm_confirm()                    # timer timeout path
-    assert strip._rows[ref]["confirm"] is False
-    assert len(w.cancel_order_calls) == 1      # nothing extra sent
-    # A status event under an armed confirm also disarms.
-    strip._on_clicked(idx)
-    w.order_status_updated.emit(_status_event(ref, "Submitted"))
-    assert strip._rows[ref]["confirm"] is False
-
-
-def test_session_strip_fill_and_reject(qtbot):
-    t, w = _make(qtbot)
-    _deliver_chain(t, w)
-    _deliver_contracts(t, w)
-    _deliver_selected_quote(t, w)
-
-    payloads = []
-    t.order_ready.connect(payloads.append)
-    t._rail._sell_btn.click()
-    ref = payloads[0]["order_ref"]
-
-    w.order_status_updated.emit(_status_event(ref, "Filled", fill="3.12"))
-    assert t._session.status_text(ref) == "Filled @ 3.12"
-    assert not t._session.can_cancel(ref)
-
-    # Second order from the same window gets its own row (newest on
-    # top); a whatIf rejection surfaces with the reason as tooltip.
-    t._submit_relock.stop()
-    t._recompute()
-    t._rail._sell_btn.click()
-    ref2 = payloads[1]["order_ref"]
-    assert ref2 != ref and len(t._session._rows) == 2
-    assert t._session._model.row_data(0)["ref"] == ref2
-    w.order_status_updated.emit(
-        _status_event(ref2, "Rejected", err="Insufficient margin"))
-    assert t._session.status_text(ref2) == "Rejected"
-    assert t._session._rows[ref2]["error"] == "Insufficient margin"
-    assert not t._session.can_cancel(ref2)
+    assert len(payloads) == 2
 
 
 def test_chain_column_widths_persist_across_opens(qtbot, monkeypatch):
@@ -905,13 +793,10 @@ def test_fanout_blocked_reason_wins(qtbot):
 
 def test_two_accounts_same_qty_each_min_capacity(qtbot):
     # Cash accounts: A holds 300 sh (3 contracts), B holds 100 (1).
-    # MAX is the smallest so the same qty fits every account; header
-    # shows the summed shares + weighted basis.
+    # MAX is the smallest so the same qty fits every account.
     t, w = _make(qtbot, accounts=("acct-A", "acct-B"),
                  shares={"acct-A": 300.0, "acct-B": 100.0},
                  is_margin=False)
-    assert t._shares == 400.0
-    assert t._h_pos.text() == "400 sh · Avg 164.20"
     assert t._ticker.symbol == "NVDA"
     _deliver_chain(t, w)
     _deliver_contracts(t, w)
@@ -924,18 +809,8 @@ def test_two_accounts_same_qty_each_min_capacity(qtbot):
     t._rail._sell_btn.click()
     assert [p["_target_accounts"] for p in payloads] == [["acct-A"],
                                                           ["acct-B"]]
-    refs = [p["order_ref"] for p in payloads]
-    assert len(set(refs)) == 2 and all(r.startswith("nano_") for r in refs)
     assert all(p["qty"] == 1 and p["_what_if_check"] for p in payloads)
     assert payloads[0]["_resolved_contract"] == payloads[1]["_resolved_contract"]
-    # One strip row per account, each cancelling on its own key.
-    assert len(t._session._rows) == 2
-    assert {rd["account"] for rd in t._session._rows.values()} == {
-        "acct-A", "acct-B"}
-    w.order_status_updated.emit(
-        _status_event(refs[1], "Submitted", account="acct-B"))
-    t._session.request_cancel(refs[1])
-    assert w.cancel_order_calls == [f"acct-B_{refs[1]}"]
 
 
 def test_ineligible_account_blocks_group(qtbot):

@@ -188,7 +188,7 @@ class OrderRail(QWidget):
         # Submit sits right under the price anchors, keeping the whole
         # order flow in one compact block.  (The ticket lives in a
         # permanent tab, so there is nothing to dismiss — no Cancel /
-        # Close button; per-order Cancel lives on the session strip.)
+        # Close button; per-order Cancel lives in the Orders panel.)
         brow = QHBoxLayout()
         brow.setSpacing(8)
         self._sell_btn = QPushButton("Submit order", self)

@@ -83,7 +83,7 @@ class SymbolChipBar(QWidget):
     at most ``_CHIP_MAX`` chips: a new symbol on a full grid replaces
     the LAST searched chip rather than becoming an invisible overflow
     entry (same rule as the Book Trader's chip bar).  Chips show the
-    bare ticker; share counts live under the ticker strip.
+    bare ticker.
 
     Signals
     -------
