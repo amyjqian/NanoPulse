@@ -316,3 +316,66 @@ class TestFlashTradeWiring:
         seen.clear()
         v._on_connection_status_for_visibility("Q-ib", True)
         assert seen and "reconnected" in seen[0]
+
+
+class TestWorkerSwap:
+    """Disconnect → Connect on the Conn tab replaces the worker.  The old
+    one's shutdown ``connected=False`` reaches this view, but the new
+    one's ``connected=True`` fires before the view wires it (on the next
+    showEvent) — wiring must sync the real link state, or the
+    connection's positions stay hidden until an app restart."""
+
+    @staticmethod
+    def _fake_worker(label, connected):
+        from PySide6.QtCore import QObject, Signal
+
+        class _FakeWorker(QObject):
+            order_status_updated = Signal(object)
+            portfolio_updated = Signal(object)
+            flatten_close_needed = Signal(object)
+            reverse_close_needed = Signal(object)
+            pnl_single_updated = Signal(str, int, float, float, float)
+            pnl_single_batch_updated = Signal(object)
+            account_pnl_updated = Signal(str, float, float, float)
+            fill_updated = Signal(object)
+            connection_status_changed = Signal(str, bool)
+            accounts_detected = Signal(str, object)
+            price_updated = Signal(str, float)
+            bg_price_updated = Signal(str, float, float, float, float)
+
+            def __init__(self):
+                super().__init__()
+                self._label = label
+                self.is_ib_connected = connected
+
+            def request_order_snapshot(self): pass
+            def request_portfolio_snapshot(self): pass
+            def request_pnl_snapshot(self): pass
+            def request_fills_snapshot(self): pass
+
+        return _FakeWorker()
+
+    def test_new_connected_worker_unhides_its_accounts(self, qtbot):
+        from src.ui.widgets.flash_trade_view import FlashTradeView
+        v = FlashTradeView()
+        qtbot.addWidget(v)
+        old = self._fake_worker("Q-ib", connected=True)
+        v._ensure_worker_connected(old)
+        old.connection_status_changed.emit("Q-ib", False)   # Disconnect
+        assert v._account_position._model.offline_labels() == {"Q-ib"}
+
+        new = self._fake_worker("Q-ib", connected=True)     # already up
+        v._ensure_worker_connected(new)
+        assert v._account_position._model.offline_labels() == set()
+        assert v._trades_panel._flat_proxy.offlineLabels() == set()
+
+    def test_still_connecting_worker_unhides_on_its_signal(self, qtbot):
+        from src.ui.widgets.flash_trade_view import FlashTradeView
+        v = FlashTradeView()
+        qtbot.addWidget(v)
+        v._on_connection_status_for_visibility("Q-ib", False)
+        new = self._fake_worker("Q-ib", connected=False)
+        v._ensure_worker_connected(new)
+        assert v._account_position._model.offline_labels() == {"Q-ib"}
+        new.connection_status_changed.emit("Q-ib", True)
+        assert v._account_position._model.offline_labels() == set()

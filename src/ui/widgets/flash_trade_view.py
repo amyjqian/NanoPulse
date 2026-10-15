@@ -1055,6 +1055,17 @@ class FlashTradeView(QWidget):
             "pnl_single_updated + account_pnl_updated + fill_updated "
             "for worker %s", label)
 
+        # Sync the offline-hide state with the new worker's real link
+        # state.  A Disconnect → Connect from the Conn tab replaces the
+        # worker: the old one's shutdown ``connected=False`` reached us
+        # (we were still wired to it), but the new one's
+        # ``connected=True`` usually fires before this view wires it (on
+        # the next showEvent), so the label stayed in ``_down_labels``
+        # and its positions/fills stayed hidden until an app restart.
+        # Read AFTER connecting the signal so no flip can fall in a gap.
+        self._on_connection_status_for_visibility(
+            label, worker.is_ib_connected)
+
         # Re-snapshot: the worker's initial snapshot may have fired before
         # this signal was connected.  Ask it to emit all known orders and
         # fills again so the Trades view is populated.
