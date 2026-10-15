@@ -71,6 +71,29 @@ _PAPER_PREFIXES = ("DU", "DF")   # DU = individual paper, DF = FA demo
 _LIVE_PREFIXES = ("U", "F", "I")  # U = individual, F = FA, I = institutional
 
 
+# BuyingPower / AvailableFunds above this reads as a margin account.  Cash
+# sits at exactly 1.0; Reg T margin at ~3.3-4.0; portfolio margin ~6.7.
+_MARGIN_RATIO_MIN = 1.5
+
+# Registered / retirement plan markers in IB's ``AccountType`` string.
+# Canadian plans (RRSP, TFSA, RESP, LIRA, RRIF, FHSA, LIF) and the US IRA
+# family (``IRA-ROTH-NEW``, ``IRA-TRAD-NEW``, …).  Matched as whole
+# alphabetic tokens so ``INDIVIDUAL`` never matches ``IRA``.
+_REGISTERED_PLANS = ("RRSP", "TFSA", "RESP", "LIRA", "RRIF", "FHSA", "LIF",
+                     "IRA")
+
+
+def registered_plan(account_type: str) -> str:
+    """The registered-plan name named by an IB ``AccountType`` string
+    (``"RRSP"``, ``"IRA"``, …), or "" for ordinary ownership types."""
+    import re
+    tokens = set(re.findall(r"[A-Z]+", (account_type or "").upper()))
+    for plan in _REGISTERED_PLANS:
+        if plan in tokens:
+            return plan
+    return ""
+
+
 def detect_account_type(account: str) -> str:
     """Return ``'Paper'``, ``'Live'``, or ``'—'`` based on IBKR account prefix."""
     acct = account.strip().upper()
@@ -110,6 +133,19 @@ class AccountsTableModel(QAbstractTableModel):
         self._aliases: dict[str, str] = config_manager.load_aliases()
         # Buying power tracked separately (not shown as a column in Connections view)
         self._buying_power: dict[str, float] = {}   # account → buying power
+        # Margin-vs-cash inputs.  IB has no flag for it on the API; the
+        # TWS Account window derives it and so do we: a cash account's
+        # BuyingPower equals its AvailableFunds, a Reg T margin account's
+        # is ~3.3-4× and portfolio margin ~6.7×.  ``AccountType`` is the
+        # ownership / registration structure (INDIVIDUAL, JOINT, IRA-…,
+        # and the Canadian registered plans) — a registered plan is
+        # always cash and is shown by its own name.
+        self._account_type: dict[str, str] = {}      # account → AccountType
+        self._available_funds: dict[str, float] = {}  # account → AvailableFunds
+        # Last classification that could be made.  Sticky, because with
+        # funds fully committed both BP and AvailableFunds read 0 for a
+        # while and the ratio says nothing — the badge must not blink.
+        self._account_kind: dict[str, str] = {}
         # Per-currency cash balances from the ``$LEDGER:ALL`` summary tag,
         # keyed account → {currency: balance}.  Not a table column — read by
         # AccountListPanel to render the "USD 6,300  JPY 5,000" line per row.
@@ -247,11 +283,26 @@ class AccountsTableModel(QAbstractTableModel):
                     continue
                 if self._buying_power.get(account) != bp:
                     self._buying_power[account] = bp
-                    row_idx = self._row_map.get((label, account))
-                    if row_idx is not None:
-                        mi = self.index(row_idx, COL_NET_LIQ)
-                        self.dataChanged.emit(
-                            mi, mi, [Qt.ItemDataRole.DisplayRole])
+                    self._nudge_row(label, account)
+                continue
+
+            # Margin / cash classification inputs (see __init__).  Same
+            # treatment as BuyingPower: cached, not a column, nudge the
+            # row only on change.
+            if tag == "AvailableFunds":
+                try:
+                    af = float(value)
+                except (ValueError, TypeError):
+                    continue
+                if self._available_funds.get(account) != af:
+                    self._available_funds[account] = af
+                    self._nudge_row(label, account)
+                continue
+            if tag == "AccountType":
+                atype = str(value or "").strip()
+                if atype and self._account_type.get(account) != atype:
+                    self._account_type[account] = atype
+                    self._nudge_row(label, account)
                 continue
 
             # Per-account, per-currency cash from the reqAccountUpdatesMulti
@@ -319,6 +370,41 @@ class AccountsTableModel(QAbstractTableModel):
         self._acct_to_label[account] = label
         self._known_accounts[account] = label
         self.endInsertRows()
+
+    def _nudge_row(self, label: str, account: str) -> None:
+        """Emit ``dataChanged`` on the account's Net Liq cell so the
+        Account List re-reads the card-only caches (BP, cash, kind)."""
+        row_idx = self._row_map.get((label, account))
+        if row_idx is not None:
+            mi = self.index(row_idx, COL_NET_LIQ)
+            self.dataChanged.emit(mi, mi, [Qt.ItemDataRole.DisplayRole])
+
+    def account_type(self, account: str) -> str:
+        """IB's ``AccountType`` tag for *account* (``INDIVIDUAL``,
+        ``JOINT``, ``IRA-…``, ``RRSP``, …), or "" before it arrives."""
+        return self._account_type.get(account, "")
+
+    def account_kind(self, account: str) -> str:
+        """``"Margin"``, ``"Cash"``, the registered plan's own name
+        (``"TFSA"``, ``"RRSP"``, …), or "" while undeterminable.
+
+        A registered plan is read off ``AccountType`` and is always a
+        cash account.  Otherwise the BuyingPower / AvailableFunds ratio
+        decides; when funds are fully committed (both ≤ 0) the ratio is
+        meaningless and the last answer stands.
+        """
+        atype = self._account_type.get(account, "").upper()
+        plan = registered_plan(atype)
+        if plan:
+            self._account_kind[account] = plan
+            return plan
+        bp = self._buying_power.get(account)
+        af = self._available_funds.get(account)
+        if bp is not None and af is not None and af > 0 and bp > 0:
+            kind = "Margin" if bp / af > _MARGIN_RATIO_MIN else "Cash"
+            self._account_kind[account] = kind
+            return kind
+        return self._account_kind.get(account, "")
 
     def get_buying_power(self, account: str) -> float:
         """Return the last-known buying power for *account*, or 0.0."""
@@ -449,6 +535,9 @@ class AccountsTableModel(QAbstractTableModel):
             return
         for account in gone:
             self._known_accounts.pop(account, None)
+            self._account_type.pop(account, None)
+            self._available_funds.pop(account, None)
+            self._account_kind.pop(account, None)
         log.info("Forgetting %d known account(s) for label=%r",
                  len(gone), label)
         self.remove_rows_by_label(label)
