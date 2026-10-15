@@ -374,3 +374,38 @@ class TestMixedSelection:
         assert answers["asks"] == []
         assert [o["account"] for o in _buys(worker)] == ["A2"]
         assert "not sent to A1" in msgs[-1]
+
+
+class TestCashCoverDialog:
+    def _texts(self, dlg):
+        from PySide6.QtWidgets import QLabel
+        return [lbl.text() for lbl in dlg.findChildren(QLabel)]
+
+    def test_cards_steps_and_button(self, qtbot):
+        from src.core.cash_cover import plan_cash_cover
+        from src.ui.widgets.cash_cover_dialog import CashCoverDialog
+        full = plan_cash_cover("U1", "NVDA", 100, 212.0, 10,
+                               [("SGOV", 2615, 100.545)])
+        part = plan_cash_cover("U2", "NVDA", 100, 212.0, 65,
+                               [("SGOV", 95, 100.545)])
+        dlg = CashCoverDialog([full, part], {"U1": "rsp-alex-01"},
+                              ["mgn-zara-07"])
+        qtbot.addWidget(dlg)
+        texts = self._texts(dlg)
+        assert "Not enough cash in 2 accounts" in texts
+        assert "rsp-alex-01" in texts and "U2" in texts
+        assert "Full buy" in texts
+        assert f"Buy reduced to {part.buy_qty}" in texts
+        assert "Sell 215 SGOV" in texts and "Buy 100 NVDA" in texts
+        assert any("right away in mgn-zara-07" in t for t in texts)
+        assert dlg._ok.text() == "Sell && Buy in 2 accounts"
+
+    def test_ok_accepts_and_cancel_rejects(self, qtbot):
+        from src.core.cash_cover import plan_cash_cover
+        from src.ui.widgets.cash_cover_dialog import CashCoverDialog
+        plan = plan_cash_cover("U1", "NVDA", 100, 212.0, 10,
+                               [("SGOV", 2615, 100.545)])
+        dlg = CashCoverDialog([plan])
+        qtbot.addWidget(dlg)
+        dlg._ok.click()
+        assert dlg.result() == dlg.DialogCode.Accepted
