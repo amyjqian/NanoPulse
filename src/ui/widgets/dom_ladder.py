@@ -219,28 +219,24 @@ class DOMLadderModel(QAbstractTableModel):
         levels are still stored (so a subsequent ``recenter`` picks
         them up without a round-trip), but only in-ladder rows emit
         ``dataChanged`` here.
+
+        Levels landing on the same snapped price are summed: smart
+        depth (SMART-routed stocks) lists one level per venue, so the
+        same price shows up once for IBEOS, once for OVERNIGHT, … and a
+        sub-tick instrument can fold two raw prices onto one row.
         """
         self._bid.clear()
         self._ask.clear()
-        max_sz = 0.0
         tick = self._tick
-        for price, size in bids:
-            if tick > 0:
-                p = round(round(price / tick) * tick, 10)
-            else:
-                p = float(price)
-            self._bid[p] = float(size)
-            if size > max_sz:
-                max_sz = float(size)
-        for price, size in asks:
-            if tick > 0:
-                p = round(round(price / tick) * tick, 10)
-            else:
-                p = float(price)
-            self._ask[p] = float(size)
-            if size > max_sz:
-                max_sz = float(size)
-        self._max_size = max_sz
+        for side, levels in ((self._bid, bids), (self._ask, asks)):
+            for price, size in levels:
+                if tick > 0:
+                    p = round(round(price / tick) * tick, 10)
+                else:
+                    p = float(price)
+                side[p] = side.get(p, 0.0) + float(size)
+        self._max_size = max(
+            list(self._bid.values()) + list(self._ask.values()), default=0.0)
         # Cheap global repaint — _rows_each_side*2+1 cells.
         n = self.rowCount()
         if n:
