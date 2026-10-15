@@ -406,6 +406,12 @@ class AccountsTableModel(QAbstractTableModel):
             return kind
         return self._account_kind.get(account, "")
 
+    def get_available_funds(self, account: str) -> float | None:
+        """Last-known AvailableFunds for *account*, or None before the
+        tag has arrived (a real 0 is meaningful — funds fully used)."""
+        af = self._available_funds.get(account)
+        return float(af) if af is not None else None
+
     def get_buying_power(self, account: str) -> float:
         """Return the last-known buying power for *account*, or 0.0."""
         return self._buying_power.get(account, 0.0)
