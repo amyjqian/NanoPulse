@@ -390,6 +390,9 @@ class IBWorkerThread(QThread):
         #                          since the last _depth_flush_loop tick
         self._depth_tickers: dict[str, object] = {}
         self._ticker_to_depth_sym: dict[int, str] = {}
+        #   _depth_smart         : symbol → isSmartDepth flag used on reqMktDepth
+        #                          (cancelMktDepth must be told the same flag)
+        self._depth_smart: dict[str, bool] = {}
         self._depth_dirty: set[str] = set()
         # L1 price coalescing (same 100 ms cadence as depth): raw ticks
         # mark these dirty; ``_depth_flush_loop`` emits at most 10×/s per
@@ -1132,6 +1135,7 @@ class IBWorkerThread(QThread):
                 # re-subscribe on the next active-symbol change.
                 self._depth_tickers.clear()
                 self._ticker_to_depth_sym.clear()
+                self._depth_smart.clear()
                 self._depth_dirty.clear()
                 # Pending coalesced L1 emits reference dead tickers.
                 self._active_price_dirty = False
@@ -3738,9 +3742,18 @@ class IBWorkerThread(QThread):
             multiplier=cached.get("multiplier", "") or "",
         )
 
+        # SMART-routed contracts (stocks) only have depth as *smart depth*
+        # — TWS aggregates the venues the account is entitled to and
+        # labels each level with its exchange.  Asking for plain
+        # per-exchange depth on SMART is rejected with error 10092
+        # ("Deep market data is not supported for this combination of
+        # security type/exchange"), so the ladder never saw a stock
+        # book.  Direct-routed futures (CME, NYMEX, …) take the plain
+        # form; smart depth on them is the error case.
+        smart = (c.exchange or "").upper() == "SMART"
         try:
             ticker = self._ib.reqMktDepth(
-                c, numRows=int(num_rows or 10), isSmartDepth=False)
+                c, numRows=int(num_rows or 10), isSmartDepth=smart)
         except Exception as exc:
             log.warning("Worker %s: reqMktDepth(%s) raised: %s",
                         self._label, sym, exc)
@@ -3749,8 +3762,12 @@ class IBWorkerThread(QThread):
 
         self._depth_tickers[sym] = ticker
         self._ticker_to_depth_sym[id(ticker)] = sym
-        log.info("Worker %s: depth subscribed %s (numRows=%d)",
-                 self._label, sym, num_rows)
+        self._depth_smart[sym] = smart
+        log.info("Worker %s: depth subscribed %s (numRows=%d, smart=%s)",
+                 self._label, sym, num_rows, smart)
+        tws_log.info("[%s] API-CALL  reqMktDepth(conId=%s, symbol=%s, "
+                     "exchange=%s, numRows=%d, isSmartDepth=%s)",
+                     self._label, c.conId, sym, c.exchange, num_rows, smart)
 
     async def _do_unsubscribe_depth(self, symbol: str) -> None:
         sym = (symbol or "").strip()
@@ -3758,12 +3775,13 @@ class IBWorkerThread(QThread):
             return
         ticker = self._depth_tickers.pop(sym, None)
         self._depth_dirty.discard(sym)
+        smart = self._depth_smart.pop(sym, False)
         if ticker is None:
             return
         self._ticker_to_depth_sym.pop(id(ticker), None)
         if self._ib is not None and self._ib.isConnected():
             try:
-                self._ib.cancelMktDepth(ticker.contract, isSmartDepth=False)
+                self._ib.cancelMktDepth(ticker.contract, isSmartDepth=smart)
             except Exception as exc:
                 log.debug("Worker %s: cancelMktDepth(%s) error: %s",
                           self._label, sym, exc)
@@ -3774,12 +3792,14 @@ class IBWorkerThread(QThread):
             for sym, ticker in list(self._depth_tickers.items()):
                 try:
                     self._ib.cancelMktDepth(
-                        ticker.contract, isSmartDepth=False)
+                        ticker.contract,
+                        isSmartDepth=self._depth_smart.get(sym, False))
                 except Exception:
                     pass
         count = len(self._depth_tickers)
         self._depth_tickers.clear()
         self._ticker_to_depth_sym.clear()
+        self._depth_smart.clear()
         self._depth_dirty.clear()
         log.debug("Worker %s: all %d depth subscriptions cleared",
                   self._label, count)
@@ -4281,6 +4301,29 @@ class IBWorkerThread(QThread):
         except Exception:
             log.debug("Worker %s: bad portfolio item: %s", self._label, item)
 
+    def _depth_sym_for_req_id(self, req_id) -> str | None:
+        """Symbol of the depth subscription behind *req_id*, or None when
+        the request isn't one of ours (L1 stream, options batch, order
+        id, …)."""
+        if not self._ticker_to_depth_sym or self._ib is None:
+            return None
+        try:
+            ticker = self._ib.wrapper.reqId2Ticker.get(req_id)
+        except Exception:
+            return None
+        if ticker is None:
+            return None
+        return self._ticker_to_depth_sym.get(id(ticker))
+
+    def _drop_depth_state(self, sym: str) -> None:
+        """Forget a depth subscription TWS refused (no cancel — nothing
+        was opened)."""
+        ticker = self._depth_tickers.pop(sym, None)
+        self._depth_smart.pop(sym, None)
+        self._depth_dirty.discard(sym)
+        if ticker is not None:
+            self._ticker_to_depth_sym.pop(id(ticker), None)
+
     def _on_ib_error(self, reqId, errorCode, errorString, contract) -> None:
         """Handle IB error events – detect market-data failures like 10197
         and order rejections like 201."""
@@ -4309,6 +4352,23 @@ class IBWorkerThread(QThread):
                         self._label)
             asyncio.ensure_future(self._do_option_quotes(
                 self._opt_quote_token, self._opt_quote_contracts))
+
+        # Depth (L2) request refused — 10092 = depth not offered for this
+        # secType/exchange combination, 354 = no depth entitlement (e.g.
+        # CME depth on a paper account).  Tell the ladder so it renders
+        # from L1, and forget the dead ticker so the next
+        # ``subscribe_depth`` for the symbol isn't skipped as "already
+        # subscribed".  Resolved through ib_async's reqId→ticker map
+        # rather than the contract's conId: the L1 stream for the same
+        # contract can raise 354 too, and that must not kill the depth.
+        if errorCode in (10092, 354):
+            d_sym = self._depth_sym_for_req_id(reqId)
+            if d_sym:
+                log.warning("Worker %s: depth unavailable for %s "
+                            "(error %s) – ladder falls back to L1",
+                            self._label, d_sym, errorCode)
+                self._drop_depth_state(d_sym)
+                self.market_data_failed.emit(d_sym)
 
         if errorCode == 10197 and self._active_ticker is not None:
             # "No market data during competing live session"

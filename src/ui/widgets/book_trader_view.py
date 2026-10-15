@@ -786,7 +786,44 @@ class BookTraderView(QWidget):
             # Real L2 data has arrived — stop the L1 warmup render so
             # the ladder shows true depth going forward.
             self._l2_seen = True
+            self._warm_start_from_depth(bids or [], asks or [])
         self._model.feed_depth(bids or [], asks or [])
+
+    def _warm_start_from_depth(self, bids: list, asks: list) -> None:
+        """Centre the ladder and fill the header bid/ask from the book
+        while the top-of-book stream has produced nothing.
+
+        TWS can accept a SMART stock's L1 request yet never send a tick
+        — seen on an account entitled only to the free overnight venues
+        (IBEOS / OVERNIGHT): the request is flagged live, no delayed
+        fallback kicks in, and bid/ask/last/close all stay NaN.  The
+        smart-depth stream for the same contract still carries those
+        venues' quotes, so without this the book arrives into a ladder
+        still centred on 0 and nothing is drawn.  Only the first
+        positive last price (``feed_price``) recentres on its own, and
+        it never comes.  Once L1 bid/ask do arrive they own the header
+        again (``update_price`` ignores zeros, so nothing is blanked).
+        """
+        if self._last_price > 0 or self._model.tick_size <= 0:
+            return
+        best_bid = max((float(p) for p, _s in bids if p and p > 0),
+                       default=0.0)
+        best_ask = min((float(p) for p, _s in asks if p and p > 0),
+                       default=0.0)
+        if self._last_bid <= 0 and self._last_ask <= 0:
+            self._ticker.update_price(0.0, best_bid, best_ask, 0.0)
+        prices = self._model.prices
+        centred = bool(prices) and prices[len(prices) // 2] > 0
+        if centred:
+            return
+        if best_bid > 0 and best_ask > 0:
+            centre = (best_bid + best_ask) / 2.0
+        else:
+            centre = best_bid or best_ask
+        if centre > 0:
+            log.info("BookTrader: no L1 for %s yet — centring ladder on "
+                     "depth mid %.4f", self._active_symbol, centre)
+            self._model.recenter(centre)
 
     def feed_sizes(
         self,

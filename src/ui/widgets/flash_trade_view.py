@@ -24,6 +24,7 @@ from .trades_panel import TradesPanel
 from .trades_summary_model import portfolio_mark_keys
 from .positions_trades_tabs import PositionsTradesTabs
 from .options_income import OptionsIncomeTicket
+from .cash_cover_dialog import confirm_cash_cover
 
 log = logging.getLogger(__name__)
 
@@ -97,6 +98,9 @@ class FlashTradeView(QWidget):
         # sessions via ``set_trading_allowed`` — enforced in
         # ``_on_order_requested`` as defence-in-depth beyond hidden UI.
         self._trading_allowed = True
+        # In-flight cash-account cover (sell sweep holdings → buy), or
+        # None.  One at a time — see ``_maybe_cover_cash_buy``.
+        self._cash_cover: dict | None = None
         # label → worker instance wired
         self._connected_order_workers: dict[str, IBWorkerThread] = {}
         # label → worker for portfolio
@@ -460,6 +464,7 @@ class FlashTradeView(QWidget):
         # to stop.
         flatten_account = payload.get("_flatten_account")
         target_accounts = payload.get("_target_accounts")
+        from_selection = not flatten_account and not target_accounts
         if flatten_account:
             accounts = [flatten_account]
         elif target_accounts:
@@ -689,6 +694,23 @@ class FlashTradeView(QWidget):
 
         log.info("FlashTrade: %s %s %d %s → %d account(s): %s",
                  action, order_type, qty, symbol, len(accounts), accounts)
+
+        # ── Cash-account cover ────────────────────────────────────────────
+        # A plain Buy on exactly one selected CASH account that needs more
+        # than its available cash: offer to sell the account's sweep
+        # holdings first and send the buy once they fill (see
+        # ``_maybe_cover_cash_buy``).  Only the selection path — flatten
+        # legs, hot-button fan-outs, sweeps and the options ticket name
+        # their accounts explicitly and are never a cash-funded stock buy
+        # the user is sizing by hand.  Percent-sized buys already size
+        # themselves to buying power (= cash on these accounts).
+        if (from_selection and len(accounts) == 1 and action == "BUY"
+                and sec_type == "STK" and not qty_pct
+                and not payload.get("_cash_cover")
+                and self._maybe_cover_cash_buy(
+                    accounts[0], payload, symbol, int(qty), order_type,
+                    limit_price, float(last_price or 0.0))):
+            return
 
         # ── 3. Route to correct worker for each account ───────────────────
         pct_skipped: list[str] = []
@@ -1066,6 +1088,7 @@ class FlashTradeView(QWidget):
 
     def _on_order_status_updated(self, data: dict) -> None:
         """Receive order status from worker thread → update OrderStatusPanel."""
+        self._track_cash_cover(data)
         order_id = data.get("order_id", "")
         account = data.get("account", "")
         status = data.get("status", "")
@@ -1176,6 +1199,168 @@ class FlashTradeView(QWidget):
         self._options_ticket.on_accounts_changed()
         for account in (accounts or []):
             self._push_account_balances(account)
+
+    # ── Cash-account cover (sell sweep holdings, then buy) ───────────────────
+
+    # Sells that end in one of these never fund the buy.
+    _COVER_FAILED = ("Cancelled", "Canceled", "ApiCancelled", "Inactive",
+                     "Rejected", "ValidationError")
+    _COVER_TIMEOUT_MS = 120_000
+    # IB needs a moment after the fill before the proceeds show in the
+    # account's available funds; a buy sent on the same tick can still
+    # be refused for insufficient cash.
+    _COVER_BUY_DELAY_MS = 1500
+
+    def _maybe_cover_cash_buy(self, account: str, payload: dict,
+                              symbol: str, qty: int, order_type: str,
+                              limit_price: float | None,
+                              last_price: float) -> bool:
+        """Cash-account pre-check for a single-account stock buy.
+
+        Returns True when the caller must NOT send the buy now: either
+        the user declined, nothing would fit even after selling, a cover
+        is already in flight, or the sells were placed and the buy is
+        deferred to ``_send_covered_buy`` (fired by ``_track_cash_cover``
+        when every sell has filled).  False means proceed as usual —
+        margin account, enough cash, no price to check against, or no
+        sweep holdings to sell (IB then answers the order itself).
+        """
+        from src.core.cash_cover import buy_unit_price, plan_cash_cover
+        from src.core.cash_management import cash_prefs
+        model = self._accounts_model
+        if model is None:
+            return False
+        kind = model.account_kind(account)
+        if not kind or kind == "Margin":
+            return False
+        available = model.get_available_funds(account)
+        if available is None:
+            return False
+        cached = self._order_entry._price_cache.get((symbol or "").upper())
+        ask = cached[2] if cached else 0.0
+        unit = buy_unit_price(order_type, limit_price, ask, last_price)
+        if unit <= 0:
+            return False
+        holdings = []
+        for sweep_sym in cash_prefs.sweep_symbols:
+            if sweep_sym.upper() == (symbol or "").upper():
+                continue
+            holdings.append((sweep_sym,
+                             self._account_position.held_shares(
+                                 account, sweep_sym),
+                             self._sweep_symbol_price(sweep_sym)))
+        plan = plan_cash_cover(account, symbol, qty, unit, available,
+                               holdings)
+        if not plan.needed:
+            return False
+        if not plan.sells:
+            log.info("FlashTrade: %s short %.0f for %d %s but holds no "
+                     "sweep symbol — sending as is",
+                     account, plan.shortfall, qty, symbol)
+            return False
+        alias = model._aliases.get(account, "") or account
+        if plan.buy_qty <= 0:
+            self.transient_status_message.emit(
+                f"{alias}: not enough cash for {qty:,} {symbol} even after "
+                "selling its sweep holdings — order not sent.", 7000)
+            return True
+        if self._cash_cover is not None:
+            self.transient_status_message.emit(
+                f"{alias}: a cash cover is already in progress — order "
+                "not sent.", 6000)
+            return True
+        log.info("FlashTrade: %s short %.0f for %d %s — asking to sell %s",
+                 account, plan.shortfall, qty, symbol,
+                 [(s.symbol, s.qty) for s in plan.sells])
+        if not confirm_cash_cover(self, plan, alias):
+            log.info("FlashTrade: cash cover declined for %s", account)
+            self.transient_status_message.emit(
+                f"{alias}: buy of {qty:,} {symbol} cancelled.", 5000)
+            return True
+        self._start_cash_cover(plan, payload, alias)
+        return True
+
+    def _start_cash_cover(self, plan, payload: dict, alias: str) -> None:
+        from src.core.ib_worker import _generate_order_ref
+        refs: dict[str, str] = {}
+        for sell in plan.sells:
+            ref = _generate_order_ref()
+            while ref in refs:
+                ref = _generate_order_ref()
+            refs[ref] = sell.symbol
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(
+            lambda: self._abort_cash_cover("the sells did not fill in time"))
+        self._cash_cover = {
+            "account": plan.account, "alias": alias, "plan": plan,
+            "payload": dict(payload), "pending": set(refs), "refs": refs,
+            "timer": timer,
+        }
+        timer.start(self._COVER_TIMEOUT_MS)
+        for ref, sell in zip(refs, plan.sells):
+            log.info("FlashTrade: cash cover → SELL %d %s @MKT account=%s "
+                     "ref=%s", sell.qty, sell.symbol, plan.account, ref)
+            self._on_order_requested({
+                "action": "SELL", "type": "MKT", "symbol": sell.symbol,
+                "qty": int(sell.qty), "last_price": float(sell.price),
+                "_target_accounts": [plan.account], "order_ref": ref,
+                "_cash_cover": True,
+            })
+        sold = ", ".join(f"{s.qty:,} {s.symbol}" for s in plan.sells)
+        self.transient_status_message.emit(
+            f"{alias}: selling {sold} — {plan.buy_qty:,} {plan.symbol} "
+            "will be bought when they fill.", 8000)
+
+    def _track_cash_cover(self, data: dict) -> None:
+        """Advance the in-flight cover on its sells' status updates."""
+        flow = self._cash_cover
+        if not flow:
+            return
+        ref = data.get("order_ref", "")
+        if ref not in flow["pending"]:
+            return
+        status = data.get("status", "")
+        sym = flow["refs"].get(ref, "")
+        if status in ("Filled", "Completed"):
+            flow["pending"].discard(ref)
+            log.info("FlashTrade: cash cover sell of %s filled (%d left)",
+                     sym, len(flow["pending"]))
+            if not flow["pending"]:
+                flow["timer"].stop()
+                self._cash_cover = None
+                QTimer.singleShot(self._COVER_BUY_DELAY_MS,
+                                  lambda: self._send_covered_buy(flow))
+        elif status in self._COVER_FAILED:
+            reason = data.get("error_message") or status
+            self._abort_cash_cover(f"the {sym} sell was {reason}")
+
+    def _abort_cash_cover(self, why: str) -> None:
+        flow = self._cash_cover
+        if not flow:
+            return
+        self._cash_cover = None
+        flow["timer"].stop()
+        plan = flow["plan"]
+        log.warning("FlashTrade: cash cover for %s abandoned — %s",
+                    plan.account, why)
+        self.transient_status_message.emit(
+            f"{flow['alias']}: {plan.buy_qty:,} {plan.symbol} NOT bought — "
+            f"{why}.", 9000)
+
+    def _send_covered_buy(self, flow: dict) -> None:
+        plan = flow["plan"]
+        payload = dict(flow["payload"])
+        payload["qty"] = int(plan.buy_qty)
+        payload.pop("qty_pct", None)
+        payload["_target_accounts"] = [plan.account]
+        payload["_cash_cover"] = True
+        log.info("FlashTrade: cash cover sells filled → BUY %d %s "
+                 "account=%s", plan.buy_qty, plan.symbol, plan.account)
+        self.transient_status_message.emit(
+            f"{flow['alias']}: sweep sells filled — buying "
+            f"{plan.buy_qty:,} {plan.symbol}.", 6000)
+        self._on_order_requested(payload)
 
     # ── Cash sweep ────────────────────────────────────────────────────────────
 
