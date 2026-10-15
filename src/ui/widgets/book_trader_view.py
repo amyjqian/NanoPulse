@@ -366,6 +366,9 @@ class BookTraderView(QWidget):
         # (common on paper accounts / no-entitlement stocks), which
         # never triggers ``market_data_failed``.
         self._l2_seen: bool = False
+        # Symbols whose quote stream the bg worker reports refused by TWS
+        # (``quote_status_changed``) — drives the ticker-strip notice.
+        self._quote_refused: set[str] = set()
         self._last_bid: float = 0.0
         self._last_ask: float = 0.0
         self._last_bid_size: float = 0.0
@@ -861,6 +864,42 @@ class BookTraderView(QWidget):
             self._l2_ok = False
             self._render_l1_depth()
 
+    def on_quote_status_changed(self, symbol: str, available: bool) -> None:
+        """The bg worker's quote stream for *symbol* was refused by TWS
+        (``available`` False) or is ticking again (True)."""
+        u = (symbol or "").upper()
+        if not u:
+            return
+        if available:
+            self._quote_refused.discard(u)
+        else:
+            self._quote_refused.add(u)
+        if self._active_symbol and u == self._active_symbol.upper():
+            self._sync_quote_notice()
+
+    def _sync_quote_notice(self) -> None:
+        """Show the "no market data" notice for a refused active symbol
+        and, with no live price, centre the ladder on the last price seen
+        this session rather than leave it around 0.00."""
+        sym = (self._active_symbol or "").upper()
+        if sym not in self._quote_refused:
+            self._ticker.set_notice("")
+            return
+        self._ticker.set_notice(
+            "No market data · retrying",
+            f"TWS refused the {sym} quote stream (no entitlement for the "
+            f"venue it was routed to).  NanoPulse re-requests it on a "
+            f"backoff; restarting TWS also reloads its permissions.")
+        if self._last_price > 0:
+            return
+        prices = self._model.prices
+        if prices and prices[len(prices) // 2] > 0:
+            return
+        last, _bid, _ask, close = self._bg_price_cache.get(
+            sym, (0.0, 0.0, 0.0, 0.0))
+        if (last or close) > 0:
+            self._model.recenter(last or close)
+
     def _render_l1_depth(self) -> None:
         """Synthesise a single-level depth snapshot from cached L1
         bid/ask + sizes.  Called whenever we're in L1-fallback mode and
@@ -1079,6 +1118,7 @@ class BookTraderView(QWidget):
         cached = self._bg_price_cache.get(sym.upper())
         if cached and any(v > 0 for v in cached[:3]):
             self.feed_price(sym, *cached)
+        self._sync_quote_notice()
 
         self.active_symbol_changed.emit(sym)
 
@@ -1596,7 +1636,15 @@ class BookTraderView(QWidget):
                     self._on_bg_worker_status)
             except (RuntimeError, TypeError):
                 pass
+            try:
+                current.quote_status_changed.disconnect(
+                    self.on_quote_status_changed)
+            except (RuntimeError, TypeError, AttributeError):
+                pass
         self._bg_worker = None
+        # Refusals were the old worker's; the new one reports its own.
+        self._quote_refused.clear()
+        self._sync_quote_notice()
         candidates = list(self._active_threads.items())
         log.info(
             "BookTrader: _ensure_bg_worker scanning %d thread(s) "
@@ -1616,6 +1664,8 @@ class BookTraderView(QWidget):
                     worker.bg_sizes_updated.connect(self.feed_sizes)
                     worker.market_data_failed.connect(
                         self.on_market_data_failed)
+                    worker.quote_status_changed.connect(
+                        self.on_quote_status_changed)
                     worker.connection_status_changed.connect(
                         self._on_bg_worker_status)
                     log.info(

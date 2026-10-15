@@ -128,6 +128,19 @@ def _parse_ib_time(s: str) -> datetime | None:
 # This is a valid finite float, so math.isnan / math.isinf won't catch it.
 _IB_DBL_MAX = 1.7e308
 
+# Top-of-book refusals for a background quote stream: 10089 "requires
+# additional subscription for API", 10168 "not subscribed, delayed not
+# enabled", 354 "not subscribed".  Seen when TWS drops a free venue from
+# the account's permissions at a session change (IBEOS after the
+# overnight session) and routes the quote to an unsubscribed exchange.
+_L1_REFUSED_CODES = frozenset({354, 10089, 10168})
+# Re-subscribe a refused quote stream after 30 s, doubling to a 5 min cap.
+_L1_RETRY_BASE_S = 30.0
+_L1_RETRY_MAX_S = 300.0
+# Price tick types that prove a quote stream is live again: bid, ask,
+# last, plus their delayed twins (66 / 67 / 68).
+_L1_PRICE_TICK_TYPES = frozenset({1, 2, 4, 66, 67, 68})
+
 
 def _safe_pnl(val) -> float:
     """Return *val* as a float, or 0.0 if it is None, NaN, or IB's DBL_MAX sentinel."""
@@ -284,6 +297,9 @@ class IBWorkerThread(QThread):
     bid_ask_updated = Signal(str, float, float)    # (symbol, bid, ask)
     # (symbol) – e.g. error 10197
     market_data_failed = Signal(str)
+    # (symbol, available) – TWS refused a background quote stream (False),
+    # or it ticks again after a refusal (True)
+    quote_status_changed = Signal(str, bool)
     # order status dict → main thread
     order_status_updated = Signal(dict)
     # list[dict] – portfolio position batch
@@ -400,6 +416,10 @@ class IBWorkerThread(QThread):
         # paint.
         self._active_price_dirty: bool = False
         self._bg_price_dirty: dict[str, object] = {}
+        # Background symbols whose quote stream TWS refused (see
+        # ``_L1_REFUSED_CODES``): sym → (retries so far, monotonic time of
+        # the next re-subscribe).  Retried from the throttler loop.
+        self._l1_refused: dict[str, tuple[int, float]] = {}
 
         # Order tracking: order_id → Trade
         self._trades: dict[str, object] = {}
@@ -1140,6 +1160,7 @@ class IBWorkerThread(QThread):
                 # Pending coalesced L1 emits reference dead tickers.
                 self._active_price_dirty = False
                 self._bg_price_dirty.clear()
+                self._clear_l1_refusals()
                 # Clear pnlSingle subscriptions so they are re-established
                 # after reconnect (IB drops all subscriptions on disconnect).
                 self._pnl_single_subs.clear()
@@ -1277,6 +1298,9 @@ class IBWorkerThread(QThread):
                                 self._label, acct, con_id, exc)
                         self._pnl_single_subs.discard(key)
                         del self._pnl_zero_pending_cancel[key]
+
+            if self._l1_refused:
+                self._retry_refused_quotes()
 
             # RC #5: periodic stale-data pruning (every ~75 s: 300 × 250 ms).
             self._prune_ticker += 1
@@ -3524,6 +3548,8 @@ class IBWorkerThread(QThread):
                 sym = self._ticker_to_sym.get(id(ticker))
                 if sym:
                     self._bg_price_dirty[sym] = ticker
+                    if sym in self._l1_refused and self._has_l1_price_tick(ticker):
+                        self._clear_l1_refusals(sym)
 
             # Depth-of-market hot path: mark dirty, don't emit here — the
             # 100 ms ``_depth_flush_loop`` coalesces bursts so we don't
@@ -3668,6 +3694,7 @@ class IBWorkerThread(QThread):
         """Unsubscribe one background market-data stream."""
         ticker = self._bg_tickers.pop(symbol, None)
         self._bg_last_bid_ask.pop(symbol, None)  # clear stale bid/ask cache
+        self._clear_l1_refusals(symbol)
         if ticker is not None:
             self._ticker_to_sym.pop(id(ticker), None)  # RC #6: clean reverse index
             if self._ib is not None and self._ib.isConnected():
@@ -3691,6 +3718,7 @@ class IBWorkerThread(QThread):
         self._bg_last_bid_ask.clear()    # clear stale bid/ask cache
         self._ticker_to_sym.clear()  # RC #6: clear reverse index
         self._bg_price_dirty.clear()     # pending emits reference dead tickers
+        self._clear_l1_refusals()
         log.debug("Worker %s: all %d bg subscriptions cleared",
                   self._label, count)
 
@@ -4308,10 +4336,14 @@ class IBWorkerThread(QThread):
         if not self._ticker_to_depth_sym or self._ib is None:
             return None
         try:
-            ticker = self._ib.wrapper.reqId2Ticker.get(req_id)
+            wrapper = self._ib.wrapper
+            ticker = wrapper.reqId2Ticker.get(req_id)
+            # L1 and depth share one Ticker per contract — only the
+            # ticker's depth reqId is a depth request.
+            if (ticker is None
+                    or wrapper.ticker2ReqId["mktDepth"].get(ticker) != req_id):
+                return None
         except Exception:
-            return None
-        if ticker is None:
             return None
         return self._ticker_to_depth_sym.get(id(ticker))
 
@@ -4323,6 +4355,100 @@ class IBWorkerThread(QThread):
         self._depth_dirty.discard(sym)
         if ticker is not None:
             self._ticker_to_depth_sym.pop(id(ticker), None)
+
+    def _bg_sym_for_l1_req_id(self, req_id) -> str | None:
+        """Background symbol whose top-of-book request is *req_id*, or
+        None (depth request, options batch, order id, …).
+
+        ib_async keys tickers by contract hash, so a symbol's L1 and depth
+        streams share ONE Ticker — the reqId is told apart by excluding
+        the ticker's live depth reqId."""
+        if not self._ticker_to_sym or self._ib is None:
+            return None
+        try:
+            wrapper = self._ib.wrapper
+            ticker = wrapper.reqId2Ticker.get(req_id)
+            if ticker is None:
+                return None
+            if wrapper.ticker2ReqId["mktDepth"].get(ticker) == req_id:
+                return None
+        except Exception:
+            return None
+        return self._ticker_to_sym.get(id(ticker))
+
+    @staticmethod
+    def _has_l1_price_tick(ticker) -> bool:
+        """True when this update cycle carried a real bid/ask/last price —
+        a depth tick on the shared Ticker doesn't count, and neither do
+        the stale fields it still holds from before a refusal."""
+        for t in getattr(ticker, "ticks", None) or ():
+            if (getattr(t, "tickType", None) in _L1_PRICE_TICK_TYPES
+                    and 0 < (getattr(t, "price", 0) or 0) < 1e12):
+                return True
+        return False
+
+    def _on_l1_refused(self, sym: str, error_code) -> None:
+        """TWS refused *sym*'s background quote stream: tell the UI once
+        and schedule a re-subscribe."""
+        if sym in self._l1_refused:
+            tws_log.info("[%s] QUOTE-REFUSED  %s again (error %s)",
+                         self._label, sym, error_code)
+            return
+        self._l1_refused[sym] = (0, time.monotonic() + _L1_RETRY_BASE_S)
+        log.warning("Worker %s: no market data for %s (error %s) – "
+                    "retrying in %.0f s", self._label, sym, error_code,
+                    _L1_RETRY_BASE_S)
+        self.quote_status_changed.emit(sym, False)
+
+    def _clear_l1_refusals(self, sym: str | None = None) -> None:
+        """Forget a refusal (all of them when *sym* is None) and tell the
+        UI quotes are back — or, after a reconnect / unsubscribe, that
+        there is no refusal standing any more."""
+        syms = list(self._l1_refused) if sym is None else [sym]
+        for s in syms:
+            if self._l1_refused.pop(s, None) is not None:
+                log.info("Worker %s: market data for %s is flowing again",
+                         self._label, s)
+                self.quote_status_changed.emit(s, True)
+
+    def _retry_refused_quotes(self) -> None:
+        """Re-request every refused background quote stream that is due.
+
+        TWS's permission set can change under a running session (it
+        re-adds a venue at the next session change), and a fresh request
+        is routed against the current set — so a stream refused at 04:00
+        may be served on a later attempt without restarting TWS."""
+        if self._ib is None or not self._ib.isConnected():
+            return
+        now = time.monotonic()
+        for sym, (tries, due) in list(self._l1_refused.items()):
+            if now < due:
+                continue
+            ticker = self._bg_tickers.get(sym)
+            if ticker is None:
+                self._l1_refused.pop(sym, None)
+                continue
+            contract = ticker.contract
+            try:
+                self._ib.cancelMktData(contract)
+            except Exception:
+                pass    # TWS already ended the refused request
+            try:
+                new_ticker = self._ib.reqMktData(
+                    contract, genericTickList="", snapshot=False)
+            except Exception as exc:
+                log.debug("Worker %s: quote retry for %s failed: %s",
+                          self._label, sym, exc)
+                new_ticker = ticker
+            if new_ticker is not ticker:
+                self._ticker_to_sym.pop(id(ticker), None)
+                self._bg_tickers[sym] = new_ticker
+                self._ticker_to_sym[id(new_ticker)] = sym
+            tries += 1
+            delay = min(_L1_RETRY_BASE_S * (2 ** tries), _L1_RETRY_MAX_S)
+            self._l1_refused[sym] = (tries, now + delay)
+            tws_log.info("[%s] API-CALL  reqMktData(symbol=%s) [quote retry "
+                         "#%d, next in %.0f s]", self._label, sym, tries, delay)
 
     def _on_ib_error(self, reqId, errorCode, errorString, contract) -> None:
         """Handle IB error events – detect market-data failures like 10197
@@ -4369,6 +4495,13 @@ class IBWorkerThread(QThread):
                             self._label, d_sym, errorCode)
                 self._drop_depth_state(d_sym)
                 self.market_data_failed.emit(d_sym)
+
+        # Background quote stream refused (no entitlement for the venue
+        # TWS routed it to) — surface it and keep re-requesting.
+        if errorCode in _L1_REFUSED_CODES:
+            l1_sym = self._bg_sym_for_l1_req_id(reqId)
+            if l1_sym:
+                self._on_l1_refused(l1_sym, errorCode)
 
         if errorCode == 10197 and self._active_ticker is not None:
             # "No market data during competing live session"

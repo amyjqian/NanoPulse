@@ -15,6 +15,7 @@ ladder on the book's mid when no last price has arrived.
 from __future__ import annotations
 
 import asyncio
+from collections import defaultdict
 from types import SimpleNamespace
 
 import pytest
@@ -26,26 +27,58 @@ import src.ui.widgets.book_trader_view as btv
 
 # ── fakes ──────────────────────────────────────────────────────────────────────
 
+class _FakeTicker:
+    """Hashable by identity, like ib_async's Ticker."""
+
+    def __init__(self, contract):
+        self.contract = contract
+        self.domBids: list = []
+        self.domAsks: list = []
+        self.ticks: list = []
+
+
 class _FakeIB:
+    """ib_async keeps ONE Ticker per contract: L1 and depth requests for
+    the same conId share it, told apart only by their reqIds."""
+
     def __init__(self):
         self.depth_calls: list[tuple[int, str, int, bool]] = []
         self.cancel_calls: list[tuple[int, bool]] = []
-        self.wrapper = SimpleNamespace(reqId2Ticker={})
+        self.mkt_calls: list[int] = []
+        self.mkt_cancels: list[int] = []
+        self.wrapper = SimpleNamespace(
+            reqId2Ticker={}, ticker2ReqId=defaultdict(dict))
+        self._tickers: dict[int, _FakeTicker] = {}
         self._next_req = 100
 
     def isConnected(self):
         return True
 
-    def reqMktDepth(self, contract, numRows=5, isSmartDepth=False):
-        self.depth_calls.append(
-            (contract.conId, contract.exchange, numRows, isSmartDepth))
-        ticker = SimpleNamespace(contract=contract, domBids=[], domAsks=[])
+    def _start(self, contract, tick_type):
+        ticker = self._tickers.setdefault(
+            contract.conId, _FakeTicker(contract))
         self.wrapper.reqId2Ticker[self._next_req] = ticker
+        self.wrapper.ticker2ReqId[tick_type][ticker] = self._next_req
         self._next_req += 1
         return ticker
 
+    def reqMktDepth(self, contract, numRows=5, isSmartDepth=False):
+        self.depth_calls.append(
+            (contract.conId, contract.exchange, numRows, isSmartDepth))
+        return self._start(contract, "mktDepth")
+
     def cancelMktDepth(self, contract, isSmartDepth=False):
         self.cancel_calls.append((contract.conId, isSmartDepth))
+
+    def reqMarketDataType(self, _type):
+        pass
+
+    def reqMktData(self, contract, genericTickList="", snapshot=False):
+        self.mkt_calls.append(contract.conId)
+        return self._start(contract, "mktData")
+
+    def cancelMktData(self, contract):
+        self.mkt_cancels.append(contract.conId)
 
 
 _NVDA = {"conid": "4815747", "symbol": "NVDA", "sec_type": "STK",
@@ -191,3 +224,108 @@ class TestWarmStartFromDepth:
     def test_other_symbol_is_ignored(self, view):
         view.feed_depth("MNQ", [(29800.0, 5)], [(29800.25, 5)])
         assert view._model.prices[len(view._model.prices) // 2] == 0.0
+
+
+# ── worker: refused quote stream is reported and re-requested ─────────────────
+
+class TestQuoteRefused:
+    """TWS can drop a free venue (IBEOS) from the account's permissions at
+    a session change and route a stock's quote to an unsubscribed
+    exchange — error 10089, and the ladder sits around 0.00.  The worker
+    reports it once, re-requests on a backoff, and clears it on the first
+    real price tick."""
+
+    _ERR = ("Requested market data requires additional subscription for "
+            "API.NVDA NASDAQ.NMS/TOP/ALL")
+
+    def _subscribe(self, worker):
+        _run(worker._do_subscribe_bg_symbols([_NVDA]))
+        ticker = worker._bg_tickers["NVDA"]
+        req_id = worker._ib.wrapper.ticker2ReqId["mktData"][ticker]
+        return req_id, ticker
+
+    def test_10089_reports_once(self, worker, qtbot):
+        req_id, ticker = self._subscribe(worker)
+        seen = []
+        worker.quote_status_changed.connect(lambda s, ok: seen.append((s, ok)))
+        worker._on_ib_error(req_id, 10089, self._ERR, ticker.contract)
+        worker._on_ib_error(req_id, 10089, self._ERR, ticker.contract)
+        assert seen == [("NVDA", False)]
+        assert "NVDA" in worker._l1_refused
+
+    def test_l1_refusal_leaves_the_depth_stream_alone(self, worker, qtbot):
+        _run(worker._do_subscribe_depth("NVDA", 10))
+        req_id, ticker = self._subscribe(worker)   # same Ticker, L1 reqId
+        with qtbot.assertNotEmitted(worker.market_data_failed):
+            worker._on_ib_error(req_id, 354, "not subscribed", ticker.contract)
+        assert "NVDA" in worker._depth_tickers
+        assert "NVDA" in worker._l1_refused
+
+    def test_depth_refusal_is_not_a_quote_refusal(self, worker, qtbot):
+        _run(worker._do_subscribe_depth("NVDA", 10))
+        _ticker_req, ticker = self._subscribe(worker)
+        depth_req = worker._ib.wrapper.ticker2ReqId["mktDepth"][ticker]
+        with qtbot.assertNotEmitted(worker.quote_status_changed):
+            worker._on_ib_error(depth_req, 354, "not subscribed",
+                                ticker.contract)
+        assert worker._l1_refused == {}
+
+    def test_retry_resubscribes_when_due_with_backoff(self, worker,
+                                                      monkeypatch):
+        import src.core.ib_worker as ibw
+        req_id, ticker = self._subscribe(worker)
+        worker._on_ib_error(req_id, 10089, self._ERR, ticker.contract)
+        clock = [1000.0]
+        monkeypatch.setattr(ibw.time, "monotonic", lambda: clock[0])
+        worker._l1_refused["NVDA"] = (0, 1010.0)
+        worker._retry_refused_quotes()              # not due yet
+        assert worker._ib.mkt_calls == [4815747]
+        clock[0] = 1010.0
+        worker._retry_refused_quotes()
+        assert worker._ib.mkt_cancels == [4815747]
+        assert worker._ib.mkt_calls == [4815747, 4815747]
+        assert worker._l1_refused["NVDA"] == (1, 1010.0 + 60.0)
+        clock[0] = 5000.0
+        for _ in range(6):
+            worker._retry_refused_quotes()
+            clock[0] += 1000.0
+        assert worker._l1_refused["NVDA"][1] - (clock[0] - 1000.0) \
+            == ibw._L1_RETRY_MAX_S
+
+    def test_first_real_price_tick_clears_it(self, worker, qtbot):
+        req_id, ticker = self._subscribe(worker)
+        worker._on_ib_error(req_id, 10089, self._ERR, ticker.contract)
+        # A depth tick on the shared Ticker is not a quote.
+        ticker.ticks = [SimpleNamespace(tickType=99, price=217.0)]
+        worker._on_pending_tickers([ticker])
+        assert "NVDA" in worker._l1_refused
+        ticker.ticks = [SimpleNamespace(tickType=4, price=217.0)]
+        with qtbot.waitSignal(worker.quote_status_changed,
+                              timeout=1000) as sig:
+            worker._on_pending_tickers([ticker])
+        assert sig.args == ["NVDA", True]
+        assert worker._l1_refused == {}
+
+    def test_unsubscribe_drops_the_refusal(self, worker):
+        req_id, ticker = self._subscribe(worker)
+        worker._on_ib_error(req_id, 10089, self._ERR, ticker.contract)
+        _run(worker._do_unsubscribe_bg_symbol("NVDA"))
+        assert worker._l1_refused == {}
+
+
+class TestQuoteNotice:
+    def test_refusal_shows_notice_and_clears(self, view):
+        view.on_quote_status_changed("NVDA", False)
+        assert "No market data" in view._ticker.notice
+        view.on_quote_status_changed("NVDA", True)
+        assert view._ticker.notice == ""
+
+    def test_other_symbol_does_not_touch_the_strip(self, view):
+        view.on_quote_status_changed("AAPL", False)
+        assert view._ticker.notice == ""
+
+    def test_refused_ladder_centres_on_last_known_price(self, view):
+        view._bg_price_cache["NVDA"] = (0.0, 0.0, 0.0, 221.30)  # close only
+        view.on_quote_status_changed("NVDA", False)
+        prices = view._model.prices
+        assert prices[len(prices) // 2] == pytest.approx(221.30)
