@@ -1,9 +1,12 @@
-"""Confirmation for covering a cash-account buy from sweep holdings.
+"""Confirmation for covering cash-account buys from sweep holdings.
 
-Shown by ``FlashTradeView`` when a single cash account's stock buy needs
-more than its available cash and the account holds the configured
-sweep symbols.  Lists the shortfall, the sells that will go out first,
-and — when the holdings cannot cover it all — the reduced buy size.
+Shown by ``FlashTradeView`` when a stock buy fans out to selected
+accounts and at least one cash account needs more than its available
+cash while holding the configured sweep symbols.  One dialog covers the
+whole click: each such account with its shortfall, the sells that go
+out first and — when its holdings cannot cover it all — its reduced buy
+size, plus the accounts that will be bought right away.  Cancel sends
+nothing to anyone.
 """
 from __future__ import annotations
 
@@ -19,37 +22,48 @@ def _money(v: float) -> str:
     return f"${v:,.0f}"
 
 
-def cover_summary(plan: CoverPlan, display_account: str = "") -> str:
-    """The dialog body as plain text (also what the status bar quotes)."""
-    acct = display_account or plan.account
-    lines = [
-        f"{acct} is a cash account with {_money(plan.available)} available.",
-        f"Buying {plan.requested_qty:,} {plan.symbol} needs about "
-        f"{_money(plan.order_value)} — {_money(plan.shortfall)} short.",
-        "",
-        "Sell first:",
-    ]
-    for s in plan.sells:
-        lines.append(f"    {s.qty:,} {s.symbol} @ MKT  (≈ {_money(s.proceeds)}, "
-                     f"holding {int(s.held):,})")
-    lines.append("")
-    if plan.shrunk:
-        lines.append(f"That still leaves it short, so the buy will be reduced "
-                     f"to {plan.buy_qty:,} {plan.symbol}.")
-    else:
-        lines.append(f"Then buy {plan.buy_qty:,} {plan.symbol} once the sells "
-                     "have filled.")
+def cover_summary(plans: list[CoverPlan], aliases: dict[str, str] | None = None,
+                  immediate: list[str] | None = None) -> str:
+    """The dialog body as plain text."""
+    aliases = aliases or {}
+    name = lambda a: aliases.get(a, "") or a   # noqa: E731
+    lines: list[str] = []
+    for plan in plans:
+        if lines:
+            lines.append("")
+        lines += [
+            f"{name(plan.account)} is a cash account with "
+            f"{_money(plan.available)} available.",
+            f"Buying {plan.requested_qty:,} {plan.symbol} needs about "
+            f"{_money(plan.order_value)} — {_money(plan.shortfall)} short.",
+            "Sell first:",
+        ]
+        for s in plan.sells:
+            lines.append(f"    {s.qty:,} {s.symbol} @ MKT  "
+                         f"(≈ {_money(s.proceeds)}, holding {int(s.held):,})")
+        if plan.shrunk:
+            lines.append(f"That still leaves it short, so its buy will be "
+                         f"reduced to {plan.buy_qty:,} {plan.symbol}.")
+        else:
+            lines.append(f"Then buy {plan.buy_qty:,} {plan.symbol} once the "
+                         "sells have filled.")
+    if immediate:
+        lines.append("")
+        lines.append("Bought right away: " + ", ".join(name(a)
+                                                       for a in immediate))
     return "\n".join(lines)
 
 
 class CashCoverDialog(QDialog):
-    def __init__(self, plan: CoverPlan, display_account: str = "",
+    def __init__(self, plans: list[CoverPlan],
+                 aliases: dict[str, str] | None = None,
+                 immediate: list[str] | None = None,
                  parent: QWidget | None = None):
         super().__init__(parent)
         self.setWindowTitle("Not enough cash")
         self.setModal(True)
         lay = QVBoxLayout(self)
-        body = QLabel(cover_summary(plan, display_account))
+        body = QLabel(cover_summary(plans, aliases, immediate))
         body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         lay.addWidget(body)
         buttons = QDialogButtonBox()
@@ -61,8 +75,9 @@ class CashCoverDialog(QDialog):
         lay.addWidget(buttons)
 
 
-def confirm_cash_cover(parent: QWidget | None, plan: CoverPlan,
-                       display_account: str = "") -> bool:
+def confirm_cash_cover(parent: QWidget | None, plans: list[CoverPlan],
+                       aliases: dict[str, str] | None = None,
+                       immediate: list[str] | None = None) -> bool:
     """Modal ask; True when the user chose Sell & Buy."""
-    dlg = CashCoverDialog(plan, display_account, parent)
+    dlg = CashCoverDialog(plans, aliases, immediate, parent)
     return dlg.exec() == QDialog.DialogCode.Accepted
