@@ -134,6 +134,14 @@ class TickerStrip(QWidget):
         self._lbl_change_pct.setFont(_ticker_font)
         self._lbl_change_pct.setStyleSheet(_dim_ss)
 
+        # Data-health notice ("No market data · retrying"); hidden when
+        # empty so it takes no room on a healthy strip.
+        self._lbl_notice = QLabel("")
+        self._lbl_notice.setFont(_ticker_font)
+        self._lbl_notice.setStyleSheet(
+            f"color: {Theme.CLR_FLATTEN}; border: none;")
+        self._lbl_notice.hide()
+
         self._btn_add = QPushButton("+")
         self._btn_add.setFixedSize(22, 22)
         self._btn_add.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -161,6 +169,7 @@ class TickerStrip(QWidget):
             self._lbl_ask.hide()
         top_row.addWidget(self._lbl_change)
         top_row.addWidget(self._lbl_change_pct)
+        top_row.addWidget(self._lbl_notice)
         top_row.addStretch(1)
         top_row.addWidget(self._btn_add)
 
@@ -218,6 +227,17 @@ class TickerStrip(QWidget):
         self._lbl_ask.setText("")
         self._lbl_change.setText("")
         self._lbl_change_pct.setText("")
+
+    def set_notice(self, text: str, tooltip: str = "") -> None:
+        """Show a short data-health notice after the price row ("" hides
+        it).  Independent of the symbol/price state."""
+        self._lbl_notice.setText(text or "")
+        self._lbl_notice.setToolTip(tooltip or "")
+        self._lbl_notice.setVisible(bool(text))
+
+    @property
+    def notice(self) -> str:
+        return self._lbl_notice.text()
 
     @property
     def symbol(self) -> str:
