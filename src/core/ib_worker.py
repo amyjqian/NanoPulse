@@ -2037,6 +2037,16 @@ class IBWorkerThread(QThread):
             # holds the stops until the regular session opens.
             defer_exits = sec_type == "STK" and c.exchange == "IBEOS"
             deferred_ref = 0.0
+            # …except a take profit alone: IBEOS takes limit children, so
+            # it rides WITH the parent as two attached TPs — one on IBEOS
+            # for tonight, one SMART (outsideRth) for 04:00 on.  Attached
+            # siblings are OCA'd by IB itself, so it all lives at IB and
+            # no NanoPulse step is needed after the fill.  A rejection
+            # retries once with the parent alone (``_no_tp_bundle``).
+            tp_bundle = (defer_exits and bool(tp_tier) and not sl_tier
+                         and not tr_tier
+                         and not params.get("_no_tp_bundle"))
+            bundle_children: list = []      # (contract, child) in order
             if any((tp_tier, sl_tier, tr_tier)):
                 # FlashTradeView sets bracket_ref_price to the expected-fill
                 # anchor — last_price for Adaptive / PEG / cap-wrapped MKT
@@ -2063,7 +2073,21 @@ class IBWorkerThread(QThread):
                             "[%s] BRACKET-REF  using bid/ask mid %.4f "
                             "for %s (last_price was 0)",
                             self._label, ref_price, sym)
-                if ref_price > 0 and defer_exits:
+                if ref_price > 0 and tp_bundle:
+                    order.orderId = self._ib.client.getReqId()
+                    order.transmit = False
+                    bracket_ref_used = ref_price
+                    bundle_children = self._build_tp_bundle(
+                        order, c, params, ref_price,
+                        float(params.get("tick_size") or 0.01))
+                    if bundle_children:
+                        order_log.info(
+                            "[%s] BRACKET-BUNDLE  overnight TP-only — "
+                            "IBEOS + SMART take profit attached, "
+                            "orderRef=%s", self._label, order.orderRef)
+                    else:
+                        order.transmit = True
+                elif ref_price > 0 and defer_exits:
                     deferred_ref = ref_price
                     order_log.info(
                         "[%s] BRACKET-DEFER  overnight (IBEOS) — exits "
@@ -2231,6 +2255,14 @@ class IBWorkerThread(QThread):
             # (Filled then Completed) — re-anchor only on the first.
             _reanchored = [False]
             _exits_placed = [False]
+            _bundle_retry = [False]
+            _placed_at = time.monotonic()
+
+            def _bundle_watch(t, _p=frozen_params):
+                # Parent or child of a TP bundle reached a final state.
+                if bundle_children:
+                    self._maybe_retry_tp_bundle(
+                        t, trade, _p, _placed_at, _bundle_retry)
 
             def _on_status(t, _oid=frozen_oid, _p=frozen_params):
                 new_status = t.orderStatus.status
@@ -2265,6 +2297,8 @@ class IBWorkerThread(QThread):
                                 self._label)
                     self._apply_fill_to_position(t, _p)
 
+                _bundle_watch(t)
+
                 # Deferred overnight exits: once the parent is done — a
                 # full fill, or a cancel / expiry after a partial one —
                 # protect whatever filled.
@@ -2293,6 +2327,11 @@ class IBWorkerThread(QThread):
             # which flushes the whole bundle to TWS atomically.
             bracket_reanchor.extend(self._submit_exit_orders(
                 c, bracket_children, params, order.orderRef))
+            # TP bundle: each child on its own venue, the last transmits.
+            for kid_contract, kid in bundle_children:
+                bracket_reanchor.extend(self._submit_exit_orders(
+                    kid_contract, [kid], params, order.orderRef,
+                    on_status=_bundle_watch))
 
         except Exception as exc:
             log.exception("Worker %s: place_order failed: %s",
@@ -2303,7 +2342,7 @@ class IBWorkerThread(QThread):
                             self._label, exc, params)
 
     def _submit_exit_orders(self, contract, children: list, params: dict,
-                            parent_ref: str) -> list:
+                            parent_ref: str, on_status=None) -> list:
         """Place exit orders (bracket children or deferred overnight
         exits) and bind their status streams.  Returns the
         ``(trade, order_key, blotter_params)`` triples — the blotter
@@ -2364,6 +2403,8 @@ class IBWorkerThread(QThread):
                     getattr(t.order, "orderRef", ""))
                 if new_status in ("Filled", "Completed"):
                     self._apply_fill_to_position(t, _p)
+                if on_status is not None:
+                    on_status(t)
 
             ch_trade.statusEvent += _on_child_status
 
@@ -2456,6 +2497,85 @@ class IBWorkerThread(QThread):
         self._submit_exit_orders(exit_contract, children, params,
                                  parent.orderRef)
         return len(children) + len(overnight_tp)
+
+    def _build_tp_bundle(self, parent, contract, params: dict,
+                         ref_price: float, tick: float) -> list:
+        """The two take-profit children of an overnight TP-only bundle:
+        ``[(IBEOS contract, tp), (SMART contract, tp twin)]``.
+
+        Both attach to *parent* (same parentId), so IB OCA's them itself
+        — no ocaGroup, which IB rejects on attached children.  The IBEOS
+        one works tonight and ends with the overnight session; the SMART
+        twin (``outsideRth``) is held until 04:00.  Only the last child
+        transmits, flushing the bundle.
+        """
+        built = self._build_bracket_children(parent, params, ref_price, tick)
+        night = next((ch for ch in built if ch.orderType == "LMT"), None)
+        if night is None:
+            return []
+        night.transmit = False
+        night.advancedErrorOverride = "10329"
+        day = copy.copy(night)
+        day.orderId = self._ib.client.getReqId()
+        day.orderRef = _generate_order_ref()
+        while day.orderRef == night.orderRef:
+            day.orderRef = _generate_order_ref()
+        day.outsideRth = True
+        day.allowPreOpen = False
+        day.advancedErrorOverride = ""
+        day.transmit = True
+        smart = copy.copy(contract)
+        smart.exchange = "SMART"
+        return [(contract, night), (smart, day)]
+
+    # Error codes on a cancelled order that mean "the user (or our own
+    # flow) cancelled it", not "TWS refused it".
+    _CANCEL_CODES = (0, 202, 10147, 10148)
+
+    def _maybe_retry_tp_bundle(self, t, parent_trade, params: dict,
+                               placed_at: float, latch: list) -> None:
+        """A part of an overnight TP bundle was refused at submission:
+        cancel what is left of it and resend the parent alone — its take
+        profit then follows the fill (deferred exits) instead.
+
+        Only a refusal counts: within 30 s of placing, nothing filled,
+        and the order's last log entry carries an error code other than
+        a cancel acknowledgement — a user cancel, or the parent expiring
+        unfilled at the end of the session, never resends.
+        """
+        if latch[0]:
+            return
+        status = getattr(t.orderStatus, "status", "") or ""
+        if status not in ("Cancelled", "ApiCancelled", "Inactive"):
+            return
+        if time.monotonic() - placed_at > 30.0:
+            return
+        if float(getattr(parent_trade.orderStatus, "filled", 0) or 0) > 0:
+            return
+        entries = list(getattr(t, "log", None) or [])
+        code = int(getattr(entries[-1], "errorCode", 0) or 0) if entries \
+            else 0
+        if code in self._CANCEL_CODES:
+            return
+        latch[0] = True
+        parent = parent_trade.order
+        order_log.warning(
+            "[%s] BRACKET-BUNDLE  refused (error %s on orderRef=%s) — "
+            "resending orderRef=%s alone, take profit after the fill",
+            self._label, code, getattr(t.order, "orderRef", ""),
+            parent.orderRef)
+        parent_status = getattr(parent_trade.orderStatus, "status", "") or ""
+        if parent_status not in _PARENT_DONE:
+            try:
+                self._ib.cancelOrder(parent)
+            except Exception:
+                order_log.exception(
+                    "[%s] BRACKET-BUNDLE  cancel of orderRef=%s failed",
+                    self._label, parent.orderRef)
+        retry = dict(params)
+        retry["_no_tp_bundle"] = True
+        retry.pop("order_ref", None)
+        asyncio.ensure_future(self._do_place_order(retry))
 
     # ── Pending overnight exits (fills seen after a restart / reconnect) ──
 
@@ -2740,7 +2860,10 @@ class IBWorkerThread(QThread):
             # transmits on its own (the bundle-level staging only
             # applies to the initial submission).
             ch_order.transmit = True
-            self._ib.placeOrder(contract, ch_order)
+            # A TP bundle's children sit on different venues — modify
+            # each on the contract it was placed with.
+            self._ib.placeOrder(
+                getattr(ch_trade, "contract", None) or contract, ch_order)
             # Refresh the blotter's frozen price columns and push the
             # row so the UI shows the re-anchored prices immediately.
             ch_params.pop("limit_price", None)
