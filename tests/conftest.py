@@ -20,3 +20,14 @@ def _sandbox_config(tmp_path, monkeypatch):
     instruments.invalidate_cache()
     yield
     instruments.invalidate_cache()
+
+
+@pytest.fixture(autouse=True)
+def _regular_hours_routing(monkeypatch):
+    """Pin stock routing to regular hours: between 20:00 and 03:59 ET
+    ``stk_routes_overnight`` turns stock pegs / Adaptive / market orders
+    into limits, which would make order tests depend on the wall clock.
+    Tests of the overnight path patch it back to True."""
+    import src.core.ib_worker as ib_worker
+    monkeypatch.setattr(ib_worker, "stk_routes_overnight",
+                        lambda currency="USD", now=None: False)

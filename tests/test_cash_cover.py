@@ -104,10 +104,6 @@ def rig(qtbot, tmp_path, monkeypatch):
     import src.core.instruments as instruments
     monkeypatch.setattr(instruments, "get_contract",
                         lambda sym: _CONTRACTS.get((sym or "").upper()))
-    # Regular hours unless a test opts into the overnight session.
-    import src.core.ib_worker as ib_worker
-    monkeypatch.setattr(ib_worker, "stk_routes_overnight",
-                        lambda currency="USD", now=None: False)
     monkeypatch.setattr(CashManagementPreferences, "sweep_symbols",
                         property(lambda self: ["SGOV", "BIL"]))
     am = AccountsTableModel()
@@ -363,19 +359,23 @@ class TestOvernightSession:
         assert [o["order_type"] for o in worker.orders] == ["MKT"]
 
 
+# Captured at import, before the conftest fixture pins it to False.
+from src.core.ib_worker import stk_routes_overnight  # noqa: E402
+
+
 class TestStkRoutesOvernight:
     @pytest.mark.parametrize("hh,mm,expected", [
         (19, 59, False), (20, 0, True), (0, 44, True), (3, 59, True),
         (4, 0, False), (12, 0, False)])
     def test_session_window(self, hh, mm, expected):
         from datetime import datetime
-        from src.core.ib_worker import _ET, stk_routes_overnight
+        from src.core.ib_worker import _ET
         now = datetime(2026, 10, 16, hh, mm, tzinfo=_ET)
         assert stk_routes_overnight("USD", now) is expected
 
     def test_non_usd_never_overnight(self):
         from datetime import datetime
-        from src.core.ib_worker import _ET, stk_routes_overnight
+        from src.core.ib_worker import _ET
         now = datetime(2026, 10, 16, 1, 0, tzinfo=_ET)
         assert stk_routes_overnight("CAD", now) is False
 
