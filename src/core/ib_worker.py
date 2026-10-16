@@ -13,12 +13,14 @@ from __future__ import annotations
 from src.utils.logger import tws_log, order_log
 
 import asyncio
+import copy
 import logging
 import math
 import random
 import string
 import time
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from src.core.enums import OrderAction, OrderType
@@ -47,6 +49,12 @@ def _generate_order_ref() -> str:
     now = datetime.now(_ET)
     tag = "".join(random.choices(string.ascii_lowercase, k=4))
     return f"nano_{now:%y%m%d}_{now:%H%M%S}_{tag}"
+
+
+# Final order states: an overnight parent in one of these owes its
+# deferred exits (for whatever filled) or, unfilled, none.
+_PARENT_DONE = ("Filled", "Completed", "Cancelled", "ApiCancelled",
+                "Inactive")
 
 
 def stk_routes_overnight(currency: str = "USD",
@@ -349,6 +357,9 @@ class IBWorkerThread(QThread):
     # Flattened Fill dict – one emission per execution (startup + live).
     # Keyed by fill.execution.execId so the UI can dedupe across reconnects.
     fill_updated = Signal(dict)
+    # One-line user notice (status bar) — e.g. overnight exits placed on
+    # reconnect for a parent that filled while NanoPulse was offline.
+    exits_notice = Signal(str)
 
     def __init__(
         self,
@@ -1245,6 +1256,10 @@ class IBWorkerThread(QThread):
                     # on startup and after a reconnect.
                     await self._snapshot_fills()
 
+                    # Overnight parents that finished while we were away
+                    # still owe their exits.
+                    await self._reconcile_pending_exits()
+
                 except Exception as exc:
                     log.exception("Worker %s post-connect setup error (connection still alive): %s",
                                   self._label, exc)
@@ -2015,6 +2030,13 @@ class IBWorkerThread(QThread):
             # them to the actual fill price.
             bracket_reanchor: list = []
             bracket_ref_used = 0.0
+            # IBEOS (overnight) takes plain limits only: an attached STP /
+            # STP LMT / TRAIL child would be refused (387).  The exits
+            # are then held back and placed after the parent fills, as
+            # standalone OCA orders routed SMART — IB accepts them and
+            # holds the stops until the regular session opens.
+            defer_exits = sec_type == "STK" and c.exchange == "IBEOS"
+            deferred_ref = 0.0
             if any((tp_tier, sl_tier, tr_tier)):
                 # FlashTradeView sets bracket_ref_price to the expected-fill
                 # anchor — last_price for Adaptive / PEG / cap-wrapped MKT
@@ -2041,7 +2063,13 @@ class IBWorkerThread(QThread):
                             "[%s] BRACKET-REF  using bid/ask mid %.4f "
                             "for %s (last_price was 0)",
                             self._label, ref_price, sym)
-                if ref_price > 0:
+                if ref_price > 0 and defer_exits:
+                    deferred_ref = ref_price
+                    order_log.info(
+                        "[%s] BRACKET-DEFER  overnight (IBEOS) — exits "
+                        "placed after the fill, routed SMART, orderRef=%s",
+                        self._label, order.orderRef)
+                elif ref_price > 0:
                     if tr_tier and self._convert_mkt_parent_for_trail(
                             order, params, ref_price):
                         order_type = "LMT"
@@ -2159,6 +2187,20 @@ class IBWorkerThread(QThread):
             order_id = f"{account}_{order.orderRef}"
             self._trades[order_id] = trade
             self._has_status_handler.add(order_id)
+            if deferred_ref > 0:
+                # On disk until the parent is done, so a fill while
+                # NanoPulse is offline is caught on the next connect.
+                try:
+                    from src.core import pending_exits
+                    pending_exits.add(
+                        order_id, label=self._label, account=account,
+                        order_ref=order.orderRef, params=params,
+                        ref_price=deferred_ref)
+                except Exception:
+                    order_log.exception(
+                        "[%s] BRACKET-DEFER  could not save pending exits "
+                        "for %s — only this session will place them",
+                        self._label, order_id)
 
             log.info("Worker %s: placed %s %s %d %s for account %s → %s",
                      self._label, action, order_type, qty,
@@ -2188,6 +2230,7 @@ class IBWorkerThread(QThread):
             # One-shot latch: Filled can be reported more than once
             # (Filled then Completed) — re-anchor only on the first.
             _reanchored = [False]
+            _exits_placed = [False]
 
             def _on_status(t, _oid=frozen_oid, _p=frozen_params):
                 new_status = t.orderStatus.status
@@ -2222,6 +2265,24 @@ class IBWorkerThread(QThread):
                                 self._label)
                     self._apply_fill_to_position(t, _p)
 
+                # Deferred overnight exits: once the parent is done — a
+                # full fill, or a cancel / expiry after a partial one —
+                # protect whatever filled.
+                if (deferred_ref > 0 and not _exits_placed[0]
+                        and new_status in _PARENT_DONE):
+                    _exits_placed[0] = True
+                    try:
+                        from src.core import pending_exits
+                        pending_exits.take(_oid)    # this session owns it
+                        if float(t.orderStatus.filled or 0) > 0:
+                            self._place_deferred_exits(c, t, _p,
+                                                       deferred_ref)
+                    except Exception:
+                        order_log.exception(
+                            "[%s] BRACKET-DEFER failed — no exits placed "
+                            "for orderRef=%s", self._label,
+                            getattr(t.order, "orderRef", ""))
+
             trade.statusEvent += _on_status
 
             # ── Place bracket children (if any) ────────────────────────────
@@ -2230,67 +2291,8 @@ class IBWorkerThread(QThread):
             # submission-time parser working) and parentId pointing at the
             # parent's IB orderId.  Only the last child has transmit=True,
             # which flushes the whole bundle to TWS atomically.
-            for ch in bracket_children:
-                ch_trade = self._ib.placeOrder(c, ch)
-                ch_key = f"{account}_{ch.orderRef}"
-                self._trades[ch_key] = ch_trade
-                self._has_status_handler.add(ch_key)
-
-                order_log.info(
-                    "[%s] BRACKET-CHILD  parentRef=%s childRef=%s "
-                    "type=%s action=%s qty=%s lmt=%s aux=%s "
-                    "oca=%s transmit=%s",
-                    self._label, order.orderRef, ch.orderRef,
-                    ch.orderType, ch.action, ch.totalQuantity,
-                    getattr(ch, "lmtPrice", "N/A"),
-                    getattr(ch, "auxPrice", "N/A"),
-                    getattr(ch, "ocaGroup", ""), ch.transmit)
-                tws_log.info(
-                    "[%s] API-RESP  placeOrder(child) → orderId=%s orderRef=%s",
-                    self._label, ch_trade.order.orderId, ch.orderRef)
-
-                # Bind each child's statusEvent so blotter/positions pick up
-                # fills and cancels without any extra plumbing.  Start from
-                # the parent's params (symbol / account / conid / sec_type)
-                # then overlay the child's own identity — without this the
-                # blotter would show the parent's BUY/SELL action and price
-                # for every child row.
-                ch_params = dict(params)
-                ch_params["order_type"] = ch.orderType
-                ch_params["action"]     = ch.action
-                ch_params["qty"]        = int(ch.totalQuantity)
-                # Child-specific price columns for the blotter.
-                ch_params.pop("limit_price", None)
-                ch_params.pop("stop_price", None)
-                ch_params.update(self._child_price_params(
-                    ch.orderType,
-                    getattr(ch, "lmtPrice", None),
-                    getattr(ch, "auxPrice", None)))
-                ch_frozen_oid = ch_key
-                # Same ch_params dict the status closure holds — the
-                # re-anchor updates it in place so the blotter row
-                # reflects the new prices.
-                bracket_reanchor.append((ch_trade, ch_key, ch_params))
-
-                def _on_child_status(t, _oid=ch_frozen_oid, _p=ch_params):
-                    new_status = t.orderStatus.status
-                    self._emit_order_status(t, _oid, _p, new_status)
-                    order_log.info(
-                        "[%s] ORDER-STATUS  %s | status=%s filled=%s "
-                        "avgFill=%s symbol=%s account=%s orderRef=%s",
-                        self._label, _oid, new_status,
-                        t.orderStatus.filled, t.orderStatus.avgFillPrice,
-                        _p.get("symbol", "?"), _p.get("account", ""),
-                        getattr(t.order, "orderRef", ""))
-                    if new_status in ("Filled", "Completed"):
-                        self._apply_fill_to_position(t, _p)
-
-                ch_trade.statusEvent += _on_child_status
-
-                # Emit the child's initial status so the UI sees it right away.
-                init_status = ch_trade.orderStatus.status or "Submitted"
-                self._emit_order_status(ch_trade, ch_key, ch_params,
-                                        init_status)
+            bracket_reanchor.extend(self._submit_exit_orders(
+                c, bracket_children, params, order.orderRef))
 
         except Exception as exc:
             log.exception("Worker %s: place_order failed: %s",
@@ -2299,6 +2301,266 @@ class IBWorkerThread(QThread):
                 "[%s] API-ERR   placeOrder failed: %s", self._label, exc)
             order_log.error("[%s] ORDER-ERROR  placeOrder failed: %s | params=%s",
                             self._label, exc, params)
+
+    def _submit_exit_orders(self, contract, children: list, params: dict,
+                            parent_ref: str) -> list:
+        """Place exit orders (bracket children or deferred overnight
+        exits) and bind their status streams.  Returns the
+        ``(trade, order_key, blotter_params)`` triples — the blotter
+        params dict is the one the status closure holds, so a re-anchor
+        that updates it in place shows in the Orders panel."""
+        placed: list = []
+        for ch in children:
+            ch_trade = self._ib.placeOrder(contract, ch)
+            ch_key = f"{ch.account}_{ch.orderRef}"
+            self._trades[ch_key] = ch_trade
+            self._has_status_handler.add(ch_key)
+
+            order_log.info(
+                "[%s] BRACKET-CHILD  parentRef=%s childRef=%s "
+                "type=%s action=%s qty=%s lmt=%s aux=%s "
+                "oca=%s transmit=%s",
+                self._label, parent_ref, ch.orderRef,
+                ch.orderType, ch.action, ch.totalQuantity,
+                getattr(ch, "lmtPrice", "N/A"),
+                getattr(ch, "auxPrice", "N/A"),
+                getattr(ch, "ocaGroup", ""), ch.transmit)
+            tws_log.info(
+                "[%s] API-RESP  placeOrder(child) → orderId=%s orderRef=%s",
+                self._label, ch_trade.order.orderId, ch.orderRef)
+
+            # Bind each child's statusEvent so blotter/positions pick up
+            # fills and cancels without any extra plumbing.  Start from
+            # the parent's params (symbol / account / conid / sec_type)
+            # then overlay the child's own identity — without this the
+            # blotter would show the parent's BUY/SELL action and price
+            # for every child row.
+            ch_params = dict(params)
+            ch_params["order_type"] = ch.orderType
+            ch_params["action"]     = ch.action
+            ch_params["qty"]        = int(ch.totalQuantity)
+            # Child-specific price columns for the blotter.
+            ch_params.pop("limit_price", None)
+            ch_params.pop("stop_price", None)
+            ch_params.update(self._child_price_params(
+                ch.orderType,
+                getattr(ch, "lmtPrice", None),
+                getattr(ch, "auxPrice", None)))
+            ch_frozen_oid = ch_key
+            # Same ch_params dict the status closure holds — the
+            # re-anchor updates it in place so the blotter row
+            # reflects the new prices.
+            placed.append((ch_trade, ch_key, ch_params))
+
+            def _on_child_status(t, _oid=ch_frozen_oid, _p=ch_params):
+                new_status = t.orderStatus.status
+                self._emit_order_status(t, _oid, _p, new_status)
+                order_log.info(
+                    "[%s] ORDER-STATUS  %s | status=%s filled=%s "
+                    "avgFill=%s symbol=%s account=%s orderRef=%s",
+                    self._label, _oid, new_status,
+                    t.orderStatus.filled, t.orderStatus.avgFillPrice,
+                    _p.get("symbol", "?"), _p.get("account", ""),
+                    getattr(t.order, "orderRef", ""))
+                if new_status in ("Filled", "Completed"):
+                    self._apply_fill_to_position(t, _p)
+
+            ch_trade.statusEvent += _on_child_status
+
+            # Emit the child's initial status so the UI sees it right away.
+            init_status = ch_trade.orderStatus.status or "Submitted"
+            self._emit_order_status(ch_trade, ch_key, ch_params,
+                                    init_status)
+        return placed
+
+    def _place_deferred_exits(self, contract, parent_trade, params: dict,
+                              ref_price: float) -> int:
+        """Place an overnight parent's exits after it fills in this session."""
+        st = parent_trade.orderStatus
+        return self._submit_deferred_exits(
+            contract, parent_trade.order,
+            int(abs(float(st.filled or 0))),
+            float(getattr(st, "avgFillPrice", 0.0) or 0.0),
+            params, ref_price)
+
+    def _submit_deferred_exits(self, contract, parent, filled: int,
+                               fill_px: float, params: dict,
+                               ref_price: float) -> int:
+        """Place a filled overnight parent's TP / SL / trail exits.
+
+        IBEOS takes limit orders only, so ``_do_place_order`` held the
+        exits back.  They go out here as standalone orders — no parentId,
+        one OCA group so the first to fill cancels the rest — sized to
+        *filled*, priced off the fill, and routed SMART with
+        ``outsideRth`` (a TP limit works from the 04:00 pre-market; IB
+        holds the stops until the regular session).  Returns how many
+        exits were placed.
+        """
+        if filled <= 0:
+            return 0
+        anchor = fill_px if 0.0 < fill_px < _IB_DBL_MAX else ref_price
+        if anchor <= 0:
+            order_log.warning(
+                "[%s] BRACKET-DEFER  no fill price — no exits placed for "
+                "orderRef=%s", self._label, parent.orderRef)
+            return 0
+        shadow = copy.copy(parent)
+        shadow.totalQuantity = filled
+        shadow.outsideRth = True
+        shadow.allowPreOpen = False
+        children = self._build_bracket_children(
+            shadow, params, anchor, float(params.get("tick_size") or 0.01))
+        if not children:
+            return 0
+        oca = f"oca_{parent.orderRef}"
+        for ch in children:
+            ch.parentId = 0
+            ch.transmit = True
+            ch.ocaGroup = oca
+            ch.ocaType = 1          # cancel the rest once one fills
+        exit_contract = copy.copy(contract)
+        exit_contract.exchange = "SMART"
+        order_log.info(
+            "[%s] BRACKET-DEFER  parent filled %d @ %.4f → %d exit(s) "
+            "SMART oca=%s", self._label, filled, anchor, len(children), oca)
+        self._submit_exit_orders(exit_contract, children, params,
+                                 parent.orderRef)
+        return len(children)
+
+    # ── Pending overnight exits (fills seen after a restart / reconnect) ──
+
+    @staticmethod
+    def _exit_contract(params: dict):
+        from ib_async import Contract
+        c = Contract(conId=int(params.get("conid") or 0))
+        c.exchange = "SMART"
+        c.currency = params.get("currency") or "USD"
+        c.symbol = params.get("symbol", "") or ""
+        c.secType = params.get("sec_type", "") or "STK"
+        c.localSymbol = params.get("local_symbol", "") or ""
+        return c
+
+    def _settle_pending_exits(self, key: str, filled: float,
+                              fill_px: float, why: str) -> None:
+        """A recorded overnight parent is done: place its exits for
+        *filled* shares (or drop the record when nothing filled)."""
+        from src.core import pending_exits
+        rec = pending_exits.take(key)
+        if rec is None:
+            return
+        params = rec.get("params") or {}
+        sym = params.get("symbol", "?")
+        account = rec.get("account", "")
+        qty = int(abs(float(filled or 0)))
+        if qty <= 0:
+            order_log.info(
+                "[%s] BRACKET-DEFER  %s ended unfilled (%s) — exits dropped",
+                self._label, key, why)
+            return
+        parent = SimpleNamespace(
+            action=params.get("action", "BUY"), totalQuantity=qty,
+            account=account, tif=params.get("tif") or "DAY", orderId=0,
+            orderRef=rec.get("order_ref", ""), outsideRth=True,
+            allowPreOpen=False)
+        n = self._submit_deferred_exits(
+            self._exit_contract(params), parent, qty, float(fill_px or 0.0),
+            params, float(rec.get("ref_price") or 0.0))
+        order_log.info("[%s] BRACKET-DEFER  %s settled (%s) → %d exit(s)",
+                       self._label, key, why, n)
+        if n:
+            self.exits_notice.emit(
+                f"{sym} ({account}): filled {qty:,} while NanoPulse was "
+                f"offline — its exits are now placed.")
+
+    def _maybe_settle_pending_from_trade(self, trade) -> None:
+        """Global order-status hook: a recorded overnight parent seen
+        after a reconnect (no session closure) reaching a final state."""
+        status = getattr(trade.orderStatus, "status", "") or ""
+        if status not in _PARENT_DONE:
+            return
+        ref = getattr(trade.order, "orderRef", "") or ""
+        account = getattr(trade.order, "account", "") or ""
+        if not ref.startswith("nano_") or not account:
+            return
+        from src.core import pending_exits
+        key = f"{account}_{ref}"
+        if not pending_exits.has(key):
+            return
+        filled, px = self._parent_fill_totals(trade, account, ref)
+        self._settle_pending_exits(key, filled, px, f"status {status}")
+
+    def _parent_fill_totals(self, trade, account: str,
+                            ref: str) -> tuple[float, float]:
+        """(shares, avg price) a parent filled — its own status, or the
+        execution reports when a replayed status carries no fill data."""
+        filled = px = 0.0
+        if trade is not None:
+            filled = float(getattr(trade.orderStatus, "filled", 0) or 0)
+            px = float(getattr(trade.orderStatus, "avgFillPrice", 0) or 0)
+        shares = notional = 0.0
+        try:
+            for f in self._ib.fills():
+                ex = f.execution
+                if (getattr(ex, "orderRef", "") == ref
+                        and getattr(ex, "acctNumber", "") == account):
+                    shares += float(ex.shares or 0)
+                    notional += float(ex.shares or 0) * float(ex.price or 0)
+        except Exception:
+            pass
+        if shares > filled:
+            filled = shares
+            px = notional / shares if shares else 0.0
+        return filled, px
+
+    async def _reconcile_pending_exits(self) -> None:
+        """On connect: settle every recorded overnight parent of this
+        connection's accounts that finished while NanoPulse was away.
+
+        Still-working parents are left for ``_on_global_order_status``.
+        A record whose exits are already out (crash between placing and
+        clearing) is just cleared.  One that can no longer be found —
+        no open order, no fill in TWS's replay — is dropped after a day
+        with a notice, since its outcome can't be verified any more.
+        """
+        if self._ib is None or not self._ib.isConnected():
+            return
+        from src.core import pending_exits
+        recs = pending_exits.records()
+        if not recs:
+            return
+        managed = set(self._ib.managedAccounts())
+        trades = list(self._ib.trades())
+        now = time.time()
+        for key, rec in recs.items():
+            account = rec.get("account", "")
+            ref = rec.get("order_ref", "")
+            if account not in managed or not ref:
+                continue
+            mine = [t for t in trades
+                    if getattr(t.order, "account", "") == account]
+            if any(getattr(t.order, "ocaGroup", "") == f"oca_{ref}"
+                   for t in mine):
+                pending_exits.take(key)
+                continue
+            parent = next((t for t in mine
+                           if getattr(t.order, "orderRef", "") == ref), None)
+            status = (getattr(parent.orderStatus, "status", "") or ""
+                      if parent is not None else "")
+            if parent is not None and status not in _PARENT_DONE:
+                continue        # still working — the global hook settles it
+            filled, px = self._parent_fill_totals(parent, account, ref)
+            if filled > 0 or parent is not None:
+                self._settle_pending_exits(key, filled, px, "reconnect")
+            elif now - float(rec.get("created") or now) > 86400:
+                pending_exits.take(key)
+                sym = (rec.get("params") or {}).get("symbol", "?")
+                order_log.warning(
+                    "[%s] BRACKET-DEFER  %s not found in TWS after a day — "
+                    "record dropped, exits NOT placed", self._label, key)
+                self.exits_notice.emit(
+                    f"{sym} ({account}): couldn't confirm whether the "
+                    "overnight order filled — exits NOT placed, check the "
+                    "position.")
 
     @staticmethod
     def _child_price_params(order_type: str, lmt_val, aux_val) -> dict:
@@ -5079,6 +5341,12 @@ class IBWorkerThread(QThread):
                 return
         except Exception:
             pass   # fall through to the full build, which guards itself
+
+        try:
+            self._maybe_settle_pending_from_trade(trade)
+        except Exception:
+            order_log.exception("[%s] BRACKET-DEFER  pending-exit check "
+                                "failed", self._label)
 
         d = self._build_trade_dict(trade)
         if not d:

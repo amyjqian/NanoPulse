@@ -31,3 +31,11 @@ def _regular_hours_routing(monkeypatch):
     import src.core.ib_worker as ib_worker
     monkeypatch.setattr(ib_worker, "stk_routes_overnight",
                         lambda currency="USD", now=None: False)
+
+
+@pytest.fixture(autouse=True)
+def _sandbox_pending_exits(tmp_path, monkeypatch):
+    """Overnight pending exits go to a throwaway file, never data/."""
+    import src.core.pending_exits as pending_exits
+    monkeypatch.setattr(pending_exits, "_path",
+                        tmp_path / "pending_exits.json")
