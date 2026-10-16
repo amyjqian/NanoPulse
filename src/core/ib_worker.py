@@ -49,6 +49,17 @@ def _generate_order_ref() -> str:
     return f"nano_{now:%y%m%d}_{now:%H%M%S}_{tag}"
 
 
+def stk_routes_overnight(currency: str = "USD",
+                         now: datetime | None = None) -> bool:
+    """True when a stock order placed now goes to IBEOS (IBKR Overnight,
+    20:00–03:59 ET).  IBEOS is US-only, so non-USD stocks never do.
+    IBEOS takes limit orders only — a MKT order there is refused (387)."""
+    if (currency or "USD").upper() != "USD":
+        return False
+    hour = (now or datetime.now(_ET)).astimezone(_ET).hour
+    return hour >= 20 or hour < 4
+
+
 def _round_to_tick(price: float, tick: float) -> float:
     """Snap *price* to the nearest multiple of *tick*.
 
@@ -1911,12 +1922,10 @@ class IBWorkerThread(QThread):
             # stay on SMART or TWS would reject the order.
             if sec_type == "STK":
                 now_et = datetime.now(_ET)
-                hour = now_et.hour
-                is_usd = (c.currency or "USD").upper() == "USD"
-                if (hour >= 20 or hour < 4) and is_usd:
+                if stk_routes_overnight(c.currency, now_et):
                     c.exchange = "IBEOS"
                     log.info("Worker %s: STK overnight → exchange=IBEOS (ET %02d:%02d)",
-                             self._label, hour, now_et.minute)
+                             self._label, now_et.hour, now_et.minute)
                 else:
                     c.exchange = "SMART"
 

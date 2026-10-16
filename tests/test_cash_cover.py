@@ -104,6 +104,10 @@ def rig(qtbot, tmp_path, monkeypatch):
     import src.core.instruments as instruments
     monkeypatch.setattr(instruments, "get_contract",
                         lambda sym: _CONTRACTS.get((sym or "").upper()))
+    # Regular hours unless a test opts into the overnight session.
+    import src.core.ib_worker as ib_worker
+    monkeypatch.setattr(ib_worker, "stk_routes_overnight",
+                        lambda currency="USD", now=None: False)
     monkeypatch.setattr(CashManagementPreferences, "sweep_symbols",
                         property(lambda self: ["SGOV", "BIL"]))
     am = AccountsTableModel()
@@ -302,6 +306,78 @@ class TestSingleAccountCover:
         v._on_order_requested(_buy())
         assert len(worker.orders) == n and len(answers["asks"]) == 1
         assert "already in progress" in msgs[-1]
+
+
+class TestOvernightSession:
+    """IBEOS (20:00–03:59 ET) refuses market orders (error 387), which
+    abandoned every overnight cover — the sweep sells go out as limits at
+    the bid instead."""
+
+    @pytest.fixture
+    def overnight(self, monkeypatch):
+        import src.core.ib_worker as ib_worker
+        monkeypatch.setattr(ib_worker, "stk_routes_overnight",
+                            lambda currency="USD", now=None: True)
+
+    def test_sells_are_limits_at_the_bid(self, rig, overnight, qtbot):
+        v, am, worker, _, answers, _ = rig
+        _cash_account(am, "A1", 5000)
+        v._on_order_requested(_buy())
+        sells = _sells(worker)
+        assert [(o["symbol"], o["order_type"], o["limit_price"])
+                for o in sells] == [("SGOV", "LMT", 100.49),
+                                    ("BIL", "LMT", 91.59)]
+        assert all(o.get("order_ref") for o in sells)
+        # Sized at the bid too, so the proceeds the dialog shows are what
+        # the limits fetch.
+        plan = answers["asks"][0][0][0]
+        assert [s.price for s in plan.sells] == [100.49, 91.59]
+        for o in sells:
+            _fill(v, o)
+        qtbot.waitUntil(lambda: bool(_buys(worker)), timeout=2000)
+        assert _buys(worker)[0]["qty"] == 100
+
+    def test_regular_hours_sells_stay_market(self, rig):
+        v, am, worker, _, _, _ = rig
+        _cash_account(am, "A1", 5000)
+        v._on_order_requested(_buy())
+        assert {o["order_type"] for o in _sells(worker)} == {"MKT"}
+
+
+    def test_sweep_out_is_a_limit_at_the_bid(self, rig, overnight):
+        v, _, worker, _, _, _ = rig
+        v._on_sweep_requested("A1", "out", 150, "SGOV")
+        (o,) = worker.orders
+        assert (o["action"], o["order_type"], o["qty"], o["limit_price"]) \
+            == ("SELL", "LMT", 150, 100.49)
+
+    def test_sweep_out_without_a_price_sends_nothing(self, rig, overnight):
+        v, _, worker, _, _, msgs = rig
+        v._order_entry._price_cache.pop("SGOV")
+        v._on_sweep_requested("A1", "out", 150, "SGOV")
+        assert worker.orders == [] and "not sent" in msgs[-1]
+
+    def test_regular_hours_sweep_out_stays_market(self, rig):
+        v, _, worker, _, _, _ = rig
+        v._on_sweep_requested("A1", "out", 150, "SGOV")
+        assert [o["order_type"] for o in worker.orders] == ["MKT"]
+
+
+class TestStkRoutesOvernight:
+    @pytest.mark.parametrize("hh,mm,expected", [
+        (19, 59, False), (20, 0, True), (0, 44, True), (3, 59, True),
+        (4, 0, False), (12, 0, False)])
+    def test_session_window(self, hh, mm, expected):
+        from datetime import datetime
+        from src.core.ib_worker import _ET, stk_routes_overnight
+        now = datetime(2026, 10, 16, hh, mm, tzinfo=_ET)
+        assert stk_routes_overnight("USD", now) is expected
+
+    def test_non_usd_never_overnight(self):
+        from datetime import datetime
+        from src.core.ib_worker import _ET, stk_routes_overnight
+        now = datetime(2026, 10, 16, 1, 0, tzinfo=_ET)
+        assert stk_routes_overnight("CAD", now) is False
 
 
 class TestMixedSelection:
