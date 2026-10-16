@@ -39,6 +39,8 @@ class _Trade:
         self.order = order
         self.orderStatus = SimpleNamespace(status="PendingSubmit",
                                            filled=0.0, avgFillPrice=0.0)
+        self.log: list = []
+        self.contract = None
         self._handlers: list = []
         self.statusEvent = self
 
@@ -46,7 +48,8 @@ class _Trade:
         self._handlers.append(handler)
         return self
 
-    def fire(self, status, filled=0.0, avg=0.0):
+    def fire(self, status, filled=0.0, avg=0.0, error=0):
+        self.log.append(SimpleNamespace(errorCode=error))
         self.orderStatus.status = status
         self.orderStatus.filled = filled
         self.orderStatus.avgFillPrice = avg
@@ -61,6 +64,7 @@ class _IB:
         self.open_trades: list = []       # what TWS replays on connect
         self.exec_fills: list = []
         self.accounts = ["U1"]
+        self.cancelled: list = []
 
     def isConnected(self):
         return True
@@ -76,8 +80,12 @@ class _IB:
 
     def placeOrder(self, contract, order):
         trade = _Trade(order)
+        trade.contract = contract
         self.placed.append((contract.exchange, order, trade))
         return trade
+
+    def cancelOrder(self, order):
+        self.cancelled.append(order)
 
 
 def _worker() -> IBWorkerThread:
@@ -344,3 +352,106 @@ class TestReconnect:
         wt._ib.exec_fills = [_exec(ref, 10, 180.0, account="U9")]
         assert _reconcile(wt) == []
         assert pending_exits.has(f"U9_{ref}")
+
+
+# ── take profit only: sent WITH the parent ───────────────────────────────────
+
+def _tp_only(**over):
+    return _params(stop_loss=None, **over)
+
+
+class TestTakeProfitBundle:
+    """No stop to link, so the take profit can ride with the parent: one
+    attached TP on IBEOS (tonight) and one SMART (from 04:00).  IB OCA's
+    attached siblings itself — everything lives at IB."""
+
+    def test_parent_and_both_take_profits_go_together(self, overnight):
+        wt = _worker()
+        placed = _place(wt, _tp_only())
+        assert [(e, o.orderType, o.action) for e, o, _ in placed] == [
+            ("IBEOS", "LMT", "BUY"), ("IBEOS", "LMT", "SELL"),
+            ("SMART", "LMT", "SELL")]
+        parent, night, day = (o for _, o, _ in placed)
+        assert [o.transmit for o in (parent, night, day)] == [
+            False, False, True]
+        assert night.parentId == day.parentId == parent.orderId
+        assert night.lmtPrice == day.lmtPrice == pytest.approx(182.10)
+        assert night.advancedErrorOverride == "10329"
+        assert day.outsideRth is True and not day.advancedErrorOverride
+        assert not getattr(night, "ocaGroup", "")
+        assert not getattr(day, "ocaGroup", "")
+        assert night.orderRef != day.orderRef
+        assert pending_exits.records() == {}    # nothing left to NanoPulse
+
+    def test_fill_places_nothing_more(self, overnight):
+        wt = _worker()
+        _place(wt, _tp_only())
+        wt._ib.placed[0][2].fire("Filled", filled=10, avg=180.10)
+        assert len(wt._ib.placed) == 3
+
+    def test_reanchor_keeps_each_take_profit_on_its_venue(self, overnight):
+        wt = _worker()
+        _place(wt, _tp_only())
+        wt._ib.placed[0][2].fire("Filled", filled=10, avg=180.00)
+        moved = wt._ib.placed[3:]
+        assert [(e, o.lmtPrice) for e, o, _ in moved] == [
+            ("IBEOS", pytest.approx(182.00)),
+            ("SMART", pytest.approx(182.00))]
+
+    def test_regular_hours_take_profit_is_a_plain_bracket(self):
+        wt = _worker()
+        placed = _place(wt, _tp_only())
+        assert [e for e, _, _ in placed] == ["SMART", "SMART"]
+
+
+def _place_then(wt, params, then):
+    async def go():
+        await wt._do_place_order(params)
+        then()
+        for _ in range(3):
+            await asyncio.sleep(0)
+    asyncio.run(go())
+    return wt._ib.placed
+
+
+class TestTakeProfitBundleRefused:
+    def test_refused_child_resends_the_parent_alone(self, overnight):
+        wt = _worker()
+        placed = _place_then(
+            wt, _tp_only(),
+            lambda: wt._ib.placed[1][2].fire("Cancelled", error=387))
+        parent = placed[0][1]
+        assert wt._ib.cancelled == [parent]
+        retry_exch, retry, _ = placed[3]
+        assert retry_exch == "IBEOS" and retry.action == "BUY"
+        assert retry.orderRef != parent.orderRef
+        assert len(placed) == 4                 # parent alone this time
+        # …so its take profit follows the fill, as deferred exits.
+        assert set(pending_exits.records()) == {f"U1_{retry.orderRef}"}
+
+    def test_refused_parent_resends_once(self, overnight):
+        wt = _worker()
+        def refuse():
+            for _, _, t in list(wt._ib.placed):
+                t.fire("Cancelled", error=201)
+        placed = _place_then(wt, _tp_only(), refuse)
+        assert len(placed) == 4
+        assert wt._ib.cancelled == []           # parent already done
+
+    def test_user_cancel_does_not_resend(self, overnight):
+        wt = _worker()
+        placed = _place_then(
+            wt, _tp_only(),
+            lambda: wt._ib.placed[0][2].fire("Cancelled", error=202))
+        assert len(placed) == 3 and wt._ib.cancelled == []
+
+    def test_unfilled_expiry_does_not_resend(self, overnight, monkeypatch):
+        wt = _worker()
+        import time as _time
+        start = _time.monotonic()
+        def expire():
+            monkeypatch.setattr(ib_worker.time, "monotonic",
+                                lambda: start + 6 * 3600)
+            wt._ib.placed[0][2].fire("Cancelled", error=161)
+        placed = _place_then(wt, _tp_only(), expire)
+        assert len(placed) == 3
