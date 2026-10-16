@@ -54,6 +54,9 @@ app_config-*.json
 # User accounts DB (holds password hashes — never commit)
 data/users.db
 
+# Overnight bracket exits awaiting their parent's fill (runtime state)
+data/pending_exits.json
+
 # Log files
 data/logs/
 

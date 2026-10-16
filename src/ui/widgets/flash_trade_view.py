@@ -729,32 +729,43 @@ class FlashTradeView(QWidget):
         # flatten / close legs included — would all be refused (387).
         # Each becomes a limit priced from the live quote; an order that
         # is already a limit is left alone.
+        from src.core.ib_worker import stk_routes_overnight
+        overnight = (sec_type == "STK"
+                     and stk_routes_overnight(contract.get("currency")
+                                              or "USD"))
         overnight_limit = False
-        if sec_type == "STK" and order_type in ("PEG_PRIM", "ADAPTIVE",
-                                                "MKT"):
-            from src.core.ib_worker import stk_routes_overnight
-            if stk_routes_overnight(contract.get("currency") or "USD"):
-                cached = self._order_entry._price_cache.get(
-                    (symbol or "").upper())
-                bid, ask = ((float(cached[1] or 0), float(cached[2] or 0))
-                            if cached else (0.0, 0.0))
-                button = str(payload.get("type", "MKT"))
-                px = overnight_limit_price(button, action, bid, ask, tick)
-                if px <= 0:
-                    log.warning("FlashTrade: overnight %s %s %s without a "
-                                "bid/ask – not sent", action, button, symbol)
-                    self.transient_status_message.emit(
-                        f"Overnight {symbol} needs a bid and ask for its "
-                        "limit price — order not sent.", 6000)
-                    return
-                log.info("FlashTrade: overnight %s %s %s (bid=%.4f "
-                         "ask=%.4f) → LMT @ %.4f (was %s)", action, button,
-                         symbol, bid, ask, px, order_type)
-                order_type = "LMT"
-                limit_price = px
-                overnight_limit = True
-                adaptive_priority = None
-                peg_offset = None
+        if overnight and order_type in ("PEG_PRIM", "ADAPTIVE", "MKT"):
+            cached = self._order_entry._price_cache.get(
+                (symbol or "").upper())
+            bid, ask = ((float(cached[1] or 0), float(cached[2] or 0))
+                        if cached else (0.0, 0.0))
+            button = str(payload.get("type", "MKT"))
+            px = overnight_limit_price(button, action, bid, ask, tick)
+            if px <= 0:
+                log.warning("FlashTrade: overnight %s %s %s without a "
+                            "bid/ask – not sent", action, button, symbol)
+                self.transient_status_message.emit(
+                    f"Overnight {symbol} needs a bid and ask for its "
+                    "limit price — order not sent.", 6000)
+                return
+            log.info("FlashTrade: overnight %s %s %s (bid=%.4f "
+                     "ask=%.4f) → LMT @ %.4f (was %s)", action, button,
+                     symbol, bid, ask, px, order_type)
+            order_type = "LMT"
+            limit_price = px
+            overnight_limit = True
+            adaptive_priority = None
+            peg_offset = None
+
+        if overnight and (payload.get("stop_loss")
+                          or payload.get("trailing")):
+            # The worker holds the exits until the fill and places them
+            # SMART; IB keeps a stop un-armed until 09:30 — say so, so
+            # nobody reads the bracket as overnight protection.
+            self.transient_status_message.emit(
+                f"Overnight {symbol}: exits are placed once the order "
+                "fills; IB holds the stop until 9:30 AM ET — no stop "
+                "protection overnight.", 9000)
 
         log.info("FlashTrade: %s %s %d %s → %d account(s): %s",
                  action, order_type, qty, symbol, len(accounts), accounts)
@@ -1049,6 +1060,10 @@ class FlashTradeView(QWidget):
         log.warning("FlashTrade: %s", msg)
         self.transient_status_message.emit(msg, 6000)
 
+    def _on_exits_notice(self, text: str) -> None:
+        """Worker notice about overnight exits settled on reconnect."""
+        self.transient_status_message.emit(text, 12000)
+
     def _ensure_worker_connected(self, worker: IBWorkerThread) -> None:
         """Connect order_status_updated, portfolio_updated, and
         flatten_close_needed signals if not already connected.
@@ -1119,6 +1134,10 @@ class FlashTradeView(QWidget):
                 prev.bg_price_updated.disconnect(self._on_bg_price_for_trades)
             except RuntimeError:
                 pass
+            try:
+                prev.exits_notice.disconnect(self._on_exits_notice)
+            except RuntimeError:
+                pass
             log.debug("FlashTrade: unwired stale signals for worker %s", label)
 
         worker.order_status_updated.connect(self._on_order_status_updated)
@@ -1137,6 +1156,7 @@ class FlashTradeView(QWidget):
         # mark unclosed positions to the last traded price.
         worker.price_updated.connect(self._on_price_for_trades)
         worker.bg_price_updated.connect(self._on_bg_price_for_trades)
+        worker.exits_notice.connect(self._on_exits_notice)
         self._connected_order_workers[label] = worker
         self._connected_portfolio_workers[label] = worker
         log.debug(

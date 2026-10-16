@@ -342,6 +342,7 @@ class TestWorkerSwap:
             accounts_detected = Signal(str, object)
             price_updated = Signal(str, float)
             bg_price_updated = Signal(str, float, float, float, float)
+            exits_notice = Signal(str)
 
             def __init__(self):
                 super().__init__()

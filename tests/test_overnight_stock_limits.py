@@ -158,6 +158,20 @@ class TestOvernightOrders:
                                      last_price=29800.0))
         assert len(worker.orders) == 1
 
+    def test_stop_tier_overnight_warns_no_overnight_protection(
+            self, rig, overnight):
+        v, worker, msgs = rig
+        v._on_order_requested(_order(
+            stop_loss={"value": 3, "unit": "price"}))
+        assert len(worker.orders) == 1
+        assert any("holds the stop until 9:30" in m for m in msgs)
+
+    def test_take_profit_alone_does_not_warn(self, rig, overnight):
+        v, worker, msgs = rig
+        v._on_order_requested(_order(
+            profit_take={"value": 3, "unit": "price"}))
+        assert not any("holds the stop" in m for m in msgs)
+
     def test_regular_hours_keep_peg_and_adaptive(self, rig):
         v, worker, _ = rig
         v._on_order_requested(_order(type="BID"))
