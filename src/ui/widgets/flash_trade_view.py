@@ -759,13 +759,15 @@ class FlashTradeView(QWidget):
 
         if overnight and (payload.get("stop_loss")
                           or payload.get("trailing")):
-            # The worker holds the exits until the fill and places them
-            # SMART; IB keeps a stop un-armed until 09:30 — say so, so
-            # nobody reads the bracket as overnight protection.
+            # The worker holds the exits until the fill (the take profit
+            # twinned on IBEOS so it works tonight); IB keeps a stop
+            # un-armed until 09:30 — say so, so nobody reads the bracket
+            # as overnight stop protection.
             self.transient_status_message.emit(
                 f"Overnight {symbol}: exits are placed once the order "
-                "fills; IB holds the stop until 9:30 AM ET — no stop "
-                "protection overnight.", 9000)
+                "fills; the take profit works overnight, but IB holds the "
+                "stop until 9:30 AM ET — no stop protection overnight.",
+                9000)
 
         log.info("FlashTrade: %s %s %d %s → %d account(s): %s",
                  action, order_type, qty, symbol, len(accounts), accounts)

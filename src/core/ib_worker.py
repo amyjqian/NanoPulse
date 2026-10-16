@@ -2393,8 +2393,9 @@ class IBWorkerThread(QThread):
         one OCA group so the first to fill cancels the rest — sized to
         *filled*, priced off the fill, and routed SMART with
         ``outsideRth`` (a TP limit works from the 04:00 pre-market; IB
-        holds the stops until the regular session).  Returns how many
-        exits were placed.
+        holds the stops until the regular session).  Overnight the take
+        profit is twinned on IBEOS so it can fill tonight.  Returns how
+        many exit orders were placed.
         """
         if filled <= 0:
             return 0
@@ -2418,6 +2419,35 @@ class IBWorkerThread(QThread):
             ch.transmit = True
             ch.ocaGroup = oca
             ch.ocaType = 1          # cancel the rest once one fills
+        # Overnight, the take profit also goes to IBEOS so it can fill
+        # tonight — IBEOS takes limits, just not stops.  It is a twin of
+        # the SMART take profit in the same OCA group: IBEOS orders end
+        # with the overnight session (~03:50 ET) and the SMART one, held
+        # until 04:00, takes over from the pre-market.  The two venues'
+        # hours don't overlap, and ocaType 1 blocks an overfill anyway;
+        # a fill on either cancels everything else.
+        overnight_tp = []
+        if stk_routes_overnight(getattr(contract, "currency", "") or "USD"):
+            for ch in children:
+                if ch.orderType == "LMT":
+                    twin = copy.copy(ch)
+                    twin.orderId = self._ib.client.getReqId()
+                    twin.orderRef = _generate_order_ref()
+                    while twin.orderRef == ch.orderRef:
+                        twin.orderRef = _generate_order_ref()
+                    twin.outsideRth = False
+                    twin.allowPreOpen = False
+                    twin.advancedErrorOverride = "10329"
+                    overnight_tp.append(twin)
+        if overnight_tp:
+            ibeos_contract = copy.copy(contract)
+            ibeos_contract.exchange = "IBEOS"
+            order_log.info(
+                "[%s] BRACKET-DEFER  overnight take profit → IBEOS "
+                "LMT %.4f oca=%s", self._label,
+                overnight_tp[0].lmtPrice, oca)
+            self._submit_exit_orders(ibeos_contract, overnight_tp, params,
+                                     parent.orderRef)
         exit_contract = copy.copy(contract)
         exit_contract.exchange = "SMART"
         order_log.info(
@@ -2425,7 +2455,7 @@ class IBWorkerThread(QThread):
             "SMART oca=%s", self._label, filled, anchor, len(children), oca)
         self._submit_exit_orders(exit_contract, children, params,
                                  parent.orderRef)
-        return len(children)
+        return len(children) + len(overnight_tp)
 
     # ── Pending overnight exits (fills seen after a restart / reconnect) ──
 
