@@ -1251,9 +1251,29 @@ class FlashTradeView(QWidget):
             holdings.append((sweep_sym,
                              self._account_position.held_shares(
                                  account, sweep_sym),
-                             self._sweep_symbol_price(sweep_sym)))
+                             self._cover_sell_price(sweep_sym)))
         return plan_cash_cover(account, symbol, qty, unit, available,
                                holdings)
+
+    @staticmethod
+    def _sweep_sells_overnight(symbol: str) -> bool:
+        """True when a sell of *symbol* placed now routes to IBEOS, which
+        refuses market orders (387) — the cover then sells at the bid."""
+        from src.core import instruments
+        from src.core.ib_worker import stk_routes_overnight
+        contract = instruments.get_contract(symbol) or {}
+        return stk_routes_overnight(contract.get("currency") or "USD")
+
+    def _cover_sell_price(self, symbol: str) -> float:
+        """Per-share price a cover sell of *symbol* is sized at — and,
+        overnight, its limit: the bid then (what the sell is sent at),
+        the last otherwise (a MKT sell)."""
+        if self._sweep_sells_overnight(symbol):
+            cached = self._order_entry._price_cache.get(
+                (symbol or "").upper())
+            if cached and cached[1] and cached[1] > 0:
+                return float(cached[1])
+        return self._sweep_symbol_price(symbol)
 
     def _maybe_cover_cash_buy(self, accounts: list[str], payload: dict,
                               symbol: str, qty: int, order_type: str,
@@ -1345,14 +1365,23 @@ class FlashTradeView(QWidget):
         }
         timer.start(self._COVER_TIMEOUT_MS)
         for ref, sell in zip(refs, plan.sells):
-            log.info("FlashTrade: cash cover → SELL %d %s @MKT account=%s "
-                     "ref=%s", sell.qty, sell.symbol, plan.account, ref)
-            self._on_order_requested({
+            order = {
                 "action": "SELL", "type": "MKT", "symbol": sell.symbol,
                 "qty": int(sell.qty), "last_price": float(sell.price),
                 "_target_accounts": [plan.account], "order_ref": ref,
                 "_cash_cover": True,
-            })
+            }
+            # IBEOS (the overnight venue) takes limit orders only: sell
+            # at the bid the plan was sized at, which a money-market ETF
+            # fills at once.
+            if self._sweep_sells_overnight(sell.symbol):
+                order["type"] = "LMT"
+                order["limit_price"] = float(sell.price)
+            log.info("FlashTrade: cash cover → SELL %d %s %s account=%s "
+                     "ref=%s", sell.qty, sell.symbol,
+                     f"LMT @ {sell.price:.2f}" if order["type"] == "LMT"
+                     else "@MKT", plan.account, ref)
+            self._on_order_requested(order)
         sold = ", ".join(f"{s.qty:,} {s.symbol}" for s in plan.sells)
         self.transient_status_message.emit(
             f"{alias}: selling {sold} — {plan.buy_qty:,} {plan.symbol} "
@@ -1444,8 +1473,10 @@ class FlashTradeView(QWidget):
         IB reserve ~5% over the order value, rejecting full-balance sweeps
         in no-margin (TFSA/RSP) accounts; the exact limit avoids that and
         still fills immediately on a stable money-market ETF.
-        Sweep out → SELL @MKT (no cash check to trip).  Both route through
-        the normal order path (RTH / prefs / admin-gate all apply)."""
+        Sweep out → SELL @MKT (no cash check to trip) — overnight, when
+        the order routes to IBEOS (limit orders only, MKT is refused with
+        387), a limit at the bid instead.  Both route through the normal
+        order path (RTH / prefs / admin-gate all apply)."""
         if qty <= 0 or not symbol or not account:
             log.warning("FlashTrade: sweep %s ignored — qty=%s symbol=%r acct=%r",
                         direction, qty, symbol, account)
@@ -1462,6 +1493,26 @@ class FlashTradeView(QWidget):
             }
             log.info("FlashTrade: sweep in → BUY %d %s LMT @ %.2f account=%s",
                      qty, symbol, limit_price, account)
+        elif direction == "out" and self._sweep_sells_overnight(symbol):
+            bid = self._cover_sell_price(symbol)
+            if bid <= 0:
+                log.warning("FlashTrade: sweep out %s overnight without a "
+                            "price – not sent", symbol)
+                self.transient_status_message.emit(
+                    f"Sweep out: no {symbol} price for the overnight limit "
+                    "— order not sent.", 6000)
+                return
+            payload = {
+                "action": "SELL",
+                "type": "LMT",
+                "symbol": symbol,
+                "qty": int(qty),
+                "limit_price": float(bid),
+                "last_price": self._sweep_symbol_price(symbol),
+                "_target_accounts": [account],
+            }
+            log.info("FlashTrade: sweep out (overnight) → SELL %d %s LMT @ "
+                     "%.2f account=%s", qty, symbol, bid, account)
         else:
             action = "BUY" if direction == "in" else "SELL"
             payload = {
