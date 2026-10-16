@@ -127,18 +127,28 @@ class TestOvernightBracket:
         assert exch == "IBEOS" and parent.orderType == "LMT"
         assert parent.transmit is True
 
-    def test_fill_places_oca_exits_on_smart_off_the_fill(self, overnight):
+    def test_fill_places_oca_exits_off_the_fill(self, overnight):
         wt = _worker()
         _place(wt, _params())
         parent_trade = wt._ib.placed[0][2]
         parent_trade.fire("Filled", filled=10, avg=180.00)
         exits = wt._ib.placed[1:]
+        # The take profit works tonight on IBEOS; its SMART twin and the
+        # stop wait for the pre-market / regular session.
         assert [(e, o.orderType, o.action, o.totalQuantity)
                 for e, o, _ in exits] == [
+            ("IBEOS", "LMT", "SELL", 10),
             ("SMART", "LMT", "SELL", 10), ("SMART", "STP", "SELL", 10)]
-        tp, sl = (o for _, o, _ in exits)
-        assert tp.lmtPrice == pytest.approx(182.00)
+        night_tp, tp, sl = (o for _, o, _ in exits)
+        assert night_tp.lmtPrice == tp.lmtPrice == pytest.approx(182.00)
         assert sl.auxPrice == pytest.approx(177.00)
+        assert night_tp.advancedErrorOverride == "10329"
+        assert night_tp.outsideRth is False
+        assert night_tp.parentId == 0 and night_tp.transmit is True
+        assert night_tp.ocaGroup == tp.ocaGroup and night_tp.ocaType == 1
+        assert len({night_tp.orderId, tp.orderId, sl.orderId}) == 3
+        assert len({night_tp.orderRef, tp.orderRef, sl.orderRef}) == 3
+        assert f"U1_{night_tp.orderRef}" in wt._trades
         for o in (tp, sl):
             assert o.parentId == 0 and o.transmit is True
             assert o.ocaGroup == f"oca_{parent_trade.order.orderRef}"
@@ -154,20 +164,27 @@ class TestOvernightBracket:
         parent_trade = wt._ib.placed[0][2]
         parent_trade.fire("Filled", filled=10, avg=180.00)
         parent_trade.fire("Completed", filled=10, avg=180.00)
-        assert len(wt._ib.placed) == 3
+        assert len(wt._ib.placed) == 4
 
     def test_partial_fill_then_cancel_protects_what_filled(self, overnight):
         wt = _worker()
         _place(wt, _params())
         parent_trade = wt._ib.placed[0][2]
         parent_trade.fire("Cancelled", filled=4, avg=180.02)
-        assert [o.totalQuantity for _, o, _ in wt._ib.placed[1:]] == [4, 4]
+        assert [o.totalQuantity for _, o, _ in wt._ib.placed[1:]] == [4, 4, 4]
 
     def test_cancel_without_fill_places_nothing(self, overnight):
         wt = _worker()
         _place(wt, _params())
         wt._ib.placed[0][2].fire("Cancelled")
         assert len(wt._ib.placed) == 1
+
+    def test_stop_only_has_no_overnight_twin(self, overnight):
+        wt = _worker()
+        _place(wt, _params(profit_take=None))
+        wt._ib.placed[0][2].fire("Filled", filled=10, avg=180.00)
+        assert [(e, o.orderType) for e, o, _ in wt._ib.placed[1:]] == [
+            ("SMART", "STP")]
 
     def test_trailing_exit_is_standalone_trail(self, overnight):
         wt = _worker()
@@ -262,6 +279,15 @@ class TestReconnect:
         assert [e for e, _, _ in wt._ib.placed] == ["SMART", "SMART"]
         assert pending_exits.records() == {}
         assert "exits are now placed" in wt.notices[-1]
+
+    def test_caught_up_overnight_also_twins_the_take_profit(
+            self, overnight):
+        ref = _record()
+        wt = _worker()
+        wt._ib.exec_fills = [_exec(ref, 10, 180.00)]
+        _reconcile(wt)
+        assert [e for e, _, _ in wt._ib.placed] == [
+            "IBEOS", "SMART", "SMART"]
 
     def test_replayed_done_parent_uses_its_status(self):
         ref = _record()
