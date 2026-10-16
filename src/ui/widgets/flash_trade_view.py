@@ -49,6 +49,37 @@ _K_LEFT_V    = "flash_left_v_splitter"    # vertical:   orders | positions-trade
 _K_ACCT_VIS  = "accounts_panel_visible"   # bool — false = panel hidden
 
 
+def overnight_limit_price(button: str, action: str, bid: float, ask: float,
+                          tick: float) -> float:
+    """The plain limit a stock order is sent as overnight, or 0 without a
+    two-sided quote.
+
+    IBEOS (IBKR Overnight, 20:00–03:59 ET) takes limit orders only — the
+    peg, the Adaptive algo and a market order are refused (387) — so each
+    button keeps its intent as a static limit:
+
+    * ``BID`` / ``ASK`` (Buy @Bid +1t / Sell @Ask -1t) → one tick inside
+      the touch, never through the far side;
+    * ``MID`` → the midpoint, rounded toward the far side;
+    * anything market-like (MKT, flatten / close legs) → the far side
+      (ask for a buy, bid for a sell), which fills at once.
+    """
+    import math
+    if not (bid > 0 and ask > 0):
+        return 0.0
+    tick = tick if tick and tick > 0 else 0.01
+    buy = action == "BUY"
+    if button in ("BID", "ASK"):
+        px = min(bid + tick, ask) if buy else max(ask - tick, bid)
+    elif button == "MID":
+        steps = (bid + ask) / 2.0 / tick
+        px = (math.ceil(steps - 1e-9) if buy
+              else math.floor(steps + 1e-9)) * tick
+    else:
+        px = ask if buy else bid
+    return round(px, 10)
+
+
 def _titled_panel(title: str) -> QWidget:
     """Return an empty dark panel with a top-left section title."""
     panel = QWidget()
@@ -692,6 +723,39 @@ class FlashTradeView(QWidget):
                          tick, limit_price)
                 order_type = "LMT"
 
+        # ── Overnight stocks → plain limit ────────────────────────────────
+        # 20:00–03:59 ET a stock routes to IBEOS, which takes limit orders
+        # only: the peg (@Bid +1t), Adaptive (@Mid) and market orders —
+        # flatten / close legs included — would all be refused (387).
+        # Each becomes a limit priced from the live quote; an order that
+        # is already a limit is left alone.
+        overnight_limit = False
+        if sec_type == "STK" and order_type in ("PEG_PRIM", "ADAPTIVE",
+                                                "MKT"):
+            from src.core.ib_worker import stk_routes_overnight
+            if stk_routes_overnight(contract.get("currency") or "USD"):
+                cached = self._order_entry._price_cache.get(
+                    (symbol or "").upper())
+                bid, ask = ((float(cached[1] or 0), float(cached[2] or 0))
+                            if cached else (0.0, 0.0))
+                button = str(payload.get("type", "MKT"))
+                px = overnight_limit_price(button, action, bid, ask, tick)
+                if px <= 0:
+                    log.warning("FlashTrade: overnight %s %s %s without a "
+                                "bid/ask – not sent", action, button, symbol)
+                    self.transient_status_message.emit(
+                        f"Overnight {symbol} needs a bid and ask for its "
+                        "limit price — order not sent.", 6000)
+                    return
+                log.info("FlashTrade: overnight %s %s %s (bid=%.4f "
+                         "ask=%.4f) → LMT @ %.4f (was %s)", action, button,
+                         symbol, bid, ask, px, order_type)
+                order_type = "LMT"
+                limit_price = px
+                overnight_limit = True
+                adaptive_priority = None
+                peg_offset = None
+
         log.info("FlashTrade: %s %s %d %s → %d account(s): %s",
                  action, order_type, qty, symbol, len(accounts), accounts)
 
@@ -819,7 +883,8 @@ class FlashTradeView(QWidget):
             params["tick_size"] = tick
             params["last_price"] = last_price
             original_type = payload.get("type", "MKT")
-            if original_type in ("BID_LMT", "ASK_LMT") and limit_price:
+            if (original_type in ("BID_LMT", "ASK_LMT")
+                    or overnight_limit) and limit_price:
                 params["bracket_ref_price"] = limit_price
             else:
                 params["bracket_ref_price"] = last_price
