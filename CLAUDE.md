@@ -118,6 +118,9 @@ Both dedicated loggers set `propagate = False` so their output stays out of the 
 - A datetime typed into the search box becomes its own window and replaces the combo's, except when the combo holds a session preset. That precedence lives in `effectiveWindow` / `effective_window` only.
 - Named-day entries are literal dates, so they go stale at ET midnight. `TradesFilterProxy.anchorDateChanged` → `TradesPanel._on_anchor_changed` rebuilds the combo and re-resolves the selection; a day that rolled off the list falls back to Today.
 
+### Search boxes (`src/ui/widgets/search_query.py`)
+- The Positions and Trades "Search..." fields share one parser, `SearchQuery`: whitespace-separated terms AND together, `not x` / `-x` excludes rows where any searched field contains `x`, a bare or trailing `not` is ignored. All four consumers — `AccountPositionModel`, `PositionsSummaryModel`, `TradesFilterProxy` and `TradesSummaryModel` — keep a `SearchQuery` and call `matches(fields)`; don't reintroduce a private substring copy (they used to have one each). The Trades time-window reading of the box (`_try_parse_time_query`) runs on the raw text first and wins. The Accounts table on the Connect tab still has its own matcher.
+
 ### Trades column sorting (`trades_filter_proxy.py` + `trades_panel.py`)
 - Both trade tables sort through `TradesFilterProxy.sortSpecs()` — a list of `(column, order)` in priority order, empty = the source model's natural order. The panel keeps no sort state of its own.
 - A plain caption click sorts by that column alone (descending → ascending → unsorted); **⇧-click** appends the column as the next tie-breaker, cycles it, then drops it on the third ⇧-click. `sectionClicked` carries no modifiers, so `TradesPanel.eventFilter` latches the Shift state off the press — installed on `horizontalHeader().viewport()`, NOT the header: QHeaderView is a scroll area and a filter on the header widget never sees the press.

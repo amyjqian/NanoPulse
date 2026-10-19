@@ -35,6 +35,7 @@ from PySide6.QtGui import QColor
 from src.ui.theme import Theme
 from src.utils.helpers import format_option_symbol_two_line
 
+from .search_query import SearchQuery
 from .table_theme import CELL_FONT_BOLD, IsFooterRowRole
 
 from .account_position_model import (
@@ -141,7 +142,7 @@ class PositionsSummaryModel(QAbstractTableModel):
         # contributes to the aggregates only when its account id/alias
         # or symbol matches — so typing an alias shows that account's
         # aggregates, typing a symbol shows that contract's row.
-        self._search_text: str = ""
+        self._search = SearchQuery()
 
         # Shared cell fonts — family + weight only, size from the table's
         # stylesheet, so every table in both tabs renders identically.
@@ -391,12 +392,13 @@ class PositionsSummaryModel(QAbstractTableModel):
         self._rebuild()
 
     def set_search_text(self, text: str) -> None:
-        """Filter by account id/alias or symbol (case-insensitive
-        substring), then rebuild.  Empty text clears the filter."""
-        text = (text or "").strip().lower()
-        if text == self._search_text:
+        """Filter by account id/alias or symbol (``SearchQuery`` syntax:
+        terms AND together, ``not x`` / ``-x`` exclude), then rebuild.
+        Empty text clears the filter."""
+        query = SearchQuery.parse(text)
+        if query == self._search:
             return
-        self._search_text = text
+        self._search = query
         self._rebuild()
 
     def set_selected_accounts(self, accounts) -> None:
@@ -528,16 +530,11 @@ class PositionsSummaryModel(QAbstractTableModel):
         return account in sel
 
     def _matches_search(self, account: str, pos: dict) -> bool:
-        if not self._search_text:
-            return True
-        if self._search_text in account.lower():
+        if not self._search:
             return True
         alias = (self._get_alias(account) if self._get_alias else "") or ""
-        if self._search_text in alias.lower():
-            return True
-        return any(
-            self._search_text in (pos.get(f) or "").lower()
-            for f in ("symbol", "local_symbol"))
+        return self._search.matches(
+            (account, alias, pos.get("symbol"), pos.get("local_symbol")))
 
     @staticmethod
     def _empty_agg(con_id: int, seed: dict) -> dict:

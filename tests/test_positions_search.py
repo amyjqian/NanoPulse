@@ -16,6 +16,7 @@ from src.ui.widgets.positions_summary_model import (
     PositionsSummaryModel,
     S_COL_SYMBOL,
 )
+from src.ui.widgets.search_query import SearchQuery
 
 _ALIASES = {"ACC1": "Momentum", "ACC2": "Swing"}
 
@@ -112,6 +113,47 @@ class TestFlatModelSearch:
         headers = [a for rt, a in _visible_rows(m) if rt == ROW_TYPE_HEADER]
         assert headers == ["ACC3"]
 
+    def test_not_hides_matching_positions_only(self):
+        m = _flat_model()
+        m.set_search_text("not aapl")
+        rows = _visible_rows(m)
+        assert (ROW_TYPE_POSITION, "AAPL") not in rows
+        assert (ROW_TYPE_POSITION, "MSFT") in rows
+        assert (ROW_TYPE_POSITION, "TSLA") in rows
+        headers = [a for rt, a in rows if rt == ROW_TYPE_HEADER]
+        assert headers == ["ACC1", "ACC2"]
+
+    def test_dash_is_the_same_as_not(self):
+        m = _flat_model()
+        m.set_search_text("-aapl")
+        a = _visible_rows(m)
+        m.set_search_text("not aapl")
+        assert _visible_rows(m) == a
+
+    def test_not_on_an_alias_drops_the_whole_account(self):
+        m = _flat_model()
+        m.set_search_text("not momen")      # ACC1's alias
+        rows = _visible_rows(m)
+        assert [a for rt, a in rows if rt == ROW_TYPE_HEADER] == ["ACC2"]
+        assert (ROW_TYPE_POSITION, "MSFT") not in rows
+
+    def test_mixed_include_and_exclude(self):
+        m = _flat_model()
+        m.set_search_text("acc1 not aapl")
+        rows = _visible_rows(m)
+        assert rows == [(ROW_TYPE_HEADER, "ACC1"),
+                        (ROW_TYPE_POSITION, "MSFT")]
+
+    def test_positionless_header_survives_an_exclusion_that_misses_it(self):
+        m = _flat_model()
+        m.set_account_data("ACC3", net_liq=5000.0)
+        m.set_search_text("not aapl")
+        headers = [a for rt, a in _visible_rows(m) if rt == ROW_TYPE_HEADER]
+        assert "ACC3" in headers
+        m.set_search_text("not acc3")
+        headers = [a for rt, a in _visible_rows(m) if rt == ROW_TYPE_HEADER]
+        assert "ACC3" not in headers
+
 
 class TestSummaryModelSearch:
     def _model(self) -> PositionsSummaryModel:
@@ -137,6 +179,19 @@ class TestSummaryModelSearch:
                     if a["symbol"] == "AAPL")
         assert aapl["position"] == 10.0  # ACC1 only
 
+    def test_not_drops_only_that_aggregate(self):
+        m = self._model()
+        m.set_search_text("not aapl")
+        assert set(self._symbols(m)) == {"MSFT", "TSLA"}
+
+    def test_not_on_an_alias_folds_the_other_account_only(self):
+        m = self._model()
+        m.set_search_text("not swing")   # ACC2
+        assert set(self._symbols(m)) == {"AAPL", "MSFT"}
+        aapl = next(a for a in (m.row_data(r) for r in range(len(m._order)))
+                    if a["symbol"] == "AAPL")
+        assert aapl["position"] == 10.0  # ACC1 only
+
     def test_clearing_restores(self):
         m = self._model()
         m.set_search_text("tsla")
@@ -151,8 +206,8 @@ class TestPanelWiring:
         qtbot.addWidget(panel)
         panel.update_positions(_BATCH)
         panel._search_field.setText("AAPL")
-        assert panel._model._search_text == "aapl"
-        assert panel._summary_model._search_text == "aapl"
+        assert panel._model._search == SearchQuery(("aapl",), ())
+        assert panel._summary_model._search == SearchQuery(("aapl",), ())
         pos_rows = [r for r in panel._model._rows
                     if r.get("_row_type") == ROW_TYPE_POSITION]
         assert {r["symbol"] for r in pos_rows} == {"AAPL"}
@@ -165,4 +220,4 @@ class TestPanelWiring:
         panel._search_field.setText("AAPL")
         qtbot.keyClick(panel._search_field, Qt.Key.Key_Escape)
         assert panel._search_field.text() == ""
-        assert panel._model._search_text == ""
+        assert not panel._model._search
