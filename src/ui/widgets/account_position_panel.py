@@ -997,6 +997,9 @@ class AccountPositionPanel(QWidget):
         self._search_field = QLineEdit()
         self._search_field.setObjectName("posSearch")
         self._search_field.setPlaceholderText("Search...")
+        self._search_field.setToolTip(
+            "Filter by symbol or account.  Several words must all match.\n"
+            "Exclude with \u201cnot sgov\u201d or \u201c-sgov\u201d.")
         self._search_field.setFixedHeight(tt.CTRL_H)
         self._search_field.setStyleSheet(f"""
             QLineEdit#posSearch {{

@@ -225,6 +225,11 @@ class TradesControlBar(QWidget):
         self._search = QLineEdit(self)
         self._search.setObjectName("tbSearch")
         self._search.setPlaceholderText("Search...")
+        self._search.setToolTip(
+            "Filter by symbol, side, account or exchange.  Several words "
+            "must all match.\nExclude with \u201cnot sgov\u201d or "
+            "\u201c-sgov\u201d.\nA time such as 12:00 or Oct 20 shows "
+            "fills from that moment on.")
         self._search.setFixedHeight(tt.CTRL_H)
         self._search.textChanged.connect(self.searchTextChanged.emit)
         lay.addWidget(self._search)

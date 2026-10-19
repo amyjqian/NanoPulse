@@ -7,9 +7,11 @@ Filters on two axes:
       - If the input parses as a datetime (e.g. ``Apr21 11:44:40``,
         ``11:44``, ``Apr21``) it becomes a "fills at or after this
         moment" threshold on the flat view.
-      - Otherwise it's a case-insensitive substring match against the
-        per-view key set (symbol / side / account / sec_type / exchange
-        / order_ref for flat; symbol / exchanges for summary).
+      - Otherwise it's a :class:`~.search_query.SearchQuery` — AND-ed
+        case-insensitive terms, ``not x`` / ``-x`` to exclude — matched
+        against the per-view key set (symbol / side / account /
+        sec_type / exchange / order_ref for flat; symbol / exchanges
+        for summary).
   * Date range — keep rows whose ``time_sort`` ISO timestamp falls in
     the active :class:`~.trades_date_filter.TradeWindow`, which is what
     every entry in the control bar's date dropdown resolves to.  See
@@ -28,6 +30,7 @@ from zoneinfo import ZoneInfo
 
 from PySide6.QtCore import QModelIndex, QSortFilterProxyModel, Qt, Signal
 
+from .search_query import SearchQuery
 from .table_theme import IsFooterRowRole, SectionRankRole, SortValueRole
 from .trades_date_filter import TradeWindow, today_et
 
@@ -146,7 +149,7 @@ class TradesFilterProxy(QSortFilterProxyModel):
         # rather than the formatted display text, so 9.99 < 10.00 and
         # "+1,234.56" doesn't sort as a string.
         self.setSortRole(SortValueRole)
-        self._search: str = ""
+        self._search = SearchQuery()
         # When the user types a parseable datetime the proxy switches into
         # "time threshold" mode: the typed moment becomes a window of its
         # own and substring matching is off.  ``None`` = substring mode.
@@ -209,11 +212,11 @@ class TradesFilterProxy(QSortFilterProxyModel):
         # TradesSummaryModel.set_time_threshold from TradesPanel), so
         # the proxy just needs to not filter by the raw text.
         if parsed is not None:
-            new_search = ""
+            new_search = SearchQuery()
             new_window = (TradeWindow.from_threshold(parsed)
                           if not self._is_summary else None)
         else:
-            new_search = raw.lower()
+            new_search = SearchQuery.parse(raw)
             new_window = None
         if new_search == self._search and new_window == self._search_window:
             return
@@ -488,27 +491,14 @@ class TradesFilterProxy(QSortFilterProxyModel):
             if not self.effectiveWindow().contains_fill(data):
                 return False
 
-        # Substring search — match across the per-view key set.  Keys
-        # whose value is a set/list (e.g. summary "exchanges") are
-        # flattened to a space-joined lowercase string so substring
-        # matching still works ("cme" matches {"CME"}).  Runs alongside
-        # the preset threshold so the user can narrow by symbol while a
+        # Text search — the query matches across the per-view key set
+        # (``SearchQuery`` flattens set values such as the summary's
+        # "exchanges", so "cme" matches {"CME"}).  Runs alongside the
+        # preset threshold so the user can narrow by symbol while a
         # session filter is active.
         if self._search:
             keys = _SEARCH_KEYS_SUMMARY if self._is_summary else _SEARCH_KEYS_FLAT
-            matched = False
-            for k in keys:
-                v = data.get(k)
-                if v is None or v == "":
-                    continue
-                if isinstance(v, (set, list, tuple)):
-                    s = " ".join(str(x) for x in v).lower()
-                else:
-                    s = str(v).lower()
-                if s and self._search in s:
-                    matched = True
-                    break
-            if not matched:
+            if not self._search.matches(data.get(k) for k in keys):
                 return False
 
         return True

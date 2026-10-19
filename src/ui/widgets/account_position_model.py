@@ -31,6 +31,7 @@ from PySide6.QtGui import QBrush, QColor
 from src.ui.theme import Theme
 from src.utils.helpers import format_option_symbol_two_line
 
+from .search_query import SearchQuery
 from .table_theme import CELL_FONT, CELL_FONT_BOLD
 
 # ── Custom roles ──────────────────────────────────────────────────────────────
@@ -204,32 +205,31 @@ class AccountPositionModel(QAbstractTableModel):
         #         Account List panel has pushed a selection).
         # set() = user has explicitly deselected everything → show nothing.
         self._selected_accounts: set[str] | None = None
-        # Lowercased search text from the control-bar search field.
-        # Matches account id / alias / symbol / localSymbol.
-        self._search_text: str = ""
+        # The control-bar search box, parsed (see ``SearchQuery`` for
+        # the syntax).  Matches account id / alias / symbol / localSymbol.
+        self._search = SearchQuery()
 
     def set_search_text(self, text: str) -> None:
-        """Filter rows by account id/alias or symbol (case-insensitive
-        substring), then rebuild.  Empty text clears the filter."""
-        text = (text or "").strip().lower()
-        if self._search_text != text:
-            self._search_text = text
+        """Filter rows by account id/alias or symbol (``SearchQuery``
+        syntax: terms AND together, ``not x`` / ``-x`` exclude), then
+        rebuild.  Empty text clears the filter."""
+        query = SearchQuery.parse(text)
+        if self._search != query:
+            self._search = query
             self.rebuild()
 
+    def _alias(self, account: str) -> str:
+        return (self._get_alias(account) if self._get_alias else "") or ""
+
     def _account_matches_search(self, account: str) -> bool:
-        if self._search_text in account.lower():
-            return True
-        alias = (self._get_alias(account) if self._get_alias else "") or ""
-        return self._search_text in alias.lower()
+        return self._search.matches((account, self._alias(account)))
 
     def _position_matches_search(self, account: str, pos: dict) -> bool:
-        if not self._search_text:
+        if not self._search:
             return True
-        if self._account_matches_search(account):
-            return True
-        return any(
-            self._search_text in (pos.get(f) or "").lower()
-            for f in ("symbol", "local_symbol"))
+        return self._search.matches(
+            (account, self._alias(account),
+             pos.get("symbol"), pos.get("local_symbol")))
 
     def set_show_zero(self, show: bool) -> None:
         """Show or hide rows where position qty == 0, then rebuild."""
@@ -727,7 +727,7 @@ class AccountPositionModel(QAbstractTableModel):
             if acct in self._acct_data:
                 # While searching, a position-less account only keeps its
                 # header row when its own id/alias matches the query.
-                if self._search_text and not self._account_matches_search(acct):
+                if self._search and not self._account_matches_search(acct):
                     continue
                 header_accounts.add(acct)
 

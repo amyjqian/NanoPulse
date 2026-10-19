@@ -39,6 +39,7 @@ from src.ui.widgets.trades_date_filter import TradeWindow, fill_dt, today_et
 from src.utils.helpers import (
     format_option_symbol, format_option_symbol_two_line)
 
+from .search_query import SearchQuery
 from .table_theme import (
     CELL_FONT_BOLD, IsFooterRowRole, SectionRankRole, SortValueRole,
     header_alignment)
@@ -322,7 +323,7 @@ class TradesSummaryModel(QAbstractTableModel):
         # so typing an account like ``U123`` shows that account's
         # symbol totals — the flat proxy can't search aggregate rows
         # on per-fill fields, so the filter lives here instead.
-        self._search_text: str = ""
+        self._search = SearchQuery()
         # Keys the user has temporarily hidden from the view via the
         # context menu / Delete key.  The underlying aggregate stays in
         # ``_agg`` so a later ``restore_hidden`` can bring it back, and
@@ -1698,13 +1699,14 @@ class TradesSummaryModel(QAbstractTableModel):
         return self._window
 
     def set_search_text(self, text: str) -> None:
-        """Substring filter applied to the fill stream before
-        aggregation.  Callers should pass the raw substring (datetime
-        queries are routed through ``set_search_window`` instead)."""
-        new_search = (text or "").strip().lower()
-        if new_search == self._search_text:
+        """Text filter (``SearchQuery`` syntax) applied to the fill
+        stream before aggregation.  Callers should pass the raw text
+        (datetime queries are routed through ``set_search_window``
+        instead)."""
+        query = SearchQuery.parse(text)
+        if query == self._search:
             return
-        self._search_text = new_search
+        self._search = query
         self._rebuild_from_fills()
 
     def set_offline_labels(self, labels) -> None:
@@ -1943,14 +1945,9 @@ class TradesSummaryModel(QAbstractTableModel):
         return self.effective_window().contains_fill(fill)
 
     def _passes_search_filter(self, fill: dict) -> bool:
-        if not self._search_text:
+        if not self._search:
             return True
-        needle = self._search_text
-        for k in _FILL_SEARCH_KEYS:
-            v = fill.get(k, "")
-            if v and needle in str(v).lower():
-                return True
-        return False
+        return self._search.matches(fill.get(k) for k in _FILL_SEARCH_KEYS)
 
     def _rebuild_from_fills(self) -> None:
         """Replace aggregates with a fresh fold over every stored fill,
