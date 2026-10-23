@@ -402,10 +402,13 @@ class PositionsSummaryModel(QAbstractTableModel):
         self._rebuild()
 
     def set_selected_accounts(self, accounts) -> None:
-        """Filter aggregates to only the given accounts.  ``None`` or
-        an empty set means "all accounts" (matches the flat model's
-        convention)."""
-        new = set(accounts) if accounts else None
+        """Filter aggregates to only the given accounts.
+
+        Same tri-state as the flat model: ``None`` clears the filter
+        (show all), an EMPTY set shows nothing (every account unchecked
+        — the "None" pill), ``{...}`` shows only those listed.
+        """
+        new = set(accounts) if accounts is not None else None
         if new == self._selected_accounts:
             return
         self._selected_accounts = new
@@ -525,7 +528,7 @@ class PositionsSummaryModel(QAbstractTableModel):
 
     def _passes_account_filter(self, account: str) -> bool:
         sel = self._selected_accounts
-        if not sel:
+        if sel is None:
             return True
         return account in sel
 

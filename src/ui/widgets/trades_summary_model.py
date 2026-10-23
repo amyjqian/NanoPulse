@@ -340,7 +340,9 @@ class TradesSummaryModel(QAbstractTableModel):
         # accounts so this must gate fills BEFORE aggregation — a proxy
         # over the aggregate rows couldn't split a mixed-account bucket.
         # Empty set = show all, mirroring the positions view.
-        self._selected_accounts: set[str] = set()
+        # None = no filter; set() = nothing checked (show nothing);
+        # {...} = only those accounts — mirrors TradesFilterProxy.
+        self._selected_accounts: set[str] | None = None
         # Connection labels currently disconnected.  Their fills stay in
         # ``_fills`` but are excluded from every aggregate, so a
         # reconnect restores the numbers — see ``offline_connections``.
@@ -1725,8 +1727,10 @@ class TradesSummaryModel(QAbstractTableModel):
 
     def set_selected_accounts(self, accounts) -> None:
         """Re-aggregate using only fills whose ``account_id`` is in
-        *accounts* (raw IB ids).  Empty/None shows every account."""
-        new = {a for a in (accounts or ()) if a}
+        *accounts* (raw IB ids).  ``None`` clears the filter; an EMPTY
+        set aggregates nothing (every account unchecked)."""
+        new = ({a for a in accounts if a} if accounts is not None
+               else None)
         if new == self._selected_accounts:
             return
         self._selected_accounts = new
@@ -1927,7 +1931,9 @@ class TradesSummaryModel(QAbstractTableModel):
             ek = fill.get("exec_id", "")
             if ek and ek in self._hidden_fills:
                 return False
-        if self._selected_accounts:
+        if self._selected_accounts is not None:
+            if not self._selected_accounts:
+                return False            # nothing checked → nothing shown
             acct = fill.get("account_id", "")
             # Fills without an account_id stay visible rather than being
             # silently dropped (mirrors TradesFilterProxy).

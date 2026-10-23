@@ -1029,8 +1029,9 @@ class TradesPanel(QWidget):
 
     def set_selected_accounts(self, accounts) -> None:
         """Follow the Account List panel's checked accounts (raw IB ids;
-        empty = show all).  Flat rows filter in the proxy; the summary
-        re-aggregates from only the matching fills."""
+        empty = nothing checked → show nothing; ``None`` = no filter).
+        Flat rows filter in the proxy; the summary re-aggregates from
+        only the matching fills."""
         self._flat_proxy.setSelectedAccounts(accounts)
         self._summary_model.set_selected_accounts(accounts)
 
