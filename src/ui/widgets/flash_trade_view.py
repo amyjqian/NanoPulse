@@ -1293,7 +1293,7 @@ class FlashTradeView(QWidget):
         show right away (rather than only after the next pnlEvent)."""
         self._account_position.set_selected_accounts(accounts)
         # Trades view follows the same checked-accounts selection
-        # (empty set = show all, matching the positions view).
+        # (nothing checked = nothing shown, same as the positions view).
         self._trades_panel.set_selected_accounts(accounts)
         # Options ticket: checked accounts ARE its fan-out targets.
         self._options_ticket.on_accounts_changed()

@@ -932,8 +932,9 @@ class AccountPositionPanel(QWidget):
     def set_selected_accounts(self, accounts: set) -> None:
         """Filter positions view to only the given selected accounts.
 
-        Delegates to the model; an empty set means show all accounts.
-        Called whenever the Account List panel's checked state changes.
+        Delegates to both models; an empty set shows nothing (every
+        account unchecked) and ``None`` clears the filter.  Called
+        whenever the Account List panel's checked state changes.
         """
         self._model.set_selected_accounts(accounts)
         self._summary_model.set_selected_accounts(accounts)

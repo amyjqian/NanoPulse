@@ -3,8 +3,13 @@
 Fills carry ``account_id`` (the raw IB id — ``account`` holds the display
 alias, which can be renamed mid-session).  The flat view filters rows in
 ``TradesFilterProxy``; the summary re-aggregates from only the matching
-fills because an aggregate row can span accounts.  Empty selection means
-"show all", mirroring the positions view.
+fills because an aggregate row can span accounts.
+
+Selection is tri-state, mirroring the positions view: ``None`` clears the
+filter (show all), an EMPTY set shows nothing — it is what the Account
+List emits when every account is unchecked (the "None" pill), and a view
+that kept showing every account's rows then read as if they were all
+still selected — and ``{...}`` shows only those accounts.
 """
 from __future__ import annotations
 
@@ -70,14 +75,33 @@ class TestFlatProxy:
         proxy.setSelectedAccounts({"U222"})
         assert proxy.rowCount() == 1
 
-    def test_empty_selection_shows_all(self, qtbot):
+    def test_empty_selection_shows_nothing(self, qtbot):
+        """Every account unchecked → no rows at all."""
         proxy, _model = self._proxy(qtbot)
         proxy.setSelectedAccounts({"U111"})
         proxy.setSelectedAccounts(set())
-        assert proxy.rowCount() == 3
+        assert proxy.rowCount() == 0
+        proxy.setSelectedAccounts([])
+        assert proxy.rowCount() == 0
+
+    def test_none_clears_the_filter(self, qtbot):
+        proxy, _model = self._proxy(qtbot)
         proxy.setSelectedAccounts({"U111"})
         proxy.setSelectedAccounts(None)
         assert proxy.rowCount() == 3
+        proxy.setSelectedAccounts(set())
+        proxy.setSelectedAccounts(None)
+        assert proxy.rowCount() == 3
+
+    def test_empty_selection_hides_id_less_rows_too(self, qtbot):
+        """The id-less leniency applies to a real selection only —
+        with nothing checked there is nothing to be lenient about."""
+        proxy, model = self._proxy(qtbot)
+        legacy = _fill("e4", "")
+        legacy.pop("account_id")
+        model.add_fill(legacy)
+        proxy.setSelectedAccounts(set())
+        assert proxy.rowCount() == 0
 
     def test_rows_without_account_id_stay_visible(self, qtbot):
         proxy, model = self._proxy(qtbot)
@@ -109,7 +133,14 @@ class TestSummaryModel:
         m.set_selected_accounts({"U111"})
         assert m._effective_agg(m.row_key(1))["buys_qty"] == 10
 
+        # Nothing checked → nothing aggregated: no symbol rows, no
+        # bands, zero totals.
         m.set_selected_accounts(set())
+        assert m.rowCount() == 0
+        assert m.pnl_totals() == (0.0, 0.0, 0.0, 0.0)
+
+        # Only None clears the filter.
+        m.set_selected_accounts(None)
         assert m._effective_agg(m.row_key(1))["buys_qty"] == 14
 
     def test_symbol_row_drops_when_no_fill_matches(self):
@@ -133,4 +164,7 @@ def test_panel_forwards_to_both_views(qtbot):
     assert panel._summary_model._effective_agg(
         panel._summary_model.row_key(1))["buys_qty"] == 10
     panel.set_selected_accounts(set())
+    assert panel._flat_proxy.rowCount() == 0
+    assert panel._summary_model.rowCount() == 0
+    panel.set_selected_accounts(None)
     assert panel._flat_proxy.rowCount() == 2

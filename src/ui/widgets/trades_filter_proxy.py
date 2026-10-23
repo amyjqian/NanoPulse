@@ -174,7 +174,10 @@ class TradesFilterProxy(QSortFilterProxyModel):
         # Checked accounts from the Account List panel, matched against
         # the row's raw ``account_id`` (the ``account`` column shows the
         # alias).  Empty set = show all, mirroring the positions view.
-        self._selected_accounts: set[str] = set()
+        # None = no filter (show all); set() = nothing checked (show
+        # nothing); {...} = only those accounts.  Same tri-state as the
+        # Positions models.
+        self._selected_accounts: set[str] | None = None
         # Connection labels currently disconnected.  Their fills stay in
         # the model but are filtered out of the view, so a reconnect
         # restores them — see ``offline_connections``.
@@ -252,8 +255,15 @@ class TradesFilterProxy(QSortFilterProxyModel):
 
     def setSelectedAccounts(self, accounts) -> None:
         """Restrict rows to fills whose ``account_id`` is in *accounts*
-        (raw IB account ids).  Empty/None shows every account."""
-        new = {a for a in (accounts or ()) if a}
+        (raw IB account ids).
+
+        ``None`` clears the filter (every account).  An EMPTY set shows
+        nothing: the Account List's checked accounts drive this, so
+        "nothing checked" must read as "nothing selected", exactly as
+        the Positions view does.
+        """
+        new = ({a for a in accounts if a} if accounts is not None
+               else None)
         if new == self._selected_accounts:
             return
         self._selected_accounts = new
@@ -475,7 +485,9 @@ class TradesFilterProxy(QSortFilterProxyModel):
             if (data.get("label", "") or "") in self._offline_labels:
                 return False
 
-        if self._selected_accounts:
+        if self._selected_accounts is not None:
+            if not self._selected_accounts:
+                return False            # nothing checked → nothing shown
             acct = data.get("account_id", "")
             if acct and acct not in self._selected_accounts:
                 return False
